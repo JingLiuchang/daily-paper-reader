@@ -1,0 +1,1353 @@
+Title: Efficiently Linking Unstructured Data for Multi-step Reasoning
+
+URL Source: https://arxiv.org/pdf/2609.19491v1
+
+Published Time: Fri, 18 Sep 2026 00:22:38 GMT
+
+Number of Pages: 23
+
+Markdown Content:
+# Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+# Jiaming Liang 
+
+liangjm@seas.upenn.edu University of Pennsylvania Philadelphia, PA, USA 
+
+# Haydn Jones 
+
+haydnj@seas.upenn.edu University of Pennsylvania Philadelphia, PA, USA 
+
+# Jacob R. Gardner 
+
+jacobrg@cis.upenn.edu University of Pennsylvania Philadelphia, PA, USA 
+
+# Mark Yatskar 
+
+myatskar@cis.upenn.edu University of Pennsylvania Philadelphia, PA, USA 
+
+# Zachary Ives 
+
+zives@cis.upenn.edu University of Pennsylvania Philadelphia, PA, USA 
+
+## Abstract 
+
+Modern LLMs and AI agents increasingly support data engineer-ing workflows that integrate evidence from unstructured sources. Such pipelines typically do data retrieval, integration, and rank-ing before proceeding to more complex agentic reasoning or ac-tions, e.g., for scientific discovery. The core retrieval problem 
+
+in these workflows jointly executes multi-attribute filtering, multi-vector search, exact relational joins, and thresholded embedding-similarity joins. Given a planned query and monotone scoring function, our DASE query engine constructs and ranks candidate evidence tuples. It comprises (i) a multi-step reasoning query model over structured predicates, multiple vectors, and relational links; (ii) SemJI, a sparse materialized embedding-similarity join index for rare near-neighbor pairs; and (iii) a co-designed execution layer that combines predicate-aware ANN traversal, batched access, and threshold-based score aggregation. On scientific-discovery workloads, DASE retrieves candidate evidence for multi-step reasoning queries 6× to 46× faster than strong RDBMS, rerank, and vector-database baselines at comparable recall; and for tasks that require semantic-operator post-processing, DASE acts as a high-recall prefilter that makes downstream LLM evaluation both cheaper and more accurate—e.g., on SemBench E-Commerce it improves BigQuery quality from 0.67 to 0.80 while cutting cost from $2.42 to $0.54. 
+
+## 1 Introduction 
+
+Novel database and AI systems have emerged that construct an-swers by integrating information from multiple unstructured sources, leveraging LLMs to reason about semantic content and relation-ships. Examples of such agentic data engineering systems include “deep research” [20, 59, 63] and “wide search” agents [7, 21, 24, 25, 53, 56], systems for scientific discovery and literature synthe-sis [3, 17, 19, 29], LLM-based information extraction tools [1, 43], and unstructured-to-structured query systems based on semantic operators [30, 36, 41, 45]. Despite fundamental differences in archi-tecture and scope, these systems generally share a core operation: given a user query, they decompose it into plans, where an initial 
+
+multi-step reasoning retrieval primitive finds and assembles entity combinations that best satisfy multiple search criteria. These inte-grated results are then fed into pipelines containing rich agentic reasoning steps, which may perform aggregate reasoning or initi-ate other actions. These agent-generated retrieval and integration workloads motivate rethinking query execution in data systems, in line with the broader call for agent-first architectures [31]. Our pa-per targets the initial data-retrieval task and layer: given a planned query and scoring function, we construct and rank candidate evi-dence tuples. Our LLM-based planner, which decomposes natural language tasks into retrieval and agentic steps using a combination of chain-of-thought reasoning [51], tool-calling [58], and ReAct-based reasoning [59], is beyond the scope of the paper. Our team, in collaboration with chemists and life scientists, is building an agentic data engineering tool to accelerate scientific discovery. Two initial classes of applications involve discovering candidate molecules with pharmaceutical benefits and engineering RNA sequences with therapeutic properties. Both require reasoning over mostly natural-language data that has been preprocessed by (1) indexing document paragraphs with embeddings, as in retrieval-augmented generation (RAG) [16], and (2) extracting knowledge-graph-like annotations of those paragraphs [38, 42] and indexing annotation labels and values by their embeddings. We use molec-ular discovery as the running example; the RNA workload has a similar retrieval structure. A molecule’s structure can be encoded as a string (SMILES) [52], a bit vector (ECFP) [40], or as a special-ized embedding (ChemBERTa) [9] depending on the downstream reasoning steps required. Accompanying textual passages, as well as knowledge graph properties such as outcomes or experimental settings, might also be embedded using standard text or multimodal embeddings. 
+
+Example 1.1 (Agentic data engineering for molecular discovery). 
+
+The process of discovering and optimizing molecules or RNA starts with an information gathering stage, i.e., a query that as-sembles candidate results. Since evidence is often fragmented across documents and their extracted annotations, a query about a molecule might (1) approximately match against a ChemBERTa embedding, extracted from the text into a knowledge graph, but linked back to the paragraph in which it appears; (2) match on an extracted organism ; (3) match against embeddings of experimen-tal conclusions. All of these matches must be joined to ensure they are within a common paper; and ranked using a function that combines all of the individual matches . Finally, a ranked list of promising candidate molecules from this query stage is often fed into additional tools, e.g., to optimize their chemistry, or to generate new molecules using fine-tuned LLMs. Such queries may also need to link information across documents based on approximate matches in their content: arXiv:2609.19491v1 [cs.DB] 16 Sep 2026 Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives                           
+
+> query keyword
+> $molecule_embed
+> molecule 𝑚 1
+> chemberta ,description
+> paragraph 𝑝 2
+> text_embed document 𝑑 2
+> paragraph 𝑝 1paragraph 𝑝 3molecule 𝑚 2
+> ChemBERTa ∼query
+> <0.30; 𝑤 =0.6description ∼text
+> <0.25; 𝑤 =0.4
+> paragraph_id pubmed_id pubmed_id paragraph_id
+> filters: p1.document_id ≠d2.pubmed_id ;
+> m1.molecule_id ≠m2.molecule_id
+
+Figure 1: A graph pattern for the query described in Exam-ple 1.2, corresponding to agentic planner-generated SQL (List-ing 1). The leftmost keyword-input leaf, $molecule_embed ,matches molecule variable 𝑚 1; dashed purple edges are thresholded embedding-similarity predicates whose dis-tances form the ranking score, and solid edges are exact joins. 
+
+Example 1.2. Building upon Example 1.1, a scientific-discovery query might be based on the observation that small molecules may have similar characteristics even if they are not particularly similar in ChemBERTa embedding space. Thus we might seek to find related molecules , by matching on a first document, then 
+
+linking and joining via text description embedding with 
+
+other documents, then traversing (joining) to their extracted molecular descriptions. Figure 1 visualizes this. We will formalize and revisit this query in subsequent examples. The retrieval task is not just to retrieve relevant records step by step. A candidate must be evaluated jointly against the query’s cri-teria, even when the evidence for those criteria is scattered across sources. This requires linking the relevant records to the same candidate and ranking the resulting combinations as a whole. As collections grow, the system must search a large space of candidate– evidence combinations while returning only a short list for down-stream reasoning. Concretely, a query can combine structured predicates, exact joins, and thresholded embedding-similarity joins. It returns the top-𝑘 evidence tuples according to a scoring function that combines multiple similarity signals. Conventional vector DBMSs such as Pinecone or Weaviate [39, 50] do not natively plan multi-table joins and joint multi-signal ranking, so an external query processor must stitch such operations together. Milvus [48], designed for hybrid search, supports logical predicates and vector retrieval but does not provide relational join planning. We therefore study how to implement multi-step reasoning queries in a relational DBMS with approximate-nearest-neighbor (ANN) vector-index support. As we demonstrate in Section 5, standard RDBMS execution strategies for combining predicates with approximate-nearest-neighbor search [18, 32] perform poorly on join-heavy multi-step reasoning queries and other semantic-query tasks [26]. Similarly, information-retrieval-style reranking [6, 34] can incur low recall. Multi-step reasoning queries therefore introduce challenges in query indexing, optimization, and execution, which we address with the following contributions: 
+
+• Query formalism for agentic systems. We formalize ranked multi-step reasoning queries that support structured filters, vec-tor scores, and cross-table joins. 
+
+• Indexing strategy. We develop SemJI, a materialized embedding-similarity join index that represents near-neighbor pairs as a relational access path for top-𝑘 multi-step reasoning queries. 
+
+• Algorithm/system co-design. We extend PostgreSQL’s ANN-index support with batched access and develop DASE, which combines predicate-aware ANN traversal, filtered score streams, and threshold-based aggregation to jointly optimize attribute predicates and vector scoring across relational joins. 
+
+• Benchmark and evaluation. We contribute a benchmark over IMDB and MOLECULE with eight query classes covering struc-tured filtering, multi-signal scoring, and cross-table joins, sepa-rately and in combination. Fixed query semantics and exhaustive top-𝑘 reference results enable comparisons of retrieval quality and throughput across systems. We also evaluate prefiltering for downstream semantic queries, scaling with join depth, and robustness to embedding anisotropy and shared context. To ensure reproducibility, our code, data, and full technical report are available at https://anonymous.4open.science/r/DASE-2C61/. 
+
+## 2 Query Model and Index Strategy 
+
+This paper targets query answering tasks over unstructured data that has been indexed and annotated within a local relational DBMS, which may include both approximate nearest-neighbor search over embeddings, as well as logical predicates over relationships. 
+
+Data model. Our underlying data model is based on object-rela-tional tables, representing raw document and file content. Tables are linked through foreign key relationships. Using a combination of user-defined functions and semantic operators [36, 43], indexed data may be parsed, mapped to an embedding, and then analyzed using LLM operators such as semantic map to extract structured information from the parsed content; semantic filter to test tuples’ content against a prompt, etc. The results of semantic maps may be saved as labeled annotations in a structured relational table, in a controlled vocabulary, with explicit provenance links to the source content, and with embeddings over their values. 
+
+Figure 2: DASE interactions with other system components. 
+
+## 2.1 Top-𝑘 Multi-Step Reasoning Queries 
+
+Our target use case involves an upper-layer agentic system, per-forming deep or wide search, or another form of multi-step rea-soning over a user’s natural-language question. This creates an agentic pipeline, in which the agent, or a planning frontend, cre-ates an initial retrieval and integration task involving a structured query over a local dataset. This multi-step reasoning query com-bines multi-attribute filtering, multi-vector similarity scoring, and Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+cross-table joins, together with a scoring function that aggregates these signals into a unified ranking objective. Our DASE engine executes this query and returns the top-𝑘 results. We assume the scoring function is supplied by the upstream agent. DASE is agnos-tic to its origin; in our own research agent, the weights are trained using logistic regression over a calibration set [36] of labeled sam-ples. These assumptions are consistent with Fagin’s monotonicity assumption [14] and thus admit efficient threshold-based top-𝑘 
+
+evaluation. DASE then outputs a ranked list , which the upstream agent consumes in one of two modes: 
+
+1. Direct consumption. When the agent’s question reduces to find-ing the best-matching combinations of evidence—a typical pattern in wide search and multi-objective discovery—the ranked output is the answer. Cross-encoders [34] are a common way for the agent to map per-source signals into a unified ranking. 
+
+2. Prefilter for semantic operators. For tasks that require a final LLM judgment—for example, evidence validation, entity resolution, or answer synthesis—DASE returns a high-recall candidate set to a downstream semantic-operator system [36, 41, 45]. This realizes the standard calibrated prefilter–LLM pattern: cheap proxy signals prune candidates before expensive semantic evaluation [36]. In our setting, the prefilter is a ranked, thresholded select–join query over embedding distances and structured attributes. In either mode, DASE executes the agent-supplied top-𝑘 scoring function over structured attributes, multiple embedding spaces, and cross-table joins. We now formalize this query. 
+
+2.1.1 Query Model. A multi-step reasoning query 𝑄 is formally defined by the triple (P , S, J ) , which characterizes the feasibility space, ranking objectives, and relational dependencies. 
+
+Predicates ( P): P = {𝑝 1, . . . , 𝑝 | P | } is a set of heterogeneous predicates over 1 or more structured components (which may be the results of a join or Cartesian product). This set may be empty ( P = ∅), indicating an unconstrained search space. Regard-less of their specific semantic types (such as range constraints, set memberships, or probabilistic filters) each 𝑝 𝑖 ∈ P can be concep-tually modeled as a Boolean indicator function 𝑝 𝑖 : R → { 0, 1}.For a given query subexpression 𝑞 and any resulting row instance 
+
+𝑟 ∈ 𝑞 (·) , 𝑝 𝑖 (𝑟 ) logically evaluates to 1 if 𝑟 satisfies the constraint, and 0 otherwise. 
+
+Similarity Join Conditions ( J ): J = {( 𝑒 1,𝑖 , 𝑒 2,𝑖 , 𝑑𝑖𝑠 𝑖 , 𝜏 𝑖 )} | J | 
+
+> 𝑖 =1
+
+is an optional set of relational constraints ( J = ∅ denotes a stan-dard single-table query). Each condition specifies a thresholded embedding-similarity join between unstructured components 
+
+across tables: a link is established when the embedding distance satisfies 𝑑𝑖𝑠 𝑖 (𝑒 1,𝑖 , 𝑒 2,𝑖 ) ≤ 𝜏 𝑖 . Thus, distances are lower-is-better fea-sibility predicates, not ranking scores. 
+
+Scoring Model ( S): S = score 𝑓 (𝑠 1, . . . , 𝑠 | S | ) defines the uni-fied ranking objective. To guarantee a definable top-𝑘 retrieval, the query must specify at least one scoring signal ( |S| ≥ 1). Every 𝑠 𝑖 
+
+is a higher-is-better affinity : an embedding distance 𝑑 is converted by a calibrated non-increasing transform 𝜙 𝑖 , e.g., 𝑠 𝑖 = 𝜙 𝑖 (𝑑 ) = −𝑑 ;and a scalar attribute is mapped to a desirability score by an analo-gous transform. Components therefore include (1) query-to-object affinity 𝜙 𝑖 (𝑑𝑖𝑠 (q𝑣 , 𝑒 𝑖 )) , (2) relational-link affinity 𝜙 𝑖 (𝑑𝑖𝑠 (𝑒 1,𝑖 , 𝑒 2,𝑖 )) ,and (3) structural-attribute desirability. The aggregation function                                                                     
+
+> 1SELECT m1 . molecule_id , m2 . molecule_id , d2 . pubmed_id ,
+> 2semantic_score (m1 , p2 , $ molecule_embed ) AS semantic_score
+> 3FROM molecule m1
+> 4JOIN paragraph p1 ON m1 . paragraph_id =p1 . paragraph_id
+> 5JOIN paragraph p2 ON p2 . text_embed <=> m1 . description_embed <0.25
+> 6JOIN document d2 ON p2 . pubmed_id =d2 . pubmed_id
+> 7JOIN paragraph p3 ON d2 . pubmed_id =p3 . pubmed_id
+> 8JOIN molecule m2 ON p3 . paragraph_id =m2 . paragraph_id
+> 9WHERE m1 . chemberta_embed <=> $ molecule_embed <0.3
+> 10 AND p1 . document_id <> d2 . pubmed_id
+> 11 AND m1 . molecule_id <> m2 . molecule_id
+> 12 ORDER BY semantic_score DESC LIMIT 100;
+
+Listing 1: Abbreviated molecular-relationship query pattern for $molecule_embed , for Example 1.2. 
+
+𝑓 is coordinatewise non-decreasing (for example, a nonnegative weighted sum), so higher component affinities cannot lower the final score. The goal is to retrieve the top-𝑘 tuples that satisfy P
+
+and J while maximizing S.As discussed above, the scoring signals and weights are pro-vided by an upper-layer agentic system (e.g., through calibration or learned rankings [8, 28, 57]) or by direct user specification; our methods are agnostic to their origin, provided the resulting compo-nent scores obey the higher-is-better, monotone contract above. Our task extends classic rank aggregation [14, 46]. Traditional settings find top answers by aggregating independent scores that evaluate the query against individual records. In contrast, our core challenge is computing dynamic, interdependent scores to evaluate embedding-similarity join conditions on the fly. Reconciling these highly coupled data-to-data affinities with structured logical predi-cates, while avoiding exhaustive search and leveraging indexing, is the primary computational hurdle in retrieving the top-𝑘 results. 
+
+Example 2.1. Listing 1 gives an abbreviated SQL query for Ex-ample 1.2 (eliding result-formatting details). The semantic_score 
+
+function computes a higher-is-better result, by negating the cali-brated weighted combination of the lookup and join distances. Standard ANN indices fall short here for two reasons. First, as they are implemented in engines such as PostgreSQL, they are designed for 1-to-N point lookups, making them unable to execute M-to-N embedding-similarity joins following a block nested loops pattern . Instead, they essentially only support tuple nested loops joins. Second, because they cannot jointly evaluate the multi-signal scoring function , the true top results for the overall query might be buried arbitrarily deep within the ANN’s ranked stream, precluding early termination. The M-to-N embedding-similarity pattern is a critical part of many object-linking tasks, such as record linking [10] or textual similarity detection. In many cases, we will have a block of 𝑀 items from the left relation (collection) that are highly similar to 𝑁 items in the right relation; the final answer set may be ranked with a holistic combination of score components (the multi-signal scoring function) including the similarities of each similarity step, as well as the intrinsic scores of the original items versus specific query constraints. We thus develop an alternative approach: precompute Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives 
+
+and materialize partial answers based on distributional knowl-edge, then expand the answer frontier as needed. This decouples join discovery from scoring and supports threshold algorithms [14] for earlier termination. 
+
+## 2.2 Precomputing Semantic Join Tail-Events 
+
+Evaluating an embedding-similarity join naively requires distances for a Cartesian product of endpoint embeddings. In high-dimensional, approximately isotropic embedding spaces 1, pairwise distances con-centrate in a dense bulk, while unusually close pairs occupy a small left tail [47]. The join candidates that carry semantic affinity are therefore sparse relative to all pairs. Figure 3 illustrates this empiri-cal pattern for IMDB actor–director embeddings: most distances lie between 0 .55 and 0 .85, with only a small close-pair tail. 
+
+Figure 3: L2 distance distribution: pairwise among IMDB Actor_Director embeddings (Gemini-embedding-001) 
+
+This observation motivates materializing the close-pair tail as a sparse embedding-similarity join index and feeding its end-points to batched retrieval. (Real endpoint populations can be anisotropic and their distance distributions need not be Gaussian, but still exhibit the tail property; Section 3.8 discusses mitigations.) 
+
+## 3 Semantic Join Index 
+
+Based on the intuition from the previous discussion, the Semantic Join Index (SemJI) materializes close vector pairs, instantiating the embedding-similarity-join topology J of our query model and avoiding repeated join discovery at query time. Here “semantic” refers to the embedding-based proxy; it is distinct from a down-stream LLM semantic operator. 
+
+## 3.1 Motivation and Definition 
+
+For materialization radius 𝜏 𝑐𝑎𝑝 , we materialize relation J𝜏 𝑐𝑎𝑝 =
+
+{( 𝐴, 𝐵 ) | dist (𝐴, 𝐵 ) ≤ 𝜏 𝑐𝑎𝑝 }. Each entry (𝑖𝑑 𝐴 , 𝑡𝑖𝑑 𝐴 , 𝑖𝑑 𝐵 , 𝑡𝑖𝑑 𝐵 , dist (𝐴, 𝐵 )) 
+
+records the source fields, tuple pointers, and distance; the distance is converted to the query’s higher-is-better affinity only during rank-ing (e.g., by subtracting from 1). Thus, 𝜏 𝑐𝑎𝑝 is an index-coverage boundary . Standard relational joins chain multiple SemJI steps for multi-hop patterns; this composes thresholded links and does not assume transitive embedding similarity. (We discuss correlation in Section 3.8.) 
+
+## 3.2 Correctness and Coverage 
+
+An exact SemJI construction stores every pair in J𝜏 𝑐𝑎𝑝 . For a query threshold 𝜏 𝑞 ≤ 𝜏 𝑐𝑎𝑝 , the index answers its similarity-join predicate exactly. For 𝜏 𝑞 > 𝜏 𝑐𝑎𝑝 , exact execution additionally enumerates the 
+
+outer band 𝜏 𝑐𝑎𝑝 < dist (𝐴, 𝐵 ) ≤ 𝜏 𝑞 through the base engine. 
+
+> 1“Approximately isotropic” means that variance is not concentrated in a small number of embedding directions.
+
+An ANN-built SemJI is instead approximate: it stores bJ𝜏 𝑐𝑎𝑝 ⊆J𝜏 𝑐𝑎𝑝 . Filtering by distance removes false positives among retrieved candidates, but ANN traversal can miss an under-the-cap pair and hence create false negatives. Completing only the outer band can-not repair such a miss. Therefore, a result using an approximate SemJI is exact only with respect to its retrieved candidate set. The approximate SemJI inherits any guarantee of its underlying ANN method; HNSW has no general completeness guarantee, whereas some alternatives have approximation bounds [18]. 
+
+## 3.3 Index Construction 
+
+The SemJI construction process determines what guarantees it pro-vides. 
+
+Exact construction. Exact construction enumerates the Cartesian product and retains every pair within 𝜏 𝑐𝑎𝑝 ; it provides the ground truth for approximate-construction recall. 
+
+Approximate construction. leverages an ANN structure. For a neighbor relationship, it probes one table against an index over the second one, and exactly refines all returned candidates. This filter-and-refine procedure removes returned candidates outside 
+
+𝜏 𝑐𝑎𝑝 but does not establish coverage. 
+
+E2LSH filter-and-refine (alternative strategy). For 𝐿 2 dis-tance, E2LSH [12] hashes each vector 𝑥 using ℎ𝑎,𝑏 (𝑥 ) = ⌊( 𝑎 ⊤𝑥 +
+
+𝑏 )/ 𝑤 ⌋, where 𝑎 ∼ N ( 0, 𝐼 ) and 𝑏 ∼ Uniform [0, 𝑤 ). The build phase stores each larger-relation vector in one or more hash tables; the probe phase retrieves larger-relation vectors sharing a hash bucket with each smaller-relation vector. We then compute exact distances for these collision candidates and materialize only pairs satisfy-ing dist (𝑎, 𝑏 ) ≤ 𝜏 𝑐𝑎𝑝 . Thus, refinement eliminates false positives, whereas missed collisions may yield false negatives. We did not implement this strategy in practice, since a hash-table and bucket-management path is less well suited to an in-engine PostgreSQL implementation than HNSW traversal. If enabled, it requires report-ing the number of tables, concatenated hashes, and tuned width (for example, 𝑤 ≈ 4𝜏 𝑐𝑎𝑝 is only a high-recall heuristic). 
+
+Radius-expanded HNSW (Algorithm 1), preferred strategy. 
+
+Standard HNSW is optimized for top-𝑘 retrieval and can prune can-didates inside a requested radius. Our radius-expanded traversal 
+
+relaxes the pruning gate to the maximum of the beam boundary and 𝜏 𝑐𝑎𝑝 : gate = max (W .furthest () , 𝜏 𝑐𝑎𝑝 ). This improves empirical range-query recall but does not establish completeness; we measure it against exact construction. 
+
+## 3.4 Space Cost 
+
+SemJI is a materialized relation, with 𝐽 = |J 𝜏 𝑐𝑎𝑝 | retained pairs. Its base representation and any distance/order or endpoint lookup indexes require 𝑂 (𝐽 ) records. Because the SemJI is constructed only for frequently used embedding-column pairs whose calibrated tail has a bounded expected degree, the retained-pair fraction 𝜌 =
+
+𝐽 /(| 𝐴 || 𝐵 |) is small, so storage scales as 𝜌 |𝐴 || 𝐵 | rather than the full product. Nonetheless, we enforce a maximum space budget per index, adjusting 𝜏 𝑐𝑎𝑝 to reach that budget. The configurations in Section 5 show practical settings. Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+Algorithm 1 Layer Traversal in Radius-Expanded HNSW 
+
+Require: Query 𝑞 , Entry Point 𝑒𝑝 , Beam 𝑒 𝑓 , Query Radius 𝜏 𝑞 ≤
+
+𝜏 𝑐𝑎𝑝 , Construction Cap 𝜏 𝑐𝑎𝑝 
+
+Ensure: Approximate Result Set R 
+
+> 1:
+
+𝑑 𝑒𝑝 ← dist (𝑒𝑝, 𝑞 ); C ← MinHeap (𝑒𝑝, 𝑑 𝑒𝑝 ); W ←
+
+MaxHeap (𝑒𝑝, 𝑑 𝑒𝑝 ); V ← { 𝑒𝑝 } 
+
+> 2:
+
+R ← ∅  
+
+> 3:
+
+if 𝑑 𝑒𝑝 ≤ 𝜏 𝑞 then R.add (𝑒𝑝 ) 
+
+> 4:
+
+end if  
+
+> 5:
+
+while C is not empty do  
+
+> 6:
+
+𝑐 ← C .pop () ; 𝑤 ← W .peek ()  
+
+> 7:
+
+if 𝑐.𝑑𝑖𝑠𝑡 > 𝑤 .𝑑𝑖𝑠𝑡 and 𝑐.𝑑𝑖𝑠𝑡 > 𝜏 𝑐𝑎𝑝 then  
+
+> 8:
+
+break ⊲ Prune only if outside both beam and radius  
+
+> 9:
+
+end if  
+
+> 10:
+
+𝑔𝑎𝑡𝑒 ← max (W .peek () .𝑑𝑖𝑠𝑡, 𝜏 𝑐𝑎𝑝 ) 
+
+> 11:
+
+for 𝑒 ∈ neighbors (𝑐 ) do  
+
+> 12:
+
+if 𝑒 ∉ V then  
+
+> 13:
+
+V.add (𝑒 ); 𝑑 𝑒 ← dist (𝑒, 𝑞 ) 
+
+> 14:
+
+if 𝑑 𝑒 ≤ 𝑔𝑎𝑡𝑒 or |W| < 𝑒 𝑓 then  
+
+> 15:
+
+C.push (𝑒, 𝑑 𝑒 ); W.push (𝑒, 𝑑 𝑒 ) 
+
+> 16:
+
+if |W| > 𝑒 𝑓 then W.pop_furthest ()  
+
+> 17:
+
+end if  
+
+> 18:
+
+if 𝑑 𝑒 ≤ 𝜏 𝑞 then R.add (𝑒 ) 
+
+> 19:
+
+end if  
+
+> 20:
+
+end if  
+
+> 21:
+
+end if  
+
+> 22:
+
+end for  
+
+> 23:
+
+end while  
+
+> 24:
+
+return R
+
+## 3.5 Batched Execution Optimization 
+
+Both exact and approximate SemJI construction options batch probes. Exact construction uses blocked, vectorized distance computation and writes only surviving pairs. Approximate construction groups HNSW probes with shared upper-layer traversals and E2LSH probes by hash bucket, improving locality for candidate access. 
+
+## 3.6 Multi-Step Reasoning 
+
+SemJI supports multi-hop paths (e.g., 𝐴 𝜏 1
+
+−→ 𝐵 𝜏 2
+
+−→ 𝐶 ) by treating its materialized connectivity as a relational view. For a chain J𝑐ℎ𝑎𝑖𝑛 =
+
+{(J 1, 𝜏 1), . . . , (J 𝑚 , 𝜏 𝑚 )} , the engine computes: 
+
+R𝑐ℎ𝑎𝑖𝑛 ← Fetch (J 1, 𝜏 1) ⊲⊳ Fetch (J 2, 𝜏 2) ⊲⊳ . . . ⊲⊳ Fetch (J 𝑚 , 𝜏 𝑚 )
+
+(1) where each Fetch applies its runtime threshold 𝜏 𝑖 ≤ 𝜏 𝑐𝑎𝑝 . Projecting 
+
+R𝑐ℎ𝑎𝑖𝑛 onto a target table yields the semantic semijoin predicate 
+
+𝑃 J , which the Filtered-Score Streamer (Section 4.2) pushes down before scoring. 
+
+## 3.7 Capacity-Based Threshold Maintenance 
+
+We can maintain both exact and approximate SemJI structures with the same basic mechanism. Initially, the SemJI has a 𝜏 𝑐𝑎𝑝 set based on a small warmup sample and query. Of course, the workload may introduce queries in the future that require a different threshold. Thus, the controller grows the index by its materialized-pair ca-pacity , which allows us to limit the estimated number of growth steps. Let 𝐽 (𝜏 ) = |J 𝜏 | and let 𝐽 = 𝐽 (𝜏 𝑐𝑎𝑝 ) be the current number of retained pairs. A space budget 𝐵 𝑚𝑎𝑥 bounds every SemJI. The budget is on retained pairs, not on the numerical radius: embedding geometry can make a small change in radius admit many pairs, whereas 𝐽 is directly proportional to base SemJI storage (up to fixed per-pair index overhead). Even with a large budget, we would expect to materialize a very small percentage of the possible pairs, as we see in Section 5. 
+
+Overflow and capacity doubling. When a query requests 𝜏 𝑞 > 𝜏 𝑐𝑎𝑝 ,DASE answers it both using the SemJI along with base-engine enumeration of the outer band 𝜏 𝑐𝑎𝑝 < dist (𝑎, 𝑏 ) ≤ 𝜏 𝑞 . Thus, index growth is not on the query’s critical path. The controller records the overflow and asynchronously doubles its retained-pair capacity, targeting 𝐵 ′ pairs at radius 𝜏 𝑛𝑒𝑥𝑡 ,
+
+𝐵 ′ = min {𝐵 𝑚𝑎𝑥 , max {2𝐽, 𝐽 𝑚𝑖𝑛 }} , 𝜏 𝑛𝑒𝑥𝑡 = inf {𝜏 ≥ 𝜏 𝑐𝑎𝑝 : 𝐽 (𝜏 ) ≥ 𝐵 ′ },
+
+where 𝐽 𝑚𝑖𝑛 prevents a near-empty initial index from growing in negligible increments. The controller expands only when 𝐽 < 𝐵 𝑚𝑎𝑥 ,materializes the new values in the range (𝜏 𝑐𝑎𝑝 , 𝜏 𝑛𝑒𝑥𝑡 ], and publishes a new index version. A single unusually permissive query need not make the index cover 𝜏 𝑞 : strict capacity doubling preserves the budget, while that query still uses its fallback. Ties or a sharp density increase can make 𝐽 (𝜏 𝑛𝑒𝑥𝑡 ) exceed 𝐵 ′; the controller rejects that expansion if it would exceed 𝐵 𝑚𝑎𝑥 .This policy is independent of the distribution of pairs under the threshold, although anisotropy can change the radius needed to admit 𝐵 ′ pairs. We additionally monitor endpoint-degree skew, since a modest total 𝐽 concentrated at a few endpoints can still make downstream joins expensive. 
+
+Amortization and data evolution. For a static relation, capacity doubling yields at most ⌈log 2 (𝐵 𝑚𝑎𝑥 /𝐽 𝑚𝑖𝑛 )⌉ expansions. If an expan-sion discovers, writes, and indexes only new distance-bands, the total pair-materialization work through final size 𝐽 𝑓 is 𝑂 (𝐽 𝑓 − 𝐽 0);even rebuilding the materialized relation at every doubling has a geometric-series bound below 2 𝐽 𝑓 for pair writing. This is an output-space amortization guarantee, where the cost of the rescan is dependent on the radius-expanded HNSW of Algorithm 1. 
+
+## 3.8 Robustness to Correlated Embeddings 
+
+Our SemJI materialization-radius heuristic relies on the pairwise-distance population being sufficiently isotropic for a tail thresh-old such as 𝜏 𝑐𝑎𝑝 = 𝜇 − 3𝜎 to be informative. This can fail when endpoint embeddings are anisotropic or share dominant direc-tions, because they were extracted from overlapping source context. Such geometry can distort the apparent distance distribution, so a statistically chosen materialization radius may omit useful close pairs [13, 33, 44]. We can detect anisotropy by computing the co-variance of the centered embeddings from a query; if the variance is concentrated in a few directions, this indicates that a raw-distance tail estimate may be error-prone once predicates or other neighbor-hood relationships are factored in. In lieu of the baseline strategy of calibrating thresholds by 𝜇 − 3𝜎 
+
+over a sample, SemJI can adopt mitigation strategies from the lit-erature for anisotropic data. PCA whitening mean-centers and rescales principal axes [44]; all-but-the-top (ABTT) removes a Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives Identity molecules   
+
+> similar to Aspirin that
+> treat sepsis in piglet
+> models.
+> Filter-Score
+> Streamer
+> Database
+> Join Indices
+> Join-Indices
+> Manager
+> Multi-Scoring
+> Aggregator
+> Filtered-Score
+> Streamer
+> SemJI
+> Manage evolution
+> SemJI Access
+> Controller
+> Fetch Semantic
+> Distance Streams
+> Find a molecule that:
+> 1. Molecule similarity:
+> similar to Aspirin
+> 2. Target: piglet sepsis
+> User Query
+> Identify molecules
+> similar to Aspirin that
+> treat sepsis in piglet models.
+> Agentic Reasoning
+> Retrieval Plan
+> ANN Indices
+> Fetch Structured
+> Attribute Streams
+> Database
+> Pull Indices
+> Structured
+> Tables
+> Fetch Join
+> Distance Streams
+
+Figure 4: DASE architecture 
+
+configured number of dominant directions [33]. Because these trans-formations define different retrieval metrics, SemJI recalibrates 𝜏 𝑐𝑎𝑝 
+
+and builds a matching transformed index; it never queries trans-formed vectors against the raw index. Even when anisotropy makes the choice of the index-selection threshold unreliable, it need not make the admitted relation dense. SemJI materializes pairs with dist (𝑎, 𝑏 ) ≤ 𝜏 𝑐𝑎𝑝 ; equivalently, 𝜏 𝑐𝑎𝑝 
+
+retains pairs whose distance-derived affinity is at least the calibrated threshold. As Section 5.7 shows, these near-neighbor edges remain a tail of the real endpoint-pair products (0.03–1.09% under the evaluated policies), even for the anisotropic corpora. 
+
+## 4 DASE Execution Strategy 
+
+The execution layer of DASE consists of three core components that interoperate to tackle multi-step reasoning with both similarity and Boolean predicates: the Multi-Scoring Aggregator (MSA), multiple Filtered-Score Streamers (FSSs), and the SemJI Access Controller , which exposes materialized connectivity. Predicate-aware ANN traversal is one access mode within FSS, alongside predicate-first and vector-first execution. Our approach requires a coordinatewise non-decreasing scoring function over higher-is-better component scores [14]. 
+
+## 4.1 Predicate-aware ANN Index Traversal 
+
+Most hybrid search systems split their strategies into two camps [18, 32]: vector-first (post-filtering) and filter-first (pre-filtering). This creates a performance gap: vector-first works well when most items match the filter, while filter-first is better when the filter elimi-nates almost everything. Between these two extremes lies a “middle ground” where neither approach is efficient. To handle this, we im-plemented a Predicate-aware ANN Index Traversal that checks filters while walking the index graph. Often one of the filter conditions is whether the ANN node endpoints lie within a batch of path endpoints retrieved from the SemJI index. Simulating an Oracle Graph. Our method is inspired by the 
+
+Oracle Graph idea from ACORN [37]. Conceptually, if we had a custom index built only from the items that pass the filter, search would be optimal. Since we cannot build a new index for every query, we simulate this experience using the global HNSW index. 
+
+Transitive neighbor expansion. The main problem with walk-ing a global ANN graph under constraints is that a path to a good candidate may need to traverse a node that fails the filter. To miti-gate this, we modify the greedy search: When the immediate neigh-bors of a node are all filtered out, we look at their neighbors (2 hops away). By using these invalid nodes as bridges rather than dead ends, we can jump over gaps in the graph and find the true nearest neighbors that satisfy the query. 
+
+Bloom filter optimization. As noted above, DASE will fre-quently combine SemJI results with an ANN traversal — doing a similarity join over a similarity-based lookup. Checking the filter condition for every node during a graph traversal is too slow if it requires fetching data from the main table. To speed this up, we compile the query’s node filter set into a Bloom filter [4] before the search begins. This allows the traversal engine to check if a node is valid using a fast bitwise operation. For a target false-positive rate 
+
+𝜖 , the Bloom filter uses 𝑂 (𝑁 log (1/𝜖 )) bits and takes 𝑂 (𝑁 ) time to build. If the dataset is too large, the system falls back to standard disk-based strategies to avoid exhausting memory. 
+
+## 4.2 Filtered-Score Streamer 
+
+The Filtered-Score Streamer (FSS) generates a sorted stream for 
+
+one higher-is-better scoring signal under constraints. Formally, its input is (1) a set of predicates P and (2) a scoring signal 𝑠 , which is one of: (a) query-to-object affinity, (b) relational-link affinity, or (c) structural-attribute desirability, according to the Query Model in Section 2. Distance-derived signals are first transformed by the query’s non-increasing affinity function. The output is an iterable stream of entries that pass the filters in descending score order: 
+
+𝐹𝑆𝑆 (P , 𝑠 ) → 𝑆𝑡𝑟𝑒𝑎𝑚 (( 𝑖𝑑 𝑖 , 𝑠𝑐𝑜𝑟𝑒 𝑖 )) . The FSS adapts its execution path based on the data source and predicate selectivity 𝜎 .
+
+(a) Semantic Path : For a query-to-object affinity derived from dist (q, 𝑒 𝑖 ), the scorer selects between attribute-first filtering, vector-first ANN traversal, and the predicate-aware ANN traversal based on 𝜎 to minimize distance-computation overhead. When 𝜎 < 𝜎 1,attribute-first filtering leaves a short candidate list for direct dis-tance computation; when 𝜎 > 𝜎 2, vector-first search with expanded retrieval and post-filtering is preferable; and when 𝜎 1 < 𝜎 < 𝜎 2,the system uses predicate-aware traversal. 
+
+Selection of 𝜎 thresholds. Offline profiling identifies crossover selectivities 𝜎 1, 𝜎 2 at a fixed recall target: attribute-first below 𝜎 1,vector-first above 𝜎 2, and predicate-aware ANN between them. 
+
+(b) Relational Path : For a relational-link affinity derived from dist (𝐴, 𝐵 ), the scorer scans the join index in ascending distance order (equivalently, descending affinity order), while applying P to filtering attributes stored in the join index or entity metadata. This can be accelerated by traditional B-tree indices on the join index. 
+
+(c) Attribute Path : For a structured attribute scoring signal, we perform filtering with B-tree indices over the relational data. 
+
+## 4.3 Multi-Scoring Aggregator 
+
+The Multi-Scoring Aggregator (MSA) combines the sorted streams 
+
+{S 𝑖 }𝑛 𝑖 =1 produced by FSS under a coordinatewise non-decreasing, higher-is-better aggregation function 𝑠𝑐𝑜𝑟𝑒 𝑓 , returning MSA ({S 𝑖 }𝑛 𝑖 =1, 𝑠𝑐𝑜𝑟𝑒 𝑓 , 𝐾 ). It is a direct adaptation of Fagin’s Thresh-old Algorithm (TA) [14], with Rank-Join-style random access [27] to reconstruct relationally valid tuples. Thus, MSA does not replace TA’s ranking logic: it retains sorted access, random access, a top-𝑘 
+
+buffer, and TA’s threshold stopping test. On observing an entry 𝑒 from any stream, MSA uses SemJI lookups and sibling attributes to materialize every valid tuple con-taining 𝑒 , scores each newly discovered tuple, and maintains the Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+best 𝐾 . The only DASE-specific changes are that random access can traverse a multi-hop SemJI predicate and that the next stream need not be selected round-robin. If 𝐿 [𝑖 ] is the most recently seen score of stream 𝑖 , every unmaterialized tuple lies below every current cursor and is bounded by 𝜏 = 𝑠𝑐𝑜𝑟𝑒 𝑓 (𝐿 [1], . . . , 𝐿 [𝑛 ]) . MSA stops when its current 𝐾 -th score is at least 𝜏 .
+
+Exact answers. This is the usual TA guarantee: the result is ex-act when all streams are complete and globally sorted, random access reconstructs every valid tuple containing a seen entry, and component scores are exact. If we leverage ANN traversal or an approximate SemJI, the stopping rule provides exact answers only with respect to the set of retrieved candidates. 
+
+Distribution-Aware Stream Selection. TA normally advances streams in round-robin order. MSA instead chooses the stream expected to reduce the termination gap 𝐺 = 𝜏 − 𝜃 𝐾 most, where 𝜃 𝐾 is the current 𝐾 -th score. For a linear 𝑠𝑐𝑜𝑟𝑒 𝑓 = Í𝑖 𝑤 𝑖 𝑠 𝑖 , profiling sup-plies each stream’s local score density 𝑓 𝑖 (an empirical density or a fitted Gaussian). The expected threshold reduction from advanc-ing stream 𝑖 is approximately 𝑤 𝑖 /( 𝑁 𝑓 𝑖 (𝐿 [𝑖 ])) . MSA also estimates the expected increase in 𝜃 𝐾 from the newly materialized tuples using the other streams’ cursor-truncated score distributions, and advances 
+
+𝑖 ∗ = arg max  
+
+> 𝑖
+
+{E[Δ𝜏 𝑖 ] + E[Δ𝜃 𝐾,𝑖 ]} .
+
+Density and truncated-expectation values are tabulated during profiling. This is a greedy scheduling policy layered on TA, with-out changing its stopping condition or exactness guarantees. Its candidate-elevation estimate uses marginal stream distributions, and is therefore heuristic when ranking signals are correlated. 
+
+## 4.4 SemJI Access Controller 
+
+The SemJI Access Controller functions as the storage abstraction layer that exposes the materialized semantic connectivity of SemJI to the query pipeline. It serves two distinct query-time roles depend-ing on whether the relational data is treated as a hard constraint or a ranking signal. Additionally, it acts as the runtime monitor that drives the structural evolution of the index. 
+
+Materializing join predicates. When the query includes hard relational constraints ( J ), the controller’s objective is to define the valid search space. It retrieves the set of materialized pairs for each join condition and, in the case of multi-hop dependencies, joins these sets to synthesize a unified candidate set of valid tuples. This process effectively converts topological constraints into a flat filter predicate 𝑃 J , which is pushed down to the Filtered-Score Streamer to prune the search space. Symbolically, 𝑃 J ←⊲⊳ | J |  
+
+> 𝑖 =1
+
+SemJIFetch (J 𝑖 ).
+
+Streaming relational scores. When the query utilizes rela-tional proximity as a ranking objective (i.e., a scoring component 
+
+𝑠 ∈ S is defined by the semantic link distance), the controller acts as a streaming source. It scans the underlying index to yield pairs (𝑖𝑑, 𝑑𝑖𝑠 ) sorted by their precomputed semantic distance. This stream is fed directly into the Multi-Scoring Aggregator as a standard ranking signal: S𝑟𝑒𝑙 ← SemJIFetch (J 𝑆 ).
+
+Workload monitoring and evolution trigger. As described in Section 3.7, the controller performs workload monitoring. Dur-ing query execution, it tracks the base-engine completion rate : the fraction of queries whose materialized SemJI coverage is exhausted, i.e., that overflow to 𝜏 𝑞 > 𝜏 𝑐𝑎𝑝 . If this rate consistently exceeds its tolerance, the controller asynchronously triggers a capacity-doubling expansion, growing 𝜏 𝑐𝑎𝑝 → 𝜏 𝑛𝑒𝑥𝑡 within the budget 𝐵 𝑚𝑎𝑥 
+
+via Radius-Expanded HNSW. This allows the index to evolve with-out bottlenecking real-time execution. 
+
+## 5 Experiments 
+
+Datasets. To evaluate DASE on deep research reasoning tasks, we constructed two benchmark datasets. In IMDB , base tables from the official IMDB (https://datasets.imdbws.com) are augmented with structured fields from the repository jquigl/imdb-genres .To support cross-table movie comparisons, the data is split by re-lease year. In MOLECULE , we collected query templates from our agentic AI system built on a PubMed-derived molecule database (https://pubmed.ncbi.nlm.nih.gov/). These templates are used to simulate multi-step reasoning workflows (e.g., discovering candi-date molecules by joining fragmented evidence). The dataset con-sists of Papers, Facts, and Molecules. Benchmark and workload details are available in our technical report (https://anonymous. 4open.science/r/DASE-2C61/). We include two public benchmark datasets that allow us to exam-ine specific aspects of DASE. The first of these is SemBench [26], which we use to explore the effectiveness of DASE in prefiltering for semantic queries. Our second benchmark is NFCorpus [5], a 2,868-paper biomedical corpus with title embeddings, real intervention– condition and study–outcome links, and categorical attributes. Its depth-scaling workload ranges from two to eight join steps, provid-ing diverse multi-step reasoning queries at different cardinalities. 
+
+Workloads. We developed synthetic workloads over our two datasets, following a taxonomy shown in Table 2 and fully detailed in our technical report. These cover all possible combinations of structured predicates ( P), multi-component scoring ( S), and cross-table joins ( J ). In this framework, single-vector similarity search serves as the default configuration. The component S represents the transition from simple embedding retrieval to a generalized scoring function 𝑓 (𝑠 1, . . . , 𝑠 𝑛 ). This allows the system to aggregate multiple vector similarities, as required for complex discovery workflows. The eight classes cover these requirements separately and in combination: W1 is the single-signal baseline; W2, W3, and W5 introduce filtering, multiple scores, and joins, respectively; and W4, W6, W7, and W8 combine them. The FSS/MSA expressions in Table 2 illustrate their execution in DASE, rather than prescribing how other systems must execute these logical workloads. Additional workloads are from the published SemBench and NFCorpus benchmark specifications. 
+
+Implementation strategies. In deep research tasks, we compare DASE against five distinct execution strategies and DBMSs: (1) PostgreSQL: The multi-step reasoning query is submitted di-rectly to the PostgreSQL engine. The embedding columns are indexed using pgvector ’s HNSW or IVFFlat structures. All execution decisions, including join order, index selection, and predicate pushdown, are delegated to the PostgreSQL optimizer. (2) Filter-First: Evaluates structural and exact-match predicates first (using the WHERE clause) to generate a candidate set of valid IDs. The system then performs random access to fetch Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives 
+
+Table 1: Main experimental data and configuration. SemJI counts are the materialized-pair records in the released configurations; a workload selects the radius appropriate to its join threshold.                       
+
+> Scenario Base relations Candidate Links / SemJI pairs Workload (queries/class, top-20 )IMDB imdb_t1 : 42,378 rows; imdb_t2 : 43,237 rows 𝜏 𝑐𝑎𝑝 =0.5: 2.10M; 0 .6: 58.41M pairs W1–W8; 84–100
+> MOLECULE facts_50k : 50,000 rows; paper : 62,857 rows 𝜏 𝑐𝑎𝑝 =0.5: 0.032M; 0 .6: 1.38M; 0 .7: 63.48M pairs W1–W8; 93–100
+> SemBench Movie, E-Commerce, Wildlife, MMQA, and Cars scenarios Calibrated embedding candidate links for se-mantic joins; no shared deep-research SemJI F/L/J/M/C/R tasks; DASE prefilter and DASE + BigQuery
+> NFCorpus 2,868 papers; title embeddings 𝜏 =0.35: 21,466 intervention–condition; 254 study–outcome pairs depth 2–8; 90 instances (3 ×30)
+
+Figure 5: Multi-step Reasoning Top-k: Deep Research workload on IMDB 
+
+Figure 6: Multi-step Reasoning Top-k: Deep Research workload on MOLECULE 
+
+the corresponding embeddings, computes the similarity scores on-the-fly, and maintains a Top-𝑘 heap to produce the result. (3) Score-First: An inverted strategy that prioritizes similarity search. It uses an ORDER BY clause to retrieve a continuous stream of records sorted by their joint similarity score. The system applies the structural predicates as a post-filter and halts the stream immediately once 𝑘 valid entities are identified. (4) Rerank: For queries involving multiple scoring signals, ex-ecutes a retrieve-and-rerank pipeline. It streams candidates separately from each signal’s index, applies predicates as post-filters, and dynamically evaluates the joint score to update the Top-𝑘 results until the exploration stopping criteria are met. For single-signal queries, it gracefully degrades to Score-First. (5) Milvus: Milvus [48] is a state-of-the-art vector database. For single-signal queries (with or without structural predicates), we push down the filters directly into Milvus. Because Milvus lacks support for multi-signal scoring or relational joins, queries involving these operations are streamed to the application layer, which applies the Rerank strategy to finalize the Top-𝑘 results. 
+
+## 5.1 Setup and Methodology 
+
+DASE is implemented in about 10,000 lines of Python and C, with part of the development driven by Claude Code (Opus 4.6–4.8) and extensive manual code review. Experiments were conducted on PostgreSQL 18.3 with the DASE-modified pgvector extension (v0.8.5). Text vectors use Gemini-embedding-001 (1536 dimen-sions); MOLECULE additionally includes molecular descriptors and an ECFP signal. We evaluated a set of multi-step reasoning queries Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+Table 2: Characterization of query workload classes.                                                                             
+
+> WL PMulti-SJPattern Expression
+> Intra-Entity Retrieval
+> 𝑊 1×××Semantic retrieval TopK {FSS (∅ , 𝑠 ) }
+> 𝑊 2✓××Filtered retrieval TopK {FSS ( P , 𝑠 ) }
+> 𝑊 3×✓×Multi-scoring retrieval
+> MSA ( { FSS (∅ , 𝑠 𝑖 ) } 𝑛 𝑖 =1,
+> score 𝑓 , 𝐾 )
+> 𝑊 4✓✓×Filtered multi-scoring
+> MSA ( { FSS ( P , 𝑠 𝑖 ) } 𝑛 𝑖 =1,
+> score 𝑓 , 𝐾 )
+> Inter-Entity Synthesis
+> 𝑊 5××✓Semantic join TopK {FSS (𝑃 J, 𝑠 ) }
+> 𝑊 6✓×✓Filtered join TopK {FSS ( P ∪ 𝑃 J, 𝑠 ) }
+> 𝑊 7×✓✓Multi-scoring join MSA ( { FSS (𝑃 J, 𝑠 𝑖 ) } 𝑛 𝑖 =1,
+> score 𝑓 , 𝐾 )
+> 𝑊 8✓✓✓Filtered multi-scoring join
+> MSA ( { FSS ( P ∪ 𝑃 J, 𝑠 𝑖 ) } 𝑛 𝑖 =1,
+> score 𝑓 , 𝐾 )
+
+involving structured filters, multi-vector relevance scoring, and join-based conditions. All vector columns use L2 HNSW indexes with 
+
+𝑚 = 16, 𝑒 𝑓 𝑐𝑜𝑛𝑠𝑡𝑟𝑢𝑐𝑡𝑖𝑜𝑛 = 64, and default 𝑒 𝑓 𝑠𝑒𝑎𝑟𝑐ℎ = 40. Each database instance runs on a dedicated set of 16 physical AMD EPYC 9575F cores (up to 5.0 GHz) and 64 GB of RAM. This hardware supports AVX-512 instructions, which pgvector leverages to accelerate vec-tor distance computations. Evaluation was CPU-based; no GPUs were used. We report each method as a recall–throughput curve. For ev-ery method we sweep a search-effort parameter and record recall against QPS: the HNSW 𝑒 𝑓 𝑠𝑒𝑎𝑟𝑐ℎ and IVFFlat probe count for in-dex scans, the threshold-algorithm admission tolerance 𝜀 for DASE and Rerank, the post-filter width for Milvus, and a per-query time budget for best-effort strategies. Each operating point averages 5 runs after discarding a warm-up run, and shaded bands denote ±1standard deviation; per method we retain the Pareto frontier over the resulting (recall, QPS) points. Recall is measured against the released exhaustive top-20 result for each planned query. Index con-struction time is isolated and excluded from all QPS measurements. Table 1 reports the dataset-specific relation, SemJI, and workload configurations; query-specific thresholds and score weights are stored with the released workload instances. For SemBench, DASE performs ranked embedding-based pre-filtering, omitting LLM judgment, using counterfactual anchors for semantic filters and calibrated thresholds for semantic joins. DASE + BigQuery sends the same candidates to BigQuery semantic oper-ators; its cost and latency therefore describe the composed pipeline. Table 3 reports USD, the SemBench task metric, and end-to-end wall-clock latency including remote Gemini API time; X denotes un-supported configurations and scenario averages exclude them. The LOTUS, Palimpzest, ThalamusDB, and BigQuery columns repro-duce SemBench’s published gemini-2.5-flash configuration [26]; only the DASE and DASE + BigQuery columns are ours. 
+
+## 5.2 Multi-Step Top-𝑘 Reasoning 
+
+Deep Research. We evaluate DASE and the alternatives across the 
+
+IMDB (Figure 5) and MOLECULE (Figure 6) datasets over our 8 workloads. Each panel plots the recall–throughput (QPS) Pareto frontier obtained by sweeping each method’s search-effort as intro-duced in the setup section (Section 5.1); up and to the right is better. Milvus excels on the single-signal W1 workload, but its advan-tage reverses when queries require multi-score ranking. Filter-first becomes a sequential scan without predicates, rerank reduces to score-first with one signal, and score-first is infeasible for W7/W8 because it forms a full Cartesian product. On W3, DASE outper-forms round-robin rerank, indicating the value of adaptive stream selection; across W5–W8, DASE and SemJI sustain higher QPS at matched recall. We separately study how performance scales with the number of coupled join positions in Section 5.4. 
+
+Semantic queries. Table 3 summarizes cost, quality, and latency on SemBench. DASE alone suffices for semantic-filter ( F) tasks that reduce to a binary or coarse distinction, such as positive vs. negative reviews in Movie : comparing embedding distance to coun-terfactual anchors returns valid answers at orders-of-magnitude lower cost and latency than any LLM-backed baseline. For semantic-map ( M) and LLM-semantic-join ( J) tasks that exceed embedding-distance reasoning, DASE + BigQuery substantially raises quality (e.g., MMQA avg. 0.11 → 0.76). Prefiltering with DASE also lets BigQuery beat its own standalone numbers at a fraction of the cost: on E-Commerce , $0.54/38s at quality 0.80 versus BigQuery alone at $2.42/45s and 0.67. The LLM sees only the prefilter’s survivors, so it spends less and decides better. The one failure mode is embed-ding quality itself: in Wildlife , rare words like “impala” are poorly aligned, so neither configuration recovers fully. Overall, DASE delivers low-cost answers when embedding dis-tance suffices, and a high-recall prefilter that makes downstream LLM evaluation more efficient and accurate when it does not. 
+
+## 5.3 SemJI Construction and Maintenance 
+
+We build SemJI using HNSW-based ANN range queries with a radius threshold. Table 4 shows an ablation from a naive iterative approach, through a batched lateral join, to a fully vectorized whole-table HNSW range query — a single JOIN LATERAL that runs entirely in-database. This reduces construction time from 81.2 hours to 1.6 minutes, only losing 2% from recall. 
+
+SemJI evolution. We evaluate the capacity-based maintenance policy (Section 3.7) on the linkage-only MOLECULE W5 stream of 2,000 seed queries. A random warmup sample fixes 𝜏 𝑖𝑛𝑖𝑡 = 𝜇 − 3𝜎 =
+
+0.607 before the workload is observed; overflowing queries use the base-engine outer-band fallback while the controller grows the index asynchronously. On this stream, two capacity doublings grow SemJI from 83K to 333K pairs and reach 𝜏 𝑐𝑜𝑛𝑣𝑒𝑟𝑔𝑒𝑑 = 0.6526 (Figure 7). The final 333K retained pairs are only 0 .011% of the 3 .14B fact–paper Cartesian product (6.7 links/fact and 5.3 links/paper on average), so SemJI remains highly compact relative to exact join enumeration. The held-out overflow rate falls from 80 .6% to 49 .8%; the remaining overflows are budget-limited sparse seeds. Ascending and random query orders reach the same final radius (spread < 0.001) with two expansions, differing only in when the work is paid (a 1 .14 ×
+
+cumulative-latency difference). 
+
+## 5.4 Scaling Multi-step Reasoning Depth 
+
+We isolate how each system scales vs. the number of coupled join positions 𝑘 , on the multi-dimensional NFCorpus workload 𝑄 =
+
+(𝑃, 𝑆, 𝐽 ). Here a 𝑘 -step query fixes per-position anchors 𝑎 1, . . . , 𝑎 𝑘 Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives 
+
+Table 3: SemBench cost, quality, and latency (notation: F = filter; L = limit-𝑘 ; J = join; M = semantic map; C = semantic classify; R = semantic rank) 
+
+LOTUS [36] Palimpzest [30] ThalamusDB [22] BigQuery [15] DASE DASE + BigQuery Cost Qual. Lat. Cost Qual. Lat. Cost Qual. Lat. Cost Qual. Lat. Cost Qual. Lat. Cost Qual. Lat. 
+
+## (a) Movie Scenario DASE Preprocess $3 ·10 −3 27.6 s $3 ·10 −3 27.6 s 
+
+Q1: F L $0.09 1.00 33.1 s $1 ·10 −3 1.00 3.8 s $4 ·10 −4 0.95 4.2 s $0.05 1.00 26.3 s $2.4 ·10 −6 1.00 0.5 s $1 ·10 −4 1.00 3.8 s 
+
+Q2: F L $0.01 1.00 2.1 s $0.01 1.00 29.7 s $2 ·10 −3 0.92 1.9 s $3 ·10 −3 1.00 9.5 s $2.4 ·10 −6 1.00 0.5 s $1 ·10 −4 1.00 4.2 s 
+
+Q3: F $5 ·10 −3 0.64 2.1 s $0.01 0.64 4.6 s $2 ·10 −3 0.74 3.1 s $3 ·10 −3 0.64 11.0 s $3.6 ·10 −6 0.82 0.5 s $7 ·10 −4 0.82 6.2 s 
+
+Q4: F $5 ·10 −3 0.64 2.8 s $0.02 0.74 4.4 s $2 ·10 −3 0.74 3.8 s $3 ·10 −3 0.64 11.4 s $3.6 ·10 −6 0.82 0.5 s $7 ·10 −4 0.82 5.3 s 
+
+Q5: J L $2.38 0.59 536.5 s $0.01 0.39 1.9 s $1 ·10 −3 1.00 2.3 s $1.01 0.89 54.5 s $3.6 ·10 −6 1.00 0.5 s $6 ·10 −4 0.82 3.9 s 
+
+Q6: J L $1.81 0.67 432.4 s $0.01 0.83 2.3 s $9 ·10 −4 0.84 1.7 s $1.00 0.69 54.5 s $3.6 ·10 −6 1.00 0.5 s $7 ·10 −4 0.94 3.8 s 
+
+Q7: J $1.81 0.21 431.8 s $7.72 0.68 1056.1 s $0.15 0.57 636.9 s $3.31 0.70 198.3 s $3.6 ·10 −6 0.73 0.5 s $9 ·10 −4 0.71 3.8 s 
+
+Q8: C $4 ·10 −3 0.93 2.3 s $0.02 0.86 4.3 s $5 ·10 −3 0.83 6.8 s $3 ·10 −3 0.76 10.9 s $3.6 ·10 −6 0.89 0.5 s $7 ·10 −4 0.89 4.2 s 
+
+Q9: R $0.02 0.75 4.9 s $0.05 0.78 5.7 s X X X $0.02 0.78 13.3 s $4.8 ·10 −6 0.66 0.5 s $6 ·10 −3 0.74 12.8 s 
+
+Q10: R $0.13 0.40 30.9 s $0.38 0.42 39.2 s X X X $0.13 0.44 32.1 s $4.8 ·10 −6 0.43 0.5 s $0.085 0.41 26.1 s 
+
+Avg $0.626 0.68 147.9 s $0.823 0.73 115.2 s $0.02 0.82 82.6 s $0.553 0.75 42.2 s $3 ·10 −4 0.83 3.0 s $9 ·10 −3 0.81 9.2 s 
+
+## (b) E-Commerce Scenario DASE Preprocess $0.03 124.0 s $0.03 124.0 s 
+
+Q1: F $0.06 1.00 12.2 s $0.08 1.00 12.2 s $0.03 1.00 34.8 s $0.04 0.59 21.2 s $5 ·10 −6 0.94 0.7 s $7 ·10 −3 1.00 8.0 s 
+
+Q2: F $0.18 0.87 166.1 s $0.38 0.83 57.5 s $0.31 0.67 100.8 s $3.96 0.21 55.7 s $7 ·10 −6 0.47 0.7 s $0.02 0.66 5.5 s 
+
+Q3: M $0.07 0.97 17.1 s $0.12 0.98 16.5 s X X X $0.12 0.97 21.2 s X X X $0.04 0.93 10.5 s 
+
+Q4: M $0.14 0.45 156.7 s $0.24 0.53 335.0 s X X X $0.37 0.69 31.0 s X X X $0.17 0.67 18.3 s 
+
+Q5: C $0.04 0.99 7.4 s $0.07 0.98 6.6 s X X X $0.17 0.98 25.7 s $4 ·10 −6 0.96 0.7 s $0.01 0.98 5.8 s 
+
+Q6: C $0.12 0.89 114.8 s $0.43 0.89 143.7 s X X X $0.35 0.88 34.9 s $4 ·10 −6 0.47 0.7 s $0.16 0.95 19.5 s 
+
+Q7: J $1.33 0.75 199.4 s $1.79 0.92 287.6 s $0.08 0.51 97.7 s $0.86 0.83 45.4 s $1 ·10 −9 0.78 2 ·10 −3 s $0.09 0.81 7.4 s 
+
+Q8: J $4 ·10 −3 1.00 4.1 s $0.01 1.00 3.9 s $0.30 0.00 713.0 s $18.23 0.29 126.2 s $1 ·10 −9 0.25 1 ·10 −3 s $0.10 1.00 3.4 s 
+
+Q9: J $0.06 0.55 243.4 s $0.10 0.49 44.9 s $0.31 0.00 872.2 s $0.21 0.58 48.6 s $1 ·10 −9 0.41 1 ·10 −3 s $0.07 0.83 18.8 s 
+
+Q10: F J $0.21 0.00 519.5 s $1.02 0.06 1192.5 s X X X X X X $1 ·10 −5 X 0.7 s $0.65 0.34 90.1 s 
+
+Q11: F J $0.27 0.78 158.7 s $0.61 0.73 132.4 s X X X X X X X X X $1.68 0.40 131.3 s 
+
+Q12: F M $0.10 0.60 36.4 s $0.14 0.00 31.9 s X X X $0.10 0.97 31.1 s $6 ·10 −6 0.85 0.7 s $0.08 0.95 32.1 s 
+
+Q13: F $0.24 0.74 274.8 s $0.44 0.74 238.3 s X X X $0.38 0.70 22.4 s $2 ·10 −5 0.58 1.0 s $0.13 0.72 11.6 s 
+
+Q14: F J R $0.23 0.87 178.2 s X X X X X X $4.26 0.37 73.6 s $5 ·10 −6 0.00 0.7 s $4.83 1.00 87.3 s 
+
+Avg $0.22 0.74 149.2 s $0.42 0.70 192.5 s $0.21 0.43 363.7 s $2.42 0.67 44.8 s $3 ·10 −3 0.57 10.8 s $0.54 0.80 38.2 s 
+
+## (c) Wildlife Scenario DASE Preprocess $0.01 53.9 s $0.01 53.9 s 
+
+Q1: F $0.11 0.79 92.4 s $0.13 0.79 32.8 s $0.11 0.79 19.6 s $0.11 0.79 32.0 s $1 ·10 −9 0.79 5·10 −4 s $0.02 0.78 10.1 s 
+
+Q2: F X X X $0.01 0.17 2.8 s $0.01 0.14 4.5 s $0.01 0.19 9.4 s $1 ·10 −9 0.83 5·10 −4 s $3 ·10 −3 0.50 6.2 s 
+
+Q3: F L $0.11 1.00 99.4 s $0.13 0.00 22.7 s $0.03 0.00 4.3 s $0.11 0.00 25.7 s $1 ·10 −9 0.00 8 ·10 −4 s $0.02 1.00 9.0 s 
+
+Q4: F L X X X $0.01 0.00 2.7 s $1 ·10 −3 0.00 1.3 s $0.01 1.00 9.4 s $1 ·10 −9 1.00 8·10 −4 s $3 ·10 −3 1.00 6.1 s 
+
+Q5: F X X X $0.13 0.75 13.5 s $0.01 0.75 2.3 s $0.12 0.75 19.2 s $1 ·10 −9 1.00 1·10 −3 s $0.02 0.85 7.0 s 
+
+Q6: F X X X $0.13 0.00 19.3 s $0.06 0.50 13.2 s $0.12 0.20 24.3 s $1 ·10 −9 0.00 1 ·10 −3 s $0.06 0.40 13.9 s 
+
+Q7: F $0.23 1.00 188.3 s $0.13 1.00 43.9 s $0.20 1.00 28.8 s $0.22 1.00 24.6 s $1 ·10 −9 0.00 1 ·10 −3 s $0.14 1.00 19.9 s 
+
+Q8: F X X X $0.13 0.75 34.9 s $0.12 0.75 23.8 s $0.23 0.75 35.5 s $1 ·10 −9 0.00 2 ·10 −3 s $0.16 0.74 24.8 s 
+
+Q9: F X X X $0.13 0.57 19.1 s $0.08 0.67 17.2 s $0.12 0.59 37.6 s $1 ·10 −9 0.00 1 ·10 −3 s $0.06 0.40 19.5 s 
+
+Q10: F L $0.11 1.00 87.8 s $0.13 0.00 19.6 s $0.03 0.00 4.4 s $0.11 0.00 40.3 s $1 ·10 −9 1.00 8·10 −4 s $0.06 0.25 24.2 s 
+
+Avg $0.14 0.94 117.0 s $0.11 0.40 21.1 s $0.07 0.46 11.9 s $0.12 0.52 25.8 s $9 ·10 −4 0.46 4.9 s $0.05 0.69 17.7 s 
+
+## (d) MMQA Scenario DASE Preprocess $0.01 50.1 s $0.01 50.1 s 
+
+Q1: M $0.02 1.00 7.4 s $3 ·10 −3 1.00 4.5 s X X X $0.01 1.00 14.1 s X X X $0.01 1.00 14.1 s 
+
+Q2a: J $0.89 0.83 169.6 s $1.04 1.00 135.9 s X X X $0.08 0.00 53.8 s $1 ·10 −5 0.08 1.0 s $0.04 0.57 28.6 s 
+
+Q2b: J $0.89 0.83 166.8 s $1.04 1.00 133.8 s X X X $0.12 0.00 38.4 s $1 ·10 −5 0.08 1.0 s $0.06 0.57 21.4 s 
+
+Q3a: F $0.01 0.83 4.2 s $0.02 0.80 4.5 s $0.01 0.75 11.0 s $0.01 0.72 19.6 s $5 ·10 −6 0.38 0.7 s $9 ·10 −3 0.72 20.5 s 
+
+Q3f: F $0.01 1.00 4.2 s $0.02 1.00 8.0 s $0.01 1.00 7.0 s $0.01 0.67 22.3 s $5 ·10 −6 0.09 0.7 s $0.01 0.67 22.3 s 
+
+Q4: M X X X $5 ·10 −3 0.54 1.2 s X X X $2 ·10 −3 0.60 9.7 s X X X $2 ·10 −3 0.61 9.5 s 
+
+Q5: M $1 ·10 −3 1.00 0.48 s $1 ·10 −3 1.00 0.50 s X X X X X X X X X X X XQ6a: F $0.01 1.00 4.4 s $0.02 1.00 4.0 s $2 ·10 −3 0.33 5.6 s $4 ·10 −3 0.03 18.9 s $5 ·10 −6 0.04 0.7 s $3 ·10 −3 1.00 15.8 s 
+
+Q6b: F $0.01 1.00 3.8 s $0.02 1.00 4.1 s $2 ·10 −3 1.00 5.5 s $4 ·10 −3 0.04 17.3 s $5 ·10 −6 0.01 0.7 s $4 ·10 −3 0.87 20.4 s 
+
+Q6c: F $0.01 1.00 4.6 s $0.02 1.00 4.7 s $2 ·10 −3 0.53 13.4 s $4 ·10 −3 0.13 17.4 s $5 ·10 −6 0.10 0.7 s $4 ·10 −3 0.66 19.1 s 
+
+Q7: J $13.61 0.32 2311.4 s $15.65 0.31 2101.6 s X X X $1.18 0.00 91.7 s $1 ·10 −5 0.10 0.7 s $0.04 1.00 6.9 s 
+
+Avg $1.55 0.88 267.7 s $1.62 0.87 218.4 s $5 ·10 −3 0.72 8.5 s $0.14 0.31 30.3 s $1 ·10 −3 0.11 6.3 s $0.02 0.76 20.8 s 
+
+## (e) Cars Scenario DASE Preprocess $2.50 1300 s $2.50 1300 s 
+
+Q1: F $1.74 0.90 550.0 s $2.44 0.69 465.6 s $1.37 0.81 829.7 s $1.44 0.71 61.7 s $5 ·10 −6 0.66 0.9 s $0.31 0.78 22.0 s 
+
+Q2: F X X X $4 ·10 −3 0.00 4.1 s $0.01 0.09 14.1 s $0.01 0.08 14.1 s $5 ·10 −6 0.00 0.7 s $1 ·10 −3 0.16 5.1 s 
+
+Q3: F L $0.60 0.90 456.2 s $0.01 0.92 6.1 s X X X $1.66 1.00 36.4 s $5 ·10 −6 1.00 0.7 s $2 ·10 −3 1.00 4.3 s 
+
+Q4: F $1.71 0.99 822.0 s $2.41 0.99 443.6 s $1.34 1.00 768.8 s $1.41 0.99 68.7 s $5 ·10 −6 0.99 0.9 s $0.31 0.99 23.4 s 
+
+Q5: F X X X $0.01 1.00 6.3 s $1.61 1.00 483.7 s $1.47 1.00 58.9 s $1 ·10 −5 0.50 1.1 s $7 ·10 −3 1.00 5.1 s 
+
+Q6: F J X X X $2.51 0.96 427.3 s $1.96 0.97 775.4 s $2.00 0.96 44.3 s $1 ·10 −5 0.88 1.3 s $0.89 0.96 41.2 s 
+
+Q7: F X X X $4.47 0.56 882.7 s $3.06 0.58 2146.2 s $3.17 0.45 86.0 s $1 ·10 −5 0.47 1.3 s $1.55 0.52 131.5 s 
+
+Q8: F L $1.78 0.45 1349.8 s $2.02 0.29 268.7 s $0.21 0.20 68.0 s $1.69 0.24 38.2 s $5 ·10 −6 0.15 0.7 s $0.04 0.39 6.0 s 
+
+Q9: F X X X $2.05 0.00 308.1 s $1.61 1.00 335.8 s $0.03 0.00 13.6 s $5 ·10 −6 1.00 0.7 s $0.03 0.00 16.4 s 
+
+Q10: C $3.09 0.41 618.1 s $4.69 0.51 594.9 s X X X $2.70 0.57 62.0 s $2 ·10 −5 0.45 1.8 s $0.86 0.55 27.6 s 
+
+Avg $1.78 0.73 759.2 s $2.06 0.59 340.7 s $1.40 0.70 677.7 s $1.56 0.60 48.4 s $0.23 0.61 119.1 s $0.59 0.63 143.9 s Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+Figure 7: SemJI evolution test. 
+
+Figure 8: Number of Join Steps vs recall in NFCorpus Table 4: SemJI Construction. Method Recall Time 
+
+Exact Construction 1.00 ∼81.2 h Iterative 0.98 14.0 m Batched 0.98 3.0 m Fully Vectorized 0.98 1.6 m 
+
+Table 5: Filtered search results. Method Setting Recall QPS 
+
+baseline - 1.0 0.23 2-hop on 0.905 9.6 Bitmap 2-hop off 0.884 10.5 adaptive 0.903 10.1 4 bits/element 0.817 9.1 Bloom 12 b/element 0.872 8.8 20 b/element 0.883 8.2 
+
+Table 6: Component ablation on IMDB. Each mechanism is disabled in isolation on the workload that exercises it; we report recall / throughput. Mechanism Variant Recall QPS             
+
+> SemJI (W5) DASE (with SemJI) 0.95 92 .0
+> −SemJI (on-the-fly join) 0.71 5.3Stream selection (W3) DASE (adaptive) 0.98 57 .8
+> −adaptive (round-robin) 0.98 29 .8
+
+and asks for the top-𝑛 length-𝑘 walks (𝑝 1, . . . , 𝑝 𝑘 ) satisfying min 1
+
+> 𝑘 𝑘
+
+∑︁ 
+
+> 𝑖 =1
+
+dist (𝑎 𝑖 , 𝑝 𝑖 ) s.t. 𝑃 (𝑝 𝑖 ) ∀ 𝑖, dist (𝑝 𝑖 , 𝑝 𝑖 +1) ≤ 𝜏 ∀𝑖, 𝑝 𝑖 ≠ 𝑝 𝑖 −2,
+
+i.e. a monotone score 𝑆 (title-embedding distance) minimized sub-ject to a predicate 𝑃 (selectivity 𝜎 =0.18) and a threshold intervention– condition similarity join 𝐽 (𝜏 =0.35) between consecutive positions, without immediate backtracking. We sweep 𝑘 =2 . . . 8 and report recall against the exact top-𝑛 result and throughput (Figure 8; 95% CI over 90 instances, 3 seeds × 30). PostgreSQL hands the whole predicate-filtered 𝑘 -way self-join to the SQL planner: it uses the materialized edge relation, but pro-duces a combinatorial intermediate. Milvus can apply per-position scalar filters, but cannot execute the cross-position join 𝐽 or rank the paths. It therefore retrieves the per-position top-𝐿 nearest neigh-bors, applies 𝑃 , and reranks the surviving length-𝑘 walks in the application layer ( 𝐿 is its accuracy knob). Given the materialized SemJI edge set, DASE recognizes the query as a minimum-cost bounded-length walk on the join graph and uses a Viterbi-like dy-namic program with beam width 𝑛 (the number of returned walks). It retains the top-𝑛 partial paths per directed-edge state (remem-bering the preceding vertex to exclude immediate backtracking); its worst-case time is 𝑂  𝑘𝑛 Í𝑣 deg (𝑣 )2 , or 𝑂 (𝑘𝑛 |𝐸 |) for bounded-degree graphs. Both baselines fail as 𝑘 grows (Figure 8). PostgreSQL is exact but its 𝑘 -way join explodes, collapsing from 70 to 0 .55 QPS over 
+
+𝑘 =2 . . . 4 and timing out for 𝑘 ≥5. Milvus’s qualifying sets are rarely nearest neighbors, so its recall decays ( 𝐿 =16: 0 .78 → 0.27) and its 𝐿 𝑘 
+
+enumeration turns the accurate settings infeasible ( 𝐿 =128 by 𝑘 =6). DASE instead keeps full recall for every 𝑘 while sustaining 5 ,540 down to 1 ,321 QPS — one-to-four orders of magnitude above the planner and never infeasible. The gap widens with 𝑘 : the baselines time out or blow up while DASE stays flat, confirming that join- and predicate-aware materialization pays off exactly in the multi-step regime. 
+
+## 5.5 Filter Sets in the ANN Index 
+
+Table 5 evaluates predicate-aware HNSW search strategies. The exhaustive baseline returns the exact top-𝑘 answer (recall 1.0), but at low throughput (0.23 QPS). To accelerate filtering, we compare Bitmap and Bloom filter structures, finding that the Bitmap ap-proach consistently delivers better recall and higher QPS across all configurations. Within the Bitmap approach, we further evaluate graph traversal methods. The 2-hop adaptive strategy yields the optimal trade-off: by dynamically exploring extended neighbors only when valid nodes are sparse, it achieves a roughly 40 × speedup (10.1 QPS) over the baseline while maintaining a highly competitive recall of 0.903. This adaptive mechanism balances the speed of the “2-hop off” method with the accuracy of the “always-on” method. 
+
+## 5.6 DASE Ablation Study 
+
+We isolate DASE’s two central algorithmic contributions by dis-abling one at a time on the workload that exercises it in isolation, Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives 
+
+holding everything else fixed (Table 6; IMDB, 100 queries, warm cache, same host). 
+
+SemJI join materialization (Table 6, top). On the pure semantic-join workload W5 we keep DASE’s seed streamer unchanged and switch only the partner check: the full engine probes the material-ized SemJI index, while the ablated variant resolves each candidate’s partner on the fly with an ANN query against the partner table. Removing SemJI is strictly worse on both axes — recall drops from 0.95 to 0 .71 and throughput falls 17 × (92 .0 → 5.3 QPS) — because without the precomputed join the partner test must either approx-imate (missing qualifying partners, hence the recall loss) or run exact (far slower still). Materializing the join is what makes the join-bearing workloads both accurate and fast. 
+
+Distribution-aware stream selection (Table 6, bottom). On the pure multi-scoring workload W3 we replace DASE’s threshold-algorithm stream selector — which extends the stream with the largest expected gap reduction 𝐺 𝑗 = 𝑤 𝑗 /PDF (𝑥 𝑗 ) — with vanilla round-robin extension. At the exact operating point ( 𝜀 =0, recall 0 .98) adaptive selection delivers 1 .9× the throughput (57 .8 vs 29 .8 QPS): choosing the right stream closes the termination gap in far fewer extension rounds. The gain is largest exactly here, in the high-recall regime where many rounds are needed, and concentrates on queries whose signals have heterogeneous score distributions. 
+
+## 5.7 Robustness to Correlated Embeddings 
+
+The materialization radius 𝜏 𝑐𝑎𝑝 retains every endpoint pair within dist (𝑎, 𝑏 ) ≤ 𝜏 𝑐𝑎𝑝 ; SemJI is the union of these per-endpoint neigh-borhoods. However, in a multi-predicate query it is not one ball around the results. A sample-derived cutoff can select the close-pair tail, but anisotropy can make a raw-distance cutoff unreliable. We therefore investigated the distribution of distances for the IMDB and MOLECULE W7/W8 join endpoints. Their covariance partici-pation ratios are only 75–93 and 112–166 of 1,536 dimensions (i.e., 5–11% effective variance-carrying directions). We then consider different methods for handling this anisotropy. For each corpus, we ran 200 queries over two independent 3K-by-3K reservoir samples (400 query–sample units per arm). During execution, we apply predicates before ranking and macro-average recall@20/precision@20 against each arm’s exhaustive predicate-filtered top-20 oracle; these are candidate-retrieval, not final-answer, measures. We use a 95% two-stage percentile bootstrap over end-point samples and then queries. The raw-workload Recall/Pre-cision intervals are 0.764–0.825/0.815–0.868 (IMDB) and 0.459– 0.554/0.648–0.749 (MOLECULE); ABTT’s are 0.982–0.998/0.999– 1.000 and 0.954–0.981/0.954–0.981. Each arm calibrates 𝜏 𝑐𝑎𝑝 in its own retrieval space; PCA uses 0.1 shrinkage and ABTT removes one leading component, both fit on each sample’s 6K endpoints. 
+
+Table 7: Real predicate-filtered SemJI quality. Each R/P entry is recall@20 / precision@20 relative to that arm’s exhaustive oracle. The pairs column gives the materialized fraction for IMDB / MOLECULE; it is not a ratio.                      
+
+> Arm IMDB Rec./Prec. MOLECULE Rec./Prec. Pairs % (I/M)
+> Raw workload cutoff 0.795 / 0.842 0.506 / 0.700 0.60% / 0.03% Raw 𝜇 −3𝜎 0.920 / 0.929 0.867 / 0.867 0.42% / 0.62% PCA whitening 0.910 / 0.920 0.868 / 0.868 0.44% / 0.47% ABTT 0.991 / 1.000 0.969 / 0.969 1.09% / 0.93% Raw radius control 0.954 / 0.962 0.881 / 0.881 1.09% / 0.93%
+
+We observe from Table 7 that the raw workload cutoff strat-egy loses substantial coverage, especially on MOLECULE. ABTT 
+
+has the highest within-arm coverage (0.991/1.000 on IMDB and 0.969/0.969 on MOLECULE). At the same materialized-pair fraction, the raw radius control remains 3.7 and 8.8 recall points lower, re-spectively; transformed-space calibration therefore improves which pairs are retained, not merely their number. 
+
+## 6 Related Work 
+
+Semantic-operator systems. LOTUS [36] and Palimpzest [30] develop declarative operations whose predicates, joins, or transfor-mations may require LLM-based evaluation. ThalamusDB [22, 45] similarly applies approximate query processing to multimodal data. SemBench [26] compares these systems and others on semantic-filter, merge, and join tasks. DASE is complementary to these sys-tems: it assumes that a semantic-query planner has supplied a retrieval plan and scoring function, then constructs and ranks a high-recall candidate set before final semantic judgment. Our DASE + BigQuery configuration instantiates this prefiltering role. There are some operator-specific optimizations include BARGAIN [61] for filtering and classification, and FDJ [62] for semantic joins. DASE in-stead supports prefiltering across multiple semantic operators and integrates joins with top-𝑘 retrieval under monotone multi-signal scoring functions. 
+
+Benchmarks for multi-source retrieval and reasoning. 
+
+MMQA [54] evaluates LLMs on multi-table retrieval, question an-swering, SQL generation, and identification of primary and foreign keys; its retrieval task ranks tables. STaRK [55] benchmarks en-tity retrieval under combined textual and relational requirements, including multi-hop relations, and reports retrieval quality and latency. FDABench [49] evaluates analytical agents that integrate structured and unstructured sources, measuring answer quality, tool use, and end-to-end cost and latency. These benchmarks assess retrieval or analytical workflows from natural-language requests. Our benchmark instead takes SQL queries and a multi-signal scor-ing function as given, and measures the recall–throughput trade-off for jointly scored evidence tuples. Its workloads combine structured constraints, exact joins, and thresholded embedding-similarity joins, with exhaustive top-𝑘 reference results defined by the fixed query and scoring semantics. 
+
+Record linking. Increasingly, record linking [11] tasks are being addressed using embeddings and LLMs [60]. SemJI can be viewed as a materialized snapshot of links above a threshold. 
+
+Hybrid DBMSs. Vector DBMSs such as Milvus [48] combine vector retrieval with scalar filtering, while filtered-ANN work such as ACORN [37] and Filtered-DiskANN [18] improve point-query vector search under structured predicates. These methods are useful building blocks for DASE’s filtered score streams, but their central access pattern is one query vector against one indexed collection. Our targets include M-to-N embedding-similarity joins between distinct relational rows, and exact joins that connect those rows into a pattern, with a monotone score that combines several lookup and join affinities. SemJI materializes a sparse subset of those cross-table pairs so that the resulting pattern can be evaluated with relational operations rather than repeated point lookups. Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+Ranked join processing. Threshold-style top-𝑘 algorithms [14, 23, 46] combine sorted score streams with random access and stop-ping bounds. DASE adopts this execution principle: an embedding-similarity-join score belongs to a pair of rows that must be con-nected through the query pattern before it contributes to an output tuple. The materialized join relation, filtered score streams, and Multi-Scoring Aggregator provide the access paths and bound-aware coordination needed for this setting. 
+
+Embedding geometry. Embedding whitening and anisotropy correction are well studied for NLP sentence and word represen-tations [2, 13, 33, 44]. We use these techniques in a different role: when anisotropic or shared-context endpoint embeddings make a distribution-derived materialization radius unreliable, DASE sep-arately calibrates a transformed embedding space and constructs the corresponding embedding-similarity join index there. 
+
+## 7 Conclusions 
+
+Multi-step reasoning queries frequently arise in agentic data en-gineering tasks such as scientific discovery. We introduced SemJI, which facilitates efficient candidate exploration in top-𝑘 multi-step reasoning queries, along with ANN extensions to enable batched re-quests. We developed DASE, a query processing strategy that jointly optimizes attribute predicates and vector similarity scoring across joins. We conducted an extensive evaluation on existing semantic benchmarks and a scientific-discovery workload that captures the structure of multi-step reasoning queries. Our results demonstrate the retrieval benefits and approximation trade-offs of SemJI. We also evaluated a robustness treatment for anisotropic endpoint em-beddings, where a raw distribution-derived SemJI materialization radius can miss useful links. We hope that our formalization, methods, and benchmarks serve as a foundation for continued progress on query systems that bridge structured and unstructured data at scale. In ongoing work, we are focused on developing a high-level planner that uses costs to break agentic plans into stages with multi-step reasoning components. 
+
+## References 
+
+[1] Eric Anderson, Jonathan Fritz, Austin Lee, Bohou Li, Mark Lindblad, Henry Lindeman, Alex Meyer, Parth Parmar, Tanvi Ranade, Mehul A. Shah, Ben Sowell, Dan G. Tecuci, Vinayak Thapliyal, and Matt Welsh. 2024. The Design of an LLM-powered Unstructured Analytics System. ArXiv abs/2409.00847 (2024). https://api.semanticscholar.org/CorpusID:272368251 [2] Sanjeev Arora, Yingyu Liang, and Tengyu Ma. 2017. A simple but tough-to-beat baseline for sentence embeddings. In International conference on learning representations .[3] Akari Asai, Jacqueline He, Rulin Shao, Weijia Shi, Amanpreet Singh, Joseph Chee Chang, Kyle Lo, Luca Soldaini, Sergey Feldman, Mike D’arcy, et al. 2026. Synthe-sizing scientific literature with retrieval-augmented language models. Nature 
+
+650, 8103 (2026), 857–863. [4] Burton H. Bloom. 1970. Space/Time Trade-offs in Hash Coding with Allowable Errors. CACM 13, 7 (July 1970), 422–426. [5] Vera Boteva, Demian Gholipour, Artem Sokolov, and Stefan Riezler. 2016. A full-text learning to rank dataset for medical information retrieval. In European Conference on Information Retrieval . Springer, 716–722. [6] Huiping Cao, Yan Qi, K Selçuk Candan, and Maria Luisa Sapino. 2010. Feedback-driven result ranking and query refinement for exploring semi-structured data collections. In EDBT . 3–14. [7] Mingju Chen, Guibin Zhang, Heng Chang, Yuchen Guo, and Shiji Zhou. 2026. A-MapReduce: Executing Wide Search via Agentic MapReduce. arXiv preprint arXiv:2602.01331 (2026). [8] Xu Chen, Zheng Qin, Yongfeng Zhang, and Tao Xu. 2016. Learning to rank features for recommendation over multiple categories. In Proceedings of the 39th International ACM SIGIR conference on Research and Development in Information Retrieval . 305–314. [9] Seyone Chithrananda, Gabriel Grand, and Bharath Ramsundar. 2020. Chem-BERTa: Large-Scale Self-Supervised Pretraining for Molecular Property Predic-tion. doi:10.48550/arXiv.2010.09885 arXiv:2010.09885. [10] Peter Christen. 2011. A survey of indexing techniques for scalable record linkage and deduplication. IEEE transactions on knowledge and data engineering 24, 9 (2011), 1537–1555. [11] Peter Christen. 2012. Data Matching: Concepts and Techniques for Record Linkage, Entity Resolution, and Duplicate Detection . Springer. [12] Mayur Datar, Nicole Immorlica, Piotr Indyk, and Vahab S Mirrokni. 2004. Locality-sensitive hashing scheme based on p-stable distributions. In Proceedings of the twentieth annual symposium on Computational geometry . 253–262. [13] Kawin Ethayarajh. 2019. How Contextual are Contextualized Word Represen-tations? Comparing the Geometry of BERT, ELMo, and GPT-2 Embeddings. In 
+
+Proceedings of the 2019 Conference on Empirical Methods in Natural Language Pro-cessing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP) . 55–65. [14] Ronald Fagin, Amnon Lotem, and Moni Naor. 2003. Optimal aggregation al-gorithms for middleware. Journal of computer and system sciences 66, 4 (2003), 614–656. [15] Sérgio Fernandes and Jorge Bernardino. 2015. What is bigquery?. In Proceedings of the 19th International Database Engineering & Applications Symposium . 202–203. [16] Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia, Jinliu Pan, Yuxi Bi, Yi Dai, Jiawei Sun, Qianyu Guo, Meng Wang, and Haofen Wang. 2023. Retrieval-Augmented Generation for Large Language Models: A Survey. ArXiv 
+
+abs/2312.10997 (2023). https://api.semanticscholar.org/CorpusID:266359151 [17] Ali Essam Ghareeb, Benjamin Chang, Ludovico Mitchener, Angela Yiu, Caralyn J Szostkiewicz, Dmytro Shved, Gavin J Gyimesi, Jon M Laurent, Samantha M Wright, Muhammed T Razzak, et al. 2026. A multi-agent system for automating scientific discovery. Nature (2026), 1–3. [18] Siddharth Gollapudi, Neel Karia, Varun Sivashankar, Ravishankar Krishnaswamy, Nikit Begwani, Swapnil Raz, Yiyong Lin, Yin Zhang, Neelam Mahapatro, Premku-mar Srinivasan, and others. 2023. Filtered-diskann: Graph algorithms for ap-proximate nearest neighbor search with filters. In Proceedings of the ACM Web Conference 2023 . 3406–3416. [19] Juraj Gottweis, Wei-Hung Weng, Alexander Daryin, Tao Tu, Petar Sirkovic, Artiom Myaskovsky, Grzegorz Glowaty, Felix Weissenberger, Alessio Orlandi, Dan Popovici, et al. 2026. Accelerating scientific discovery with Co-Scientist. 
+
+Nature (2026), 1–3. [20] Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Peiyi Wang, Qihao Zhu, Runxin Xu, Ruoyu Zhang, Shirong Ma, Xiao Bi, Xiaokang Zhang, Xingkai Yu, Yu Wu, Z. F. Wu, Zhibin Gou, Zhihong Shao, Zhuoshu Li, Ziyi Gao, Aixin Liu, Bing Xue, Bingxuan Wang, Bochao Wu, Bei Feng, Chengda Lu, Chenggang Zhao, Chengqi Deng, Chong Ruan, Damai Dai, Deli Chen, Dongjie Ji, Erhang Li, Fangyun Lin, Fucong Dai, Fuli Luo, Guangbo Hao, Guanting Chen, Guowei Li, H. Zhang, Hanwei Xu, Honghui Ding, Huazuo Gao, Hui Qu, Hui Li, Jianzhong Guo, Jiashi Li, Jingchang Chen, Jingyang Yuan, Jinhao Tu, Junjie Qiu, Junlong Li, J. L. Cai, Jiaqi Ni, Jian Liang, Jin Chen, Kai Dong, Kai Hu, Kaichao You, Kaige Gao, Kang Guan, Kexin Huang, Kuai Yu, Lean Wang, Lecong Zhang, Liang Zhao, Litong Wang, Liyue Zhang, Lei Xu, Leyi Xia, Mingchuan Zhang, Minghua Zhang, Minghui Tang, Mingxu Zhou, Meng Li, Miaojun Wang, Mingming Li, Ning Tian, Panpan Huang, Peng Zhang, Qiancheng Wang, Qinyu Chen, Qiushi Du, Ruiqi Ge, Ruisong Zhang, Ruizhe Pan, Runji Wang, R. J. Chen, R. L. Jin, Ruyi Chen, Shanghao Lu, Shangyan Zhou, Shanhuang Chen, Shengfeng Ye, Shiyu Wang, Shuiping Yu, Shunfeng Zhou, Shuting Pan, S. S. Li, Shuang Zhou, Shaoqing Wu, Tao Yun, Tian Pei, Tianyu Sun, T. Wang, Wangding Zeng, Wen Liu, Wenfeng Liang, Wenjun Gao, Wenqin Yu, Wentao Zhang, W. L. Xiao, Wei An, Xiaodong Liu, Xiaohan Wang, Xiaokang Chen, Xiaotao Nie, Xin Cheng, Xin Liu, Xin Xie, Xingchao Liu, Xinyu Yang, Xinyuan Li, Xuecheng Su, Xuheng Lin, X. Q. Li, Xiangyue Jin, Xiaojin Shen, Xiaosha Chen, Xiaowen Sun, Xiaoxiang Wang, Xinnan Song, Xinyi Zhou, Xianzu Wang, Xinxia Shan, Y. K. Li, Y. Q. Wang, Y. X. Wei, Yang Zhang, Yanhong Xu, Yao Li, Yao Zhao, Yaofeng Sun, Yaohui Wang, Yi Yu, Yichao Zhang, Yifan Shi, Yiliang Xiong, Ying He, Yishi Piao, Yisong Wang, Yixuan Tan, Yiyang Ma, Yiyuan Liu, Yongqiang Guo, Yuan Ou, Yuduan Wang, Yue Gong, Yuheng Zou, Yujia He, Yunfan Xiong, Yuxiang Luo, Yuxiang You, Yuxuan Liu, Yuyang Zhou, Y. X. Zhu, Yanping Huang, Yaohui Li, Yi Zheng, Yuchen Zhu, Yunxian Ma, Ying Tang, Yukun Zha, Yuting Yan, Z. Z. Ren, Zehui Ren, Zhangli Sha, Zhe Fu, Zhean Xu, Zhenda Xie, Zhengyan Zhang, Zhewen Hao, Zhicheng Ma, Zhigang Yan, Zhiyu Wu, Zihui Gu, Zijia Zhu, Zijun Liu, Zilin Li, Ziwei Xie, Ziyang Song, Zizheng Pan, Zhen Huang, Zhipeng Xu, Zhongyu Zhang, and Zhen Zhang. 2025. DeepSeek-R1 incentivizes reasoning in LLMs through reinforcement learning. Nature 645, 8081 (Sept. 2025), 633–638. doi:10.1038/s41586-025-09422-z [21] Ziyang Huang, Haolin Ren, Xiaowei Yuan, Jiawei Wang, Zhongtao Jiang, Kun Xu, Shizhu He, Jun Zhao, and Kang Liu. 2026. WideSeek: Advancing Wide Research via Multi-Agent Scaling. arXiv preprint arXiv:2602.02636 (2026). [22] Saehan Jo and Immanuel Trummer. 2024. ThalamusDB: Approximate Query Processing on Multi-Modal Data. Proceedings of the ACM on Management of Data 
+
+2, 3 (May 2024), 1–26. doi:10.1145/3654989 Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives 
+
+[23] Benny Kimelfeld and Yehoshua Sagiv. 2006. Finding and approximating top-k answers in keyword proximity search. In PODS . 173–182. [24] Tian Lan, Felix Henry, Bin Zhu, Qianghuai Jia, Junyang Ren, Qihang Pu, Haijun Li, Longyue Wang, Zhao Xu, and Weihua Luo. 2026. Table-as-Search: Formulate Long-Horizon Agentic Information Seeking as Table Completion. arXiv preprint arXiv:2602.06724 (2026). [25] Tian Lan, Bin Zhu, Qianghuai Jia, Junyang Ren, Haijun Li, Longyue Wang, Zhao Xu, Weihua Luo, and Kaifu Zhang. 2025. Deepwidesearch: Benchmarking depth and width in agentic information seeking. arXiv preprint arXiv:2510.20168 (2025). [26] Jiale Lao, Andreas Zimmerer, Olga Ovcharenko, Tianji Cong, Matthew Russo, Gerardo Vitagliano, Michael Cochez, Fatma Özcan, Gautam Gupta, Thibaud Hottelier, H. V. Jagadish, Kris Kissel, Sebastian Schelter, Andreas Kipf, and Im-manuel Trummer. 2025. SemBench: A Benchmark for Semantic Query Processing Engines. doi:10.48550/arXiv.2511.01716 arXiv:2511.01716. [27] Chengkai Li, Kevin Chen-Chuan Chang, Ihab F. Ilyas, and Sumin Song. 2005. RankSQL: Query Algebra and Optimization for Relational Top-k Queries. In 
+
+SIGMOD . 131–142. [28] Hang Li. 2011. Learning to Rank for Information Retrieval and Natural Language Processing . Morgan Claypool. [29] Jisen Li, Bingxuan Li, Nanyi Jiang, Xuying Ning, Xiyao Wang, Yifan Shen, Heng Wang, Yuqing Jian, Xiaoxia Wu, Ben Athiwaratkun, et al. 2026. Multi-Turn Agentic Scientific Literature Search via Workflow Induction. arXiv preprint arXiv:2607.00597 (2026). [30] Chunwei Liu, Matthew Russo, Michael Cafarella, Lei Cao, Peter Baile Chen, Zui Chen, Michael Franklin, Tim Kraska, Samuel Madden, Rana Shahout, et al. 2025. Palimpzest: Optimizing ai-powered analytics with declarative query processing. In Proceedings of the Conference on Innovative Database Research (CIDR) . 2. [31] Shu Liu, Soujanya Ponnapalli, Shreya Shankar, Sepanta Zeighami, Alan Zhu, Shubham Agarwal, Ruiqi Chen, Samion Suwito, Shuo Yuan, Ion Stoica, et al. 2025. Supporting our ai overlords: Redesigning data systems to be agent-first. 
+
+arXiv preprint arXiv:2509.00997 (2025). [32] Duo Lu, Helena Caminal, Manos Chatzakis, Yannis Papakonstantinou, Yannis Chronis, Vaibhav Jain, and Fatma Özcan. 2026. An in-depth study of filter-agnostic vector search on a postgresql database system:[experiments & analysis]. 
+
+Proceedings of the ACM on Management of Data 4, 3 (SIGMOD (2026), 1–26. [33] Jiaqi Mu and Pramod Viswanath. 2018. All-but-the-Top: Simple and Effective Postprocessing for Word Representations. In International Conference on Learning Representations (ICLR) .[34] Rodrigo Nogueira and Kyunghyun Cho. 2020. Passage Re-ranking with BERT. doi:10.48550/arXiv.1901.04085 arXiv:1901.04085. [35] Liana Patel, Siddharth Jha, Parth Asawa, Melissa Pan, Carlos Guestrin, and Matei Zaharia. 2024. Semantic Operators: A Declarative Model for Rich, AI-based Analytics Over Text Data. https://api.semanticscholar.org/CorpusID:271218837 [36] Liana Patel, Siddharth Jha, Melissa Pan, Harshit Gupta, Parth Asawa, Carlos Guestrin, and Matei Zaharia. 2025. Semantic Operators and Their Optimization: Enabling LLM-Based Data Processing with Accuracy Guarantees in LOTUS. 
+
+Proceedings of the VLDB Endowment 18, 11 (2025), 4171–4184. [37] Liana Patel, Peter Kraft, Carlos Guestrin, and Matei Zaharia. 2024. Acorn: Per-formant and predicate-agnostic search over vector embeddings and structured data. Proceedings of the ACM on Management of Data 2, 3 (2024), 1–27. [38] Boci Peng, Yun Zhu, Yongchao Liu, Xiaohe Bo, Haizhou Shi, Chuntao Hong, Yan Zhang, and Siliang Tang. 2024. Graph Retrieval-Augmented Generation: A Survey. doi:10.48550/arXiv.2408.08921 arXiv:2408.08921. [39] Pinecone Systems. 2026. Pinecone: The Vector Database for AI Applications. https://www.pinecone.io/. Accessed: 2026-04-15. [40] David Rogers and Mathew Hahn. 2010. Extended-Connectivity Fingerprints. 
+
+Journal of Chemical Information and Modeling 50, 5 (May 2010), 742–754. doi:10. 1021/ci100050t [41] Matthew Russo, Sivaprasad Sudhir, Gerardo Vitagliano, Chunwei Liu, Tim Kraska, Samuel Madden, and Michael Cafarella. 2025. Abacus: A Cost-Based Optimizer for Semantic Operator Systems. arXiv preprint arXiv:2505.14661 (2025). [42] Ahmmad OM Saleh, Gokhan Tur, and Yucel Saygin. 2024. SG-RAG: Multi-hop question answering with large language models through knowledge graphs. In 
+
+Proceedings of the 7th International Conference on Natural Language and Speech Processing (ICNLSP 2024) . 439–448. [43] Shreya Shankar, Tristan Chambers, Tarak Shah, Aditya G Parameswaran, and Eugene Wu. 2025. DocETL: Agentic Query Rewriting and Evaluation for Complex Document Processing. Proceedings of the VLDB Endowment 18, 9 (2025), 3035– 3048. [44] Jianlin Su, Jiarun Cao, Weijie Liu, and Yangyiwen Ou. 2021. Whitening Sen-tence Representations for Better Semantics and Faster Retrieval. arXiv preprint arXiv:2103.15316 (2021). doi:10.48550/arXiv.2103.15316 arXiv:2103.15316. [45] Immanuel Trummer. 2025. Implementing Semantic Join Operators Efficiently. doi:10.48550/arXiv.2510.08489 arXiv:2510.08489. [46] Nikolaos Tziavelis, Wolfgang Gatterbauer, and Mirek Riedewald. 2024. Ranked Enumeration for Database Queries. ACM SIGMOD Record 53, 3 (Nov. 2024), 6–19. doi:10.1145/3703922.3703924 [47] Roman Vershynin. 2018. High-dimensional probability: An introduction with applications in data science . Vol. 47. Cambridge university press. [48] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li, Xi-angyu Wang, Xiangzhou Guo, Chengming Li, Xiaohai Xu, Kun Yu, Yuxing Yuan, Yinghao Zou, Jiquan Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang, Yihua Mo, Jun Gu, Ruiyi Jiang, Yi Wei, and Charles Xie. 2021. Milvus: A Purpose-Built Vector Data Management System. In Proceedings of the 2021 International Conference on Management of Data . ACM, Virtual Event China, 2614–2627. doi:10.1145/3448016.3457550 [49] Ziting Wang, Shize Zhang, Haitao Yuan, Jinwei Zhu, Wei Dong, and Gao Cong. 2026. FDABench: A Benchmark for Data Agents on Analytical Queries over Heterogeneous Data. In Proceedings of the 32nd ACM SIGKDD Conference on Knowledge Discovery and Data Mining V.2 . ACM, New York, NY, USA, 9985–9996. doi:10.1145/3770855.3817454 [50] Weaviate. 2026. Weaviate: An Open-Source Cloud-Native Vector Database. https://github.com/weaviate/weaviate. Accessed: 2026-04-15. [51] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi, Quoc V Le, Denny Zhou, and others. 2022. Chain-of-thought prompting elicits reasoning in large language models. Advances in neural information processing systems 35 (2022), 24824–24837. [52] David Weininger. 1988. SMILES, a chemical language and information system. 1. Introduction to methodology and encoding rules. Journal of chemical information and computer sciences 28, 1 (1988), 31–36. [53] Ryan Wong, Jiawei Wang, Junjie Zhao, Li Chen, Yan Gao, Long Zhang, Xuan Zhou, Zuo Wang, Kai Xiang, Ge Zhang, Wenhao Huang, Yang Wang, and Ke Wang. 2025. WideSearch: Benchmarking Agentic Broad Info-Seeking. arXiv:2508.07999 [cs.CL] https://arxiv.org/abs/2508.07999 [54] Jian Wu, Linyi Yang, Dongyuan Li, Yuliang Ji, Manabu Okumura, and Yue Zhang. 2025. MMQA: Evaluating LLMs with multi-table multi-hop complex questions. In International Conference on Learning Representations , Vol. 2025. 48626–48643. [55] Shirley Wu, Shiyu Zhao, Michihiro Yasunaga, Kexin Huang, Kaidi Cao, Qian Huang, Vassilis N. Ioannidis, Karthik Subbian, James Zou, and Jure Leskovec. 2024. STaRK: Benchmarking LLM Retrieval on Textual and Relational Knowledge Bases. In Advances in Neural Information Processing Systems , A. Globerson, L. Mackey, D. Belgrave, A. Fan, U. Paquet, J. Tomczak, and C. Zhang (Eds.), Vol. 37. Curran Associates, Inc., 127129–127153. doi:10.52202/079017-4037 [56] Zelai Xu, Zhexuan Xu, Ruize Zhang, Chunyang Zhu, Shi Yu, Weilin Liu, Quanlu Zhang, Wenbo Ding, Chao Yu, and Yu Wang. 2026. WideSeek-R1: Exploring Width Scaling for Broad Information Seeking via Multi-Agent Reinforcement Learning. arXiv:2602.04634 [cs.AI] https://arxiv.org/abs/2602.04634 [57] Zhepeng Yan, Nan Zheng, Zachary Ives, Partha Talukdar, and Cong Yu. 2013. Actively Soliciting Feedback for Query Answers in Keyword Search-Based Data Integration. PVLDB (2013). [58] Rui Yang, Lin Song, Yanwei Li, Sijie Zhao, Yixiao Ge, Xiu Li, and Ying Shan. 2023. Gpt4tools: Teaching large language model to use tools via self-instruction. 
+
+Advances in Neural Information Processing Systems 36 (2023), 71995–72007. [59] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and Yuan Cao. 2022. ReAct: Synergizing Reasoning and Acting in Language Models. International Conference on Learning Representations abs/2210.03629 (2022). [60] Alexandros Zeakis, George Papadakis, Dimitrios Skoutas, and Manolis Koubarakis. 2025. AvengER: Ensembling and Fine-Tuning LLMs for SELECT Prompts in Entity Resolution. In European Semantic Web Conference . Springer, 301–320. [61] Sepanta Zeighami, Shreya Shankar, and Aditya Parameswaran. 2025. Cut costs, not accuracy: Llm-powered data processing with guarantees. Proceedings of the ACM on Management of Data 3, 6 (2025), 1–26. [62] Sepanta Zeighami, Shreya Shankar, and Aditya Parameswaran. 2026. Featurized-Decomposition Join: Low-Cost Semantic Joins with Guarantees. Proc. VLDB Endow. 19, 11 (Sept. 2026), 3048–3061. doi:10.14778/3836663.3836672 [63] Yuxiang Zheng, Dayuan Fu, Xiangkun Hu, Xiaojie Cai, Lyumanshan Ye, Pengrui Lu, and Pengfei Liu. 2025. Deepresearcher: Scaling deep research via reinforce-ment learning in real-world environments. In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing . 414–431. 
+
+## A Benchmark Dataset A.1 IMDB Benchmark 
+
+A.1.1 Dataset Description. The IMDB dataset is designed to simu-late a movie discovery and recommendation environment. It allows for querying films based on a combination of categorical metadata (e.g., genres, ratings, release years) and rich textual profiles. To set up a scenario facilitating cross-era movie discovery (e.g., finding modern successors to classic cinema), we partition the data into Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+Figure 9: Validation of the semantic join proxy: shared cast metrics versus embedding distance 𝜏 . Dashed lines indicate global baselines. 
+
+two relational tables, 𝑇 1 and 𝑇 2, representing different time periods. Each record encapsulates a comprehensive movie profile, including a synthesized crew description and high-dimensional embeddings for its plot and title. 
+
+A.1.2 Data Source and Construction. To construct this benchmark, we integrated official metadata with unstructured content: 
+
+• Data Sourcing: We extracted structured attributes (ti-tle, rating, crew identifiers) from the official IMDB non-commercial datasets. To ensure a high-quality corpus, we limited the scope to non-adult feature films released be-tween 1950 and 2020. This was augmented with detailed plot descriptions sourced from the jquigl/imdb-genres 
+
+collection. 
+
+• Profile Construction: We synthesized an actor_director 
+
+textual field for each movie by joining the crew identifiers with the name basics table, resolving top-billed cast mem-bers and directors into human-readable strings. The final consolidated table, consisting of 85,615 cleaned records, was merged on the composite key of movie title and release year. 
+
+• Vectorization / Partition: We generated 1536-dimensional embeddings for the title , plot , and actor_director 
+
+fields using the Gemini-embedding-001 model. Finally, the dataset was split by the median release year (2007) into table imdb_t1 (42,378 records, pre-2007) and table imdb_t2 
+
+(43,237 records, 2007–2020) to provide physical targets for relational semantic joins. 
+
+A.1.3 Workload Construction. To systematically evaluate the ex-ecution strategies, we generate a synthetic workload suite that instantiates the three core dimensions of our multi-step reasoning query model: structured predicates ( P), multi-vector scoring ( S), and semantic join conditions ( J ). 
+
+Predicates and Scoring ( P and S). We instantiate hard logical constraints ( P) using the exact relational metadata, such as bound-ing the release years or applying exact-match filters on categorical genres. The multi-dimensional ranking objective ( S) is formulated by aggregating the semantic similarities between user-provided query anchors and the movies’ high-dimensional plot and title 
+
+embeddings. 
+
+Semantic Joins ( J ). To evaluate inter-entity synthesis (work-loads W5–W8), we simulate a cross-era discovery scenario that links classic films in imdb_t1 with their modern counterparts in 
+
+imdb_t2 . This linkage is fundamentally driven by a semantic join over the actor_director embeddings. To validate that the geometric distance ( 𝜏 ) in this specific em-bedding space serves as a robust proxy for real-world semantic relatedness, we profiled the pairwise distances across the dataset. As illustrated in Figure 9, we measured both the average number of shared cast members (left) and the probability of two movies sharing at least one cast member (right) as a function of the distance threshold 𝜏 . Note that the y-axes are scaled logarithmically, and the horizontal dashed lines denote the global expected baselines across the unconstrained Cartesian product. The empirical results exhibit a pronounced correlation: at tight distance thresholds (small 𝜏 ), both the expected density and the probability of shared cast members increase exponentially, vastly outperforming the global average. This observation perfectly aligns with our geometric premise that meaningful semantic affinities manifest strictly as extreme tail events. Consequently, this justifies our methodology of utilizing the actor_director embedding dis-tance as the underlying relational proxy to construct and evaluate ground-truth semantic join pairs. 
+
+W1: Find movies by a plot description (Semantic Retrieval). 
+
+To establish a performance baseline, we synthesize a query set of 100 seed phrases simulating authentic user search behaviors. We generate these search intents using OpenAI GPT-4o (temperature =
+
+0.8) with the following exact prompt: “Generate exactly [N] short phrases that someone might type when searching for movies. Ex-amples: ’thriller with twist’, ’romantic comedy in Paris’. Output one phrase per line, no numbering, no other text.” Each generated phrase is then vectorized into 1536-dimensional embeddings using the Gemini-embedding-001 model. To ensure uniform coverage across the partitioned corpus, the generator randomly assigns each query to one of the four possible target spaces: either the plot or title 
+
+embeddings within imdb_t1 or imdb_t2 . Each query is parameter-ized with 𝐾 = 20. This workload represents the simplest form of single-signal semantic retrieval, providing the ground-truth base-line for the system’s raw vector search throughput without struc-tural constraints.                         
+
+> 1--Searching for "a thriller with unexpected twist and mystery "
+> 2SELECT tconst , title , plot
+> 3FROM imdb_t1
+> 4ORDER BY plot_emb <-> ' [0.0336 , -0.0163 , ...] '
+> 5LIMIT 20;
+
+Listing 2: Example W1 Query 
+
+W2: Find movies by a plot description, within genre/era (Filtered Retrieval). Building upon W1, workload W2 introduces exact structured predicates ( P) to evaluate filtered semantic search. To construct this workload, we keep the same query-text prompt setting as W1, generate 100 intents, and vectorize each into a 1536-dimensional embedding. We then augment each query with 1 to 3 relational filters applied strictly to target-table metadata. The predicate space is bounded by three explicit rules: (1) temporal constraints applying ≥ or ≤ operators on year within [1980 , 2020 ];(2) quality thresholds applying the ≥ operator on rating within 
+
+[1.0, 10 .0]; and (3) categorical constraints applying the IN operator over random subsets of 12 predefined cinematic genre s. Paired Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives 
+
+with a uniformly selected target semantic space (either plot_emb 
+
+or title_emb within imdb_t1 or imdb_t2 ) and parameterized with 
+
+𝐾 = 20, this workload benchmarks hybrid execution with relational pruning plus dense vector scans.                                      
+
+> 1--Q: "a thriller with unexpected twist and mystery "
+> 2--Filtered by specific categorical genres
+> 3SELECT tconst , title , genre , plot
+> 4FROM imdb_t1
+> 5WHERE genre IN ( ' Action ', ' Fantasy ', ' Thriller ')
+> 6ORDER BY plot_emb <-> ' [ -0.007 , -0.028 , ...] '
+> 7LIMIT 20;
+
+Listing 3: Example W2 Query 
+
+W3: Find movies matching a multi-aspect semantic pro-file (Multi-scoring retrieval). To evaluate multi-signal aggrega-tion (Multi-S) over a single entity without structural predicates (P = ∅), workload W3 synthesizes user intents spanning mul-tiple semantic dimensions. We generate 100 queries uniformly targeting either imdb_t1 or imdb_t2 . Query text generation uses a 3-slot prompt template (plot description | title style | actor/di-rector vibe), then maps each slot to plot_emb , title_emb , and 
+
+actor_director_emb , respectively. Each component phrase is em-bedded with Gemini-embedding-001 (1536-d). Ranking uses a late-binding weighted sum over these 𝐿 2 vector distances, with per-query weights normalized to 1.0 and 𝐾 = 20.                                                          
+
+> 1--Q: Find movies in imdb_t1 matching amulti - aspect profile :
+> 2--famous thriller actors AND unexpected twist plot motif
+> 3SELECT tconst , title , year
+> 4FROM imdb_t1
+> 5ORDER BY
+> 60.60 *( actor_director_emb <-> ' [ -0.033 , -0.031 , ...] ')
+> 7--demographic cast intent mapping ( L2 distance )
+> 8+0.40 *( plot_emb <-> ' [ -0.007 , -0.028 , ...] ')
+> 9--narrative plot intent mapping ( L2 distance )
+> 10 LIMIT 20;
+
+Listing 4: Example W3 Query 
+
+W4: Find movies matching a multi-aspect semantic profile within strict relational filters (Filtered multi-scoring). Build-ing upon W3, workload W4 introduces exact structural predicates (P) to evaluate filtered multi-signal aggregation (Multi-S) over a single entity without cross-table joins ( J = ∅). We synthesize 1000 queries uniformly targeting either imdb_t1 or imdb_t2 . Query text generation follows the same three-slot semantics as W3, using a tab-separated triple format to improve parsing robustness at larger scale. The three text slots are mapped to plot_emb , title_emb ,and actor_director_emb , and each is embedded with Gemini-embedding-001 (1536-d). To instantiate the structured predicates, each query is dynami-cally augmented with 1 to 2 relational filter groups applied strictly to the target table’s metadata. The predicate generation space is strictly bounded by three explicit logical rules: (1) temporal constraints applying the ≥ operator on year sampled within [1983 , 2008 ], or applying both ≥ and ≤ operators bounded by intervals [1983 , 2003 ]
+
+and [1995 , 2018 ]; (2) quality thresholds applying the ≥ operator on rating sampled within [3.5, 7.5], or both ≥ and ≤ operators bounded by [3.5, 6.5] and [5.0, 9.0]; and (3) categorical constraints applying the IN operator over random subsets of 1 to 4 predefined cinematic genre s from a pool of 12 options. Logically, the query formulates a top-𝐾 (𝐾 = 20) retrieval where the final ranking is de-termined by a late-binding, weighted sum of the 𝐿 2 distances across 2 to 3 corresponding continuous vector spaces. Each component signal is assigned a randomized interpolation weight summing to 1.0. This workload benchmarks the capability of the database engine to efficiently execute hybrid queries combining diverse relational filters with dense multi-stream vector scans.                                                                                        
+
+> 1--Q: Find movies in imdb_t2 matching amulti - aspect profile :
+> 2--" enchanting romance film " ( title ) , " magical romance movie stars " ( cast ) ,
+> 3--and " romantic fantasy involving mythical realms " ( plot )
+> 4SELECT tconst , title , year , genre
+> 5FROM imdb_t2
+> 6WHERE year >= 2005
+> 7AND genre IN ( ' Adventure ', ' Mystery ')
+> 8ORDER BY
+> 90.440 *( plot_emb <-> ' [ -0.028 , -0.012 , ...] ')
+> 10 --narrative plot intent ( L2 distance )
+> 11 +0.426 *( actor_director_emb <-> ' [ -0.039 , -0.034 , ...] ' )
+> 12 --demographic cast intent ( L2 distance )
+> 13 +0.134 *( title_emb <-> ' [ -0.058 , -0.016 , ...] ')
+> 14 --stylistic title intent ( L2 distance )
+> 15 LIMIT 20;
+
+Listing 5: Example W4 Query 
+
+W5: Pair up similar-cast films that fit a plot or title theme (Semantic join). Transitioning to Inter-Entity Synthesis ( J ), work-load W5 evaluates semantic joins without structural predicates (P = ∅). At a high level, this query pattern represents a cross-era discovery task: it finds pairs of classic and modern movies that share a highly identical demographic cast or crew, and ranks these linked pairs globally based on how well one of the movies matches a specific narrative or stylistic search intent. To construct this work-load, we synthesize 100 movie search intents using OpenAI GPT-4o (temperature = 0.8) with the following exact prompt: “Generate exactly [N] short phrases that someone might type when searching for movies. Examples: ’thriller with twist’, ’romantic comedy in Paris’. Output one phrase per line, no numbering, no other text.” Each gen-erated phrase is independently vectorized into a 1536-dimensional embedding using the Gemini-embedding-001 model. Logically, the query formulates a distance-threshold 𝜖 -join on the 
+
+actor_director_emb vectors between the imdb_t1 and imdb_t2 
+
+tables. To comprehensively evaluate the engine across varying link-age densities, the parameter 𝜏 is strictly sampled from predefined discrete semantic similarity tiers (0 .40 , 0.45 , 0.50 , 0.55 , 0.60). These distinct values map directly to physical real-world relationships: a tight threshold ( 𝜏 = 0.40) captures highly identical cast combina-tions yielding an intermediate join selectivity of 0 .01%, a medium threshold ( 𝜏 = 0.50) captures similar associations yielding 0 .23% selectivity, while a relaxed threshold ( 𝜏 = 0.60) captures loosely related connections yielding an exponentially larger 5 .13% interme-diate join selectivity. The semantic scoring signal ( S) is uniformly assigned to target either plot_emb or title_emb on either the 
+
+imdb_t1 or imdb_t2 table. Crucially, to prevent a single highly-ranked anchor film from dominating the result set with multiple join partners, the valid joined pairs are explicitly deduplicated by Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+the primary key ( tconst ) of the scored table. The pairs are then globally ranked by the 𝐿 2 distance between the assigned target embedding and the query vector, retaining the overall top 𝐾 = 20 distinct pairs.                                                                                   
+
+> 1--Q: Find classic - modern movie pairs with similar cast / crew ( L2 <= 0.40) ,
+> 2--ensure distinct classic movies , globally ranked by how well t1 fits aplot intent
+> 3SELECT t1_tconst , t1_title , t2_title
+> 4FROM (
+> 5SELECT DISTINCT ON ( t1 . tconst )
+> 6t1 . tconst AS t1_tconst ,
+> 7t1 . title AS t1_title ,
+> 8t2 . title AS t2_title ,
+> 9t1 . plot_emb <-> ' [ -0.007 , -0.028 , ...] ' AS score
+> 10 FROM imdb_t1 t1
+> 11 JOIN imdb_t2 t2
+> 12 ON ( t1 . actor_director_emb <-> t2 . actor_director_emb ) <= 0.40
+> 13 --cast similarity join ( sampled from discrete similarity tiers )
+> 14 ORDER BY t1 . tconst , score
+> 15 )distinct_pairs
+> 16 ORDER BY score
+> 17 LIMIT 20;
+
+Listing 6: Example W5 Query 
+
+W6: Pair up similar-cast films that fit a plot theme, within genre/era on each side (Filtered join). Building upon W5, work-load W6 introduces exact structural predicates ( P) on both sides of the semantic join to evaluate filtered inter-entity synthesis. At a high level, this query pattern represents a constrained cross-era discovery task: it finds pairs of classic and modern movies that share a highly identical demographic cast or crew, satisfying rigor-ous structural constraints on both sides (restricting release eras or demanding specific minimum ratings), and ranks these linked pairs globally based on how well the primary movie matches a specific narrative search intent. To construct this workload, we synthesize 100 movie plot motifs using OpenAI GPT-4o (temperature = 0.8) with the following exact prompt: “Generate exactly [N] short phrases describing a specific movie theme, setting, or plot motif. Examples: ’a detective solving a murder in a small town’, ’spaceship crew encounter-ing an alien anomaly’. Output one phrase per line, no numbering, no other text.” Each generated phrase is independently vectorized into a 1536-dimensional embedding using the Gemini-embedding-001 model to serve as the ranking intent on plot_emb .To instantiate the structured predicates, each query is dynami-cally augmented with relational filters applied strictly to the meta-data of both imdb_t1 and imdb_t2 . The predicate generation space is strictly bounded by explicit logical rules: temporal constraints applying the ≥ or ≤ operators on year sampled within the inter-val [1980 , 2020 ]; quality thresholds applying the ≥ or ≤ operators on rating sampled within [1.0, 10 .0]; and categorical constraints applying the IN operator over random subsets of 12 predefined cinematic genre s. The join threshold tiers, deduplication policy, and sparse-to-dense linkage settings follow W5. W6 adds only dual-sided relational filtering before final ranking, and then ranks surviving pairs by the 𝐿 2 distance between imdb_t1.plot_emb and the query vector (top 𝐾 = 20).                                                                                        
+
+> 1--Q: Find thriller plot movies in imdb_t1 linked to imdb_t2 movies with
+> 2--similar cast / crew ( L2 <= 0.45) , satisfying specific year and rating filters
+> 3SELECT t1_tconst , t1_title , t2_title
+> 4FROM (
+> 5SELECT DISTINCT ON ( t1 . tconst )
+> 6t1 . tconst AS t1_tconst ,
+> 7t1 . title AS t1_title ,
+> 8t2 . title AS t2_title ,
+> 9t1 . plot_emb <-> ' [ -0.007 , -0.027 , ...] ' AS score
+> 10 FROM imdb_t1 t1
+> 11 JOIN imdb_t2 t2
+> 12 ON ( t1 . actor_director_emb <-> t2 . actor_director_emb ) <= 0.45
+> 13 --cast similarity join ( sampled from discrete similarity tiers )
+> 14 WHERE t1 . year >= 1985
+> 15 AND t2 . rating >= 5.7
+> 16 ORDER BY t1 . tconst , score
+> 17 )distinct_pairs
+> 18 ORDER BY score
+> 19 LIMIT 20;
+
+Listing 7: Example W6 Query 
+
+W7: Pair up similar-cast films across two plot themes (Multi-scoring join). Building upon W5, workload W7 introduces complex multi-signal aggregation (Multi-S) into the inter-entity synthesis pipeline ( J ) without structural predicates ( P = ∅). At a high level, this query pattern represents a dual-intent cross-era discovery task: it finds tuples of classic and modern movies that share a highly identical demographic cast or crew, and globally ranks these pairs based on how well the primary movie matches a first narrative motif, how well the secondary movie matches a second narrative motif, and the absolute tightness of their shared cast similarity. To construct this workload, we synthesize 1000 search intents per table using OpenAI GPT-4o (temperature = 1.0) with the following exact prompt: “Generate exactly [N] short, diverse phrases (3-8 words each) that someone might type when searching for movies. They should cover a wide range of genres, moods, settings, and themes. Avoid repeating themes already covered.\nOutput one phrase per line, no numbering, no other text.” Each phrase is independently vectorized into a 1536-dimensional embedding using the Gemini-embedding-001 model to target either the imdb_t1 plot_emb or 
+
+imdb_t2 plot_emb . The primary and secondary query vectors are paired dynamically across specific correlation tiers (anti, low, medium, high) to rigorously control query hardness. The join threshold tiers and sparse-to-dense linkage settings follow W5. The key change in W7 is the ranking objective: globally valid pairs are scored by a late-binding weighted sum of three 𝐿 2
+
+distances, combining imdb_t1.plot_emb to the first intent, imdb_ t2.plot_emb to the second intent, and the cross-table actor_ director_emb distance. Each weight vector is sampled and nor-malized to 1.0, and the top 𝐾 = 20 pairs are retained.                                                                                               
+
+> 1--Q: Find classic - modern movie tuples with similar cast / crew ( L2 <= 0.50) ,
+> 2--ranked globally by a3- way multi - scoring objective
+> 3SELECT t1 . tconst AS t1_tconst ,
+> 4t2 . tconst AS t2_tconst ,
+> 5(0.20 *( t1 . plot_emb <-> ' [ -0.009 , 0.021 , ...] ')
+> 6--primary plot intent ( L2 distance )
+> 7+0.20 *( t2 . plot_emb <-> ' [ -0.019 , -0.008 , ...] ') Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives
+> 8--secondary plot intent ( L2 distance )
+> 9+0.60 *( t1 . actor_director_emb <-> t2 . actor_director_emb )
+> 10 --actual cast similarity ( L2 distance )
+> 11 )AS score
+> 12 FROM imdb_t1 t1
+> 13 JOIN imdb_t2 t2
+> 14 ON ( t1 . actor_director_emb <-> t2 . actor_director_emb ) <= 0.50
+> 15 --cast similarity join ( sampled from discrete similarity tiers )
+> 16 ORDER BY score
+> 17 LIMIT 20;
+
+Listing 8: Example W7 Query 
+
+W8: Pair up similar-cast films across two plot themes, within genre/era on each side (Filtered multi-scoring join). 
+
+Building upon W7, workload W8 represents the most compre-hensive query pattern, introducing exact structural predicates (P) on both sides of the multi-signal aggregation (Multi-S) and inter-entity synthesis pipeline ( J ). At a high level, this query pattern represents a constrained, dual-intent cross-era discovery task: it finds tuples of classic and modern movies that share a highly identical demographic cast or crew, satisfying rigorous structural constraints on both sides (restricting release eras or demanding specific minimum ratings), and globally ranks these linked pairs based on how well the primary movie matches a first narrative motif, how well the secondary movie matches a second narrative motif, and the absolute tightness of their shared cast similarity. To construct this workload, we synthesize 100 pairs of distinct movie concepts using OpenAI GPT-4o (temperature = 0.8) with the following exact prompt: “Generate exactly [N] pairs of movie concepts. Each line should contain two distinct concepts separated by a pipe character ’|’. For example: ’A gritty sci-fi thriller about time travel | A lighthearted comedy about a robot learning to love’. Output only the pipe-separated pairs, one pair per line.” Each text field in the generated pair is independently vectorized into a 1536-dimensional embedding using the Gemini-embedding-001 model, with the first concept targeting the imdb_t1 plot_emb and the second targeting the imdb_t2 plot_emb .To instantiate the structured predicates, each query is dynami-cally augmented with relational filters applied strictly to the meta-data of both imdb_t1 and imdb_t2 . The predicate generation space is strictly bounded by explicit logical rules: temporal constraints applying the ≥ or ≤ operators on year sampled within the inter-val [1980 , 2020 ]; quality thresholds applying the ≥ or ≤ operators on rating sampled within [1.0, 10 .0]; and categorical constraints applying the IN operator over random subsets of 12 predefined cinematic genre s. W8 follows W5 for join tiers, and follows W7 for three-signal late-binding ranking; its only additional step is ap-plying dual-sided relational filters before ranking. The final result keeps the top 𝐾 = 20 distinct pairs.                                                                                                                         
+
+> 1--Q: Find " Sci - fi movies with robots " in imdb_t1 ( year >= 1985) linked to
+> 2--" Exploration documentaries of outer space " in imdb_t2 ( rating >= 5.7)
+> 3--with similar cast / crew ( L2 <= 0.50) , ranked globally by a3- way objective
+> 4SELECT t1 . tconst AS t1_tconst ,
+> 5t1 . title AS t1_title ,
+> 6t2 . title AS t2_title ,
+> 7(0.25 *( t1 . plot_emb <-> ' [ -0.009 , 0.021 , ...] ')
+> 8--primary plot intent ( L2 distance )
+> 9+0.25 *( t2 . plot_emb <-> ' [ -0.027 , -0.013 , ...] ')
+> 10 --secondary plot intent ( L2 distance )
+> 11 +0.50 *( t1 . actor_director_emb <-> t2 . actor_director_emb )
+> 12 --actual cast similarity ( L2 distance )
+> 13 )AS score
+> 14 FROM imdb_t1 t1
+> 15 JOIN imdb_t2 t2
+> 16 ON ( t1 . actor_director_emb <-> t2 . actor_director_emb ) <= 0.50
+> 17 --cast similarity join ( sampled from discrete similarity tiers )
+> 18 WHERE t1 . year >= 1985
+> 19 AND t2 . rating >= 5.7
+> 20 ORDER BY score
+> 21 LIMIT 20;
+
+Listing 9: Example W8 Query 
+
+## A.2 MOLECULE Benchmark 
+
+A.2.1 Dataset Description. Unlike IMDB, which is positioned as a fabricated discovery benchmark, MOLECULE provides real hybrid workloads extracted from an operational Biofoundry project dedi-cated to academic knowledge integration and retrieval. The under-lying database naturally stores heterogeneous entities—including research papers, researchers, organizations, and biochemical con-cepts—augmented with semantic tags, structured attributes, and multiple field-level embeddings. To expose this complex, evidence-centric biomedical reasoning in a relational benchmark, we project the relevant entity interactions into a bipartite schema: a fact-side relation ( molecule_fact ) and a paper-side relation ( molecule_ paper ). This layout successfully captures the target user behav-ior of our deep research agent system: proposing molecule-related concepts, retrieving supporting literature, applying metadata con-straints, and ranking candidates under multi-signal criteria. 
+
+A.2.2 Data Source and Construction. To construct this benchmark, we combine two sources: (i) molecule-centric fact/paper data ex-tracted from the broader heterogeneous knowledge graph and (ii) deep research agent query traces. The construction pipeline is: 
+
+• Agent-Trace Grounding: We collect historical deep re-search agent queries and cluster them into eight workload intents (W1–W8). For each intent class 𝑥 , we retain a set of representative trace templates 𝑇 𝑥 , where each template includes the query skeleton and the fields that must be in-stantiated ( query_text , predicates, join tier, weight vector, or combinations thereof). 
+
+• Data Sourcing: We collect molecule facts and publication records with complete text fields and normalized molecule identifiers from the Biofoundry integration engine, then re-tain only rows with valid metadata required by the template instantiation fields. 
+
+• Profile Construction: On the fact side, each row stores a fact statement plus structured molecule descriptors; on the paper side, each row stores publication metadata and abstract-level content. This yields a physically separated Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+but semantically linkable two-relation layout aligned with agent reasoning hops. 
+
+• Vectorization / Structural Features: We encode textual fields with Gemini-embedding-001 into 1536-dimensional vectors and represent molecular structure with 1024-bit ECFP fingerprints. These representations are exactly the fields consumed by template-driven augmentation from 𝑇 𝑥 .
+
+A.2.3 Workload Construction. To systematically evaluate execu-tion strategies, we construct eight workloads that cover the full taxonomy of our query model: structured predicates ( P), multi-signal scoring ( S), and semantic joins ( J ). For each workload 𝑥 ,we follow an agent-grounded augmentation recipe: (1) select rep-resentative templates 𝑇 𝑥 from deep research agent traces, (2) map template slots to physical fields, (3) generate or sample slot values, and (4) materialize augmented queries as workload JSON. 
+
+Predicates and Scoring ( P and S). For fact-side filtering, predi-cate atoms are sampled from categorical fields ( fact_type , claim_ polarity , mol_source_origin , mol_toxicity_flag , mol_moa ,
+
+mol_target_type , evidence_type , organism ), numeric fields (mol_mw , mol_logp , mol_tpsa , mol_num_atoms , mol_num_rings ,
+
+mol_num_hbd , mol_num_hba ), and array containment on mol_ therapeutic_area . Multi-signal scoring combines fact-text se-mantic distance and molecule-structure Jaccard distance, with per-query randomized weights normalized to sum to 1. 
+
+Semantic Joins ( J ). For inter-entity synthesis (W5–W8), we link fact rows to paper rows using a distance-threshold join over textual evidence vectors. The threshold 𝜏 is sampled from discrete tiers {0.45 , 0.50 , 0.55 , 0.65 }, labeled very_similar , similar , related ,and loose . These tiers induce exponentially different candidate den-sities (from thousands to millions of pairs), which we intentionally preserve to stress both sparse and dense join regimes. To avoid synthetic key joins, all cross-table linkage is parame-terized geometrically by 𝜏 ; smaller tiers produce strict semantic evidence alignment, and larger tiers expand recall with sharply higher pair counts. This discrete-tier design mirrors realistic re-trieval behavior where semantic relatedness appears as tail events in embedding space. 
+
+W1: Find facts on a research topic (Semantic retrieval). For W1, we first extract a template set 𝑇 1 from agent traces whose intent is single-hop fact retrieval without filters or joins. We then instan-tiate the query_text slot using OpenAI GPT-4o (temperature =
+
+0.9) with the exact prompt: “Generate exactly [N] diverse natural-language queries a biomedical researcher might type when search-ing a database of facts about drug molecules and proteins. Cover varied topics: drug mechanism of action, toxicity, pharmacokinetics, structure-activity relationships, clinical outcomes, natural products, therapeutic areas (oncology / neurology / infectious / metabolic / cardio / psychiatry / immunology), organisms tested (human / mouse / rat / cell_line / bacteria), in vitro vs in vivo evidence, and synthesis routes. Vary phrasing style: keyword style, question style, long-sentence style. Keep each under 15 words, realistic, no numbering, one phrase per line.” Instantiated queries are deduplicated, embedded by Gemini-embedding-001 (1536-d), and bound to molecule_fact.fact_emb 
+
+with 𝐾 = 20. This yields pure semantic retrieval with P = ∅ and 
+
+J = ∅.                     
+
+> 1--Q: " inhibits beta - amyloid aggregation "
+> 2SELECT id , organism , property_type , fact_description
+> 3FROM molecule_fact
+> 4ORDER BY fact_emb <-> ' [ -0.0125 , 0.0341 , ...] '
+> 5LIMIT 20;
+
+Listing 10: Example W1 Query 
+
+W2: Find facts on a research topic, within organism/prop-erty scope (Filtered retrieval). For W2, we extract templates 𝑇 2
+
+from agent traces where semantic retrieval is explicitly conditioned by metadata constraints. We instantiate query_text by referring to the W1 generation setting, then augment each template with sampled predicate slots (1–3 predicates) over molecule_fact . The predicate slot space is explicitly bounded: categorical IN predicates over fact_type , claim_polarity , mol_source_origin , mol_ toxicity_flag , mol_moa , mol_target_type , evidence_type ,
+
+organism ; numeric threshold predicates ( ≥, ≤) over mol_mw , mol_ logp , mol_tpsa , mol_num_atoms , mol_num_rings , mol_num_hbd ,
+
+mol_num_hba ; and array containment ( @> ) on mol_therapeutic_ area . We retain augmented queries by selectivity buckets: tight 
+
+[0.01 , 0.10 ) at 30%, medium [0.10 , 0.30 ) at 40%, and loose [0.30 , 0.70 )
+
+at 30%.                                              
+
+> 1--Q: " drug interaction mechanisms with cytochrome P450 enzymes "
+> 2--medium - selectivity bundle : numeric +categorical +array containment
+> 3SELECT id , organism , property_type , fact_description
+> 4FROM molecule_fact
+> 5WHERE mol_tpsa >= 115.54
+> 6AND organism IN ( ' human ', ' mouse ')
+> 7AND mol_therapeutic_area @ > ARRAY [ ' oncology ']
+> 8ORDER BY fact_emb <-> ' [ -0.0102 , -0.0001 , ...] '
+> 9LIMIT 20;
+
+Listing 11: Example W2 Query 
+
+W3: Find facts on a topic about a reference molecule (Multi-scoring retrieval). For W3, we extract templates 𝑇 3 from traces where the agent jointly reasons over textual evidence and molecule structure in one retrieval hop. We instantiate two template slots: (i) query_text (referring to the W1 generation setting) mapped to molecule_fact.fact_emb and (ii) a reference molecule slot mapped to molecule_fact.mol_ecfp as a 1024-bit ECFP anchor. We then instantiate per-query weight slots and normalize to 1.0, producing a late-binding weighted sum across L2 text distance and Jaccard structure distance.                                                   
+
+> 1--Q: " drug interaction mechanisms ..." related to aspecific reference molecule
+> 2SELECT id , organism , property_type , fact_description
+> 3FROM molecule_fact
+> 4ORDER BY
+> 50.60 *( fact_emb <-> ' [ -0.0101 , -0.0001 , ...] ')
+> 6--biological topic intent ( semantic distance )
+> 7+0.40 *( mol_ecfp <%> '[0 , 0, 0, 1, ...] ')
+> 8--structural chemical similarity ( Jaccard distance )
+> 9LIMIT 20;
+
+Listing 12: Example W3 Query Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives 
+
+W4: Find facts on a topic about a reference molecule, within organism/property scope (Filtered multi-scoring). For W4, we extract templates 𝑇 4 from traces that combine dual-signal scoring with explicit fact-side filtering. We instantiate text, structure, and weight slots exactly as in W3, then instantiate 1–3 predicate slots by referring to the W2 predicate setting and retain queries under the same selectivity-bucket policy ( tight 30%, medium 40%, loose 30%). This yields a template-grounded filtered multi-scoring workload on a single relation.                                                                            
+
+> 1--Q: " drug interaction mechanisms ..." related to aspecific reference molecule
+> 2--filtered multi - scoring : same two signals as W3 +predicates following W2
+> 3SELECT id , organism , property_type , fact_description
+> 4FROM molecule_fact
+> 5WHERE mol_tpsa >= 115.54
+> 6AND evidence_type IN ( ' in_vitro ', ' in_vivo ')
+> 7AND mol_target_type IN ( ' enzyme ', ' receptor ')
+> 8ORDER BY
+> 90.60 *( fact_emb <-> ' [ -0.0101 , -0.0001 , ...] ')
+> 10 --biological topic intent ( semantic distance )
+> 11 +0.40 *( mol_ecfp <%> '[0 , 0, 0, 1, ...] ')
+> 12 --structural chemical similarity ( Jaccard distance )
+> 13 LIMIT 20;
+
+Listing 13: Example W4 Query 
+
+W5: Find paper-supported facts about a reference molecule (Semantic join). For W5, we extract templates 𝑇 5 from traces where the agent retrieves fact candidates and then links them to support-ing literature. We instantiate a structure-anchor slot (sampled valid 
+
+mol_id , 1024-bit ECFP) and a join-threshold slot for molecule_ fact.fact_emb ↔ molecule_paper.abstract_emb . The join-threshold slot is sampled from discrete tiers: very_similar (0 .45), 
+
+similar (0 .50), related (0 .55), loose (0 .65), and unrelated (0 .75), preserving the observed sparse-to-dense evidence-linking regimes in agent behavior.                                                                                          
+
+> 1--Q: Find facts matching aspecific molecular structure ,
+> 2--then join papers providing semantic textual evidence (L2 <= 0.45)
+> 3SELECT fact_id , paper_id
+> 4FROM (
+> 5SELECT DISTINCT ON (f. id )
+> 6f. id AS fact_id ,
+> 7p. pmid AS paper_id ,
+> 8(f. fact_emb <-> p. abstract_emb ) AS join_dist
+> 9FROM (
+> 10 SELECT id , fact_emb
+> 11 FROM molecule_fact
+> 12 ORDER BY mol_ecfp <%> '[0 , 0, 0, 0, ...] ' --fact -side structure intent
+> 13 LIMIT 20
+> 14 )AS f
+> 15 JOIN molecule_paper AS p
+> 16 ON (f. fact_emb <-> p. abstract_emb ) <= 0.45 --very_similar tier
+> 17 ORDER BY f.id , join_dist
+> 18 )AS dedup
+> 19 ORDER BY join_dist
+> 20 LIMIT 20;
+
+Listing 14: Example W5 Query 
+
+W6: Find paper-supported facts about a reference molecule, within fact/paper filters (Filtered join). For W6, we extract tem-plates 𝑇 6 from traces where evidence-linking is constrained by both fact-side and paper-side metadata. We instantiate W5 structure-anchor and join slots, then instantiate dual-sided predicate slots us-ing an oversampled candidate pool: fact-side predicates by referring to the W2 predicate setting and paper-side predicates over year ,
+
+journal , pub_type , and mesh_terms . Candidate templates are re-tained via soft selectivity acceptance (knee at 0.10), producing a broad left/right selectivity grid aligned with agent-side constrained retrieval behavior.                                                                                                     
+
+> 1--Q: Facts for areference molecule ( natural / microbial origin ) ,
+> 2--joined with US Gov supported papers providing semantic evidence
+> 3SELECT fact_id , paper_id
+> 4FROM (
+> 5SELECT DISTINCT ON (f. id )
+> 6f. id AS fact_id ,
+> 7p. pmid AS paper_id ,
+> 8(f. fact_emb <-> p. abstract_emb ) AS join_dist
+> 9FROM (
+> 10 SELECT id , fact_emb
+> 11 FROM molecule_fact
+> 12 WHERE mol_source_origin IN ( ' natural_product ', 'microbial ')
+> 13 AND mol_toxicity_flag IN ( ' non_toxic ')
+> 14 ORDER BY mol_ecfp <%> '[0 , 0, 0, 0, ...] '
+> 15 LIMIT 20
+> 16 )AS f
+> 17 JOIN molecule_paper AS p
+> 18 ON (f. fact_emb <-> p. abstract_emb ) <= 0.45
+> 19 AND p. pub_type @ > ARRAY [ ' Research Support , U.S. Gov ''t ']
+> 20 AND p. mesh_terms @ > ARRAY [ ' Humans ']
+> 21 ORDER BY f.id , join_dist
+> 22 )AS dedup
+> 23 ORDER BY join_dist
+> 24 LIMIT 20;
+
+Listing 15: Example W6 Query 
+
+W7: Find paper-supported facts combining a reference molecule, a topic, and tight fact-paper alignment (Multi-scoring join). For W7, we extract templates 𝑇 7 from traces where the agent performs cross-table tuple retrieval with three simulta-neous ranking signals. We instantiate a molecule-anchor slot, a topic-text slot, a join-tier slot, and a three-weight slot. Topic texts are generated by OpenAI GPT-4o (temperature = 0.8) from four exact prompt templates ( mol_specific , area_specific , target_ topic , unrelated ) and embedded by Gemini-embedding-001 onto molecule_paper.abstract_emb . Join tiers are sampled from 
+
+{0.45 , 0.50 , 0.55 , 0.65 } and weight slots are normalized to 1.0, yield-ing a template-grounded late-binding multi-signal join workload for global tuple pairs.                                                                                 
+
+> 1--Q: Find fact - paper tuples matching amolecular structure and topic ,
+> 2--ranked globally by a3- way objective
+> 3SELECT f. id AS fact_id ,
+> 4p. pmid AS paper_id ,
+> 5(0.35 *(f. mol_ecfp <%> '[0 , 1, 0, ...] ') --fact molecule intent
+> 6+0.33 *(p. abstract_emb <-> ' [ -0.009 , 0.021 , ...] ') --paper topic intent Efficiently Linking Unstructured Data for Multi-step Reasoning
+> 7+0.32 *(f. fact_emb <-> p. abstract_emb ) )AS score --join penalty
+> 8FROM molecule_fact AS f
+> 9JOIN molecule_paper AS p
+> 10 ON (f. fact_emb <-> p. abstract_emb ) <= 0.50 --similar tier
+> 11 ORDER BY score
+> 12 LIMIT 20;
+
+Listing 16: Example W7 Query 
+
+W8: Find paper-supported facts combining molecule/topic/ fact-paper alignment, within fact/paper filters (Filtered multi-scoring join). For W8, we extract templates 𝑇 8 from traces repre-senting full deep-research behavior: constrained cross-entity tuple linking with multi-signal ranking. We instantiate W7 slots (mole-cule anchor, topic embedding, join tier, normalized three-weight vector) and W6 slots (dual-sided predicate bundle) together. Opera-tionally, we pair an oversampled W6 predicate pool with W7 query templates, then select a final subset that preserves diversity over filter hardness, join density tier, and topic-to-molecule correlation tier. This yields the comprehensive agent-grounded tuple workload where P, S, and J are jointly active.                                                                                             
+
+> 1--Q: Find tuples of Catalyst facts +NIH - funded papers , ranked
+> 2--globally by molecule intent +topic intent +alignment penalty
+> 3SELECT f. id AS fact_id ,
+> 4p. pmid AS paper_id ,
+> 5(0.35 *(f. mol_ecfp <%> '[0 , 1, 0, ...] ')
+> 6+0.33 *(p. abstract_emb <-> ' [ -0.006 , 0.012 , ...] ')
+> 7+0.32 *(f. fact_emb <-> p. abstract_emb ) )AS score
+> 8FROM molecule_fact AS f
+> 9JOIN molecule_paper AS p
+> 10 ON (f. fact_emb <-> p. abstract_emb ) <= 0.55 --related tier
+> 11 WHERE f. mol_moa IN ( ' catalyst ')
+> 12 AND f. evidence_type IN ( ' in_vivo ', ' clinical ')
+> 13 AND p. pub_type @ > ARRAY [ ' Research Support , N.I.H., Extramural ']
+> 14 AND p. year >= 2005
+> 15 ORDER BY score
+> 16 LIMIT 20;
+
+Listing 17: Example W8 Query 
+
+## B Integration with Semantic Operator Systems 
+
+As established in Sec. 2.1, DASE is designed to assist semantic op-erator systems [35, 41, 45] by acting as a cost-effective prefiltering stage that prunes input data before any LLM invocation. These systems typically implement a suite of LLM-backed semantic oper-ators , including sem_filter, sem_classify, sem_rank, sem_join, and sem_map. DASE functions as a plug-in prefilter for these op-erators, leveraging multi-facet vector embeddings to identify the most promising candidate tuples for downstream LLM evaluation. Detailed SemBench performance results are provided in Table 3. 
+
+## B.1 The Prefilter Pipeline 
+
+In this architecture, DASE serves as a pluggable prefilter com-ponent. The overall workflow typically operates in two stages: DASE first recommends a high-recall candidate set, which a full-featured semantic operator engine subsequently evaluates and re-fines using targeted LLM calls. Alternatively, in scenarios where the downstream semantic operator is omitted, the workflow bypasses LLM evaluation entirely and simply accepts all of DASE’s multi-dimensional recommendations directly as the final output. This “DASE alone” configuration (denoted as DASE in Table 3) remains highly competitive whenever the embedding distance effectively separates relevant tuples from the background distribution. 
+
+## B.2 Per-Operator Strategies 
+
+The integration logic is specifically tailored to the semantics of each operator. Crucially, DASE treats every natural-language query as a 
+
+multi-dimensional evaluation task : it decomposes the user’s seman-tic intent into a statistical proxy comprising weighted aggregations over multiple, potentially heterogeneous embedding streams (e.g., visual, textual, and structural). At the execution layer, these op-erators are natively compiled into the multi-scoring architecture introduced in Sec. 4, where independent Filtered-Score Streamers (FSS) are synchronized and pruned by the Multi-Scoring Aggregator (MSA). 
+
+B.2.1 sem_filter. A sem_filter evaluates a natural-language Boolean predicate ℓ on an input relation 𝑇 . For a query such as “finding a blue shirt with positive reviews,” the semantics are not restricted to a single modality. DASE captures this by modeling the filter as a joint multi-scoring task across all relevant feature spaces 
+
+F (e.g., image embeddings for visual traits and text embeddings for sentiment). For each space 𝑓 ∈ F , DASE derives a specific set of positive an-chors 𝑃 𝑓 and antithetical anchors 𝑁 𝑓 . The MSA then synchronizes these independent FSS streams to compute a cross-dimensional contrastive margin on the fly: 
+
+𝑠 𝑖 =∑︁  
+
+> 𝑓 ∈ F
+
+𝑤 𝑓 ©« 
+
+> 1
+> |𝑃 𝑓 |
+
+∑︁ 𝑝 ∈𝑃 𝑓 
+
+cos (e𝑝 , e(𝑓 ) 
+
+> 𝑖
+
+) − 1 
+
+> |𝑁 𝑓 |
+
+∑︁ 𝑛 ∈𝑁 𝑓 
+
+cos (e𝑛 , e(𝑓 ) 
+
+> 𝑖
+
+)ª®¬
+
+where e(𝑓 ) 
+
+> 𝑖
+
+is the embedding of tuple 𝑖 in space 𝑓 , and 𝑤 𝑓 balances the contribution of each modality. This mechanism natively aggre-gates signals—such as visual blueness and textual sentiment—to identify top candidates. Because DASE acts as a high-recall prefilter, avoiding false negatives is paramount. We employ two recommen-dation rules that utilize intentionally relaxed boundaries: 
+
+• Margin-based uncertainty band. For total labeling tasks (e.g., 
+
+Wildlife Q1), DASE applies thresholds to the joint margin 𝑠 𝑖 .To aggressively protect recall, it forwards a conservatively wide uncertain band (typically 𝛼 ≈ 0.2–0 .5) for LLM evalu-ation, while accepting the cheap sign of 𝑠 𝑖 for confidently extreme rows. 
+
+• Top-𝐾 ′ shortlist. For LIMIT 𝐾 queries (e.g., Movie Q1), the MSA seamlessly streams the 𝐾 ′ tuples with the highest ag-gregate 𝑠 𝑖 . The downstream engine’s AI.IF then evaluates this multi-dimensional shortlist, short-circuiting at the 𝐾 -th valid survivor. This heuristic reduces the query latency for Movie Q1 from 26.3 s to 0.5 s. Jiaming Liang, Haydn Jones, Jacob R. Gardner, Mark Yatskar, and Zachary Ives 
+
+B.2.2 sem_classify. A sem_classify operator assigns each tu-ple to one of 𝐾 enumerated classes C = {𝑐 1, . . . , 𝑐 𝐾 }. Whereas sem_filter contrasts a single positive concept against its antitheti-cal paraphrases, sem_classify generalises this to a 𝐾 -way contrast: each class becomes its own anchor, and the per-row decision re-duces to identifying which anchor wins. For instance, in Cars Q10 the engine must classify automotive complaints into 24 distinct problem categories, where a complaint may comprise both a tex-tual description and an image of the defect, requiring multi-modal reasoning. DASE natively maps this multi-class evaluation onto a parallel multi-scoring retrieval task. It embeds each class anchor prompt 
+
+𝑐 𝑘 once per facet to obtain e(𝑓 ) 
+
+> 𝑐 𝑘
+
+, initialising an independent FSS stream per category. The MSA then synchronises these 𝐾 streams across the required feature spaces F (e.g., visual embeddings of the damaged car part and text embeddings of the complaint description), aggregating per-facet cosine similarities into a per-class affinity 
+
+𝑠 (𝑘 ) 
+
+> 𝑖
+
+, from which a proxy label ˆ𝑘 𝑖 and confidence margin 𝑚 𝑖 follow directly: 
+
+𝑠 (𝑘 ) 
+
+> 𝑖
+
+=∑︁  
+
+> 𝑓 ∈ F
+
+𝑤 𝑓 cos  e(𝑓 ) 
+
+> 𝑐 𝑘
+
+, e(𝑓 )
+
+> 𝑖
+
+, 𝑘 = 1, . . . , 𝐾, 
+
+ˆ𝑘 𝑖 = arg max 
+
+> 𝑘
+
+𝑠 (𝑘 ) 
+
+> 𝑖
+
+, 𝑚 𝑖 = 𝑠 ( ˆ𝑘 𝑖 ) 
+
+> 𝑖
+
+− max  
+
+> 𝑘 ≠ˆ𝑘 𝑖
+
+𝑠 (𝑘 ) 
+
+> 𝑖
+
+.
+
+All three quantities are computed without any LLM invocation. DASE then partitions the result set on 𝑚 𝑖 : the bottom-𝛼 tuples (smallest margin) are forwarded to the downstream engine for rig-orous refinement via AI.CLASSIFY , while the engine safely accepts the cheap argmax ˆ𝑘 𝑖 on the remaining confident rows. The final output unions the LLM-resolved tail with the DASE-asserted confi-dent bulk, achieving macro 𝐹 1 parity with an exhaustive all-LLM baseline at roughly half the inference cost (Table 3). 
+
+B.2.3 sem_rank. A sem_rank operator orders or scores tuples according to a defined rubric. DASE compiles this requirement into two distinct multi-scoring execution paths based on the query objective: 
+
+• Top-𝐾 retrieval. When the query strictly demands the highest-ranking candidates, the execution naturally re-duces to the sem_filter + LIMIT paradigm of Sec. B.2.1. DASE leverages the MSA to synchronise contrastive margin streams across all targeted feature spaces F , or-ganically short-circuiting the retrieval once 𝐾 confidently top-ranked tuples survive downstream AI.IF validation. 
+
+• Rubric scoring. When a strict numeric label is required for 
+
+every row (e.g., Movie Q9, which scores from 1 to 5 how much a reviewer liked a movie), the task is structurally a sem_classify over an ordinal class set: each rubric grade 
+
+𝑔 ∈ {1, . . . , 𝐺 } plays the role of a class anchor 𝑐 𝑔 , and the per-grade affinity 𝑠 (𝑔 ) 
+
+> 𝑖
+
+, proxy label ˆ 𝑔 𝑖 = arg max 𝑔 𝑠 (𝑔 ) 
+
+> 𝑖
+
+,and confidence margin 𝑚 𝑖 all carry over verbatim from the formulation in Sec. B.2.2. The only operator-specific change lies in the cascade policy. Because global rank-correlation metrics like Spearman integrate over the entire score distribution, a single mis-ranked tuple can dispropor-tionately degrade the global metric, so DASE cannot afford the aggressive accept-rate used for nominal classification. The bottom-𝛼 tail (smallest 𝑚 𝑖 ) is therefore widened sub-stantially ( 𝛼 ≈ 0.7) and refined via AI.SCORE rather than 
+
+AI.CLASSIFY ; the proxy argmax ˆ 𝑔 𝑖 is accepted only on the confident head, and the two streams are concatenated into the final ranking. 
+
+B.2.4 sem_join. A sem_join evaluates a match predicate over pairs 
+
+(𝑡 𝑖 , 𝑡 𝑗 ) ∈ 𝑇 1 ×𝑇 2, such as verifying if two items share the same brand and category ( Ecomm Q7). Unlike the per-row operators above, the candidate space here is the Cartesian product |𝑇 1 | · | 𝑇 2 |,so prefiltering is not merely an optimisation but a feasibility re-quirement. DASE evaluates the match proxy directly against the SemJI, which strictly decouples continuous multi-facet similarities in SemJI(embed) from discrete semantic truths in SemJI(AI.IF) .During execution, DASE first probes SemJI(AI.IF) to resolve previously verified pairs at zero LLM cost. For unresolved pairs, the MSA translates the NL match criteria into a multi-scoring problem, synchronising the traversal across multiple SemJI(embed) streams (e.g., product titles and images) to compute a joint similarity score. 
+
+• Two-sided uncertainty band. For joins like Ecomm Q7, the MSA organically identifies pairs with the highest aggregate scores ( 𝑆 𝑖 𝑗 ≥ 𝜏 hi ) as confident matches. Pairs in the inter-mediate range ( 𝜏 lo <𝑆 𝑖 𝑗 <𝜏 hi )—where combined visual and textual cues are strong but exact identity is ambiguous—are forwarded to the LLM. The MSA traversal short-circuits once the upper bound of the joint score drops below 𝜏 lo ,implicitly pruning the massive tail of certain negatives. If the materialised caches exhaust before reaching 𝜏 lo , DASE gracefully resumes the stream by dynamically evaluating distances via the base vector indices as discussed in Sec. 3.7. 
+
+• Top-𝐾 poles. For queries seeking extreme pairs (e.g., 
+
+Movie Q5), the MSA fetches the 𝐾 highest- and lowest-scoring pairs by directly aggregating the underlying facet streams. Crucially, as the downstream LLM resolves uncertain cases via 
+
+AI.IF , the deterministic results are written back exclusively to 
+
+SemJI(AI.IF) , effectively amortising the cost of multi-faceted rea-soning for subsequent queries. 
+
+B.2.5 sem_map. A sem_map call applies a per-row natural-language transformation that returns a free-form string, e.g., brand extraction ( Ecomm Q3), colour labelling ( Ecomm Q12), or genre clustering ( MMQA Q4). Because the output domain is open-vocabulary, neither the contrastive margin of sem_filter nor the 𝐾 -way argmax of sem_classify applies—there is no fixed anchor set to contrast against. Instead, DASE exploits a comple-mentary form of semantic redundancy: tuples whose embeddings are near-duplicates across the query-relevant feature spaces F
+
+are statistically guaranteed to map to the same target string, so a single LLM call on one representative safely labels its entire neighbourhood. To compose this joint similarity, the MSA initialises a parallel FSS per facet 𝑓 ∈ F and aggregates the per-facet cosine streams into a unified affinity 𝜎 𝑖 𝑗 = Í𝑓 ∈ F 𝑤 𝑓 cos (e(𝑓 ) 
+
+> 𝑖
+
+, e(𝑓 ) 
+
+> 𝑗
+
+) on the fly. DASE then clusters the input tuples by agglomerative clustering on this aggregate affinity (complete linkage, distance threshold 𝜏 𝑑 =0.10, Efficiently Linking Unstructured Data for Multi-step Reasoning 
+
+i.e., 𝜎 𝑖 𝑗 ≥ 0.90) and recommends only the medoid nearest each cluster centroid. The downstream engine runs AI.GENERATE on this condensed 𝐾 -tuple shortlist (e.g., ∼90 medoids out of 500 rows on 
+
+Ecomm Q3), and the returned label is broadcast to the entire cluster via a SQL join on the synthetic cluster ID. Because clusters form in the joint multi-facet space rather than over any single embedding axis, the medoid is robust to single-modality drift—visually similar but textually distinct items remain in separate clusters. Quality degrades only when 𝜏 𝑑 is lax enough to fuse genuinely distinct entities, which on Ecomm costs less than 0 .01 ARI while reducing LLM invocations by an order of magnitude.
