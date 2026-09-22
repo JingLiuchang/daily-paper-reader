@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-09-13 ~ 2026-09-22</span>
+      <span class="dpr-home-dashboard-kicker">2026-09-22</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 10 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 3 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
-    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>2 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>6</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>1</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>2</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-09-22 10:04:38 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-09-22 22:06:39 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,9 +69,10 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>本期日报共筛出 10 篇（精读 4、速读 6），主线明显集中在带标签过滤的向量近邻检索上。</p>
-<p>最值得看的是两篇 9.0 分精读——用渐进式标签集分层做标签过滤 ANNS，以及在 GPU 上对过滤 ANNS 做 beamwidth 在线自适应，代表了过滤检索的算法与工程两个突破口。</p>
-<p>建议普通读者先啃这两篇 9 分精读建立直觉，再按需速读 7 分的 Quanta 混合检索库与知识图谱稠密向量检索，理解落地工具链。</p>
+<p>今日共生成 3 篇推荐（精读 1 篇，速读 2 篇）</p>
+<p>精读：《Exploiting Residual Reachability for Cross-Model Migration of Graph-Based Indexes in Approximate Nearest Neighbor Search》（9.0/10）</p>
+<p>速读：《Quanta: A Self-Contained Python Library for Hybrid Retrieval over Quantised Embeddings, Lexical Indexes, and Knowledge Graphs》（6.0/10）, 《Parameterized Dense-Sparse Fusion for Hybrid Retrieval: Tuning a Rank-Score Mix on BEIR SciFact with Qdrant》（6.0/10）</p>
+<p>这些结果覆盖了当下较热的方向，建议先看精读区论文的关键问题与方法。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -80,12 +81,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">4 篇</strong>
+    <strong class="dpr-home-dashboard-count">1 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Fast Label-Filtering Approximate Nearest Neighbor Search via Progressive Label Set Stratification">Fast Label-Filtering Approximate Nearest Neighbor Search via Progressive Label Set Stratification</span></li><li><span class="dpr-home-dashboard-paper-title" title="BOA: Beamwidth Online Adaptation for Filtered-ANNS on a GPU">BOA: Beamwidth Online Adaptation for Filtered-ANNS on a GPU</span></li><li><span class="dpr-home-dashboard-paper-title" title="Exploiting Residual Reachability for Cross-Model Migration of Graph-Based Indexes in Approximate Nearest Neighbor Search">Exploiting Residual Reachability for Cross-Model Migration of Graph-Based Indexes in Approximate Nearest Neighbor Search</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Exploiting Residual Reachability for Cross-Model Migration of Graph-Based Indexes in Approximate Nearest Neighbor Search">Exploiting Residual Reachability for Cross-Model Migration of Graph-Based Indexes in Approximate Nearest Neighbor Search</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>4</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>4</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -93,12 +94,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">6 篇</strong>
+    <strong class="dpr-home-dashboard-count">2 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Quanta: A Self-Contained Python Library for Hybrid Retrieval over Quantised Embeddings, Lexical Indexes, and Knowledge Graphs">Quanta: A Self-Contained Python Library for Hybrid Retrieval over Quantised Embeddings, Lexical Indexes, and Knowledge Graphs</span></li><li><span class="dpr-home-dashboard-paper-title" title="Efficient Dense Vector Search within Knowledge Graph Content Embeddings">Efficient Dense Vector Search within Knowledge Graph Content Embeddings</span></li><li><span class="dpr-home-dashboard-paper-title" title="Efficiently Linking Unstructured Data for Multi-step Reasoning">Efficiently Linking Unstructured Data for Multi-step Reasoning</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Quanta: A Self-Contained Python Library for Hybrid Retrieval over Quantised Embeddings, Lexical Indexes, and Knowledge Graphs">Quanta: A Self-Contained Python Library for Hybrid Retrieval over Quantised Embeddings, Lexical Indexes, and Knowledge Graphs</span></li><li><span class="dpr-home-dashboard-paper-title" title="Parameterized Dense-Sparse Fusion for Hybrid Retrieval: Tuning a Rank-Score Mix on BEIR SciFact with Qdrant">Parameterized Dense-Sparse Fusion for Hybrid Retrieval: Tuning a Rank-Score Mix on BEIR SciFact with Qdrant</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-ann <strong>6</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-ann <strong>2</strong></span></div>
 </section>
 </div>
 
