@@ -1,0 +1,499 @@
+Title: BOA: Beamwidth Online Adaptation for Filtered-ANNS on a GPU
+
+URL Source: https://arxiv.org/pdf/2609.16175v1
+
+Published Time: Wed, 16 Sep 2026 00:12:50 GMT
+
+Number of Pages: 10
+
+Markdown Content:
+# BOA: Beamwidth Online Adaptation for Filtered-ANNS on a GPU 
+
+Farhana Akter Tumpa 
+
+Department of Computer Science University of California 
+
+Riverside, USA ftump001@ucr.edu 
+
+Rajiv Gupta 
+
+Department of Computer Science University of California 
+
+Riverside, USA rajivg@ucr.edu 
+
+Abstract —Filtered approximate nearest neighbor search, i.e. returning the top-k vectors nearest to a query vector among those satisfying one or more attribute predicates, has become a fundamental operation in modern vector search systems. Graph-based solutions employ beam search to solve a batch of queries in parallel for high throughput and employ high fixed beamwidth 
+
+of 100 or greater for ensuring high recall. We observe that, given a batch of queries, more than half of the queries across multiple data sets can be solved precisely with a beamwidth of just 50 or less. Therefore, existing systems based on fixed high beamwidth sacrifice throughput to achieve high recall by forcing every query to search as thoroughly as the hardest query in the batch even though majority of queries can be resolved by a shallow search. In this paper we present a filtered ANNS engine for a single GPU named BOA that uses online beamwidth adaptation to customize the search effort across queries within a batch under 
+
+multi-attribute range filters. We address the recall throughput tradeoff with a multi-phase search: all queries are first evaluated under a narrow beam, and only those with uncertain results are progressively refined with wider beamwidths. This renders recall largely insensitive to the starting beamwidth, whereas prior methods must use a fixed high beamwidth for high recall. BOA+ overlaps execution of phases to further enhance throughput. Our experiments show that, for 10,000 queries, online adaptation achieves 94.05% to 99.96% recall with average beamwidth ranging from 22 to 77, while a non-adaptive approach requires a fixed beamwidth of 500 to achieve similar or lower recall. Consequently, adaptivity increases throughput by 7 × to 12.5 ×.
+
+Index Terms —nearest-neighbor search, filtering attributes, beam-width, recall, throughput, GPU. 
+
+I. I NTRODUCTION 
+
+The Approximate Nearest Neighbor Search (ANNS) on high-dimensional vectors is a core operation in modern re-trieval [1], recommendation [2]–[4] and retrieval-augmented generation [5]–[7] systems. In practice, a query usually comes with a condition attached, not just a vector.. Each vector carries structured attributes such as price, timestamp, category, tags, access permissions, and a query specifies not only a target vector but also a predicate that those attributes must satisfy such as, a value to match, an interval to fall within, and a set of tags to contain. Given a query vector and a predicate, the task is to return the top-k points nearest to the query among those satisfying the predicate. Because embeddings are increasingly stored alongside structured metadata, filtered queries are now common [8], [9], and an index that can enforce the predicate is of immense practical use. TABLE I: ANNS Methods. 
+
+System Beamwidth (L) #Attribute Filters (m) Platform BANG [16] Fixed L None (m=0) GPU JAG [18] Fixed L Single (m=1) CPU Garfield [17] Fixed L Multiple (m ≥1) GPU 
+
+BOA Adaptive L Multiple (m ≥1) GPU 
+
+Graph-based indices are the state of the art for ANNS [10], [12]. They connect each point to a small set of near neighbors and answer a query by greedily walking the graph toward the query vector, visiting only a small fraction of query relevant data. This traversal is regular enough to parallelize, and a line of work has mapped it onto GPUs [13]–[15] where a large batch of queries are processed concurrently to achieve large throughput gains [16]. Of the GPU-based systems available, BANG [16] delivers high-throughput but only supports unfiltered queries, while Garfield [17] supports filtering via range predicates. Garfield index partitions the attribute space into intervals and employs a structure specific to ranges. Filtered search over a single graph has been addressed on the CPU by JAG [18] but for a single attribute per query. Table I compares these systems with ours. 
+
+Fixed Beamwidth Challenge Both GPU-based systems, BANG [16] and Garfield [17], share a common limitation. The graph search is governed by a single parameter, the beamwidth 
+
+L which is the number of candidates kept active as the walk proceeds. The parameter leads to a direct recall-throughput tradeoff. A small L searches little and is fast, sustaining high throughput but yielding low recall; a large L searches thoroughly and attains high recall, but at low throughput. In existing GPU systems this width is fixed for the entire query batch, so recall can be raised only by widening the beam for every query and paying the throughput cost across all of them; thus, incapable of avoiding recall-throughput tradeoff. This tradeoff, however, is an artifact of searching ev-ery query identically rather than a property of the queries. Searched with a small L, most queries already retrieve their true neighbors; their answers are settled and do not improve with a wider search. Only a minority, whose neighborhoods lie in sparse or heavily filtered regions, fall short and genuinely need greater effort. A uniformly large L pays the full cost arXiv:2609.16175v1 [cs.DC] 14 Sep 2026 on every query to serve this minority, spending on the easy majority a great deal of work that changes nothing. The difficulty of a query is not known in advance but revealed online by the search itself and a system that reads this signal need not pay the cost for hardest queries on all queries. 
+
+Filtering Challenge A filter is a hard constraint imposed on a graph whose edges are unaware of the constraint because the graph is built on vector proximity alone. Therefore, a vector may not be returned as a neighbor, no matter how close it is to the query vector, unless its attributes satisfy the predicate. Thus, finding a solution to a query is more difficult when only a small fraction of points satisfy the predicate. Under a given predicate, the valid neighbors are sparse and scattered, with few edges among them, so a greedy walk following vector-proximity edges spends nearly all its steps among invalid nodes and often halts at a local optimum containing no valid points, never reaching the neighbors it was meant to find. Discarding invalid nodes mid-walk only makes this worse, since valid points are frequently reachable only through invalid intermediaries, and removing them disconnects the graph. Filtered search therefore cannot be recovered by constraining a vector-only graph at query time: the attribute structure must be built into the index, and the traversal must remain aware of the filter as it walks. 
+
+Our Approach: Our system exploits the observation that all queries in a batch do not require an equally high beamwidth to achieve high recall. In fact, we observe that more than half the queries across multiple data sets can be solved with a beamwidth of just 50 or less. Therefore, we vary the search effort across queries within a batch instead of fixing the beamwidth for all of them, Instead of using a fixed beamwidth, the search runs in phases: every query is first searched with a small L; each query’s own result is then examined by how sharply its nearest candidates separate from the rest, minority whose answers are not yet reliable; and only those queries are re-searched with a larger L. The easy majority is answered cheaply in fewer phases, the hard minority receives the thorough search it needs via more phases to deliver the high recall. While the existing GPU systems must trade recall for throughput, our recall is insensitive to the starting beamwidth L. We handle the challenge posed by multi-attribute range filters on a single GPU as follows. Our algorithm searches over a single attribute-unaware graph [19] guided by a per-query filter signal via a GPU beam search: candidates that violate the predicate are demoted in the search ordering rather than removed, so the walk is steered toward valid regions while those regions stay reachable through the demoted nodes. Our BOA is the only system in Table I that adapts beamwidth online and performs multi-attribute filtering on a GPU. 
+
+We make the following contributions:  
+
+> •
+
+High Recall Without Wasteful Computation. We intro-duce a multi-phase search that runs every query starting at a small L, identifies from their results the minority whose answers are not yet reliable, and searches only those with a larger L, decoupling recall from the throughput penalty that a uniformly wide beam imposes on every query. That is, via online adaptation of L, we ensure high recall while avoiding wasteful computation for high throughput.  
+
+> •
+
+Multi-Attribute Filtered Search on a GPU. Our nearest neighbor engine supports multiple range filters and adapts traversal to them by carrying a filter signal through a GPU beam search so that filter satisfaction guides navigation while graph connectivity is preserved even in presence of multi-attribute filtering.  
+
+> •
+
+Evaluation. We evaluate our approach on filtered-search queries and show that our method holds recall steady (94.05% to 99.96%) with low average beamwidth (22 to 77) while a non-adaptive approach requires very high fixed beamwidth (500) to attain similar or lower recall. Consequently, online beamwidth adaptation leads to 7 ×
+
+to 12.5 × increase in throughput. II. B ACKGROUND & M OTIVATION 
+
+A. Background: Problem Definition 
+
+Filtered approximate nearest neighbor search: Let D =
+
+{p1, . . . , p n} be a dataset of n points, each a pair p = ( xp, a p)
+
+with a vector xp ∈ Rd and an attribute record ap ∈ A . A query is a pair (qi, f i) with a query vector qi ∈ Rd and a filter 
+
+fi ∈ F . A point is eligible only if its attributes satisfy the filter, expressed by a binary matching function g : A × F → { 0, 1},and the eligible points form the valid set Df = { p ∈ D :
+
+g(ap, f i) = 1 }.
+
+Definition 1. Filtered k-NNS - Given a dataset D, a query 
+
+(qi, f i), and an integer k ≤ |D f |, filtered k-nearest neighbor search returns the set Kf ⊆ D f of k points st: 
+
+max 
+
+> p∈K f
+
+∥xp, q i∥ ≤ min  
+
+> p∈D f\K f
+
+∥xp, q i∥, (1) 
+
+where ∥xp, q i∥ denotes the distance between two vectors, either the Euclidean ( L2) norm or cosine distance. When 
+
+|D f | < k , the answer is Df .
+
+We use the Euclidean norm throughout. Filter satisfaction is a hard constraint, and distance ranks only among the points satisfying it; setting g ≡ 1 recovers ordinary k-NNS. Computing Kf exactly requires a distance computation against every valid point, which is prohibitive at scale, so practical systems solve the approximate variant [20], [21]. 
+
+Range-filtered nearest neighbor search: Vectors in produc-tion systems usually arrive with numeric metadata attached like a price, a timestamp, a rating, a geographic distance, and queries constrain that metadata alongside the similarity search. A user browsing restaurants wants results that match a textual description, cost under some amount, and sit within a few kilometers. Encoding the description as a vector reduces this to similarity search restricted to a numeric region, the problem known as range-filtered nearest neighbor search (RFNNS), and this is the problem the paper addresses. Formally, the range-filtered setting fixes A = Rm: each point p = ( xp, a p) ∈ D 
+
+carries a set of m numeric attributes ap = {a1
+
+> p
+
+, a 2
+
+> p
+
+, . . . , a mp }alongside its d-dimensional vector xp, and a query bounds a subset of these attributes by intervals. The exact RFNNS problem is defined as follows. 
+
+Definition 2 (RFNNS) . Given a dataset D with n points 
+
+{p1, . . . , p n}, a distance metric ∥· , ·∥ , and a query (qi, f i),where qi ∈ Rd is the query vector and fi = { [lj , u j ] |
+
+j ∈ M } denotes the range predicates over a subset of attributes M ⊆ {1, . . . , m }, the object of RFNNS is to identify a k-element subset Kf ⊆ D such that: (1) every point p = ( xp, {a1
+
+> p
+
+, . . . , a mp }) ∈ Kf satisfies lj ≤ ajp ≤ uj
+
+for all j ∈ M ; and (2) for any point u ∈ Df \ Kf ,
+
+∥xp, q i∥ ≤ ∥ xu, q i∥.
+
+Condition (1) instantiates the matching function of Defini-tion 1 as 
+
+g(ap, f i) = Y
+
+> j∈M
+
+1 lj ≤ ajp ≤ uj
+
+ , (2) so Df contains the points satisfying all intervals in fi simulta-neously, and condition (2) is (1) restricted to that set. A query with |M | = 1 is single-attribute and |M | ≥ 2 multi-attribute ;we address both in our paper. 
+
+Graph construction. Graph-based methods are the dominant approach to ANNS on high-dimensional data [10]–[12], [24]. We build a Vamana proximity graph [11], which inserts points incrementally. A beam search collects candidates for each new point, and a pruning step keeps at most R diverse out-neighbors using the α-dominance rule of DiskANN. Vector distance alone is a poor basis for range filtering, since under a narrow interval most out-neighbors of a vertex are ineligible and the traversal wastes its budget on points that cannot be re-turned. We therefore adopt the threshold pruning of JAG [18], the prune runs once per threshold t over a capped attribute dis-tance max(dist A − t, 0) , each pass receiving a degree budget of R/ |T |. Thresholds are quantiles of each point’s sampled attribute-distance distribution. A large threshold zeroes every candidate’s attribute distance, reducing the pass to standard Vamana pruning on vector distance; a small one zeroes only the attribute-nearest candidates, retaining edges among points likely to co-occur within a narrow range. Since each pass is capped at R/ |T | neighbors, the merged out-neighborhood stays bounded by R and the index occupies O(nR ) space, independent of |T |, a single graph adapts to selectivity through its edge mix rather than through duplicated indexes. JAG [18] gives a range filter distance for one numeric attribute, but does not say how several such attributes combine. In our system φ
+
+is the count of predicates a candidate violates, and the filter penalty λφ is added to the vector distance to form the score the search orders by during traversal. Counting weighs every attribute equally and keeps φ at most m, so a single λ suffices. 
+
+Beam search. Queries are answered by beam search [11], [12], which maintains a worklist W of the L closest candi-dates encountered so far, where L is the beamwidth . Each iteration selects the closest unvisited point in W , computes the distances from xq to its out-neighbors, inserts them into 
+
+W , and discards the farthest points when |W | exceeds L. The traversal terminates once every point in W has been visited, and the closest k points in W are returned. The beamwidth bounds both the cost and the accuracy of the search: each iteration costs at most R distance computations, while a small 
+
+L discards candidates early and cannot recover from a descent into the wrong region of G.
+
+B. Motivation: Beamwidth vs. Recall 
+
+The beamwidth L bounds the size of the candidate set maintained during traversal. Each iteration expands the closest unvisited candidate and inserts its out-neighbors; when the set exceeds L entries, the farthest are discarded. For a query q, let Kf be the exact filtered k nearest neighbors and ˜Kf the set returned. Recall@ k is | ˜Kf ∩ Kf |/k ,averaged over the query set. The number of filter attributes m
+
+is the number of attributes the query constrains, and a point is valid only if it satisfies all m predicates. As m grows the valid set shrinks and the surviving points lie further apart in the graph, so at a fixed L recall falls with m.A large beamwidth gives high recall and low throughput; a small one gives low recall and high throughput. Both follow from the size of the candidate set the search maintains. L
+
+is the capacity of that set. A larger L admits more candi-dates, and every admitted candidate is eventually expanded, its out-neighbors scored against the query. The number of distance computations per query therefore grows with L, and throughput falls in proportion. A candidate dropped from the set when it overflows is never expanded, and if the path to the true neighbors ran through it, that path is closed the traversal converges in a region that does not contain the answer. A large candidate set keeps such nodes available and the search reaches the neighbors it was meant to find; a small one discards them early and returns whatever it converged on. 
+
+Fig. 1: Recall and throughput trade-off with beamwidth L
+
+for Garfield [17] with m=4 ). Throughput is normalized to its maximum over the range of L shown. Fig. 1 shows this for Garfield [17] with m = 4 , where m is the number of filtered attributes, on SIFT1M, DBLP, Deep1M, and Youtube datasets. Throughput is normalized with respect to the maximum over the range of L. The two curves move in opposite directions on every dataset. For example, on Deep1M the search attains 0.21 recall at L = 10 , where throughput is at its maximum; reaching 0.9 recall requires L = 500 , at a 17 ×
+
+loss in throughput, and reaching 0.97 requires L = 1700 , by which point throughput has fallen by more than 190 ×. The same trade-off appears at m = 1 and m = 2 .BANG [16] performs unfiltered ANNS on GPU, attaining low recall on filtered workloads regardless of L, yet shows the same throughput-recall tradeoff with beamwidth. JAG [18] supports only single-attribute filtering and runs on a CPU, it does not support GPU. However, the severity of recall-throughput arises when multi-attribute filtering is supported. III. BOA: B EAM WIDTH ONLINE ADAPTATION 
+
+We carried a study of multiple datasets that reveal the cause of recall-throughput tradeoff observed in fixed beamwidth systems. Fig. 2 shows the recall achieved for a large batch of queries across beamwidths ranging from 10 to 200. For a given L, recall essentially gives us the percentage of queries that were accurately solved with beamwidth of L. From the data in Fig. 2 we observe that not every query needs a wide beam. In fact in most cases, half of the queries require a beamwidth of 50 or lower. The distribution differ across datasets as they depend upon multiple factors including the dataset, the query workload, where each query’s neighbors lie in the graph relative to its filter. 
+
+Fig. 2: Recall Percentage vs. Bean Width. If a query is already solved at L = 10 , searching it again at L = 100 is a wasteful computation that adds to the cost but does not improve the recall. Therefore, to obtain high recall across a batch of queries, fixed beamwidth systems pay the high cost on every query in the batch. The wasted computation is not minimal. Widening the beam from 10 to 
+
+500 costs the throughput to drop by large factors indicating that resources taken by queries whose answers have already stopped changing is substantial. The above observation motivates our approach based on online beamwidth adaption to match the queries. We evaluate a batch of queries over multiple phases : search first with a small beamwidth, set aside the queries that are already answered, and advance the rest to search with a wider beamwidth. A query answered in an early phase leaves the batch and requires no further work, so each phase runs on a strictly smaller query set than the preceding phase. The wide-beam search that in fixed-beamwidth system applies to all ρ queries is applied to only few queries that need it, and the throughput cost of that width is paid only by a small subset of queries. The potential benefit can be examined by further analyzing the data in Fig. 2. Note that the potential for throughput improvement by adapting L is substantial for all data sets and 
+
+m values. The higher the value of m the greater is the effort (i.e., L value) required to solve the query. The YouTube data set with m = 4 has the highest degree of wasted computation and hence the drop in throughput with increasing L. At L = 50 
+
+only 40% of queries are resolved and to obtain recall greater than 90%, L should be well over 200. As our experiments presented later show, we can achieve a 94.05% recall simply by using the average L of 77. Next we present our beamwidth adaptation-based multi-phase algorithm, multi-attribute filtering algorithm, some op-timizations, and finally GPU implementation details. BOA supports multi-attribute filtering across multiple phases on the GPU, changing both the traversal and the surviving query set from phase to phase; no prior system combines the two. 
+
+A. Adaptive Filtered Search Algorithm 
+
+How adaptation works. Our adaptive algorithm, presented in Algorithm 1, iteratively evaluates a batch of ρ queries, where each iteration is a phase. As the algorithm progresses through phases, the beamwidth used in the search is increased. Moreover, in each phase, only a subset of queries from the preceding phase that remain unresolved is evaluated. That is, fewer and fewer queries are evaluated at increasingly higher beamwidths as the algorithm progresses through the phases. In the first phase, all queries are active and they are evaluated with an initial beamwidth of Lmin (lines 1–2). A phase begins by gathering the active queries into consecu-tive positions (lines 4–5). Algorithm 2 searches for gathered queries at current width (line 6) and writes back the results (lines 7–8). Note that the results of queries are maintained according to the index associated with them during the first phase regardless of the phase that produces the results. After active queries have been evaluated in a given phase, we separate them into those that have now been resolved (line 11) and remaining survivors (line 12) that will remain active for evaluation in the next phase. The survivors will then be evaluated in the next phase at a beamwidth that is a factor of α greater than the beamwidth of the just concluded phase (line 13). Separating resolved queries from surviving ones is carried out using the confidence test (line 10), where the sorted candidate list phase produced before its nearest k entries are taken as the result. That list holds more filter-valid candidates than the k returned, and a query is confident when the relative gap between the k-th and the farthest of them is small: 
+
+γ(Di) = dmax  
+
+> i
+
+− d(k)
+
+> i
+
+dmax 
+
+> i
+
+≤ ε. (3) The gap measures how far the search reaches beyond the 
+
+k it will return, and is normalized by dmax  
+
+> i
+
+because absolute Algorithm 1 BOA: Beamwidth Online Adaptive Search. 
+
+Require: graph G; batch of ρ queries Q with filter predicates; neighbors k; initial beamwidth Lmin ; growth factor α > 1;confidence threshold ε; residual fraction τ ; filter penalty λ
+
+Ensure: {Ki}: the filter-valid k-NN of each (qi, f i) ∈ Q 
+
+> 1:
+
+A ← { 1, . . . , ρ } ▷ active (unresolved) queries  
+
+> 2:
+
+L ← Lmin ▷ initial beamwidth  
+
+> 3:
+
+while |A| > τ · ρ do ▷ each iteration is one phase  
+
+> 4:
+
+for j ← 1 to |A| in parallel do  
+
+> 5:
+
+QA[j] ← Q[A[j]] ▷ compact active queries  
+
+> 6:
+
+{K′ 
+
+> j
+
+, D ′ 
+
+> j
+
+} ← FILTER AWARE BEAM SEARCH (G, Q A, k, L, λ ) 
+
+> 7:
+
+for j ← 1 to |A| in parallel do  
+
+> 8:
+
+KA[j] ← K′ 
+
+> j
+
+; DA[j] ← D′ 
+
+> j
+
+▷ scatter results  
+
+> 9:
+
+for all i ∈ A in parallel do  
+
+> 10:
+
+confident i ←   γ(Di) ≤ ε  ▷ confidence test, Eq. 3  
+
+> 11:
+
+F ← { i ∈ A : confident i } ▷ finished queries  
+
+> 12:
+
+A ← A \ F ▷ survivors escalate  
+
+> 13:
+
+L ← α · L 
+
+> 14:
+
+return {Ki} ▷ all queries return results 
+
+Algorithm 2 Filter-Aware Beam Search. 
+
+Require: graph G; entry medoid s; PQ distance tables; batch of ρ queries Q st each query is of the form (qi, f i) where qi is the query vector and fi is the filter predicate; neighbors k; beamwidth t (≥ k); filter penalty λ
+
+Ensure: {Ki}: the filter fi-valid k nearest neighbors of each query (qi, f i) ∈ Q 
+
+> 1:
+
+for all (qi, f i) ∈ Q in parallel do ▷ one thread-block per query  
+
+> 2:
+
+Li ← { s}; ui ← s; converged ← false  
+
+> 3:
+
+while not converged do  
+
+> 4:
+
+Ni ← FETCH NEIGHBORS (ui, G ) ▷ graph stays on CPU, only current node’s neighbor IDs are sent to the GPU  
+
+> 5:
+
+for all n ∈ Ni do  
+
+> 6:
+
+φi[n] ← dist F (an, f i) ▷ filter distance  
+
+> 7:
+
+transfer Ni and φi to GPU  
+
+> 8:
+
+N ′ 
+
+> i
+
+← { n ∈ Ni : not VISITED (i, n ) }; mark N ′ 
+
+> i
+
+visited ▷ Bloom filter on GPU, candidates seen before dropped  
+
+> 9:
+
+for all n ∈ N ′ 
+
+> i
+
+in parallel do ▷ on GPU  
+
+> 10:
+
+Di[n] ← PQD IST (n, q i) + λ · φi[n] ▷ filter-penalized distance  
+
+> 11:
+
+( ˆDi, ˆNi) ← PARALLEL SORT (Di, N ′ 
+
+> i
+
+) ▷ on GPU  
+
+> 12:
+
+Li ← PARALLEL MERGE (Li, ˆNi, ˆDi) ▷ on GPU  
+
+> 13:
+
+if |Li| > t then keep the t closest entries of Li 
+
+> 14:
+
+ui ← nearest unvisited node in Li; mark ui visited  
+
+> 15:
+
+converged ← (all nodes in Li are visited ) 
+
+> 16:
+
+Ki ← the k filter-valid ( φ = 0 ) nodes in Li nearest to qi 
+
+> 17:
+
+return {Ki}
+
+distances differ in scale across datasets. A narrow gap means the remaining candidates sit at essentially the distance of the 
+
+kth, so a wider beam would only add points farther than those already returned and the top-k is settled. A wide gap means the search has not converged on a single neighborhood, so a wider beam may reach points nearer than the current k-th and the query escalates. We use ε = 0 .05 for every data set. 
+
+Note that the number of phases is not fixed. How many phases a given query takes is determined at run time by its difficulty. Most of the queries maybe answered at a narrow beam, while the remaining whose neighborhoods lie in sparse or in heavily filtered regions take multiple phases. Moreover, the cost widest beams are paid for by fewest queries since each phase runs only on survivors from preceding phase. 
+
+The loop terminates when fewer than τ ρ queries remain active. A small residual fraction likely does not converge at any beamwidth the system is run on, and τ bounds the cost of pursuing it; those queries return the best answer found. Every query returns a result (line 14). 
+
+How Filtered Search Works. Next we discuss the details of the filter-aware beam search presented in Algorithm 2. This algorithm evaluates a batch of ρ queries at a single beamwidth t, and is invoked by Algorithm 1 once per phase. Since the queries being solved are independent, each query is assigned its own thread block and the whole batch traverses the graph concurrently (line 1). Every query enters at the same medoid s and maintains its own worklist Li of the t closest candidates found so far (line 2). Each iteration expands one node. The adjacency list of the current candidate is read on the CPU, where the graph resides (line 4), and in the same pass over that memory the filter distance φi[n] is evaluated for every neighbor: the number of the query’s range predicates that neighbor violates, so φ =0 exactly when it is filter-valid (lines 5–6). Identifiers and filter distances are transferred to the GPU together in a single asynchronous copy, which keeps each candidate paired with its own violation count (line 7). A per-query Bloom filter then discards candidates seen in an earlier iteration (line 8); without it, repeated entries would displace better candidates from the worklist and end the traversal prematurely. The surviving candidates are scored on the GPU against the product-quantized codes, and the filter enters the score directly (lines 9–10): a candidate violating v of the query’s predicates is ranked at PQD IST (n, q i) + λv . Because λ is set well above the scale of vector distances, valid candidates are ordered ahead of invalid ones, and vector distance breaks ties within each group. Consequently, invalid candidates are demoted rather than removed. Thus, they remain in the worklist and can still be expanded, allowing traversal to pass through invalid regions to reach valid ones. Removing them would have disconnect the graph precisely where the predicate is most selective, since under a narrow interval the valid points are sparse and frequently reachable only via invalid intermediaries. The scored candidates are sorted and merged into the worklist (lines 11–13). Both operations run in parallel across the thread block. In the merge, each element of the two sorted lists is assigned a thread, which binary-searches its element’s position in the opposite list; the sum of that position and the element’s own index gives its slot in the merged output, so every thread writes directly to its destination. The sort for the new candidate list applies the same merge routine bottom-up, beginning from singleton lists and doubling the merged length each round, so it completes in log |N ′ 
+
+> i
+
+| rounds. Both keep their lists in shared memory, which is possible because a candidate list holds at most R + 1 entries. The worklist is then truncated to its t closest entries (line 13), which bounds the work each query performs. The next node to expand is the nearest unvisited entry of the worklist (line 14), and the traversal ends for a query once every entry has been expanded (line 15). The predicate is enforced exactly at the end: only candidates with φ = 0 are eligible for the result, and the k nearest of those are returned (line 16). The penalty guides navigation; it does not decide validity. 
+
+Optimizations. Next, we describe a couple of optimiza-tions that enable us to maximize the throughput: redundancy avoidance ; and pipelining batches .
+
+Redundancy Avoidance: Consider a query that is evalu-ated over two consecutive phases with L and αL beamwidths. 
+
+Fig. 3: BOA vs. BOA+ execution schedule. We should avoid repeating the computation performed with beamwidth L during the next phase that uses αL . This is achieved by computing the topk L results from the first L
+
+children of each node during first phase graph traversal. In the next phase we compute the topk αL −L results from next 
+
+αL − L children. Finally, by comparing topk L and topk αL −L,we obtain topk αL as the results for all αL children. 
+
+Pipelining Multiple Batches: Because the search pro-ceeds in phases, part of one phase can overlap another. In BOA it does not, as Fig. 3(a) shows: a phase cannot begin until the preceding one ends, since the confidence test needs the distances that phase produced, and the Lmin pass covers all ρ queries in a single launch. The dependency, however, is between phases of the same query, not between different queries. BOA+ splits only the first. It issues the Lmin search as K sub-batches B1 . . . B K , so the survivors of the early sub-batches are known before the later ones have run. Those survivors are accumulated and escalated together at the wider beamwidth in one pooled launch, concurrently with the Lmin 
+
+search of the sub-batches that remain Fig. 3(b). Escalating each sub-batch as it finishes would split a small query set across many launches, none large enough to fill the GPU. Pooling them keeps the escalation wide. Both settle the same batch to the same recall. BOA+ only reaches that point sooner, and the shorter span is where the higher throughput comes from. 
+
+B. BOA Implementation on a GPU System 
+
+A graph traversal is a sequence of dependent steps: the neighbors expanded in one iteration determine which node is expanded in the next. Batching thousands of independent queries recovers the parallelism a single traversal lacks, but it does not remove the dependency within a query, and at scale each step requires data the GPU does not hold. Designing the execution so that neither processor waits on the other is therefore the central concern. The CPU memory retains the graph index and the original vectors, laid out in interleaved records so that a node’s vector sits immediately before its neighbor list and one sequential read retrieves both. The GPU memory retains the product-quantized codes [19], the quantization pivots, and the per-point CPU GPU Gather neighbors Filter distance          
+
+> 12
+> Graph index Original vectors Suppress visited Penalized PQ dist. Sort and merge Re-rank exact
+> 3456
+> PQ codes Attribute array
+> IDs, φcandidate
+
+Fig. 4: BOA workflow across CPU and GPU. attribute array. PQ distance evaluation, candidate ranking, worklist maintenance, and the final exact-distance pass run on the GPU, where as adjacency lookup and filter evaluation run on the CPU, where the data they read already resides. Transfers are issued asynchronously on dedicated streams and overlapped with kernel execution, so that per-iteration latency is absorbed into work the GPU performs regardless. As shown in Fig. 4, a batch of queries proceeds as follows. The CPU 1 transfers the query vectors and their range bounds, after which the GPU 2 builds the PQ distance table [19], giving each query the distance from its subvectors to every centroid in every subspace. The traversal then begins. In each iteration the CPU 3 reads the adjacency list of the current candidate for every active query and, in the same pass over that memory, evaluates how many of the query’s range predicates each neighbor violates. Identifiers and violation counts are 4 transferred together in one asynchronous copy. The GPU 5 discards neighbors already visited and compacts the remainder, 6 computes their penalized distances as the asymmetric PQ distance [19] the sum of table lookups indexed by the neighbor’s quantized code as well as the transferred violation count, and 7 sorts them and merges them into the worklist, selecting the next candidate. On convergence the GPU 8 ranks the accumulated candidates by exact distance under a hard predicate penalty, and the top-k identifiers are  
+
+> 9
+
+returned to the CPU. Queries within a batch of ρ queries are independent, so ρ
+
+blocks are launched with each query occupying one block; throughput scales with ρ until the hardware saturates. Within a block the width of the work varies across stages 5 – 
+
+> 7
+
+: visited-set suppression assigns one thread per candidate, PQ distance evaluation assigns a group of eight threads per candidate so that partial sums over the quantization subspaces reduce within a sub-warp, sorting assigns one thread per ele-ment of the candidate list, and merging assigns one thread per element of the two lists being combined. Issuing the iteration as a single fused kernel would fix the launch configuration at the widest, leaving threads idle in the rest, so each stage is a separate kernel configured for its own occupancy. The phase transition of BOA requires one further mech-anism on the GPU. After the confidence test the survivors are scattered arbitrarily across the batch index space, and dispatching a thread block per query so that most terminate on their first instruction would consume scheduling slots and depress occupancy. We therefore gather the survivors’ query vectors, range bounds, and search state into contiguous arrays, so that the second phase launches one block per survivor and its cost tracks the number of queries that require it rather than the size of the batch. IV. E XPERIMENTS 
+
+To demonstrate the benefits of our approach we present results for the following three versions of GPU algorithms:  
+
+> •
+
+Fixed L is the baseline that uses a high beamwidth of 500 to achieve high recall of >90%;  
+
+> •
+
+BOA performs online adaptation of beamwidth (L). The multiple-phases with beamwidths of 10, 100, and 200 are used to achieve high recall of >90%; and  
+
+> •
+
+BOA+ is the version of BOA that is enhanced by incorporating pipelining. All experiments are performed on a system equipped with 2 ×
+
+AMD EPYC 7543 32-Core CPUs (64 cores) and an NVIDIA A100 GPU (80GB). BOA is implemented in C++/CUDA using CUDA 12.4. We evaluate the algorithms on four datasets widely used in related work [23], [25]–[27]; SIFT1M [32], Deep1M [35], DBLP [34], and YouTube [33]. Because SIFT1M and Deep1M include vectors but no attributes, synthe-size a randomly generated integer attribute for each vector, fol-lowing standard practice [23], [27], [28]. DBLP and YouTube, in contrast, pair real-world vectors with naturally skewed numeric attributes. Following Garfield’s approach [17], each query poses a range predicate per attribute, with selectivity generated uniformly between 1% and 100%. Table II provides a statistical summary of all datasets. TABLE II: Details of Datasets.                     
+
+> Dataset Dim. #Base #Queries Attributes
+> Deep1M 96 1,000,000 10,000 Uniform random SIFT1M 128 1,000,000 10,000 Uniform random DBLP 768 1,000,000 10,000 Year, #authors, #refs, #cites YouTube 1024 1,000,000 10,000 Year, time, #views, #likes
+
+A. BOA: Recall and Throughput 
+
+The performance of BOA , both Recall and Throughput, are plotted in Fig. 5 for m ∈ { 1, 2, 4} and all four datasets. We evaluate a single batch of 10,000 queries per dataset. The beamwidths used are: 10, 100, and 200. 
+
+Recall. Fig. 5(a) reports recall@10 for m = 1 , 2, 4 for all datasets. The pattern is the same everywhere. Recall is highest with a single filter attribute and degrades as multi-attributes are added. At one end is SIFT1M that goes from 99.96% →99.47% →97.69% and at the other end is YouTube that goes from 97.15% →96.23% →94.05%. All twelve values exceed the 90% target. (a) Recall@10 
+
+(b) End-to-end throughput 
+
+Fig. 5: BOA : Recall@Top10 (%) and End-to-end Throughput in Queries Per Second (QPS) for one batch of 10,000 queries. 
+
+Throughput. Fig. 5(b) reports queries per second for m =1, 2, 4. As expected, throughput declines as m increases, since a larger fraction of queries require additional work. At one end is SIFT1M that goes from 47.6k →27.5k →20.5k and at the other end is YouTube goes from 13.6k →7.5k →5.7k. Next we present more detailed analysis to demonstrates how our approach consistently and simultaneously delivers high recall and high throughput. 
+
+B. BOA : Achieving Steady High Recall 
+
+Table III shows how many phases are employed for each dataset and different number of attribute filters. From these detailed results we observe the following:  
+
+> •
+
+Number of Phases: We observe that three datasets of SIFT1M, Deep1M, and DBLP require two phases with L
+
+values of 10 and 100 to achieve high recall rate of greater than 90%. YouTube, the most challenging workload with 1K vectors, requires three phases with L values of 10, 100, and 200. The recall rate is consistently greater than 90% and quite a bit higher: 94.05% to 99.96%.  
+
+> •
+
+Queries Resolved Across Phases: Depending upon the hardness of the queries, our algorithm automatically adapts the load distribution across the phases. For exam-ple, for m = 4 and SIF1M dataset, BOA resolves 47.9% and 52.1% queries in first and second phases respectively. In contrast, for YouTube dataset, BOA resolves 57.0%, 14.8%, and 28.2% of queries in the three phases. TABLE III: BOA Behavior: Percentage of queries from a 10,000-query batch resolved at various beamwidths across up to three phases and the resulting Recall@10.                                                      
+
+> Dataset mL=10 L=100 L=200 Recall@10 SIFT1M 186.1 13.9 –99.96% 254.3 45.6 –99.47% 447.9 52.1 –97.69% Deep1M 165.7 34.2 –99.83% 259.8 40.1 –98.59% 445.4 54.5 –94.73% DBLP 175.7 24.2 –99.92% 261.4 38.5 –98.76% 455.4 44.5 –96.26% YouTube 182.0 11.6 5.2 97.15% 267.8 13.8 18.2 96.23% 457.0 14.8 28.2 94.05%
+
+C. Beamwidth Needed for High Recall: BOA vs. Fixed L 
+
+Table III clearly demonstrated that BOA adapts dynamically to the workload and always delivers high recall. Next we show that this adaptation greatly reduces the average beamwidth (Lavg ) used across all queries. Fig. 6 plots the recall rate of BOA and non-adaptive Fixed L baseline. Note that Lavg 
+
+ranges are: 22 to 41 for m = 1 ; 45 to 58 for m = 2 ; and 50 to 77 for m = 4 . In contrast, Fixed L uses beamwidth of 500 and still delivers similar or lower recall. In other words, BOA’s adaptivity is effective in delivering a greatly reduced 
+
+Lavg while delivering similar or superior recall. 
+
+D. Throughput Enhancement: BOA and BOA+ vs. Fixed L 
+
+Finally, we show that low Lavg leads to significant improve-ment in throughput. We compare the throughput of Fixed L 
+
+with BOA and BOA+ . While BOA solves all 10,000 queries in one batch, BOA+ divides the queries into 10 batches of 1,000 queries each and exploits pipelining. Fig. 7 and Table IV show that throughput of BOA is 3.5 ×
+
+to 11.3 × times greater than for Fixed L . Moreover, pipelining further improves the throughput significantly resulting in 7.0 ×
+
+to 12.5 × improvements in throughput over Fixed L .TABLE IV: Throughput Improvement Factor Over Fixed L .                                  
+
+> Alg. Throughput Improvement Dataset Version m=1 m=2 m=4
+> SIFT1M BOA+ 12.5 ×10.9 ×7.2 ×
+> BOA 11.3 ×7.8 ×5.7 ×
+> Deep1M BOA+ 10.4 ×9.0 ×7.9 ×
+> BOA 8.4 ×8.1 ×6.9 ×
+> DBLP BOA+ 8.1 ×9.3 ×7.9 ×
+> BOA 6.7 ×7.3 ×6.6 ×
+> YouTube BOA+ 11.4 ×11.5 ×7.0 ×
+> BOA 8.1 ×4.9 ×3.5 ×
+
+Fig. 6: Recall@Top10 at our average beamwidth Lavg versus a fixed beamwidth L = 500 .
+
+Fig. 7: Throughput: BOA and BOA+ vs. Fixed L .V. R ELATED WORK 
+
+There is a great deal of research on vector search that has been carried out on evaluating approximate nearest neighbor queries [21], [24]. These works evaluate queries in batches to fully exploit hardware parallelism present in CPUs and GPUs and maximize throughput [13]–[18], [37], [41]. The use of GPU is attractive because for massive parallelism that when effectively exploited leads to high throughput. The algorithms and systems differ in following respects: 
+
+Filtering Attributes. While some systems support multi-attribute filtering [17], others support only a single attribute filter [16], yet others do not support filtering attributes at all. Nearly all of this filtered work targets the CPU. Filtered search on the GPU has seen far less work despite the throughput it offers. In this work we considered range filters. However, there are other types of filters, namely equality and subset filters [8], [35], [37], [38]. Our work can be be extended to consider these filter types in a straightforward manner. 
+
+Graph construction. In presence of filtering attributes, there are two approaches that have been proposed. One ap-proach that is used by JAG [18] (for CPU) and BOA (for GPU) constructs a single attribute-unaware graph offline, and then handles filtering during the traversal process. Another approach, used by Garfield [17], builds an attribute-aware partitioned graph such that filter attributes associated with a query are used to index the graph partition at the start of the search. Then search is performed mostly within the partition, and to a much lesser extent by traversing inter-partition edges and traversing other graph partitions. SeRF [22], iRange-Graph [23], UNIFY [27], and DIGRA [28] follow this route with segment graphs, segment trees, segmented inclusive graphs, multi-way trees, and KD-trees respectively, and all of them inflate the index. GAAF [36] instead maintains an ensemble of graphs partitioned by label frequency and routes each query to the subset whose labels it matches. Systems also differ in when the filter is applied, with pre-filtering restricting the search before it begins [29], post-filtering discarding failures after retrieval [40], and both of the above folding the check into traversal. PANNS [41] also splits the search into two phases by hardness, entering the second once the top-
+
+k entries of a query’s beam are all visited and then widening the step size while reducing the cut-off factor. Its adaptation is limited to this switch within a single traversal, and it supports neither filtering nor execution on a GPU. VI. C ONCLUSION 
+
+The Approximate Nearest Neighbor Search (ANNS) on high-dimensional vectors is a core operation in modern rec-ommendation systems. This problem becomes computationally more expensive when multi-attribute filtering is supported as deeper search is needed for many queries that is achieved by setting beamwidth to a very high number for all queries. This approach yields high recall at the expense of significantly lower throughput. We overcome this limitation by developing 
+
+BOA and BOA+ that perform online adaptation of beamwidth to minimize wasteful computation and maximize throughput. Our experiments show that more challenging the workload, the greater are the improvements in throughput. REFERENCES [1] Li, X., Jin, J., Zhou, Y., Zhang, Y., Zhang, P., Zhu, Y. and Dou, Z., 2025. “From matching to generation: A survey on generative information retrieval,” ACM Transactions on Information Systems , 43(3), pp.1-62. [2] Yang, C., Dai, S., Hou, Y., Zhao, W.X., Xu, J., Song, Y. and Zhu, H., 2024, August. “Revisiting reciprocal recommender systems: Metrics, formulation, and method,” In Proc. of the 30th ACM SIGKDD Confer-ence on Knowledge Discovery and Data Mining (pp. 3714-3723). [3] Jiang, W., He, Z., Zhang, S., Zeng, K., Feng, L., Zhang, J., Liu, T., Li, Y., Zhou, J., Zhang, C. and Alonso, G., 2021. “Fleetrec: Large-scale recommendation inference on hybrid gpu-fpga clusters,” In Proc. of the 27th ACM SIGKDD Conference on Knowledge Discovery & Data Mining (pp. 3097-3105). [4] Miao, X., Shi, Y., Zhang, H., Zhang, X., Nie, X., Yang, Z. and Cui, B., 2022. “HET-GMP: A graph-based system approach to scaling large embedding model training,” In Proc. of the International Conference on Management of Data (pp. 470-480). [5] Jiang, W., Zeller, M., Waleffe, R., Hoefler, T. and Alonso, G., 2023. “Chameleon: a heterogeneous and disaggregated accelerator system for retrieval-augmented language models,” arXiv preprint arXiv:2310.09949. [6] Li, P., Chen, C., Yuan, H., Fu, Z., Shen, H., Yang, X., Wang, Q., Ai, X., Zhang, Y., Wen, Y. and Yu, G., 2025, June. “NeutronRAG: Towards Understanding the Effectiveness of RAG from a Data Retrieval Perspec-tive,” In Companion of the International Conference on Management of Data (pp. 163-166). [7] Zhou, Y., Su, Y., Sun, Y., Wang, S., Wang, T., He, R., Zhang, Y., Liang, S., Liu, X., Ma, Y. and Fang, Y., 2025. “In-depth Analysis of Graph-based RAG in a Unified Framework,” arXiv preprint arXiv:2503.04338. [8] Gollapudi, S., Karia, N., Sivashankar, V., Krishnaswamy, R., Begwani, N., Raz, S., Lin, Y., Zhang, Y., Mahapatro, N., Srinivasan, P. and Singh, A., 2023. “Filtered-diskann: Graph algorithms for approximate nearest neighbor search with filters,” In Proc. ACM Web Conf. (pp. 3406-3416). [9] Patel, L., Kraft, P., Guestrin, C. and Zaharia, M., 2024. “Acorn: Performant and predicate-agnostic search over vector embeddings and structured data,” In Proc. of the ACM SIGMOD , 2(3), pp.1-27. [10] Fu, C., Xiang, C., Wang, C. and Cai, D., 2019. “Fast approximate nearest neighbor search with the navigating spreading-out graph,” Proc. of the VLDB Endowment , 12(5), pp.461-474. [11] Subramanya, S.J., Devvrit, Kadekodi, R., Krishaswamy, R. and Simhadri, H.V., 2019. “Diskann: Fast accurate billion-point nearest neighbor search on a single node,” In Proc. of the 33rd International Conf. on Neural Information Processing Systems (pp. 13766-13776). [12] Malkov, Y.A. and Yashunin, D.A., 2018. “Efficient and robust ap-proximate nearest neighbor search using hierarchical navigable small world graphs,” IEEE Transactions on Pattern Analysis and Machine Intelligence , 42(4), pp.824-836. [13] Ootomo, H., Naruse, A., Nolet, C., Wang, R., Feher, T. and Wang, Y., 2024, May. “Cagra: Highly parallel graph construction and approximate nearest neighbor search for gpus,” In IEEE International Conference on Data Engineering (pp. 4236-4247). [14] Groh, F., Ruppert, L., Wieschollek, P. and Lensch, H.P., 2022. “Ggnn: Graph-based gpu nearest neighbor search,” IEEE Transactions on Big Data , 9(1), pp.267-279. [15] Johnson, J., Douze, M. and J´ egou, H., 2017. “Billion-scale similarity search with GPUs,” arXiv preprint arXiv:1702.08734. [16] Venkatasubba, K., Khan, S., Singh, S., Simhadri, H.V. and Vedurada, J., 2025. “Bang: Billion-scale approximate nearest neighbour search using a single gpu,” IEEE Transactions on Big Data , 11(6), pp.3142-3157. [17] Li, Z., Yu, H., Xu, Z., Zhu, Y. and Gao, Y., 2026. “A GPU-Accelerated Framework for Multi-Attribute Range Filtered Approximate Nearest Neighbor Search,” arXiv preprint arXiv:2604.20121. [18] Xu, H., Blelloch, G., Dhulipala, L., Gottesb¨ uren, L., Jayaram, R. and Lacki, J., 2026. “JAG: Joint Attribute Graphs for Filtered Nearest Neighbor Search,” arXiv preprint arXiv:2602.10258. [19] Jegou, H., Douze, M. and Schmid, C., 2011. “Product quantization for nearest neighbor search,” IEEE Transactions on Pattern Analysis & Machine Intelligence , 33(01), pp.117-128. [20] Indyk, P. and Motwani, R., 1998. “Approximate nearest neighbors: towards removing the curse of dimensionality,” In Proc. of the 13th Annual ACM Symposium on Theory of Computing (pp. 604-613). [21] Aum¨ uller, M., Bernhardsson, E. and Faithfull, A., 2020. “ANN-Benchmarks: A benchmarking tool for approximate nearest neighbor algorithms,” Information Systems , 87, p.101374. [22] Zuo, C., Qiao, M., Zhou, W., Li, F. and Deng, D., 2024. “Serf: Segment graph for range-filtering approximate nearest neighbor search,” In Proc. of ACM SIGMOD , 2(1), pp.1-26. [23] Xu, Y., Gao, J., Gou, Y., Long, C. and Jensen, C.S., 2024. “irangegraph: Improvising range-dedicated graphs for range-filtering nearest neighbor search,” In Proc. of ACM SIGMOD , 2(6), pp.1-26. [24] Wang, M., Xu, X., Yue, Q. and Wang, Y., 2021. “A comprehensive survey and experimental comparison of graph-based approximate nearest neighbor search,” arXiv preprint arXiv:2101.12631. [25] Gong, Z., Zeng, Y. and Chen, L., 2025. “Accelerating approximate nearest neighbor search in hierarchical graphs: Efficient level navigation with shortcuts,” In Proc. VLDB Endowment , 18(10), pp.3518-3530. [26] Li, M., Yan, X., Lu, B., Zhang, Y., Cheng, J. and Ma, C., 2025. “Attribute filtering in approximate nearest neighbor search: An in-depth experimental study,” In Proc. of ACM SIGMOD , 3(6), pp.1-26. [27] Liang, A., Zhang, P., Yao, B., Chen, Z., Song, Y. and Cheng, G., 2024. “Unify: Unified index for range filtered approximate nearest neighbors search,” arXiv preprint arXiv:2412.02448. [28] Jiang, M., Yang, Z., Zhang, F., Hou, G., Shi, J., Zhou, W., Li, F. and Wang, S., 2025. “Digra: A dynamic graph indexing for approximate nearest neighbor search with range filter,” In Proc. of ACM SIGMOD ,3(3), pp.1-26. [29] Wang, J., Yi, X., Guo, R., Jin, H., Xu, P., Li, S., Wang, X., Guo, X., Li, C., Xu, X. and Yu, K., 2021. “Milvus: A purpose-built vector data management system,” In Proc. of the International Conf. on Management of Data (pp. 2614-2627). [30] Bloom, B.H., 1970. “Space/time trade-offs in hash coding with allowable errors,” Communications of the ACM , 13(7), pp.422-426. [31] Guide, D., 2020. Cuda c++ programming guide. NVIDIA, July, pp.6-11. [32] 2010. SIFT.http://corpus-texmex.irisa.fr. [33] 2019. YouTube. https://research.google.com/youtube8m/download.html. [34] 2025. DBLP. https://open.aminer.cn/open/article?id=655db2202ab17a0 72284bc0c. [35] Babenko, A. and Lempitsky, V., 2016. “Efficient indexing of billion-scale datasets of deep descriptors,” In Proc. of the IEEE Conference on Computer Vision and Pattern Recognition (pp. 2055-2063). [36] Manohar, M.D., Shen, Z., Blelloch, G., Dhulipala, L., Gu, Y., Simhadri, H.V. and Sun, Y., 2024. “ParlayANN: Scalable and deterministic parallel graph-based approximate nearest neighbor search algorithms,” In Proc. of the ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming (pp. 270–285). [37] Ma, M., Yin, X. and Qiu, J., 2026. “GAAF: Fast and Scalable Graph-based Vector Similarity Search with Any-Match Label Filtering,” In 
+
+Proc. of the ACM International Conf. on Supercomputing (pp. 551-564). [38] Wang, M., Lv, L., Xu, X., Wang, Y., Yue, Q. and Ni, J., 2023. “An efficient and robust framework for approximate nearest neighbor search with attribute constraint,” Advances in Neural Information Processing Systems , 36, pp.15738-15751. [39] Cai, Y., Shi, J., Chen, Y. and Zheng, W., 2024. “Navigating labels and vectors: A unified approach to filtered approximate nearest neighbor search,” In Proc. of ACM SIGMOD , 2(6), 246:1-246:27. [40] Yang, W., Li, T., Fang, G. and Wei, H., 2020. “PASE: PostgreSQL ultra-high-dimensional approximate nearest neighbor search extension,” In Proc. of ACM SIGMOD , pp. 2241-2253. [41] Yin, X., Gao, C., Zhao, Z. and Gupta, R., 2025, March. “PANNS: Enhancing graph-based approximate nearest neighbor search through recency-aware construction and parameterized search,” In Proc. of the ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming (pp. 369-381).
