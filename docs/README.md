@@ -51,14 +51,14 @@
       <span class="dpr-home-dashboard-kicker">2026-09-29</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 1 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 2 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
-    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>2 次</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>1</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>0</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>1</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-09-29 00:33:50 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-09-29 23:07:08 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,9 +69,9 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日精读1篇9.0分论文，聚焦基于搜索的图构建中的批处理反馈与随机访问墙问题。</p>
-<p>最值得看的是“随机访问墙”这一瓶颈的成因，以及批处理反馈能否为图构建效率带来改善。</p>
-<p>普通读者可先读摘要与结论，抓住瓶颈与批处理策略的核心结论，再决定是否深入方法细节。</p>
+<p>今日精读1篇、速读1篇共2篇，主线聚焦图构建与注意力加速中的性能瓶颈。</p>
+<p>最值得看的是9.0分的《Batched Feedback and the Random-Access Wall in Search-Based Graph Construction》，它点出基于搜索的图构建里&quot;随机访问墙&quot;这一关键限制；速读的《PQ-HSA》则提出复用乘积量化分数来降低混合稀疏-近似注意力开销。</p>
+<p>建议普通读者先读精读那篇，抓住&quot;随机访问墙&quot;为何拖慢图构建，再按兴趣翻PQ-HSA的分数复用思路。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -93,12 +93,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">0 篇</strong>
+    <strong class="dpr-home-dashboard-count">1 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p class="dpr-home-dashboard-empty">今日暂无推荐。</p>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="PQ-HSA: Reusing Product-Quantized Scores for Hybrid Sparse-Approximate Attention">PQ-HSA: Reusing Product-Quantized Scores for Hybrid Sparse-Approximate Attention</span></li></ul>
   </div>
-
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vq-ann <strong>1</strong></span></div>
 </section>
 </div>
 
