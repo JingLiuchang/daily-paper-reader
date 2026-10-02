@@ -1,0 +1,736 @@
+Title: VADER: Filtered Vector Search with Declarative Recall
+
+URL Source: https://arxiv.org/pdf/2609.38053v2
+
+Published Time: Thu, 01 Oct 2026 01:49:38 GMT
+
+Number of Pages: 16
+
+Markdown Content:
+# VADER: Filtered Vector Search with Declarative Recall [Extended Version] 
+
+## Manos Chatzakis 1, Duo Lu 2, Helena Caminal 3, Yannis Chronis 3,4, Fatma Özcan 3, Yannis Papakonstantinou 3, Timofey Asyrkin 3, Sebastian Infante Murguia 3, Itai Rosenblatt 3,Themis Palpanas 1
+
+> 1
+
+Université Paris Cité, LIPADE 2Brown University 3Google 4ETH Zürich manos.chatzaki@gmail.com,duo_lu@brown.edu,{hcaminal,fozcan,yannispap,tasyrkin,sebinf,itairos}@google.com chronis@ethz.ch,themis@mi.parisdescartes.fr 
+
+ABSTRACT 
+
+Approximate filtered vector search (FVS), a core operation in many data management tasks that combine structured data with vector embeddings, exhibits increased complexity due to the characteris-tics of filtering predicates. Each predicate is defined by selectivity (i.e., the fraction of vectors that satisfy the predicate) and correla-tion (i.e., the relationship between the filter and the vector space), which can significantly affect search difficulty even for the same query vector. This poses a key challenge for users aiming to in-tegrate vector search with structured data, as efficient execution often requires extensive manual tuning of algorithm parameters. In this paper, we present VADER, the first approach that eliminates hyperparameter tuning by introducing declarative recall for approx-imate filtered vector search. With declarative recall, users specify a desired recall target, and VADER executes FVS queries to meet this target without requiring manual configuration. VADER achieves this by employing a filter-aware recall predictor that generalizes across varying selectivities and correlations without explicit tun-ing, and by performing early termination once the predicted recall reaches the user-defined target. Through extensive experimental evaluation, we show that VADER achieves near-optimal early termi-nation, while providing significant speedups of up to 53% faster and improved result quality of 28% compared to the best-performing baseline. This paper appeared in VLDB 2027. 
+
+1 INTRODUCTION 
+
+Approximate nearest neighbor vector search is a core operation in many data science tasks [14, 18, 26, 33, 40, 52]. Recently, filtered approximate vector search (FVS) has gained traction, as combining structured attributes with vector embeddings is common in retrieval applications [19, 42, 43]. In this type of vector search, vector data are combined with structured attribute metadata, and the goal is to retrieve the top-𝑘 most similar vectors for a given query vector while ensuring that the returned results satisfy a specified predicate .FVS can be performed by pre-filtering (applying the filter before a brute-force search), post-filtering (filtering the results of a vector search), iterative scans (repeated post-filtering until enough results are found), or inline filtering , which blends the two. Inline filtering stands out because it retains the efficiency of vector search indexes while incorporating filtering into the search rather than decoupling the two. Among inline methods, filter-agnostic ones make minimal assumptions about predicate characteristics and require only lim-ited modifications to the underlying index, thereby supporting a wide range of filtering operations and enabling practical adoption in large-scale systems [51, 59]. 
+
+The Complexity of FVS. Since queries process both vectors with predicates in structured columns, each query is characterized by a specific selectivity (i.e., the fraction of rows/vectors that satisfy the predicate) and correlation between the filter selectivity and the distance from the query vector. These predicate characteristics significantly increase the difficulty of achieving the desired result quality (measured as Recall , the fraction of ground-truth vectors retrieved by the search) and latency. As a motivating example, Figure 1 shows the number of vectors we need to search for a query to reach recall 0.9 on GLOVE1M [3, 50], under varying selectivity and correlation. The required search effort varies by orders of magnitude: fixing selectivity at 0.01 by only varying correlation we need to search up to 30 × more vectors to achieve the same recall. Similarly for fixed no correlation, varying selectivity from 0.01 to 1.0 we need to search up to 8 × more vectors. 
+
+Practical Implications. The task of tuning FVS hyperparameters to achieve a desired recall without excessive resource consump-tion is very challenging for end users. One option could be to tune parameters (e.g., 𝑒 𝑓 _𝑠𝑒𝑎𝑟𝑐ℎ in 𝑘 -NN graphs) per selectivity and correlation combination, which is impractical: correlation is not known in advance, and selectivity estimates, when available, may be inaccurate [39]. The alternative, reusing values that generalize across selectivities (e.g., tuned on unfiltered workloads), depends heavily on the generalization of the underlying algorithm and typi-cally yields configurations that are either too conservative or too aggressive for the given filter. Moreover, the tuning procedures underlying both approaches introduce additional challenges [15, 62]. Existing methods apply the same hyperparameter values across all queries in a workload. As a result, easy queries that require minimal effort to reach the target recall oversearch the index, leading to wasted computation and increased latency. Conversely, difficult queries may undersearch, producing results that fail to meet the desired recall target. Iterative scan [1] does not provide a universal solution either. Iterative scan resumes the search if fewer than 𝑘 results remain after filtering, by using a resumable post-filtering strategy. However, this approach does not fully address the complexity of achieving a target recall in filtered vector search, as there may exist other vectors that satisfy the predicate and are closer to the query, but the hard-stop policy prevents the search from discovering them. We discuss iterative scan in details in Section 2.2. 
+
+Declarative Recall for Unfiltered Vector Search. Recent work addresses the same tuning burden for unfiltered vector search arXiv:2609.38053v2 [cs.DB] 30 Sep 2026 30x 6x 5x 8x Figure 1: Search effort of a query with different filter corre-lations in the GLOVE1M dataset for the same recall target. 
+
+through declarative recall with early termination [15, 46, 58, 62]: users specify a target recall and the system terminates each query once that target is reached, eliminating manual tuning. The in-creased complexity of FVS, however, has so far prevented the de-velopment of declarative recall methods tailored to this setting. 
+
+Contributions. We summarize our contributions as follows. 
+
+• We present VADER, the first declarative recall solution for filtered vector search based on early termination. VADER eliminates the need for hyperparameter tuning, and generalizes seamlessly across different filtering configurations. 
+
+• We introduce a filter-aware recall predictor along with a novel set of input features that enable highly accurate recall prediction with no prior knowledge of predicate selectivity or correlation. 
+
+• We introduce a novel asymmetric loss function for the recall predictor, specifically designed for declarative recall, which auto-matically penalizes more cases of overpredictions of recall, and ensures that VADER minimizes the number of queries that fall below the target recall, without significantly affecting prediction quality or requiring additional tuning. 
+
+• We implement VADER on top of popular filter-agnostic FVS algo-rithms of different families, including (without loss of generality) 
+
+𝑘 -NN graphs (on top of Sweeping [59] and ACORN [49]) and IVF (on top of Filtered-ScaNN [29, 31]), demonstrating its versatility. 
+
+• We evaluate VADER through an extensive experimental study spanning multiple datasets and filtering configurations. VADER can be trained within a few minutes and delivers accurate performance independent of selectivity, correlation, and target recall. VADER terminates search within 4% of the optimal termination point, meets the desired recall targets across selectivities and correlations with-out introducing overhead, and achieves up to 25 × speedup over search without early termination. Against the best-performing base-line, which (unlike VADER) is tuned for each selectivity and recall target, VADER is simultaneously up to 28% better in quality and 53% faster, establishing the state of the art for FVS declarative recall. 
+
+2 PRELIMINARIES 2.1 Background 
+
+2.1.1 Filtered Approximate Nearest Neighbor Vector Search (FVS). 
+
+Given a collection of vectors 𝑉 , a query vector 𝑞 , a distance measure 
+
+𝐷 , a number 𝑘 , and a filter predicate 𝐹 , 𝑘 -nearest neighbor vector search refers to the task of retrieving the 𝑘 most similar vectors (nearest neighbors) to 𝑞 in 𝑉 that satisfy 𝐹 , according to 𝐷 . This task can be either exact [12, 13, 21, 24, 48], where all retrieved nearest neighbors are correct, or approximate [4, 25], where some errors in the retrieved results are tolerated in exchange for significantly faster query processing. In FVS, the approximation only affects the proximity of vectors in the high dimensional space, and the filtering constraint is satisfied for all returned results. In this work, we focus on approximate search and remain agnos-tic to the type of predicate 𝐹 , which may represent any filtering operation over structured data (e.g., joins, selections). When using approximate search, the quality of the results is evaluated using two main measures. The first measure is search quality , typically quantified using recall (the fraction of true filtered nearest neigh-bors that are correctly retrieved). The second measure is latency ,defined as the time required to process the query. 
+
+2.1.2 Vector Search Index. Approximate vector search is typically performed by constructing an index over the vector collection; the most widely used index types are the 𝑘 -NN graph and inverted files (IVF). 𝑘 -NN graph methods build an approximate proximity graph in which vectors are nodes and edges connect similar vectors. Variants differ in construction (e.g., HNSW [44] builds a hierarchical multilayer graph, DiskANN [34] relaxes the edge-creation policy) but share the search procedure: starting from a predefined entry point, the search proceeds greedily toward nodes progressively closer to the query. Its extent is controlled by 𝑒 𝑓 𝑆𝑒𝑎𝑟𝑐ℎ , which governs the trade-off between efficiency and accuracy. IVF methods (such as ScaNN [31]) cluster the vectors into 𝑛𝐿𝑖𝑠𝑡 partitions using k-means and then retrieve the nearest neighbors of a given query by examining the vectors that belong to the partition of the closest 
+
+𝑛𝑃𝑟𝑜𝑏𝑒 cluster centroids. Similar to 𝑒 𝑓 𝑆𝑒𝑎𝑟𝑐ℎ , the 𝑛𝑃𝑟𝑜𝑏𝑒 parameter controls the trade-off between efficiency and accuracy at query time. 
+
+2.1.3 Filter-Agnostic FVS. Filter-agnostic FVS methods assume no prior knowledge of the structured filter predicates, and so generalize to settings where the structured data may evolve. They construct a standard vector index over the vector collection (e.g., a 𝑘 -NN graph). During search, the algorithm evaluates the structured information of each vector using a simple Boolean test to check if it satisfies the given predicate. This design allows these methods to generalize across different types of filtering mechanisms and facilitates their adoption in large-scale vector databases [1, 29, 45, 51, 59]. 
+
+2.1.4 Filtering Strategies for Vector Search. There are 3 main FVS approaches: pre-, inline-, and post-filtering [43]. Pre-filtering ap-plies the predicate before vector search, removing vectors that do not satisfy the predicate and then performing exhaustive search on the remaining vectors. Post-filtering first performs an unfiltered vector search and then removes the returned vectors that do not satisfy the predicate. Inline-filtering integrates search and filtering by applying the predicate during the search process, rather than sep-arating the two steps. Inline filtering methods are the focus of this work, as they offer greater opportunities for adaptive optimization. 
+
+2.1.5 Declarative Recall for Filtered Vector Search. Current FVS al-gorithms are typically invoked in the form 𝐹𝑉 𝑆 (𝑞, 𝐼, 𝑘, 𝐹, 𝑠𝑝 ), where 
+
+𝑞 is the query, 𝐼 is the index built over the vector collection, 𝑘 is the number of neighbors to retrieve, 𝐹 is the predicate over the structured data, and 𝑠𝑝 denotes the search parameter values (e.g., 
+
+𝑒 𝑓 _𝑠𝑒𝑎𝑟𝑐ℎ for 𝑘 -NN graphs). However, selecting 𝑠𝑝 for a given recall target 𝑅 𝑡 is challenging, as the behavior of each filter pred-icate 𝐹 (in terms of selectivity and correlation) is not known in advance and varies across queries. VADER is the first approach to 
+
+> 2
+
+provide declarative recall for FVS, supporting an interface of the form 𝐹𝑉 𝑆 (𝑞, 𝐼, 𝑘, 𝐹, 𝑅 𝑡 ) and eliminating the need for hyperparame-ter tuning by requiring only the desired target recall 𝑅 𝑡 .
+
+2.2 Related Work 
+
+2.2.1 Filter-Agnostic FVS Algorithms. Several filter-agnostic ap-proaches for FVS have been proposed, with a comprehensive overview provided in [43]. ACORN [49] builds on a 𝑘 -NN graph index, specifically HNSW, and traverses at query time only the subgraph of nodes that satisfy the predicate. Since such subgraphs can be sparse or disconnected, ACORN maintains connectivity through run-time 2-hop expansion: at each step it collects 1-hop and 2-hop neighbors, applies the filter, and computes distances only for nodes that satisfy the predicate. ACORN-1 relies solely on this search-time expansion, while ACORN-𝛾 additionally densifies the graph during construction, using compression to control in-dex size. NaviX [53] extends ACORN by incorporating additional heuristics into the traversal process. Sweeping [59] constructs the candidate set in the HNSW graph based on proximity, similar to an unfiltered traversal, while retaining in the result set only vectors that satisfy the predicate. This ensures that the search operates over a well-connected graph. Iterative scan [1] decouples HNSW traversal from predicate evaluation, resuming the index search whenever fewer than 𝑘 results remain after filtering. It cannot fully address the complexity of achieving a target recall, however: its hard-stop policy prevents the search from discovering other vectors that satisfy the predicate and are closer to the query. Filtered-ScaNN [31] operates similarly to a standard unfiltered IVF-based vector index. To retrieve the top-𝑘 results for a query, Filtered-ScaNN processes the nearest neighbors of the partitions of the 𝑛𝑃𝑟𝑜𝑏𝑒 closest centroids, and only vectors that satisfy the filter are retrieved and added to the final result set. 
+
+2.2.2 Early Termination for Unfiltered Vector Search. Early termi-nation approaches, i.e., vector search methods that terminate query processing once a predefined target recall has been met [11], have been proposed only for unfiltered vector search. Most such meth-ods operate on a single index type, such as IVF [8, 17, 32, 46, 63], 
+
+𝑘 -NN graphs [57, 58, 62], or iSAX [23, 28] (an index for exact vector search [9]), and often rely on assumptions about the underlying distance measure [23, 28, 62]. Among recent methods that sup-port arbitrary index types (including both 𝑘 -NN-graph and IVF approaches [41]), DARTH and DARTH+ [15, 16] stand out as the only methods that natively support declarative recall without mak-ing assumptions about the underlying distance measure. However, to the best of our knowledge, there is still a lack of early termination approaches able to provide declarative recall specifically for FVS. 
+
+3 THE VADER APPROACH 
+
+In this section, we present the details of the VADER approach, with an overview provided in Figure 2. VADER operates on top of a vector index (e.g., a 𝑘 -NN graph or IVF). In an offline phase, VADER combines training query vectors with predicates generated across different selectivities and correlations. It then extracts query search progression training data by executing the FVS training queries on the vector index. This training data is used to train a recall predictor model. During the online phase, users submit FVS queries with a declarative recall target 𝑅 𝑡 . Upon query submission, VADER exe-cutes the query using the vector index, invoking the recall predictor at appropriate points and performing early termination once the predicted recall meets or exceeds the target. We now provide details on both phases. First, we describe how the recall predictor is used within VADER (Section 3.1), then we describe the architecture of the model (Section 3.2), followed by the procedure for constructing and training the predictor (Section 3.3). Finally, we present implementation-specific details for integrating VADER into filter-agnostic inline filtering algorithms (Section 3.4). 
+
+3.1 Early Termination with Recall Prediction 
+
+VADER is a successor of DARTH [15] and DARTH+ [16], which introduce a recall predictor that estimates the recall of a query at any point during the search, enabling a declarative recall inter-face without per-query parameter tuning. An important problem they address is the invocation strategy: when to call the predictor during query execution. Since vector search operates at millisecond-scale latency, too many invocations introduce overhead that off-sets the benefit of early termination, while too few cause the sys-tem to miss optimal termination points. The adaptive strategy of DARTH/DARTH+ invokes the predictor more frequently as the predicted recall approaches the target, and less frequently when it is far from it, enabling fine-grained invocation near the optimal termination point and avoiding overhead during the early stages. To implement this adaptive strategy, DARTH/DARTH+ use the number of distance computations as the invocation interval, evalu-ating at each call 𝑝𝑖 = 𝑚𝑝𝑖 + ( 𝑖𝑝𝑖 − 𝑚𝑝𝑖 ) · ( 𝑅 𝑡 − 𝑅 𝑝 ), where 𝑅 𝑡 is the target recall, 𝑅 𝑝 the predicted recall, 𝑝𝑖 the number of distance com-putations after which the next prediction occurs, and 𝑚𝑝𝑖 and 𝑖𝑝𝑖 
+
+the minimum and maximum (initial) prediction intervals. Although 
+
+𝑖𝑝𝑖 and 𝑚𝑝𝑖 are hyperparameters, they are set automatically based on the training data: the average number of distance computations required to reach each recall target, 𝑑𝑖𝑠𝑡 𝑅 𝑡 , is obtained at no addi-tional cost during training data collection, and the strategy sets 
+
+𝑖𝑝𝑖 = 𝑑𝑖𝑠𝑡 𝑅𝑡  
+
+> 2
+
+and 𝑚𝑝𝑖 = 𝑑𝑖𝑠𝑡 𝑅𝑡  
+
+> 10
+
+. Note that we experimentally verify and discuss the performance of this heuristic for FVS queries in Section 4.2. Since DARTH/DARTH+ do not support FVS queries, VADER builds upon them to provide an efficient declarative recall interface for filtered vector search, but adopts the recall prediction and adaptive invocation mechanisms from them. Figure 2 (right) shows this for 2 FVS GLOVE1M queries with 
+
+𝑅 𝑡 =0 .8, marking the points at which the predictor is invoked; dashed lines denote search without early termination. Note that the predic-tor is invoked more frequently as the predicted recall approaches the target, and the search terminates once the target is exceeded. 
+
+3.2 Model Architecture 
+
+We now describe our design choices for the architectural details of VADER’s recall predictor. 
+
+3.2.1 Recall Predictor Model. The model must achieve high predic-tion accuracy while keeping inference latency low enough not to introduce overhead into the usually millisecond-scale vector search. 
+
+> 3Training Query Vectors Vector DB Predicates Vector Index
+> FVS(q, k, Rt=0.9, F)
+> Recall Predictor (RP) k-NN results GBDT Training Extract Statistics
+
+VADER      
+
+> 1. Start query search in the vector index 2. Adaptively predict recall using RP 3. Early terminate once pred. recall surpasses target R t
+> q
+> RP Rpr =0.28
+> RP Rpr =0.67
+> RP Rpr =0.92: Terminate!
+> Offline Online
+> FVS queries
+> Rt=0.8
+> Rpred =0.81: Terminate !Rpred =0.82: Terminate !
+> Rpred =0.77 next pred: Dist.Comp.=16 Rpred =0.70 next pred: Dist.Comp.=10 Rpred =0.21 next pred: Dist.Comp.=8 Rpred =0.08 next pred: Dist.Comp.=52 Rpred =0.61 next pred: Dist.Comp.=55 Rpred =0.75 next pred: Dist.Comp.=58
+
+Figure 2: Overview of VADER (left) and example of recall predictor usage in VADER for two FVS queries (right). 
+
+Complex deep learning models are therefore impractical, while sim-pler regression models (e.g., linear regression) lack sufficient accu-racy [15, 41]. These constraints motivate Gradient Boosted Decision Trees (GBDT) [27], an ensemble of decision trees in which each tree corrects the errors of the previous ones, capturing complex, non-linear relationships at low computational cost. Thus, GBDT achieves a favorable balance between prediction accuracy and in-ference efficiency. Such models have been successfully applied to similar tasks [15, 16, 41], particularly using optimized libraries such as LightGBM [37], which offer fast training and near-constant-time, sub-millisecond inference. VADER therefore adopts GBDT as the architecture of its recall predictor. 
+
+3.2.2 Asymmetric Loss Function. Classic GBDT training uses a standard loss function such as the Mean Squared Error (MSE): 
+
+L𝑀𝑆𝐸 = 12
+
+Í𝑛 𝑖 =1 (𝑅 𝑝𝑟𝑒𝑑,𝑖 − 𝑅 𝑎𝑐𝑡,𝑖 )2, where 𝑅 𝑝𝑟𝑒𝑑,𝑖 , 𝑅 𝑎𝑐𝑡,𝑖 ∈ [ 0, 1] de-note the predicted and the actual recall, and the (optional) factor  
+
+> 12
+
+makes the gradient with respect to 𝑅 𝑝𝑟𝑒𝑑,𝑖 equal to the residual, avoiding an additional multiplicative constant. This penalizes recall overpredictions (predicting a recall higher than the actual value) and underpredictions equally. However, in recall-critical applica-tions, such as those in the legal or medical domain or High-Recall-Retrieval (HRR) settings [38, 56, 60], ensuring that queries meet the target recall is essential, making overpredictions more harmful than underpredictions 1. This is because in declarative recall the objective is to reach the target recall (there is an implicit bias in the definition). To address this, VADER introduces an optional asym-metric loss function that penalizes overpredictions more heavily than underpredictions, yielding more conservative recall estimates and reducing the likelihood of failing to meet the target. Defining a penalty parameter 𝜆 > 1 on overprediction, the resulting loss for each observation is 
+
+L𝑎𝑠𝑦𝑚 (𝑅 𝑎𝑐𝑡,𝑖 , 𝑅 𝑝𝑟𝑒𝑑,𝑖 ) =
+
+
+
+12 (𝑅 pred ,𝑖 − 𝑅 act ,𝑖 )2, if 𝑅 pred ,𝑖 ≤ 𝑅 act ,𝑖 ,𝜆 
+
+2 (𝑅 pred ,𝑖 − 𝑅 act ,𝑖 )2, if 𝑅 pred ,𝑖 > 𝑅 act ,𝑖 .
+
+The total empirical loss is L = Í𝑛 𝑖 =1 L( 𝑅 act ,𝑖 , 𝑅 pred ,𝑖 ), which pre-serves the quadratic structure of the MSE objective while assigning a higher weight 𝜆 to positive residuals (i.e., 𝑅 pred ,𝑖 > 𝑅 𝑎𝑐𝑡,𝑖 ), reducing overprediction of recall by making the predictor more conservative. 
+
+> 1Note that overpredictions lead to undersearching for hard queries since it triggers the early termination signal earlier than it should
+
+A key challenge in this design is determining the appropriate penalization factor 𝜆 , as excessive penalization may degrade pre-diction accuracy. Further, hand-tuning such a parameter would contradict VADER’s goal of eliminating hyperparameter tuning. VADER sets 𝜆 in a cost free way based on the distribution of the recall values of the training data as 𝜆 = 1 +√︁ 1 − ¯𝑅 𝑎𝑐𝑡 , where ¯ 𝑅 𝑎𝑐𝑡 
+
+is the average training recall. This formula is used to calculate the penalty across different settings and datasets. Note that we experimentally study the penalty behavior in Section 4.1. 
+
+3.3 Recall Predictor Training 
+
+We now focus on the details of constructing an accurate recall predictor, discussing the input features and the training procedure. 
+
+3.3.1 Recall Prediction Features. A core design challenge is to de-rive an effective set of features that capture different characteristics of the filtered search process. Recall that since our predictor is called multiple times for each query, the derived input features can capture dynamic characteristics of the search progress of each query. Prior work [15] demonstrated that query recall during unfil-tered search can be predicted using features that track vector search progression. We argue (and experimentally verify in Section 4) that this approach is insufficient for accurate recall prediction under the presence of filters. This limitation arises from relying only on vector search progression features that fail to capture the dynamics of the filtering process. Recall that for the same query vector, the characteristics of the filtering predicate can significantly alter the search effort required to achieve the same recall (Figure 1). To address this, VADER employs a novel feature set, combining dynamic vector search progression features and nearest neighbor statistics with features that capture dynamic predicate-related char-acteristics. Importantly, VADER does not explicitly use predicate se-lectivity or correlation as input features, as these quantities cannot be assumed to be known in advance. Moreover, the input features are not tied to a specific algorithm and can be applied across a wide range of vector search indexing and FVS algorithms. Furthermore, the feature set can be extended with additional algorithm-specific features, depending on the underlying FVS method, as subsequently discussed in Section 3.4. We summarize the full set of VADER fea-tures in Table 1 and describe below the key filtering-related features. VADER is designed to operate as a filter-agnostic technique. Specifically, we do not assume access to predicate-specific data distribution information before the start of the filtered vector search                             
+
+> 4Type Features Description Search Progression
+> 𝑛𝑠𝑡𝑒𝑝 Search Step (e.g. 𝑘 -NN graph hops)
+> 𝑛𝑑𝑖𝑠 No. distance calculations
+> 𝑛𝑖𝑛𝑠𝑒𝑟𝑡𝑠 No. updates in the NN result set Intermediate-NN-Stats
+> 𝑓 𝑖𝑟𝑠𝑡 𝑁 𝑁 Distance of the first NN evaluated
+> 𝑐𝑙𝑜𝑠𝑒𝑠𝑡 𝑁 𝑁 Distance of current closest NN
+> 𝑓 𝑢𝑟𝑡ℎ𝑒𝑠𝑡 𝑁 𝑁 Distance of current furthest ( 𝑘 -th) NN
+> 𝑎𝑣𝑔 Average of distances of the NN
+> 𝑣𝑎𝑟 Variance of distances of NN
+> 𝑚𝑒𝑑 Median of distances of NN
+> 𝑝𝑒𝑟𝑐 25 25th percentile of distances of NN
+> 𝑝𝑒𝑟𝑐 75 75th percentile of distances of NN Query-Dim-Stats
+> 𝑞 _𝑎𝑣𝑔 Average of query dimensions
+> 𝑞 _𝑚𝑒𝑑 Median of query dimensions
+> 𝑞 _𝑠𝑡𝑑 Stan. dev. of query dimensions
+> 𝑞 _𝑚𝑖𝑛 Min of query dimensions
+> 𝑞 _𝑚𝑎𝑥 Max of query dimensions
+> 𝑞 _𝑟𝑎𝑛𝑔𝑒 Range of query dimensions ( 𝑞 _𝑚𝑎𝑥 −𝑞 _𝑚𝑖𝑛 )
+> 𝑞 _𝐿 1L1 norm of query dimensions
+> 𝑞 _𝐿 2L2 norm of query dimensions Novel Filtering Stats
+> 𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑐ℎ𝑒𝑐𝑘𝑒𝑑 Number of predicates vectors evaluated
+> 𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑝𝑎𝑠𝑠𝑒𝑑 Number of vectors passing filter
+> 𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑓 𝑎𝑖𝑙𝑒𝑑 Number of vectors failing filter
+> 𝑜𝑏𝑠𝑒𝑟 𝑣𝑒𝑑 _𝑠𝑒𝑙𝑒𝑐𝑡𝑖𝑣𝑖𝑡 𝑦 Ratio of passed to checked vectors
+
+Table 1: Input features of VADER for recall prediction. 
+
+execution. Instead, we rely on features derivable from the filter-agnostic search process itself. The first three are 𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑐ℎ𝑒𝑐𝑘𝑒𝑑 ,
+
+𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑝𝑎𝑠𝑠𝑒𝑑 , and 𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑓 𝑎𝑖𝑙𝑒𝑑 , which represent the number of vectors for which the predicate has been evaluated, the number that satisfy the predicate, and the number that do not, respec-tively. In addition, we include 𝑜𝑏𝑠𝑒𝑟𝑣𝑒𝑑 _𝑠𝑒𝑙𝑒𝑐𝑡𝑖𝑣𝑖𝑡𝑦 , defined as the fraction of examined vectors that satisfy the predicate (i.e., 
+
+𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑝𝑎𝑠𝑠𝑒𝑑 /𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑐ℎ𝑒𝑐𝑘𝑒𝑑 ). This feature has proven the most informative of the four and one whose importance is also highlighted in prior work [53]. Section 4.1 studies the contribution of each feature in more depth. The non-filtering related features of VADER are inherited di-rectly from DARTH and DARTH+ [15, 16] that experimentally ver-ified that these features accurately capture vector-specific search characteristics. Specifically, the features capture the search progres-sion within the index ( Search-Progression ), statistics of intermediate nearest neighbor distances ( Intermediate-NN-Stats ), and query di-mensional distribution properties ( Query-Dim-Stats ). Note that the features in Table 1 capture the core state of an individual query search and are common across ANNS methods, so the same base set applies to both 𝑘 -NN graph and IVF algorithms; Section 3.4 gives the per-algorithm specifics. 
+
+3.3.2 Training FVS Query Generation. To train our filter-aware recall predictor, we need to generate training data with various combinations of filtering selectivities and value-vector correlations. The query vectors follow a distribution similar to that of the index vectors in our datasets. As we argue in our experimental evalua-tion in Section 4.1, as few as 100 query vectors suffice for accurate results; predictor performance stabilizes at 500 query vectors. To generate predicates, we use the filtered workload generation proce-dure introduced in [43]. This generation simulates the result of evaluating a filter predi-cate, represented as a bitmap, without requiring artificially gener-ated structured data: given a vector dataset, a query vector, a target selectivity, and a correlation type, it sorts all dataset vectors by ascending distance to the query and samples from that sorted list using a method determined by the correlation type (e.g., under pos-itive vector-predicate correlation [49] vectors closest to the query are more likely to satisfy the filter). Since filter evaluation does not affect VADER’s predictor, simulating it does not impact accuracy and makes training data generation more efficient. We consider positive, negative, and no correlation, using the same definitions as prior work [43, 49], and refer the reader to [43] for the sampling details. We combine our training queries with the generated predi-cates to construct FVS training queries, which are executed in the index to produce training data for our recall predictor. A natural question is which predicate characteristics the predic-tor needs, and at what training cost. In practice, a small number of representative selectivities suffices for the predictor to generalize to unseen selectivity values. For correlations, a robust setup spans positive, negative, and no correlation predicates, but since negative correlations are relatively rare in practice VADER also supports faster training on a reduced set, with the predictor retaining strong performance and generalization; Section 4.1 details the accuracy and trade-offs of these choices. 
+
+3.3.3 Extracting Training Data from FVS Queries. Once the FVS training queries are generated, VADER extracts training samples by executing these queries on the vector index. For each training query, VADER periodically computes the feature values listed in Ta-ble 1, and the corresponding actual recall at that point in the search. Since these queries are derived from ground truth data, their exact recall values are known. VADER collects training samples more frequently in higher recall ranges (e.g., ≥ 0.80) and less frequently in lower ranges, as declarative recall primarily targets high-recall regimes. Moreover, for queries that reach maximum recall early in the search, VADER terminates sample collection to reduce data gen-eration overhead. The VADER training data generation process is embarrassingly parallel and can be completed within a few minutes even in the worst case (cf. (Section 4.1). 
+
+3.4 VADER in Filter-Agnostic FVS Algorithms 
+
+As discussed in Section 3.3, the standard VADER features of Table 1 are compatible with a wide range of filter-agnostic vector search algorithms and indexes. This design choice enables VADER to be employed on top of various algorithms for FVS. Indeed, the VADER features can always be expanded based on the details of the under-lying algorithm. Below, we detail how VADER is implemented on top of three popular, widely adopted filter-agnostic vector search algorithms [43], namely Sweeping [59], ACORN [49], and Filtered-ScaNN [2], without loss of generality for other FVS algorithms. 
+
+3.4.1 Sweeping. Sweeping [59] follows the standard 𝑘 -NN graph search procedure, closely mimicking HNSW [44], maintaining two priority queues: 𝐶 , holding candidate nearest neighbors to be ex-plored in subsequent steps, and 𝑊 , the result set, which contains only vectors that satisfy the predicate. The contents of 𝐶 can there-fore differ significantly from those of 𝑊 depending on the selectiv-ity and correlation of the predicate, so we incorporate additional feature statistics describing the distance distribution of vectors in 
+
+𝐶 . Recall from Table 1 that distance-based statistics from 𝑊 are already included in the intermediate nearest neighbor features. For 
+
+𝐶 , we include features such as 𝑎𝑣𝑔𝐶 , the average distance of vectors in 𝐶 ; 𝑚𝑖𝑛𝐶 and 𝑚𝑎𝑥𝐶 , the minimum and maximum distances in 𝐶 ,
+
+𝑟𝑎𝑛𝑔𝑒𝐶 , the range between 𝑚𝑖𝑛𝐶 and 𝑚𝑎𝑥𝐶 ; and 𝑓 𝑖𝑟𝑠𝑡𝑁 𝑁𝐶 , the distance of the first neighbor included in 𝐶 . We also include the average distance of vectors that pass the predicate and those that do not, denoted as 𝑎𝑣𝑔𝑃𝑎𝑠𝑠𝐷𝑖𝑠𝑡 and 𝑎𝑣𝑔𝐹𝑎𝑖𝑙𝐷𝑖𝑠𝑡 , respectively.                             
+
+> 5Dataset Dim Vectors Description Dist. Meas. SIFT1M [36] 128 1M Image Descriptors L2 GIST1M [35] 960 1M Spatial Image Descriptors L2 GLOVE1M [3, 50] 100 1.1M Word Embeddings IP DEEP10M [5] 96 10M Image Embeddings L2 T2I10M [55] 200 10M Image and Text Embeddings (OOD) IP CASELAW7M [7] 1532 7.4M Caselaw text and metadata L2
+
+Table 2: Datasets used in our evaluation. 
+
+3.4.2 ACORN. For ACORN [49], we focus on the ACORN-1 variant, which does not modify the underlying 𝑘 -NN graph index, with-out loss of generality. The main design principle of ACORN is the two-hop expansion mechanism. At each step of the graph search, ACORN explores not only the direct neighbors of the current node but also their neighbors (i.e., two-hop neighbors), and includes in the candidate set 𝐶 only those vectors that satisfy the predicate. Distances are then computed for these vectors, and they are in-serted into the 𝐶 and 𝑊 queues following a strategy similar to HNSW. Since, in ACORN, both 𝐶 and 𝑊 contain only vectors that satisfy the predicate, we observe that 𝐶 -related features similar to those used in Sweeping do not improve prediction quality. Further-more, ACORN computes distances only for vectors that satisfy the predicate, preventing the use of features such as 𝑎𝑣𝑔𝑃𝑎𝑠𝑠𝐷𝑖𝑠𝑡 and 
+
+𝑎𝑣𝑔𝐹𝑎𝑖𝑙𝐷𝑖𝑠𝑡 .
+
+3.4.3 Filtered-ScaNN. Although Filtered-ScaNN [29, 31] belongs to a different index family (IVF), every feature of Table 1 is com-puted and used without change, with 𝑛𝑠𝑡𝑒𝑝 denoting the currently explored partition rather than a 𝑘 -NN graph hop; we add only 
+
+𝑐𝑒𝑛𝑡𝑟𝑜𝑖𝑑𝑁 𝑁 , the distance of the query to the current cluster cen-troid. Since Filtered-ScaNN computes the distances of an entire partition with a highly optimized SIMD routine, we perform re-call prediction at partition granularity, leaving all other details unchanged, including the frequency of predictor calls provided by the heuristic of Section 3.1. Achieving declarative recall on a funda-mentally different index with this minimal modification showcases the versatility of VADER. 
+
+4 EXPERIMENTS 
+
+Setup. We use a server with Intel(R) Xeon(R) CPU E5-2650 v4 @ 2.20GHz (24 cores, 48 hyperthreads) and 380GB of RAM, running Ubuntu 22.04.5 LTS. All implementations are in C++, compiled with g++ version 11.4.0, using hnswlib [47] with SIMD 2 enabled. 
+
+Datasets. We consider 6 datasets that are widely used in the litera-ture, with a diverse range of sizes, dimensionalities, and structural characteristics. Their details are summarized in Table 2. 
+
+Query Workloads. Our testing query workloads consist of 100 queries randomly sampled from the official repositories of the datasets listed in Table 2. For training the recall predictor, we use 500 queries randomly sampled from the official learning vector work-loads provided in the same repositories. For tasks that require tun-ing (e.g., tuning competing approaches), we also use the same 500 queries. To generate predicates for each vector, we construct work-loads with varying selectivities (0.01–1.0) and correlations (positive, negative, and no correlation), following the procedure described in [43]. This setup extends beyond standard FVS benchmarks, com-bining datasets of diverse sizes, dimensionalities, distance measures, and structures with a wide range of filtering characteristics. Every 
+
+> 2Single Instruction Multiple Data (SIMD): A parallel computing method where a single instruction operates simultaneously on multiple data points.
+
+query is executed on a single thread, with 48 queries running in par-allel, in both training and inference. The exception is CASELAW7M, which ships with real structured metadata and its own FVS queries rather than generated ones; we therefore examine it separately in Section 4.2.10. 
+
+Indexing Parameters. For each dataset, we construct an HNSW vector index with 𝑀 = 32 and 𝑒 𝑓 𝐶𝑜𝑛𝑠𝑡𝑟𝑢𝑐𝑡𝑖𝑜𝑛 = 200 for both Sweeping and ACORN. The index construction time using 48 threads is approximately 10 minutes for SIFT1M and GLOVE1M, 30 minutes for GIST1M, 20 minutes for DEEP10M, 40 minutes for T2I10M, and 4 hours for CASELAW7M. The elevated indexing time for CASELAW7M is attributed to the higher dimensionality of the vectors it contains. When VADER is used, both ACORN and Sweep-ing are configured with large 𝑒 𝑓 𝑆𝑒𝑎𝑟𝑐ℎ values (5K for ACORN and 1K for Sweeping). These settings allow plain search (i.e., search without early termination) to achieve approximately 0.97 recall for Sweeping and approximately 0.95 recall for ACORN across all datasets and experimental configurations. We follow the same approach to build a ScaNN index per dataset; since Filtered-ScaNN is a fundamentally different FVS algorithm, we give its details and results separately in Section 4.2.11. 
+
+Values of k, selectivity, correlation, and recall target. All experiments run with 𝑘 ∈ {10 , 100 , 250 }, selectivities 𝑠𝑒𝑙 ∈{0.01 , 0.1, ..., 0.9, 1.0} (including values VADER is not trained on, and unfiltered search at 𝑠𝑒𝑙 = 1.0), recall targets 𝑅 𝑡 ∈{0.8, 0.85 , 0.9, 0.95 }, and positive, negative, and no correlation. For 𝑘 -NN graph experiments, we omit 𝑅 𝑡 = 0.99, which is unattain-able in our workloads even with elevated indexing and search hyperparameter values. 
+
+VADER Model. We train and deploy the VADER models using LightGBM [37] with its default values (100 estimators, 0.1 learning rate) across all experiments. A predictor averages approximately 380kB, enabling efficient caching; it is initialized once, shared across all threads, and evaluated on a single thread to avoid interfering with parallel query execution, requiring on average 0.1 ms per prediction including feature computation. It is invoked multiple times during each query, at the frequency given by the strategy of Section 3.1. 
+
+Baselines. Since VADER is the first approach to provide declarative recall for FVS, there are no direct baselines. We therefore compare against its predecessor DARTH/DARTH+ [15, 16], which supports declarative recall for unfiltered search, and against the two tuning-based alternatives of Section 1, which we call REM (Recall-to-Effort Mapping) as they derive hyperparameter values that achieve the desired recall on average [15, 20, 61]. REM-Filtered tunes separately for each selectivity (under no correlation); REM-Unfiltered tunes on unfiltered workloads and applies the same values across all se-lectivities. Neither is a declarative recall approach, as both require explicit tuning per recall target and support only the targets they were tuned for, and REM-Filtered further assumes selectivity is known in advance, which does not generally hold in practice [39]. Both REM variants are significantly stronger baselines than iterative scan (Section 2.2), whose hard stop at the first 𝑘 predicate-satisfying vectors prevents the broader exploration that retrieving the true 
+
+𝑘 nearest neighbors usually requires. REM-Filtered searches more effectively because it is explicitly tuned for each selectivity, and 
+
+> 6
+
+REM-Unfiltered explores more broadly because its 𝑒 𝑓 𝑆𝑒𝑎𝑟𝑐ℎ val-ues are always ≥ 𝑘 and in most cases > 𝑘 . All baselines require either training (DARTH) or extensive tuning (both REM variants), for which we use the same 500 training query vectors as VADER; Section 4.2 gives the configuration details. 
+
+Quality Measures. We evaluate result quality primarily by the recall each approach achieves on a query workload. We additionally examine the recall distribution over individual queries, the deviation of queries from the recall target, and the Ratio of Queries below the recall Target (RQUT). We compare speed by average query latency, and assess the recall prediction quality with the Mean Absolute Error (MAE) between predicted and true recall. 
+
+4.1 Recall Prediction Analysis 
+
+In this section, we examine the quality and characteristics of the VADER recall predictor models. We focus on their prediction ac-curacy, required number of training queries, training time, feature importance, and loss function configurations. In this set of experi-ments, all reported results are obtained by invoking the predictor at every distance computation during the search, in order to evaluate recall prediction accuracy in an unbiased manner. Throughout this experimental setup, we study three main VADER predictor vari-ants based on the data used for training. We denote these variants as no-corr (trained on queries combined with predicates exhibit-ing no correlation), pos-corr (trained on queries combined with predicates exhibiting positive correlation), and all-corr (trained on queries combined with predicates exhibiting positive, negative, and no correlation). 
+
+4.1.1 Recall Prediction Accuracy. We begin by presenting recall prediction accuracy using the Mean Absolute Error (MAE) between the predicted recall by VADER and the ground-truth recall at each point during the search. Figure 3 plots MAE against selectivity for no correlation predicates using Sweeping with 𝑘 = 100, with one line per VADER predictor: trained on all correlations (all-corr), only positive correlation (pos-corr), or no correlation (no-corr), across all of our datasets. Figures for other correlations exhibit very similar trends and are omitted, while the numbers reported below are computed across all configurations. Across all settings, VADER achieves high prediction accuracy. The all-corr model consistently delivers the best performance on av-erage, achieving 𝑀𝐴𝐸 = 0.046, while the no-corr and pos-corr mod-els achieve 𝑀𝐴𝐸 = 0.048 and 𝑀𝐴𝐸 = 0.054, respectively. In particu-lar, the all-corr model maintains strong performance under negative correlation, achieving 𝑀𝐴𝐸 = 0.070, compared to 𝑀𝐴𝐸 = 0.074 for no-corr and 𝑀𝐴𝐸 = 0.122 for pos-corr. This behavior is expected, as negative correlation cases differ significantly from positive and no correlation cases, and achieving strong performance in such cases requires additional training data. This performance gener-alizes across different values of 𝑘 (specifically 𝑘 ∈ { 10 , 100 , 250 }), where the all-corr model achieves an average 𝑀𝐴𝐸 = 0.052, com-pared to 𝑀𝐴𝐸 = 0.055 for no-corr and 𝑀𝐴𝐸 = 0.072 for pos-corr. Note that the reported values correspond to averages over the en-tire search process, including lower recall ranges, to provide an unbiased evaluation of model performance. When focusing on higher recall ranges (e.g., ≥ 0.80), the MAE values of all models are further reduced. For ACORN, we observe             
+
+> Training Query Vectors pos-corr no-corr all-corr 100 0.083 0.057 0.053 500 0.072 0.055 0.052 1000 0.064 0.054 0.051
+
+Table 3: Mean Absolute Error of VADER models across a varying number of training queries. 
+
+similar trends and therefore omit the corresponding figures due to space constraints. Across all configurations, the all-corr model again achieves the best performance, with 𝑀𝐴𝐸 = 0.054, while the no-corr and pos-corr models achieve 𝑀𝐴𝐸 = 0.086 and 𝑀𝐴𝐸 = 0.080, respectively. 
+
+4.1.2 Training Queries. We evaluate the recall predictor with 100, 500, and 1000 training query vectors, each combined with predi-cates of various selectivities and correlations (for the all-corr variant, 
+
+𝑠𝑒𝑙 ∈ { 0.01 , 0.1, 0.3, 0.5, 0.7, 0.9, 1.0} with positive, negative, and no correlation). Performance stabilizes at approximately 500 queries for the no-corr and all-corr variants, while pos-corr peaks at 1K. The average MAE across all datasets, selectivities, and correlations for Sweeping is summarized in Table 3. For all-corr, 100/500/1000 queries yield 𝑀𝐴𝐸 = 0.053 /0.052 /0.051, and the corresponding ACORN values are 0 .057 /0.054 /0.054, with the other variants fol-lowing very similar trends. Accuracy is therefore high even with as few as 100 training queries, and we use 500 as the default for the remainder of the evaluation. 
+
+4.1.3 Training Sample Sizes. Although we use 500 queries as the default number of training query vectors, the number of training samples extracted from these queries varies across VADER model variants. For example, the all-corr model is trained on more samples than the no-corr and pos-corr variants for two main reasons. First, the same set of 500 queries is combined with predicates spanning positive, negative, and no correlation configurations, resulting in a larger training set. Second, as correlation shifts from positive to negative, filtered vector search becomes more challenging, requir-ing more extensive search to reach high recall levels, so queries under negative correlation generate more training samples, further increasing the total number of samples used by the all-corr model. This effect is evident in the number of training samples used for GBDT training across the three VADER variants: for Sweeping with 
+
+𝑘 = 100 (without loss of generality, with similar trends observed for ACORN), the all-corr model uses approximately 40M samples for SIFT1M, 16M for GIST1M, 50M for GLOVE1M, 17M for DEEP10M, and 20M for T2I10M. In comparison, the no-corr model uses 10M samples for SIFT1M, 5M for GIST1M, 15M for GLOVE1M, and 3M for T2I10M. Finally, the pos-corr model, which exhibits the lowest recall prediction accuracy, uses 3M samples for SIFT1M, 3M for GIST1M, 5M for GLOVE1M, and 1M for DEEP10M and T2I10M. Note that the variation in sample size across datasets is not solely determined by dataset size, as the intrinsic complexity of the vector space plays a more significant role. For example, GLOVE1M consistently requires the largest number of training samples across all configurations, as it is a word embedding dataset with a highly clustered structure [10, 50, 54]; under inner-product similarity, it becomes more challenging to distinguish true nearest neighbors at high recall levels, prolonging the search process, particularly under negative correlation, and generating a larger number of training samples.     
+
+> 7pos-corr VADER no-corr VADER all-corr VADER 0.0 0.5 1.0 Selectivity 0.0 0.1 0.2 MAE
+
+(a) SIFT1M 0.0 0.5 1.0 Selectivity 0.0 0.1 0.2 MAE (b) GIST1M 0.0 0.5 1.0 Selectivity 0.0 0.1 0.2 MAE (c) GLOVE1M 0.0 0.5 1.0 Selectivity 0.0 0.1 0.2 MAE (d) DEEP10M 0.0 0.5 1.0 Selectivity 0.0 0.1 0.2 MAE (e) T2I10M 
+
+Figure 3: MAE of recall prediction (Sweeping, 𝑘 = 100 , No Correlation). SIFT1M GLOVE1M GIST1M DEEP10M T2I10M 0.0 0.5 1.0 Normal. Pear. Corr.  S S S S SA A A A A  
+
+> Sweeping (S) ACORN (A) vectors_checked (A & S) vectors_passed (A & S) vectors_failed (A & S) observed selectivity (A & S) firstNNC (S) avgNNC (S) maxNNC (S) minNNC (S) rangeNNC (S) avgPassDist (S) avgFailDist (S)
+
+Figure 4: Filtering Feature Correlation to Recall. 
+
+4.1.4 Training Times. Training a recall predictor consists of two stages: (i) generating training data from FVS training queries, and (ii) training a GBDT model using this data. Both complete within a few minutes, including for the all-corr variant on the largest datasets. For Sweeping, all-corr requires 5 minutes for data genera-tion and 0.85 minutes for GBDT training, under 6 minutes in total, while no-corr requires 1 minute. For ACORN the corresponding figures are 8 and 0.46 minutes for all-corr, under 9 minutes in total, and approximately 3 minutes for no-corr. 
+
+4.1.5 Feature Selection. To verify the contribution of our novel fil-tering features independently from the trained model, we compute the normalized Pearson correlation [6] of each feature to the true recall on our training data, presented in Figure 4 for Sweeping and ACORN. We focus exclusively on these features, as the non-filtering ones are established in prior work [15, 16, 41]; recall that Sweeping contributes additional features compared to ACORN (Section 3.4). Our analysis shows that all filtering-related features exhibit a non-negligible correlation with recall. In particular, 𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑐ℎ𝑒𝑐𝑘𝑒𝑑 ,
+
+𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑝𝑎𝑠𝑠𝑒𝑑 , and 𝑣𝑒𝑐𝑡𝑜𝑟𝑠 _𝑓 𝑎𝑖𝑙𝑒𝑑 demonstrate significant corre-lation in both algorithms. However, 𝑜𝑏𝑠𝑒𝑟𝑣𝑒𝑑 _𝑠𝑒𝑙𝑒𝑐𝑡𝑖𝑣𝑖𝑡𝑦 exhibits higher correlation in ACORN and lower correlation in Sweeping. This difference can be attributed to the distinct traversal strate-gies of the two algorithms. In ACORN, search expansion is strictly based on the subset of neighbors that satisfy the predicate, making observed selectivity a more influential factor. In contrast, Sweep-ing traverses the graph using unfiltered neighbors, reducing the relative importance of observed selectivity. We also evaluate the contribution of VADER’s filter-aware fea-tures through an ablation study. We train two variants of the VADER recall predictor in a controlled setting where all config-urations, including the model architecture and the training data, are identical, differing only in the features provided to the predictor: all_features uses the complete feature set presented in Table 1 and corresponds to the VADER model used throughout the paper, while no_filter_features excludes the filter-aware features, retaining all remaining ones. The results, presented in Figure 5, demonstrate the importance of the proposed filter-aware features: despite in-troducing only a small number of additional features (discussed in Sections 3.3.1 and 3.4), the complete VADER model achieves 12% lower MAE on average for Sweeping, and 16% lower MAE for ACORN, across all values of 𝑘 and correlation settings. Finally, we examine the importance the GBDT model assigns to each feature category after VADER training [37], computed as the sum of the gain-based importance scores of the individual fea-tures across all configurations, for both Sweeping and ACORN. For Sweeping, the importance is distributed as 21% for search progres-sion features, 30% for intermediate nearest neighbor statistics, 17% for query-dimensional statistics, and 31% for filtering-related fea-tures. For ACORN, the corresponding values are 11%, 46%, 25%, and 17%, respectively. These results highlight an important aspect of the recall prediction task: no single feature category dominates, in-dicating that all selected feature categories contribute meaningfully to prediction performance. This also means that accurate recall prediction requires combining diverse signals, namely search pro-gression dynamics, query characteristics, intermediate results, and filtering behavior. 
+
+4.1.6 Asymmetric Loss Sensitivity Study. We finally examine the effect of the asymmetric loss function using the all-corr model variant, reporting results averaged across different correlations, selectivities, and values of 𝑘 for Sweeping (results for ACORN follow very similar trends). We perform a sensitivity study over the 𝜆 penalty value (cf. Sec-tion 3.2) to study its effect on VADER’s recall prediction quality and the percentage of recall overpredictions among all model predic-tions. We present the results in Figure 6 for all of our datasets, using no correlation, 𝑘 = 100, 𝑠𝑒𝑙 = 0.3, and Sweeping (results are similar for other configurations and are omitted for brevity). As expected, increasing the penalty value results in a much smaller number of recall overpredictions, since the recall predictor becomes more conservative, but the recall prediction error (expressed by MAE) increases as well, revealing a tradeoff between reducing the number of overpredictions and maintaining recall prediction quality in gen-eral. This tradeoff is also reflected in the end-to-end performance, with higher penalty values resulting in fewer queries falling below the target, at the cost of increased latency. Striking a balance for the asymmetric loss is a task-specific ob-jective, and the penalty can be adjusted in VADER based on the application requirements. In our implementation, however, we use an automatic method to set it that requires no tuning, as discussed in Section 3.2. The penalty values obtained using this automatic method, depicted in Figure 6 as black dotted vertical lines, reduce the percentage of recall overpredictions to around 33% across all   
+
+> 80.0 0.5 1.0 Selectivity 0.02 0.04 MAE
+> all-feats no-filter-feats
+
+(a) SIFT1M 0.0 0.5 1.0 Selectivity 0.04 0.06 MAE  
+
+> all-feats no-filter-feats
+
+(b) GIST1M 0.0 0.5 1.0 Selectivity 0.05 0.10 MAE  
+
+> all-feats no-filter-feats
+
+(c) GLOVE1M 0.0 0.5 1.0 Selectivity 0.02 0.04 0.06 MAE  all-feats no-filter-feats (d) DEEP10M 0.0 0.5 1.0 Selectivity 0.04 0.05 0.06 MAE  
+
+> all-feats no-filter-feats
+
+(e) T2I10M 
+
+Figure 5: Ablation study for VADER model variants across all datasets (Sweeping, 𝑘 = 100 , No Correlation). % Overpredictions MAE auto 1 2 3 4 5Penalty 
+
+> 21 29 36 44 % Overpred.
+> 1.7 2.0 2.2 2.5 MAE ( 10  2)
+
+(a) SIFT1M 1 2 3 4 5Penalty  
+
+> 18 24 30 36 % Overpred.
+> 2.8 3.3 3.7 4.1 MAE ( 10  2)
+
+(b) GIST1M 1 2 3 4 5Penalty  
+
+> 19 26 34 41 % Overpred.
+> 2.8 3.1 3.5 3.8 MAE ( 10  2)
+
+(c) GLOVE1M 1 2 3 4 5Penalty  
+
+> 21 28 35 42 % Overpred.
+> 2.1 2.3 2.5 2.8 MAE ( 10  2)
+
+(d) DEEP10M 1 2 3 4 5Penalty  
+
+> 22 29 37 45 % Overpred.
+> 4.6 5.2 5.7 6.2 MAE ( 10  2)
+
+(e) T2I10M 
+
+Figure 6: Asymmetric penalty sensitivity study (Sweeping, 𝑘 = 100 , No Correlation, 𝑠𝑒𝑙 = 0.3). 
+
+configurations, compared with 40% achieved by the symmetric loss function, without noticeable degradation in prediction quality (MAE = 0.053, compared with MAE = 0.052 for the symmetric loss). Therefore, we use this automatically configured asymmetric loss function throughout our evaluation. 
+
+4.2 End-to-end Performance Results 
+
+We now focus on the end-to-end performance of VADER. Unless stated otherwise, we use the all-corr variation with the asymmetric loss function as our VADER recall predictor. 
+
+4.2.1 Summary of Achieved Recalls and Speedups over Plain Search. 
+
+We evaluate the recall VADER achieves and its speedup over plain search (i.e., search without early termination, at fixed 𝑒 𝑓 _𝑠𝑒𝑎𝑟𝑐ℎ )for both Sweeping and ACORN, reporting speedup relative to plain search to highlight that the recall predictor not only avoids sig-nificant overhead but enables substantial gains. Figures 7 and 8 give the achieved recall and the speedup for varying recall targets across all datasets and correlations, at 𝑠𝑒𝑙 = 0.3, 𝑘 = 100, using Sweeping; other selectivities and values of 𝑘 are similar. The results demonstrate that VADER consistently meets the specified recall targets across different correlation settings. The achieved recall across all queries of the workload closely matches the specified target, while achieving an average 𝑅𝑄𝑈𝑇 = 0.27, with the average recall deviation of queries from the target recall, both for queries above and below the target, is only 0.04. At the same time, VADER is achieving significant speedups of up to 24 .8× and 8 .8× on average. For ACORN, we observe similar trends. VADER still achieves recalls that closely match the desired recall target, ( 𝑅𝑄𝑈𝑇 = 0.35 and aver-age recall deviation of 0.05), while providing substantial speedups over plain search, reaching up to 15 .1× and 3 .4× on average. 
+
+4.2.2 Recall Distributions. In this set of experiments, we report the recall distribution of all queries for each dataset and correlation setting, using Sweeping with 𝑘 = 100, 𝑅 𝑡 = 0.9, and 𝑠𝑒𝑙 = 0.3 (results for other configurations and algorithms exhibit similar trends and are therefore omitted). Recall distributions for all datasets in no correlation are shown in Figure 9 (results for other correlations are similar). The results indicate that VADER consistently achieves recall values very close to the target for individual queries across all datasets and correlation settings. Across all configurations, the average deviation from the target recall is 0.04 (with an 𝑅𝑄𝑈𝑇 =
+
+0.27), demonstrating that even queries that do not exactly meet the target still achieve recall values very close to it. Examining the worst-case results, the lowest observed recall across all workloads is 0.76, which remains relatively close to the target recall. 
+
+4.2.3 Optimality of Early Termination Points. We examine the qual-ity of VADER’s termination points against an oracle that computes, for each query, selectivity, and correlation, the minimum number of distance computations required to reach 𝑅 𝑡 ; this reference is infeasible in practice but serves as a useful benchmark. For addi-tional context we also report the distance computations of plain search without early termination. Figure 10 shows the results for no correlation with Sweeping at 𝑘 = 100 and 𝑅 𝑡 = 0.9; positive and negative correlation, and ACORN, exhibit very similar trends and are included in the numbers below. Across all datasets, selectivities, and correlations, VADER terminates near-optimally, deviating from the oracle by only 4.1% with respect to plain search. 
+
+4.2.4 Predictor Invocations Heuristics. Recall that the frequency at which the VADER recall predictor is invoked during query ex-ecution is governed by the heuristic described in Section 3.1. We perform a sensitivity analysis to examine how different values of 
+
+𝑚𝑝𝑖 and 𝑖𝑝𝑖 affect VADER’s performance and to evaluate the effec-tiveness of the heuristically selected values. Specifically, we explore a grid of 𝑚𝑝𝑖 and 𝑖𝑝𝑖 values, with 𝑚𝑝𝑖 ∈ { 50 , 75 , 100 , 150 , ..., 5𝐾, 
+
+7.5𝐾, 10 𝐾 } and 𝑖𝑝𝑖 ∈ { 100 , 200 , 300 , ..., 50 𝐾, 75 𝐾, 100 𝐾 }, and evalu-ate VADER in terms of achieved recall, RQUT, query latency, and number of predictor invocations. Figure 11 presents the results for SIFT1M with 𝑘 = 100, no correlation, 𝑠𝑒𝑙 = 0.3, and 𝑅 𝑡 = 0.9, show-ing heatmaps of the achieved recall (a) and RQUT (b) for varying 
+
+𝑖𝑝𝑖 and 𝑚𝑝𝑖 , along with the corresponding number of predictor invocations (c) and query latency (d); similar trends are observed across other datasets and configurations. In general, large values of 𝑚𝑝𝑖 and 𝑖𝑝𝑖 result in slightly higher recall ( ∼0.95–0.96) and very low RQUT ( ∼0.00–0.02), but the resulting coarse-grained invocation schedule leads to very few predictor calls (typically 1–2), causing 
+
+> 9
+
+No corr. Positive corr. Negative corr. 0.80 0.85 0.90 0.95 
+
+Rt
+
+0.80 0.85 0.90 0.95 1.00 Avg. Recall (a) SIFT1M 0.80 0.85 0.90 0.95 
+
+Rt
+
+0.80 0.85 0.90 0.95 1.00 Avg. Recall (b) GIST1M 0.80 0.85 0.90 0.95 
+
+Rt
+
+0.80 0.85 0.90 0.95 1.00 Avg. Recall (c) GLOVE1M 0.80 0.85 0.90 0.95 
+
+Rt
+
+0.80 0.85 0.90 0.95 1.00 Avg. Recall (d) DEEP10M 0.80 0.85 0.90 0.95 
+
+Rt
+
+0.80 0.85 0.90 0.95 1.00 Avg. Recall (e) T2I10M 
+
+Figure 7: Achieved Recalls of VADER across FVS query workloads with different correlations, 𝑘 = 100 , 𝑠𝑒𝑙 = 0.3, Sweeping 0.80 0.85 0.90 0.95 
+
+Rt
+
+5x 10x 15x 20x 1x Speedup 
+
+(a) SIFT1M 0.80 0.85 0.90 0.95 
+
+Rt
+
+10x 20x 30x 1x Speedup (b) GIST1M 0.80 0.85 0.90 0.95 
+
+Rt
+
+2x 4x 6x 1x Speedup (c) GLOVE1M 0.80 0.85 0.90 0.95 
+
+Rt
+
+10x 20x 30x 1x Speedup (d) DEEP10M 0.80 0.85 0.90 0.95 
+
+Rt
+
+10x 20x 30x 1x Speedup (e) T2I10M 
+
+Figure 8: Speedups of VADER over plain search across different correlations (Sweeping, 𝑘 = 100 , 𝑠𝑒𝑙 = 0.3). 0.8 0.9 1.0 Recall 020 40 % queries  Rt
+
+avg: 0.92 
+
+(a) SIFT1M 0.8 0.9 1.0 Recall 020 40 % queries  Rt
+
+avg: 0.93 (b) GIST1M 0.85 0.90 0.95 Recall 010 % queries  Rt
+
+avg: 0.91 (c) GLOVE1M 0.7 0.8 0.9 1.0 Recall 020 % queries  Rt
+
+avg: 0.90 (d) DEEP10M 0.7 0.8 0.9 1.0 Recall 020 % queries  Rt
+
+avg: 0.93 (e) T2I10M 
+
+Figure 9: Recall distr. (Sweeping, 𝑘 = 100 , 𝑅 𝑡 = 0.90 , No correlation, 𝑠𝑒𝑙 = 0.3). plain search (fixed ef_search) VADER Optimal 0.0 0.5 1.0 Selectivity 10 1
+
+10 2
+
+> Dists (10 3)
+
+(a) SIFT1M 0.0 0.5 1.0 Selectivity 10 1
+
+10 2 
+
+> Dists (10 3)
+
+(b) GIST1M 0.0 0.5 1.0 Selectivity 10 2 
+
+> Dists (10 3)
+
+(c) GLOVE1M 0.0 0.5 1.0 Selectivity 10 1
+
+10 2 
+
+> Dists (10 3)
+
+(d) DEEP10M 0.0 0.5 1.0 Selectivity 10 1
+
+10 2 
+
+> Dists (10 3)
+
+(e) T2I10M 
+
+Figure 10: Early termination quality of VADER against the Optimal (Sweeping, 𝑘 = 100 , 𝑅 𝑡 = 0.9, No Correlation). 50 200 500 1K 2K 5K 
+
+mpi 
+
+100 500 2K 5K 10K 25K 
+
+> ipi
+> 0.920.92 0.920.920.92 0.920.920.920.920.92 0.920.920.920.920.920.930.93 0.920.920.920.920.920.930.930.930.94 0.930.930.930.930.930.930.930.930.940.94 0.940.940.940.940.940.940.940.940.940.940.95 0.950.950.950.950.950.950.950.950.950.950.95 0.950.950.950.950.950.950.950.950.950.950.96 0.960.960.960.960.960.960.960.960.960.960.96 0.960.960.960.960.960.960.960.960.960.960.96
+
+0.92 0.94 0.96 
+
+> Avg. Recall
+
+(a) Avg. Recall 50 200 500 1K 2K 5K 
+
+mpi 
+
+100 500 2K 5K 10K 25K 
+
+> ipi
+> 0.240.22 0.250.220.20 0.230.220.230.190.19 0.250.220.210.230.210.180.17 0.240.220.200.200.180.160.170.130.08 0.190.190.190.180.180.190.170.150.150.08 0.130.130.130.120.120.130.110.120.100.100.07 0.070.070.070.070.070.070.070.070.070.060.06 0.020.020.020.020.020.020.020.020.020.020.02 0.010.010.010.010.010.010.010.010.010.010.01 0.000.000.000.000.000.000.000.000.000.000.00
+
+0.00 0.10 0.20  
+
+> RQUT
+
+(b) RQUT 50 200 500 1K 2K 5K 
+
+mpi 
+
+100 500 2K 5K 10K 25K                                                                                 
+
+> ipi
+> 71 42 58 35 21 41 27 17 12 930 20 13 10 76519 13 975433312 9654332225432222211122211111111111111111111111111111111111111111
+
+25 50  
+
+> Pred. calls
+
+(c) Predictor Calls 50 200 500 1K 2K 5K 
+
+mpi 
+
+100 500 2K 5K 10K 25K                                                            
+
+> ipi
+> 204 119 164 99 58 115 71 38 25 27 82 51 26 26 26 28 29 49 31 26 26 27 28 29 32 33 29 29 29 29 29 30 31 31 33 37 38 39 39 39 39 39 40 40 40 41 43 55 55 54 54 55 55 55 55 55 56 57 74 73 73 74 74 74 74 74 74 74 74 115 113 112 391 112 113 113 113 113 113 113 177 174 173 173 174 174 174 174 175 175 174
+
+100 200 300  
+
+> Latency (ms)
+
+(d) Latency (ms) 
+
+Figure 11: Predictor invocation sensitivity study (Sweeping, 𝑘 = 100 , No correlation, 𝑅 𝑡 = 0.9, 𝑠𝑒𝑙 = 0.3, SIFT1M). sel=0.02 sel=0.05 sel=0.2 sel=0.8 No Corr. Pos. Corr. Neg. Corr. 0.75 0.80 0.85 0.90 0.95 1.00 Avg. Recall 
+
+(a) SIFT1M No Corr. Pos. Corr. Neg. Corr. 0.75 0.80 0.85 0.90 0.95 1.00 Avg. Recall (b) GIST1M No Corr. Pos. Corr. Neg. Corr. 0.75 0.80 0.85 0.90 0.95 1.00 Avg. Recall (c) GLOVE1M No Corr. Pos. Corr. Neg. Corr. 0.75 0.80 0.85 0.90 0.95 1.00 Avg. Recall (d) DEEP10M No Corr. Pos. Corr. Neg. Corr. 0.75 0.80 0.85 0.90 0.95 1.00 Avg. Recall (e) T2I10M 
+
+Figure 12: Achieved recalls of VADER on selectivities is was not trained on (Sweeping, 𝑘 = 100 , 𝑅 𝑡 = 0.9). 
+
+10 VADER to miss near-optimal termination points and perform re-dundant distance computations, and thus substantially increasing query latency, in some cases exceeding 100 ms. Conversely, small values of 𝑚𝑝𝑖 and 𝑖𝑝𝑖 result in recall values closer to the target (∼0.92) and higher RQUT ( ∼0.24), as frequent predictor invocations allow VADER to terminate more precisely near the target recall. However, these configurations invoke the predictor substantially more often than necessary (e.g., 31–71 times per query), and the resulting inference overhead again leads to high query latency, in some cases exceeding 100ms. These results reveal an important trade-off in selecting 𝑚𝑝𝑖 and 𝑖𝑝𝑖 : both excessively small and ex-cessively large values can result in high latency, albeit for different reasons, with intermediate values providing the best balance across recall, RQUT, predictor invocations, and query latency. This ob-servation motivates the heuristic introduced in Section 3.1, which automatically identifies a near-optimal operating point without requiring explicit tuning. The configuration selected by our heuristic is highlighted by the red square in each heatmap. Despite the large and complex param-eter space, the heuristically selected 𝑚𝑝𝑖 and 𝑖𝑝𝑖 values achieve a recall of 0 .92 with an RQUT of 0 .23, while requiring only ap-proximately 10 predictor invocations per query and achieving an average query latency of approximately 26 ms. Finally, we observe that small variations of the heuristic, such as modifying the scaling factors or using the median instead of the mean, produce similar results. This indicates that the underlying heuristic is robust and consistently provides an effective balance between result quality and search latency without requiring parameter tuning. 
+
+4.2.5 Generalization to Unseen Selectivities. We now examine the generalization ability of VADER to selectivities that are not observed during training. Thus, we examined the recall qual-ity of VADER with 𝑘 = 100, 𝑅 𝑡 = 0.9, and selectivities with 
+
+𝑠𝑒𝑙 ∈ { 0.02 , 0.05 , 0.2, 0.8}, that were not included in the training of the model. The results, illustrated in Figure 12 across all datasets, show that, even for unseen selectivities, VADER consistently achieves high-quality performance across both highly selective cases and less selective cases. Specifically, VADER deviates by 0.045 on average from the target recall across all configurations, compared to 0.041 for selectivities observed during training. The slight increase in deviation for unseen selectivities is expected, as the model is not explicitly trained on these configurations; nevertheless, the results remain close to the target, demonstrating the strong generalization capability of VADER. 
+
+4.2.6 Setting Up Baselines. For REM-Unfiltered we manually tune the 𝑒 𝑓 _𝑠𝑒𝑎𝑟𝑐ℎ value that achieves the desired recall target on aver-age at 𝑠𝑒𝑙 = 1.0, and use it across all experiments. For REM-Filtered we tune extensively, per selectivity and recall target under no cor-relation, applying each tuned value across all correlation settings since correlation is not known in advance. Both variants are tuned twice, once for ACORN and once for Sweeping. This places VADER at a clear disadvantage: the per-selectivity, per-target tuning of REM-Filtered is impractical in deployment but sets a high bar, and exceeding it implies VADER would also exceed the more realistic REM configurations. We present our comparisons across varying selectivities, recall targets and values of 𝑘 . We start by presenting a full comparison of VADER across the above configurations for no correlation, and then we present the figures for positive and negative correlation. 
+
+4.2.7 Performance for Varying Selectivities. We now proceed to compare how VADER compares to other baselines, starting by com-paring the results of different approaches for varying selectivities. Throughout this experiment, we set 𝑅 𝑡 = 0.9, and 𝑘 = 100, and we test all methods for all datasets, selectivities, and correlations. The results are shown in Figure 13 for Sweeping and Figure 14 for ACORN for no correlation. The results for positive and negative correlation for Sweeping are in Figure 19 and Figure 25, while for ACORN in Figure 20 and Figure 26. Note that the black dashed line corresponds to 𝑅 𝑡 = 0.9, and thus, the closer a method is to the line, the better result quality it achieves. Our results show that VADER is the approach with the best results. From the results, and across all correlations, VADER is the only approach that consistently maintains recall values close to the target across all configurations, with an average deviation of 0.04. This represents the best performance among all methods, outperforming REM-Filtered by 12%, REM-Unfiltered by 25%, and DARTH by 81%. Notably, the second-best method, REM-Filtered, is specifically tuned for each selectivity using the same FVS training queries as VADER, yet VADER still achieves superior accuracy. In addition to improved result quality, VADER is 32% faster than REM-Filtered and 52% faster than REM-Unfiltered. VADER is not faster than DARTH in this configuration, as DARTH fails to meet the target recall in most cases. Furthermore, both REM variants tend to overshoot, performing more distance computations than necessary. Finally, when we examine queries that fall below the target recall, VADER and REM-Unfiltered have the same average deviation, while VADER is 20% better than REM-Filtered and 84% better than DARTH. Regarding ACORN, VADER again achieves the best performance, this time by an even larger margin. The results show that VADER consistently achieves recall values closest to the target, with an average deviation of 0.04. This corresponds to improvements of 28% over REM-Filtered, 44% over REM-Unfiltered, and 17% over DARTH. While VADER may incur slightly higher latency in ACORN due to its consistent effort to meet the recall target, competing methods often fail to do so, it maintains stable and high-quality results across all selectivities. When focusing on queries that fall below the target recall, VADER again demonstrates superior performance, improving by 53% over REM-Filtered, 72% over REM-Unfiltered, and 60% over DARTH. 
+
+4.2.8 Performance for Varying Recall Targets. Fixing 𝑠𝑒𝑙 = 0.3 and varying the recall target 𝑅 𝑡 at 𝑘 = 100, Figures 15 and 16 show the no correlation results for Sweeping and ACORN. The results for positive and negative correlation with Sweeping are presented in Figures 21 and 27 for Sweeping and in Figures 22 and 28 for ACORN. For Sweeping, and across all correlations, VADER is again closest to the ideal target, indicated by the dashed line. It outperforms REM-Filtered by 5%, REM-Unfiltered by 20%, and DARTH by 75%, while being 29%, 48%, and 47% faster respectively. On queries that fall below the target it trails REM-Unfiltered (average error 0.05 against 0.03, a 35% gap) but still outperforms REM-Filtered by 12% and DARTH by 80%. For ACORN, VADER outperforms REM-Filtered by 56%, REM-Unfiltered by 65%, and DARTH by 50% in proximity to the target, and by 59%, 70%, and 54% respectively on queries below 
+
+> 11
+
+REM-Unfiltered REM-Filtered DARTH VADER Ideal SIFT1M GIST1M GLOVE1M DEEP10M T2I10M 0.0 0.5 1.0 Selectivity 0.50 1.00 Avg. Recall 0.0 0.5 1.0 Selectivity 0.50 1.00 Avg. Recall 0.0 0.5 1.0 Selectivity 0.50 0.75 1.00 Avg. Recall 0.0 0.5 1.0 Selectivity 0.50 1.00 Avg. Recall 0.0 0.5 1.0 Selectivity 0.80 1.00 Avg. Recall 
+
+Figure 13: Sweeping: Achieved recalls for varying selectivity (No Correlation, 𝑘 = 100 , 𝑅 𝑡 = 0.9). 0.0 0.5 1.0 Selectivity 0.80 1.00 Avg. Recall 0.0 0.5 1.0 Selectivity 0.80 1.00 Avg. Recall 0.0 0.5 1.0 Selectivity 0.80 1.00 Avg. Recall 0.0 0.5 1.0 Selectivity 0.80 1.00 Avg. Recall 0.0 0.5 1.0 Selectivity 0.80 1.00 Avg. Recall 
+
+Figure 14: ACORN: Achieved recalls for varying selectivity (No Correlation, 𝑘 = 100 , 𝑅 𝑡 = 0.9). 0.80 0.85 0.90 0.95             
+
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall
+
+Figure 15: Sweeping: Achieved recalls for varying recall target (No Correlation, 𝑘 = 100 , 𝑠𝑒𝑙 = 0.3). 0.80 0.85 0.90 0.95             
+
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall
+
+Figure 16: ACORN: Achieved recalls for varying recall target (No Correlation, 𝑘 = 100 , 𝑠𝑒𝑙 = 0.3). 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 
+
+Figure 17: Sweeping: Achieved recalls for varying value of 𝑘 (No correlation, 𝑅 𝑡 = 0.9, 𝑠𝑒𝑙 = 0.3). 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 
+
+Figure 18: ACORN: Achieved recalls for varying value of 𝑘 (No correlation, 𝑅 𝑡 = 0.9, 𝑠𝑒𝑙 = 0.3). 
+
+it; it is slightly slower only because the other methods terminate prematurely without reaching the target. 
+
+4.2.9 Performance for Varying Values of 𝑘 . Finally, we vary 𝑘 , with the no correlation results shown in Figure 17 for Sweeping and Fig-ure 18 for ACORN. The results for positive and negative correlation with Sweeping are presented in Figures 23 and 29 for Sweeping and in Figures 24 and 30 for ACORN. For Sweeping, VADER, DARTH, and REM-Unfiltered deviate from the target by similar amounts, with VADER 9% better than REM-Unfiltered; REM-Unfiltered is marginally faster than VADER, which is in turn 11% faster than DARTH, while REM-Filtered matches their latency but reaches the target less often. For ACORN, VADER is again the most stable, improving by 45% over REM-Filtered, 58% over REM-Unfiltered, and 28% over DARTH, and by 79%, 83%, and 74% respectively on queries that fall below the target. 
+
+4.2.10 Results on Real Structured Metadata. We now evaluate VADER on the CASELAW7M [7] dataset, which contains filtered vector search queries over real structured metadata, allowing us to assess VADER without relying on a synthetic predicate generation process. CASELAW7M consists of 7.4M vectors together with their associated structured metadata, and approximately 89K filtered queries defined over the real metadata, with an average predicate selectivity of 0.05. From the provided workload, we reserve a subset of queries for training and use an additional 5K queries for evalua-tion. To study the effect of training set size, we train VADER using between 100 and 80K training queries, with the results presented in Figure 31(a). VADER achieves recall prediction accuracy comparable to that observed on the previous datasets. Specifically, for Sweeping, the MAE decreases from 0.076 with 100 training queries to 0.038 with 80K queries, while for ACORN it decreases from 0.049 to 0.036 over 
+
+> 12
+
+REM-Unfiltered REM-Filtered DARTH VADER Ideal SIFT1M GIST1M GLOVE1M DEEP10M T2I10M 0.0 0.5 1.0 Selectivity 0.50 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.60 0.80 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.80 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.80 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.80 1.00 Avg. Recall 
+
+Figure 19: Sweeping: Achieved recalls for varying selectivity (Positive Correlation, 𝑘 = 100 , 𝑅 𝑡 = 0.9). 0.00 0.25 0.50 0.75 Selectivity 0.80 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.80 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.60 0.80 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.80 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.80 1.00 Avg. Recall 
+
+Figure 20: ACORN: Achieved recalls for varying selectivity (Positive Correlation, 𝑘 = 100 , 𝑅 𝑡 = 0.9). 0.80 0.85 0.90 0.95             
+
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall
+
+Figure 21: Sweeping: Achieved recalls for varying recall target (Positive Correlation, 𝑘 = 100 , 𝑠𝑒𝑙 = 0.3). 0.80 0.85 0.90 0.95             
+
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.60 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall
+
+Figure 22: ACORN: Achieved recalls for varying recall target (Positive Correlation, 𝑘 = 100 , 𝑠𝑒𝑙 = 0.3). 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 
+
+Figure 23: Sweeping: Achieved recalls for varying value of 𝑘 (Positive Correlation, 𝑅 𝑡 = 0.9, 𝑠𝑒𝑙 = 0.3). 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 
+
+Figure 24: ACORN: Achieved recalls for varying value of 𝑘 (Positive Correlation, 𝑅 𝑡 = 0.9, 𝑠𝑒𝑙 = 0.3). 
+
+the same range. Performance stabilizes at approximately 10K train-ing queries, achieving 𝑀𝐴𝐸 = 0.045 for Sweeping and 𝑀𝐴𝐸 = 0.037 for ACORN. The required training time, shown in Figure 31(b), in-cluding both training data generation and GBDT model training, remains low, ranging from 0.02 to 13 minutes for Sweeping and from 0.04 to 23 minutes for ACORN. Using 10K training queries, the total training time is only 1.8 minutes for Sweeping and 3.2 min-utes for ACORN. Although larger training sets provide marginal improvements in recall prediction accuracy, we adopt 10K training queries for the remainder of the evaluation in order to maintain consistency with the rest of our experiments. Our training setup combines 500 query vectors with three correlation settings (no, pos-itive, and negative correlation) and seven selectivities (0.01, 0.1, 0.2, 0.5, 0.7, 0.9, and 1.0), resulting in approximately 10.5K filtered train-ing queries. Therefore, using 10K CASELAW7M training queries provides a comparable amount of training data. The CASELAW7M predictor is deployed using the same VADER configuration as in the previous experiments, including the proposed asymmetric loss function. We also evaluate VADER across varying recall targets on CASELAW7M, in Figure 31(c), for both Sweeping and ACORN. In both algorithms, the achieved recall among all queries of the workload closely matches the corresponding target, confirming that the approach generalizes effectively to real-world filtered vector search workloads. Regarding individual query recall distributions, and across all recall targets, Sweeping achieves an 𝑅𝑄𝑈𝑇 = 0.27, while the deviation of queries from the recall target, both with recalls above and below the target, is approximately 0.07. ACORN results achieve an 𝑅𝑄𝑈𝑇 = 0.17, with queries deviating from the recall target by approximately 0.05 across all recall targets. The individual query recall distributions for both Sweeping and ACORN are presented in Figures 31(c) and (d) respectively, for 𝑅 𝑡 = 0.9. 
+
+4.2.11 VADER for Filtered-ScaNN. We now evaluate the VADER in-tegration with Filtered-ScaNN [2], the IVF-based [22] filter-agnostic 
+
+> 13
+
+REM-Unfiltered REM-Filtered DARTH VADER Ideal SIFT1M GIST1M GLOVE1M DEEP10M T2I10M 0.0 0.5 1.0 Selectivity 0.50 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.50 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.50 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.00 0.50 1.00 Avg. Recall 0.00 0.25 0.50 0.75 Selectivity 0.50 0.75 1.00 Avg. Recall 
+
+Figure 25: Sweeping: Achieved recalls for varying selectivity (Negative Correlation, 𝑘 = 100 , 𝑅 𝑡 = 0.9). 0.25 0.50 0.75 Selectivity 0.60 0.80 1.00 Avg. Recall 0.25 0.50 0.75 Selectivity 0.80 1.00 Avg. Recall 0.4 0.6 0.8 Selectivity 0.60 0.80 1.00 Avg. Recall 0.25 0.50 0.75 Selectivity 0.50 0.75 1.00 Avg. Recall 0.4 0.6 0.8 Selectivity 0.60 0.80 1.00 Avg. Recall 
+
+Figure 26: ACORN: Achieved recalls for varying selectivity (Negative Correlation, 𝑘 = 100 , 𝑅 𝑡 = 0.9). 0.80 0.85 0.90 0.95             
+
+> Rt
+> 0.50 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.60 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.50 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.50 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall
+
+Figure 27: Sweeping: Achieved recalls for varying recall target (Negative Correlation, 𝑘 = 100 , 𝑠𝑒𝑙 = 0.3). 0.80 0.85 0.90 0.95             
+
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.50 0.75 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.60 0.80 1.00 Avg. Recall 0.80 0.85 0.90 0.95
+> Rt
+> 0.50 0.75 1.00 Avg. Recall
+
+Figure 28: ACORN: Achieved recalls for varying recall target (Negative Correlation, 𝑘 = 100 , 𝑠𝑒𝑙 = 0.3). 0 100 200 k0.50 1.00 Avg. Recall 0 100 200 k0.60 0.80 1.00 Avg. Recall 0 100 200 k0.50 0.75 1.00 Avg. Recall 0 100 200 k0.50 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 
+
+Figure 29: Sweeping: Achieved recalls for varying value of 𝑘 (Negative Correlation, 𝑅 𝑡 = 0.9, 𝑠𝑒𝑙 = 0.3). 0 100 200 k0.80 1.00 Avg. Recall 0 100 200 k0.80 1.00 Avg. Recall 25 50 75 100 k0.60 0.80 1.00 Avg. Recall 0 100 200 k0.60 0.80 1.00 Avg. Recall 0 100 200 k0.60 0.80 1.00 Avg. Recall 
+
+Figure 30: ACORN: Achieved recalls for varying value of 𝑘 (Negative Correlation, 𝑅 𝑡 = 0.9, 𝑠𝑒𝑙 = 0.3). 100 1K 10K 80K # Training queries 0.04 0.06 0.08 MAE  Sweeping ACORN 
+
+(a) MAE for Varying train-ing queries 100 1K 10K 80K # Training queries 010 20 
+
+> Train time (m)
+> Sweeping ACORN
+
+(b) Training time for vary-ing training queries 0.80 0.85 0.90 0.95 
+
+> Rt
+> 0.80 0.85 0.90 0.95 1.00 Avg. Recall  Sweeping ACORN
+
+(c) Varying 𝑅 𝑡 0.6 0.8 1.0 Recall 025 50 % queries  Rt 
+
+> avg: 0.93
+
+(d) Recall distr. (Sweeping, 
+
+𝑅 𝑡 = 0.9)0.8 0.9 1.0 Recall 020 40 % queries  Rt
+
+> avg: 0.93
+
+(e) Recall distr. (ACORN, 
+
+𝑅 𝑡 = 0.9)
+
+Figure 31: VADER for the CASELAW7M dataset ( 𝑘 = 100 ). 
+
+FVS algorithm built on ScaNN [31], described in Section 3.4. The training procedure is the same as in the 𝑘 -NN graph case. For the experimental evaluation, we constructed one ScaNN index per dataset using the official ScaNN parameter selection heuristics [30]. This yields 2K partitions for GIST1M, 10K for SIFT1M, 11K for GLOVE1M, and 100K for both DEEP10M and T2I10M, all with single-level IVF clustering. Generating the training data and train-ing the predictor requires approximately 4 minutes for the 1M-scale datasets and 20 minutes for DEEP10M and T2I10M. Figure 32 reports the achieved recall results for varying selec-tivities and recall targets across all datasets at 𝑘 = 100 with no correlation; other configurations are similar. In all cases, VADER manages to achieve a recall very close to the recall target. The only exception is the T2I10M dataset, where VADER achieves recall values above the recall target, though, not very close to it. This minor behavior glitch is attributed to the OOD nature of the dataset, which causes the following behavior. Since the VADER recall pre-diction is done after processing entire leafs, it may happen that the 
+
+> 14
+
+Rt = 0.8 Rt = 0.85 Rt = 0.9 Rt = 0.95 Rt = 0.99 0.0 0.5 1.0 Selectivity 0.80 0.85 0.90 0.95 1.00 Avg. Recall (a) SIFT1M. 0.0 0.5 1.0 Selectivity 0.80 0.85 0.90 0.95 1.00 Avg. Recall (b) GIST1M. 0.0 0.5 1.0 Selectivity 0.80 0.85 0.90 0.95 1.00 Avg. Recall (c) GLOVE1M. 0.0 0.5 1.0 Selectivity 0.80 0.85 0.90 0.95 1.00 Avg. Recall (d) DEEP10M. 0.0 0.5 1.0 Selectivity 0.80 0.85 0.90 0.95 1.00 Avg. Recall (e) T2I10M. 
+
+Figure 32: VADER for Filtered-ScaNN with varying 𝑅𝑡 (𝑘 = 100 , No correlation). 0.8 0.9 1.0 Recall 010 20 30 % queries  Rt
+
+> avg: 0.90
+
+(a) SIFT1M 0.8 0.9 1.0 Recall 010 20 30 % queries  Rt 
+
+> avg: 0.91
+
+(b) GIST1M 0.8 1.0 Recall 020 40 % queries  Rt 
+
+> avg: 0.91
+
+(c) GLOVE1M 0.7 0.8 0.9 1.0 Recall 010 20 30 % queries  Rt 
+
+> avg: 0.90
+
+(d) DEEP10M 0.6 0.8 1.0 Recall 025 50 75 % queries  Rt 
+
+> avg: 0.96
+
+(e) T2I10M 
+
+Figure 33: Recall distr. of VADER for Filtered-ScaNN ( 𝑘 = 100 , No correlation). 
+
+achieved recall before processing the leaf is much lower than the target, while the recall after processing the leaf surpasses the target. Since VADER does not terminate the search while processing the vectors of a leaf, we experience some recall overshooting in this particular dataset, however, VADER still achieves the recall targets. Overall, across all of our datasets and recall targets, VADER always achieves recall very close to the target, achieving on average 
+
+𝑅𝑄𝑈𝑇 = 0.16, while the deviation of individual query recalls from the target (including the queries above and below the target recall) is only 0.05, similar to the results of the k-NN graphs, with the individual query recall distributions presented in Figure 33 for all datasets. 
+
+5 CONCLUSIONS 
+
+We presented VADER, the first declarative recall approach for fil-tered approximate vector search. VADER employs a filter-aware recall predictor that adaptively estimates per-query recall during execution and terminates the search once the specified target is reached. Extensive experiments across diverse datasets and work-loads show that VADER outperforms existing baselines and repre-sents the state of the art for declarative recall in FVS. 
+
+ACKNOWLEDGMENTS 
+
+Work supported by EU Horizon project DataGEMS (101188416). Manos Chatzakis is supported with a PhD Scholarship from the Onassis Foundation. 
+
+REFERENCES 
+
+[1] 2024. pgvector. github.com/pgvector/pgvector. [2] 2025. A Deep Dive into AlloyDB’s Vector Search Enhancements. https://cloud.google.com/blog/products/databases/alloydb-ais-scann-index-improves-search-on-all-kinds-of-data. [3] Martin Aumüller, Erik Bernhardsson, and Alexander Faithfull. 2020. ANN-Benchmarks: A benchmarking tool for approximate nearest neighbor algorithms. 
+
+Information Systems (2020). [4] Ilias Azizi, Karima Echihabi, and Themis Palpanas. 2025. Graph-based vector search: An experimental evaluation of the state-of-the-art. Proceedings of the ACM on Management of Data 3, 1 (2025), 1–31. [5] Artem Babenko and Victor Lempitsky. 2016. Efficient indexing of billion-scale datasets of deep descriptors. In CVPR .[6] Jacob Benesty, Jingdong Chen, Yiteng Huang, and Israel Cohen. 2009. Pearson correlation coefficient. In Noise reduction in speech processing . Springer, 1–4. [7] big-ann benchmarks. 2025. Caselaw Dataset. https://github.com/harsha-simhadri/big-ann-benchmarks/blob/main/dataset_preparation/caselaw_ dataset.md. [8] Francesco Busolin, Claudio Lucchese, Franco Maria Nardini, Salvatore Orlando, Raffaele Perego, and Salvatore Trani. 2024. Early exit strategies for approximate k-NN search in dense retrieval. In CIKM .[9] Alessandro Camerra, Themis Palpanas, Jin Shieh, and Eamonn Keogh. 2010. isax 2.0: Indexing and mining one billion time series. In ICDM .[10] Miriam Cha, Youngjune Gwon, and HT Kung. 2017. Language modeling by clustering with word embeddings for text readability assessment. In CIKM .[11] Manos Chatzakis, Francesca Del Gaudio, Sophia Sideri, and Themis Palpanas. 2026. The Quest for Faster ANN Vector Search. In EDBT .[12] Manos Chatzakis, Panagiota Fatourou, Eleftherios Kosmas, Themis Palpanas, and Botao Peng. 2023. Odyssey: A Journey in the Land of Distributed Data Series Similarity Search. 16, 5 (2023), 1140–1153. [13] Manos Chatzakis, Panagiota Fatourou, Eleftherios Kosmas, Themis Palpanas, and Botao Peng. 2026. Distributed Data Series Similarity Search with Odyssey+. (July 2026). https://hal.science/hal-05704980 [14] Manos Chatzakis, Michalis Mountantonakis, and Yannis Tzitzikas. 2021. RDFSIM: similarity-based browsing over dbpedia using embeddings. Information (2021). [15] Manos Chatzakis, Yannis Papakonstantinou, and Themis Palpanas. 2025. DARTH: Declarative Recall Through Early Termination for Approximate Nearest Neighbor Search. SIGMOD (2025). [16] Manos Chatzakis, Yannis Papakonstantinou, and Themis Palpanas. 2026. DARTH+: Approximate Nearest Neighbor Search with Declarative Recall and Quality Guarantees. (2026). https://hal.science/hal-05566027 [17] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li, Mao Yang, and Jingdong Wang. 2021. Spann: Highly-efficient billion-scale approximate nearest neighborhood search. NeurIPS (2021). [18] Rihan Chen, Bin Liu, Han Zhu, Yaoxuan Wang, Qi Li, Buting Ma, Qingbo Hua, Jun Jiang, Yunlong Xu, Hongbo Deng, et al. 2022. Approximate nearest neighbor search under neural similarity metric for large-scale recommendation. In CIKM .[19] Yannis Chronis, Helena Caminal, Yannis Papakonstantinou, Fatma Özcan, and Anastasia Ailamaki. 2025. Filtered vector search: State-of-the-art and research opportunities. PVLDB (2025). [20] Samuel Daulton, Maximilian Balandat, and Eytan Bakshy. 2020. Differentiable expected hypervolume improvement for parallel multi-objective Bayesian opti-mization. NeurIPS (2020). [21] Francesca Del Gaudio, Manos Chatzakis, Gayathiri Ravendirane, Botao Peng, and Themis Palpanas. 2026. DaiSy: A Library for Scalable Data Series Similarity Search. SIGMOD Record (2026). [22] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. 2024. The faiss library. Trans. Big Data (2024). [23] Karima Echihabi, Theophanis Tsandilas, Anna Gogolou, Anastasia Bezerianos, and Themis Palpanas. [n.d.]. ProS: data series progressive k-NN similarity search and classification with probabilistic quality guarantees. VLDBJ ([n. d.]). 
+
+> 15
+
+[24] Karima Echihabi, Kostas Zoumpatianos, Themis Palpanas, and Houda Benbrahim. 2018. The lernaean hydra of data series similarity search: an experimental evaluation of the state of the art. Proc. VLDB Endow. 12, 2 (2018), 112–127. https://doi.org/10.14778/3282495.3282498 [25] Karima Echihabi, Kostas Zoumpatianos, Themis Palpanas, and Houda Benbrahim. 2019. Return of the Lernaean Hydra: experimental evaluation of data series approximate similarity search. Proc. VLDB Endow. 13, 3 (2019), 403–420. https: //doi.org/10.14778/3368289.3368303 [26] Hakan Ferhatosmanoglu, Ertem Tuncel, Divyakant Agrawal, and Amr El Abbadi. 2001. Approximate nearest neighbor searching in multimedia databases. In 
+
+ICDE .[27] Jerome H Friedman. 2002. Stochastic gradient boosting. CMStatistics (2002). [28] Anna Gogolou, Theophanis Tsandilas, Themis Palpanas, and Anastasia Bezeri-anos. 2019. Progressive similarity search on time series data. In BigVis .[29] Google Cloud. 2025. Filtered Vector Search in AlloyDB for PostgreSQL: Overview. https://docs.cloud.google.com/alloydb/docs/ai/filtered-vector-search-overview. [30] Google Cloud. 2026. Tune Vector Query Performance in AlloyDB for PostgreSQL. https://docs.cloud.google.com/alloydb/docs/ai/tune-indexes?resource=scann. [31] Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern, and Sanjiv Kumar. 2020. Accelerating large-scale inference with anisotropic vector quantization. In ICML .[32] Sonia Horchidan, Fabian Zeiher, Henrik Boström, and Paris Carbone. 2025. Co-nANN: Conformal Approximate Nearest Neighbor Search. PVLDB (2025). [33] Jui-Ting Huang, Ashish Sharma, Shuying Sun, Li Xia, David Zhang, Philip Pronin, Janani Padmanabhan, Giuseppe Ottaviano, and Linjun Yang. 2020. Embedding-based retrieval in facebook search. In SIGKDD .[34] Suhas Jayaram Subramanya, Fnu Devvrit, Harsha Vardhan Simhadri, Ravishankar Krishnawamy, and Rohan Kadekodi. 2019. Diskann: Fast accurate billion-point nearest neighbor search on a single node. Advances in neural information pro-cessing Systems 32 (2019). [35] Herve Jegou, Matthijs Douze, and Cordelia Schmid. 2010. Product quantization for nearest neighbor search. PAMI (2010). [36] Hervé Jégou, Romain Tavenard, Matthijs Douze, and Laurent Amsaleg. 2011. Searching in one billion vectors: re-rank with source coding. In ICASSP .[37] Guolin Ke, Qi Meng, Thomas Finley, Taifeng Wang, Wei Chen, Weidong Ma, Qiwei Ye, and Tie-Yan Liu. 2017. Lightgbm: A highly efficient gradient boosting decision tree. NeurIPS (2017). [38] Mi-Young Kim, Juliano Rabelo, Kingsley Okeke, and Randy Goebel. 2022. Legal information retrieval and entailment based on bm25, transformer and semantic thesaurus methods. RSOC (2022). [39] Viktor Leis, Andrey Gubichev, Atanas Mirchev, Peter Boncz, Alfons Kemper, and Thomas Neumann. 2015. How good are query optimizers, really? Proceedings of the VLDB Endowment 9, 3 (2015), 204–215. [40] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rock-täschel, et al. 2020. Retrieval-augmented generation for knowledge-intensive nlp tasks. NeurIPS (2020). [41] Conglong Li, Minjia Zhang, David G Andersen, and Yuxiong He. 2020. Improving approximate nearest neighbor search through learned adaptive early termination. In SIGMOD .[42] Zhaoheng Li, Silu Huang, Wei Ding, Yongjoo Park, and Jianjun Chen. 2025. Sieve: Effective filtered vector search with collection of indexes. PVLDB (2025). [43] Duo Lu, Helena Caminal, Manos Chatzakis, Yannis Papakonstantinou, Yannis Chronis, Vaibhav Jain, and Fatma Özcan. 2026. An In-Depth Study of Filter-Agnostic Vector Search on a PostgreSQL Database System:[Experiments and Analysis]. SIGMOD (2026). [44] Yu A Malkov and Dmitry A Yashunin. 2018. Efficient and robust approximate nearest neighbor search using hierarchical navigable small world graphs. PAMI 
+
+(2018). [45] Milvus Documentation. 2024. Filtered Search. https://milvus.io/docs/filtered-search.md. [46] Jason Mohoney, Devesh Sarda, Mengze Tang, Shihabur Rahman Chowdhury, Anil Pacaci, Ihab F. Ilyas, Theodoros Rekatsinas, and Shivaram Venkataraman. 2025. Quake: adaptive indexing for vector search. In OSDI .[47] nmslib. 2026. hnswlib: Header-only C++/Python Library for Fast Approximate Nearest Neighbors. https://github.com/nmslib/hnswlib. GitHub repository, accessed 2026-08-01. [48] Themis Palpanas. 2019. Evolution of a data series index: The isax family of data series indexes: isax, isax2. 0, isax2+, ads, ads+, ads-full, paris, paris+, messi, dpisax, ulisse, coconut-trie/tree, coconut-lsm. In International Workshop on Information Search, Integration, and Personalization . Springer, 68–83. [49] Liana Patel, Peter Kraft, Carlos Guestrin, and Matei Zaharia. 2024. Acorn: Per-formant and predicate-agnostic search over vector embeddings and structured data. SIGMOD (2024). [50] Jeffrey Pennington, Richard Socher, and Christopher D Manning. 2014. Glove: Global vectors for word representation. In EMNLP .[51] Pinecone. 2023. The Missing WHERE Clause in Vector Search. https://www.pinecone.io/learn/vector-search-filtering/. [52] Viktor Sanca, Manos Chatzakis, and Anastasia Ailamaki. 2024. Optimizing Context-Enhanced Relational Joins. (2024). [53] Gaurav Sehgal and Semih Salihoglu. 2025. NaviX: A Native Vector Index Design for Graph DBMSs With Robust Predicate-Agnostic Search Performance. PVLDB 
+
+(2025). [54] Min Shi, Jianxun Liu, Dong Zhou, Mingdong Tang, and Buqing Cao. 2017. WE-LDA: a word embeddings augmented LDA model for web services clustering. In 
+
+ICWS .[55] Harsha Vardhan Simhadri, George Williams, Martin Aumüller, Matthijs Douze, Artem Babenko, Dmitry Baranchuk, Qi Chen, Lucas Hosseini, Ravishankar Kr-ishnaswamny, Gopal Srinivasa, et al. 2022. Results of the NeurIPS’21 challenge on billion-scale approximate nearest neighbor search. In NeurIPS 2021 Comp. and Demo Track .[56] Justin JongSu Song, Wookey Lee, and Jafar Afshar. 2019. An effective high recall retrieval method. Data & Knowledge Engineering (2019). [57] Tommaso Teofili and Jimmy Lin. 2025. Patience in proximity: a simple early ter-mination strategy for HNSW graph traversal in approximate K-nearest neighbor search. In ECIR . Springer. [58] Zeyu Wang, Manos Chatzakis, Qitong Wang, Themis Palpanas, Peng Wang, and Wei Wang. 2026. ANNiE: A Learned Query Cost Estimator for Graph-Based Approximate Nearest Neighbor Search. Proceedings of the VLDB Endowment 19, 11 (2026), 3820–3833. [59] Weaviate Documentation. 2024. Filtering in Weaviate. https://docs.weaviate.io/weaviate/concepts/filtering. [60] Eugene Yang. 2024. Contextualization with SPLADE for high recall retrieval. In 
+
+SIGIR .[61] Tiannuo Yang, Wen Hu, Wangqi Peng, Yusen Li, Jianguo Li, Gang Wang, and Xiaoguang Liu. 2024. VDTuner: Automated Performance Tuning for Vector Data Management Systems. ICDE (2024). [62] Chao Zhang and Renée J Miller. 2025. Distribution-Aware Exploration for Adap-tive HNSW Search. PACMMOD (2025). [63] Zili Zhang, Chao Jin, Linpeng Tang, Xuanzhe Liu, and Xin Jin. 2023. Fast, approximate vector queries on very large unstructured datasets. In NSDI 23 .
