@@ -1,6 +1,9 @@
 * <a class="dpr-sidebar-root-link" href="#/">首页</a>
 * <a class="dpr-sidebar-root-link dpr-sidebar-noactive-link" href="javascript:void(0)" data-dpr-hash="#/tutorial/README">使用教程</a>
 * Daily Papers
+  * 2026-10-03 <!--dpr-date:20261003-->
+    * 精读区
+      * <a class="dpr-sidebar-item-link dpr-sidebar-item-structured" href="#/202610/03/2609.36359v1-better-nearest-neighbor-graph-indices-via-efficient-llm-guided-pruning" data-sidebar-item="{&quot;title&quot;: &quot;Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning&quot;, &quot;link&quot;: &quot;https://arxiv.org/abs/2609.36359v1-better-nearest-neighbor-graph-indices-via-efficient-llm-guided-pruning&quot;, &quot;score&quot;: &quot;9.0&quot;, &quot;tags&quot;: [{&quot;kind&quot;: &quot;query&quot;, &quot;label&quot;: &quot;ann-graph&quot;}], &quot;evidence&quot;: &quot;基于图的近似最近邻搜索索引构建&quot;}">Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning</a>
   * 2026-10-02 <!--dpr-date:20261002-->
     * 精读区
       * <a class="dpr-sidebar-item-link dpr-sidebar-item-structured" href="#/202610/02/2609.36359v1-better-nearest-neighbor-graph-indices-via-efficient-llm-guided-pruning" data-sidebar-item="{&quot;title&quot;: &quot;Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning&quot;, &quot;link&quot;: &quot;https://arxiv.org/abs/2609.36359v1-better-nearest-neighbor-graph-indices-via-efficient-llm-guided-pruning&quot;, &quot;score&quot;: &quot;9.0&quot;, &quot;tags&quot;: [{&quot;kind&quot;: &quot;query&quot;, &quot;label&quot;: &quot;ann-graph&quot;}], &quot;evidence&quot;: &quot;基于LLM引导剪枝的图近似最近邻索引构建&quot;}">Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning</a>

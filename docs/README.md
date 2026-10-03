@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-10-02</span>
+      <span class="dpr-home-dashboard-kicker">2026-10-03</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 2 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 1 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>2</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>1</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>0</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-10-02 22:56:58 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-10-03 22:38:05 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,9 +69,9 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>10月2日精读两篇向量检索论文：LLM 引导剪枝优化近邻图索引（9.0分）与带声明式召回率的过滤向量搜索 VADER（8.0分）。</p>
-<p>值得关注的是大模型开始介入索引构建这一底层环节，以及过滤检索中&quot;召回率可声明&quot;这一实用性方向。</p>
-<p>普通读者可先看 VADER 了解过滤搜索的落地思路，再顺着 LLM 剪枝那篇思考索引优化的新可能。</p>
+<p>今日精读 1 篇、速读 0 篇，聚焦一篇 9.0 分的高分工作：用（高效的）LLM 引导剪枝来改进最近邻图索引。</p>
+<p>最值得看的方向是「LLM 引导剪枝」这一思路——把大模型引入近邻图索引的构建/剪枝环节，属于向量检索与 LLM 的交叉点，对关注 ANN 索引质量的读者有参考价值。</p>
+<p>普通读者可先读摘要与实验部分，重点确认它在索引构建开销与检索精度之间如何取舍，再判断是否值得跟进复现。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -80,12 +80,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">2 篇</strong>
+    <strong class="dpr-home-dashboard-count">1 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning">Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning</span></li><li><span class="dpr-home-dashboard-paper-title" title="VADER: Filtered Vector Search with Declarative Recall">VADER: Filtered Vector Search with Declarative Recall</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning">Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
