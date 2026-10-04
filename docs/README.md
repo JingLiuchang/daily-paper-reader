@@ -48,7 +48,7 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-10-03</span>
+      <span class="dpr-home-dashboard-kicker">2026-10-04</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
     <strong class="dpr-home-dashboard-count">共 1 篇</strong>
@@ -58,7 +58,7 @@
     <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>1</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>0</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-10-03 22:38:05 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-10-04 22:11:33 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,9 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日精读 1 篇、速读 0 篇，聚焦一篇 9.0 分的高分工作：用（高效的）LLM 引导剪枝来改进最近邻图索引。</p>
-<p>最值得看的方向是「LLM 引导剪枝」这一思路——把大模型引入近邻图索引的构建/剪枝环节，属于向量检索与 LLM 的交叉点，对关注 ANN 索引质量的读者有参考价值。</p>
-<p>普通读者可先读摘要与实验部分，重点确认它在索引构建开销与检索精度之间如何取舍，再判断是否值得跟进复现。</p>
+<p>今日精读1篇9.0分论文，聚焦用LLM引导剪枝来优化近邻图索引。最值得关注的是LLM如何高效介入图索引剪枝，兼顾索引质量与构建效率。普通读者可先了解近邻图索引的基本原理，再跟进该方向的后续实验与开源实现。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
