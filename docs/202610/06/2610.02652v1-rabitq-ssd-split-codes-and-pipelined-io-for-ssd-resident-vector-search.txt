@@ -1,0 +1,3024 @@
+RaBitQ-SSD: Split Codes and Pipelined I/O for SSD-Resident
+Vector Search
+Yuexuan Xu
+Nanyang Technological
+University, Singapore
+yuexuan001@e.ntu.edu.sg
+Jianyang Gao
+ETH Zurich
+Zurich, Switzerland
+jianyang.gao@inf.ethz.ch
+Michael Norris
+Meta
+Menlo Park, United States
+mnorris@meta.com
+Alibek Zhakubayev
+Meta
+Menlo Park, United States
+alibek@meta.com
+Pankaj Singh
+Meta
+Bellevue, United States
+pankajsingh@meta.com
+Junjie Qi
+Meta
+Bellevue, United States
+jqi@meta.com
+Matthijs Douze
+Meta
+Paris, France
+matthijs@meta.com
+Cheng Long
+Nanyang Technological
+University, Singapore
+c.long@ntu.edu.sg
+Abstract
+SSD-resident approximate nearest-neighbor search is essential
+when vector collections exceed DRAM capacity. The challenge is
+to reduce SSD reads and hide I/O latency through concurrent reads
+and overlap with computation. However, for graph-based search,
+progressive candidate discovery limits advance I/O planning while
+IVF search reads inverted lists in full, incurring unnecessary SSD
+reads. In this paper, we present RaBitQ-SSD, an extension of IVF-
+RaBitQ for SSD-resident vector search. Specifically, we propose
+Split-RaBitQ, which retains a configurable prefix of each binary
+code in DRAM, allowing in-memory code storage below one bit per
+dimension. Using this partial representation, it provides an unbi-
+ased distance estimator with a probabilistic error bound. Once the
+in-memory coarse quantizer identifies candidate lists, this bound
+supports pruning individual candidates within them, enabling finer-
+grained SSD access. We also design an asynchronous search pipeline
+that coordinates candidate pruning with SSD read scheduling to
+reduce unnecessary reads while overlapping I/O with computation.
+On datasets ranging from 5 million to 1 billion vectors, RaBitQ-SSD
+delivers up to 1.74× the throughput of graph-based baselines at
+90% recall, while reducing SSD page reads by up to 3.8×. Its on-
+SSD indexes are up to 7.0× smaller and 10.0× faster to build than
+DiskANN. We also build and search an index of 10 billion vectors
+on a single machine with one SSD, achieving over 3,000 queries per
+second at 90% recall.
+1
+Introduction
+Modern embedding models represent unstructured data, such as
+images and text, as high-dimensional vectors, typically with hun-
+dreds to thousands of dimensions. Approximate nearest-neighbor
+(ANN) search retrieves vectors close to a query without exhaus-
+tively scanning the collection and underlies applications such as
+semantic search, recommendation, and retrieval-augmented gener-
+ation [32, 43]. As collections grow, however, the vectors themselves
+can exceed the memory capacity of a single machine: one billion
+1024-dimensional vectors in FP32 already occupy 4 TB. Flash stor-
+age provides a natural storage tier for such collections: modern
+flash-based SSDs offer roughly 10–50× lower cost per byte than
+DRAM and a single PCIe 4.0 NVMe SSD can deliver over one mil-
+lion random-read IOPS [25]. Consequently, storing the vectors on
+SSD while keeping compressed representations in memory has
+100k
+1M
+10M
+100M
+1B
+10B
+Number of vectors (in-memory index in GB)
+0
+5k
+10k
+15k
+Queries per second
+(0.0055) (0.0545)
+(0.545)
+(5.45)
+(54.5)
+(545)
+10−7
+10−6
+10−5
+10−4
+10−3
+10−2
+SSD read fraction
+Recall 0.90
+Recall 0.95
+Throughput
+Read fraction
+Figure 1: RaBitQ-SSD scales from 100 thousand to 10 billion
+DINO vectors (1, 024 dimensions) on one server with one SSD.
+Solid lines show throughput for a given recall target (left
+axis); dashed lines show the fraction of the on-SSD data that
+is read to perform the search (right axis, log scale): at 10B
+scale it is less than one millionth.
+become a practical and cost-effective design for billion-scale ANN
+search [9, 22, 53, 63].
+DiskANN [53] established a widely adopted graph-based design
+for SSD-based ANN search in which compact quantized codes in
+DRAM guide the search while the graph and full-precision vectors
+reside on SSD. Its synchronous beam search batches reads to exploit
+device parallelism, but each search round waits for those reads to
+complete before the next round, limiting I/O–computation overlap.
+Starling [63] reduces SSD I/O through locality-aware graph reorder-
+ing and shorter traversal paths. However, as vector dimensionality
+grows and vertex records become larger, fewer related vertices can
+be co-located within the same SSD block. PipeANN [22] breaks the
+strict compute–I/O ordering of conventional beam search by spec-
+ulatively issuing reads while computation proceeds. However, later
+I/O completions may reveal better candidates, making some specu-
+lative reads unnecessary. Subsequent work further optimizes disk
+layouts and caching [30, 34, 42, 75], the placement of compressed
+codes [44, 54, 73], distance computation [10], and I/O–computation
+scheduling [31]. Despite these optimizations, graph methods with
+SSD-resident adjacency lists retain a structural constraint: candi-
+dates are discovered progressively as the traversal proceeds. Ex-
+panding an uncached vertex requires accessing its on-disk record
+1
+arXiv:2610.02652v1  [cs.DB]  2 Oct 2026
+
+
+to obtain its neighbors for subsequent exploration. This causality
+limits how far SSD accesses can be planned ahead of time.
+On the other hand, IVF-based indexes organize vectors into
+inverted lists, avoiding the cost of building and storing a proximity
+graph over the full collection. An in-memory coarse index identifies
+candidate lists before accessing their SSD-resident contents. Among
+these methods, SPANN [9] uses query-aware pruning to select
+inverted lists, while HELMSMAN [27] learns how many lists to
+probe. Both read the selected lists in full from SSD.
+This motivates finer-grained I/O pruning within probed inverted
+lists. If an in-memory representation provides distance estimates
+with lower bounds for each vector, the bounds can help rule out
+vectors that cannot improve the current 𝑘NN result before fetching
+their SSD-resident data. The in-memory IVF-RaBitQ [16, 17, 59]
+supports such error-bounded pruning by maintaining two repre-
+sentations of each vector. It scans a compact 𝐷-bit RaBitQ code
+to estimate distances and prune candidates, and accesses a higher-
+precision representation only for the surviving candidates, where
+𝐷denotes the vector dimensionality. This separation naturally sug-
+gests an SSD-based extension: retain the compact codes in DRAM
+for pruning and place the higher-precision representations on SSD
+for re-ranking, but this exposes two challenges. First, this direct
+extension retains the full binary code and cannot accommodate
+memory budgets below one bit per dimension that is necessary on
+billion scale datasets, e.g., for 10 billion 1024-dimensional vectors,
+the binary codes alone require about 1.28TB of DRAM. Second, the
+in-memory pruning needs careful coordination with I/O pipelining
+so as to reduce unnecessary reads and enable I/O–computation
+overlap, e.g., fetching the candidates surviving the pruning individ-
+ually wastes page bandwidth, issuing pages too early can read data
+that later pruning would eliminate, etc.
+In this paper, we present RaBitQ-SSD, an SSD-based extension of
+in-memory IVF-RaBitQ that addresses these two challenges. First,
+we propose Split-RaBitQ (§3), which keeps only a prefix of 𝐷𝑚≤𝐷
+bits of each binary code in memory. Therefore, the memory con-
+sumption is configurable by setting 𝐷𝑚. We derive an unbiased
+distance estimator and a corresponding error bound from the prefix
+alone, enabling error-bounded pruning. Second, we develop an asyn-
+chronous SSD search pipeline that reduces SSD reads while overlap-
+ping I/O with computation. The pipeline coalesces surviving can-
+didates at page granularity and issues page reads asynchronously
+under a bounded in-flight I/O budget. It prioritizes more promising
+pages and re-evaluates them against the latest distance threshold
+before issuance, allowing updated search results to eliminate many
+unnecessary SSD reads without sacrificing I/O concurrency.
+In summary, we make the following contributions.
+• We propose Split-RaBitQ (§3), which keeps a configurable
+prefix of each RaBitQ binary code in DRAM. We derive
+an unbiased distance estimator and a probabilistic error
+bound from the prefix, enabling candidate pruning with an
+in-memory code footprint below one bit per dimension.
+• We design an asynchronous search pipeline (§4) that
+reduces unnecessary SSD I/O while sustaining I/O–
+computation overlap.
+• We conduct an extensive evaluation of RaBitQ-SSD (§5) on
+six datasets ranging from 5M to 1B vectors and 512–1536
+dimensions, comparing against strong baselines. We further
+evaluate scalability from 100 thousand to 10 billion DINO
+vectors on a single server with one SSD (Figure 1).
+RaBitQ-SSD is open-sourced at https://github.com/VectorDB-
+NTU/RaBitQ-SSD.
+2
+Preliminaries
+2.1
+ANN Search and IVF
+Let X ⊂R𝐷be a collection of 𝑁data vectors, and let 𝑞𝑟∈R𝐷
+be a query vector. Given a distance function, a 𝑘-nearest-neighbor
+(𝑘NN) query asks for the 𝑘vectors in X closest to 𝑞𝑟. In large-scale
+vector search, this query is typically answered approximately and
+thus is called approximate nearest neighbor (ANN) query: an ANN
+algorithm returns a set R of 𝑘vectors, whose accuracy is measured
+by recall@𝑘= |R ∩G|/𝑘, where G denotes the exact 𝑘NN set.
+The inverted file (IVF) [28] is a classical partitioning-based ANN
+index that underlies many widely deployed vector search sys-
+tems [11, 61, 65]. At build time, the dataset is partitioned into 𝑛list
+clusters, typically by 𝑘-means. The centroids 𝑐1, . . . ,𝑐𝑛list serve as a
+coarse quantizer, each vector being assigned to its nearest centroid,
+and the vectors assigned to 𝑐𝑖form the inverted list 𝐿𝑖. At query
+time, IVF scans the 𝑛probe lists whose centroids are closest to 𝑞𝑟, in
+ascending order of centroid distance; the parameter 𝑛probe controls
+the accuracy–efficiency trade-off. Though IVF narrows the search
+to the probed lists, scanning a list still requires estimating the dis-
+tance from 𝑞𝑟to every vector in it, so fast distance estimation with
+a small memory footprint is crucial. It can be achieved through
+vector quantization such as RaBitQ [16, 17], which we review next.
+2.2
+RaBitQ and Its Error Bound
+RaBitQ [17] quantizes a vector relative to a center vector, for which
+the cluster centroid is the natural choice. RaBitQ’s notation is used
+throughout: for a raw data vector𝑜𝑟assigned to centroid𝑐and a raw
+query𝑞𝑟,𝑜:= (𝑜𝑟−𝑐)/∥𝑜𝑟−𝑐∥and𝑞:= (𝑞𝑟−𝑐)/∥𝑞𝑟−𝑐∥are the unit
+residuals. The distance metric is 𝑑(𝑞𝑟,𝑜𝑟) = ∥𝑜𝑟−𝑞𝑟∥2. Expanding
+either around 𝑐yields 𝑑(𝑞𝑟,𝑜𝑟) = −2 ∥𝑜𝑟−𝑐∥∥𝑞𝑟−𝑐∥⟨𝑜,𝑞⟩+ 𝐾. 𝐾
+groups the terms precomputed per vector or computed once per
+probed cluster [17]. Therefore the per-vector computation reduces
+to estimating the inner product between two unit vectors ⟨𝑜,𝑞⟩,
+and RaBitQ focuses on quantizing unit vectors. This decomposition
+works similarly when the nearest neighbor search in L2 space is
+replaced by maximum inner product search.
+The codebook of RaBitQ is the set of 2𝐷vectors {±1/
+√
+𝐷}𝐷
+rotated by a random orthogonal matrix 𝑃, sampled once per in-
+dex. The quantized vector of 𝑜is the nearest codeword ¯𝑜:= 𝑃¯𝑥,
+¯𝑥∈{±1/
+√
+𝐷}𝐷; since ⟨𝑜, 𝑃¯𝑥⟩= ⟨𝑃−1𝑜, ¯𝑥⟩, ¯𝑥takes the signs of the
+coordinates of the rotated vector 𝑃−1𝑜, stored as the 𝐷-bit binary
+code ¯𝑥𝑏∈{0, 1}𝐷with ¯𝑥= (2¯𝑥𝑏−1)/
+√
+𝐷.
+RaBitQ estimates 𝛽= ⟨𝑜,𝑞⟩≈b𝛽𝐷= ⟨¯𝑜,𝑞⟩/⟨¯𝑜,𝑜⟩, where ⟨¯𝑜,𝑜⟩is
+a per-vector scalar precomputed at indexing time as follows [17].
+⟨¯𝑜,𝑜⟩= ⟨¯𝑥, 𝑃−1𝑜⟩=
+1
+√
+𝐷
+𝐷
+∑︁
+𝑖=1
+(𝑃−1𝑜)[𝑖]
+
+(1)
+2
+
+
+Lemma 2.1 (Theorem 3.2 of [17]). b𝛽𝐷= ⟨¯𝑜,𝑞⟩/⟨¯𝑜,𝑜⟩is an unbi-
+ased estimator of 𝛽= ⟨𝑜,𝑞⟩, and
+Pr
+( 𝛽−b𝛽𝐷
+ >
+√︄
+1 −⟨¯𝑜,𝑜⟩2
+⟨¯𝑜,𝑜⟩2
+·
+𝜖0
+√
+𝐷−1
+)
+≤2𝑒−𝑐0𝜖2
+0,
+where 𝜖0 is a parameter that controls the failure probability and 𝑐0 is
+a constant.
+Lemma 2.1 gives a confidence interval for ⟨𝑜,𝑞⟩: the estimate plus
+or minus the error bound above. Since the coefficient of ⟨𝑜,𝑞⟩in
+𝑑(𝑞𝑟,𝑜𝑟) is negative, substituting the upper endpoint of its con-
+fidence interval yields a lower bound LB(𝑞𝑟,𝑜𝑟) on the distance
+that holds with probability at least 1 −2𝑒−𝑐0𝜖2
+0. The in-memory
+IVF-RaBitQ uses this bound to prune candidates before re-ranking
+(§2.3).
+The numerator of the estimate ⟨¯𝑜,𝑞⟩= ⟨¯𝑥, 𝑃−1𝑞⟩is a sum of 𝐷
+coordinate-wise products that can be stored in a lookup table built
+once per query [17, 59]. The vectors are laid out in batches of 32
+packed codes so that the lookups can be performed from SIMD
+registers, a technique called FastScan [4]. All other terms of the
+estimate and the bound that depend on the data vector are folded
+at indexing time into three per-vector scalars, the factors, stored
+beside the code [59]. For higher accuracy, Extended RaBitQ [16]
+spends 𝐵bits per coordinate: the most significant bit is the sign
+bit above, and the remaining 𝐵−1 bits constitute the ex-code; its
+estimate needs two further factors per vector [16, 59]. The multi-bit
+RaBitQ distance estimation [16] reuses the sign-bit sum and refines
+it with the ex-code part.
+2.3
+In-Memory IVF-RaBitQ and a Naive SSD
+Extension
+The in-memory IVF-RaBitQ [16, 17, 59] integrates Extended Ra-
+BitQ into an in-memory IVF index. Each inverted list stores the
+binary codes of its vectors packed in batches of 32 for FastScan.
+The search maintains KNNSet, the 𝑘candidates with the smallest
+refined distances found so far. The threshold dist𝑘is the largest of
+these distances, or +∞before 𝑘candidates have been collected. In
+a probed list, every batch yields estimates and lower bounds (for
+batches of 32 candidates). Candidates with LB(𝑞𝑟,𝑜𝑟) < dist𝑘are
+re-ranked using their ex-codes and may update KNNSet; all others
+are pruned. No raw vectors are kept; the refined distances are used
+for the final ranking [16].
+The most direct way to port this index to SSD, suggested in [16],
+keeps the binary code and the three factors in memory, and moves
+the ex-codes, with their two re-ranking factors, to SSD. The search
+is unchanged up to re-ranking: when a candidate survives pruning,
+the page holding its ex-code is read from SSD, scanning blocks until
+the read completes, and the candidate is re-ranked. However, this
+naive extension has two problems.
+Problem 1: a rigid memory footprint. The binary code has a
+fixed size, one bit per coordinate, so the in-memory part of the index
+occupies 𝑁𝐷/8 bytes plus the factors, which is over 1TB when 𝑁
+is 10 billion and 𝐷= 1024. In this paper, we present Split-RaBitQ
+(§3), which keeps only a prefix of the binary code in memory, and
+show that the prefix still yields a lower bound for pruning. As a
+result, the size of the in-memory code is configurable by setting the
+length of the prefix.
+Problem 2: blocking I/O. A random SSD read of 4 KB typically
+takes 10s of microseconds. Issuing one read at a time therefore
+completes ∼10k of reads per second, far below the 1M+ 4 KB ran-
+dom reads per second that an SSD can sustain [25]. Reaching this
+throughput requires hundreds of concurrent outstanding requests.
+Instead of blocking on every read in the naive extension, we de-
+velop an asynchronous pipeline (§4) that overlaps I/O with the
+computation of scanning the codes in memory.
+3
+Split-RaBitQ
+Split-RaBitQ, resolves Problem 1 by splitting the binary code be-
+tween memory and SSD: §3.1 gives the design, and §3.2 derives the
+lower bound and its guarantee from RaBitQ’s analysis.
+3.1
+The Code Splitting Design
+Split-RaBitQ keeps RaBitQ’s quantization, and what changes is how
+many bits of the binary code are kept in memory. The first 𝐷𝑚bits
+of the binary code with 𝐷𝑚≤𝐷, referred to as the prefix, stay in
+memory together with the three factors used to compute the lower
+bound in the pruning stage. 𝐷𝑚is fixed at build time according
+to the RAM budget, and the prefix is packed in batches of 32 for
+FastScan (§2.2). The remaining 𝐷𝑠:= 𝐷−𝐷𝑚bits of the binary
+code, the ex-code, and the two re-ranking factors reside on SSD.
+For codeword ¯𝑥, let ¯𝑥𝐷𝑚be ¯𝑥with the remaining 𝐷−𝐷𝑚co-
+ordinates set to zero. Let ¯𝑜𝐷𝑚:= 𝑃¯𝑥𝐷𝑚. Since 𝑃is orthogonal and
+¯𝑥∈{±1/
+√
+𝐷}𝐷, we have ∥¯𝑜𝐷𝑚∥2 = ∥¯𝑥𝐷𝑚∥2 = 𝐷𝑚/𝐷. Split-RaBitQ
+estimates ⟨𝑜,𝑞⟩from the prefix by
+b𝛽𝐷𝑚= 𝐷
+𝐷𝑚
+· ⟨¯𝑜𝐷𝑚,𝑞⟩
+⟨¯𝑜,𝑜⟩
+.
+(2)
+As before, ⟨¯𝑜,𝑜⟩is computed at indexing time when all coordinates
+are available, see Eq. (1). The numerator ⟨¯𝑜𝐷𝑚,𝑞⟩= ⟨¯𝑥𝐷𝑚, 𝑃−1𝑞⟩
+is the inner product ⟨¯𝑜,𝑞⟩of §2.2 restricted to the first 𝐷𝑚coor-
+dinates. The factor 𝐷/𝐷𝑚compensates for the omitted 𝐷−𝐷𝑚
+coordinates (§3.2). As in RaBitQ, the estimate and lower bound use
+three precomputed per-vector factors. For re-ranking, it fetches the
+remaining 𝐷−𝐷𝑚bits of the binary code, the ex-code, and the
+factors from SSD and computes the estimate based on the codes as
+in the original RaBitQ method (§2.2).
+3.2
+A Lower Bound from the Prefix Code
+Let 𝛽:= ⟨𝑜,𝑞⟩. The projection of 𝑞onto 𝑜is 𝛽𝑜, and the remaining
+component 𝑞−𝛽𝑜is perpendicular to 𝑜. For non-collinear 𝑜and
+𝑞, let 𝑒1 be the unit vector along this perpendicular component.
+Then 𝑞= 𝛽𝑜+
+√︁
+1 −𝛽2 𝑒1. For collinear 𝑜and 𝑞, the perpendicular
+component vanishes. Substituting this decomposition into Eq. (2),
+the Split-RaBitQ estimation error becomes
+b𝛽𝐷𝑚−𝛽= 𝛽
+ 𝐷
+𝐷𝑚
+⟨¯𝑜𝐷𝑚,𝑜⟩
+⟨¯𝑜,𝑜⟩
+−1
+
++
+√︁
+1 −𝛽2 𝐷
+𝐷𝑚
+⟨¯𝑜𝐷𝑚,𝑒1⟩
+⟨¯𝑜,𝑜⟩
+.
+(3)
+For the full code (𝐷𝑚= 𝐷), the first term vanishes and the
+remaining term is RaBitQ’s estimation error.
+By Eq. (1), ⟨¯𝑜𝐷𝑚,𝑜⟩/⟨¯𝑜,𝑜⟩is the fraction of the ℓ1 mass of 𝑃−1𝑜
+that lies in the prefix coordinates. By exchangeability of the coordi-
+nates of 𝑃−1𝑜, each coordinate contributes a 1/𝐷share of this mass
+3
+
+
+c3
+c7
+c1
+drain
+0.53
+0.52
+0.47
+0.63
+0.51
+pg 09
+pg 23
+pg 23
+0.21
+0.26
+0.29
+0.52
+0.55
+0.58
+cluster c1
+pg 23
+cluster c3
+pg 41
+pg 74
+cluster c7
+pg 88
+MEMORY
+SSD
+coarse quantizer 
+ IRQ
+a small in-memory IVF-RaBitQ
+over the centroids
+returns the nprobe nearest
+centroids of q
+rotated q
+top-nprobe clusters · near 
+ far
+scan cluster c1, batch by batch
+batch b
+batch b+1
+batch b+2
+each batch: FastScan + factors yield a lower bound LBDm for every point;
+then its points are swept in order 
+ keep one if its LBDm < distk
+survivors of the same page coalesce into one page candidate
+page candidate · pg 23
+0.52
+0.47
+page LB 0.47
+priority set
+sorted by page LB
+pg 41
+0.38
+pg 23
+0.47
+0.52 0.47
+pg 08
+0.50
+truncate in drain
+page LB 
+ -quantile
+pg 09
+0.53
+truncate in IVF search
+page LB 
+ distk
+pg 35
+0.56
+pg 12
+0.57
+pg 66
+0.61
+I/O pipeline
+at most Q in flight
+pg 41
+0.38
+pg 23
+0.47
+pg 74
+0.43
+in flight
+pop the best page candidates
+harvest
+pg 88 · completed 
+0.44 0.59 0.49
+re-screen vs new distk
+LBDm 
+ 
+ pruned
+LBDm < 
+ re-rank
+KNNSet
+the running top-k
+-quantile
+= k-th distance
+distk threshold
+the k-th distance
+entries only tighten
+prune against the current distk
+re-screen
+update KNNSet
+each page packs several records 
+ each: suffix bits + ex-code + re-ranking factors
+submit reads
+read in flight
+completed
+1
+7
+2
+3
+4
+5
+6
+Figure 2: Overview of the RaBitQ-SSD search pipeline. Memory (top) holds the coarse quantizer and the per-vector prefix codes;
+the SSD (bottom) holds one record per vector, in cluster-contiguous 4 KB pages. See § 4.1 for details on the search process.
+in expectation. The scaling factor 𝐷/𝐷𝑚rescales the prefix estimate
+to the full vector. The deviation of the scaled prefix fraction from
+one produces the first error term, while the second comes from the
+component of ¯𝑜𝐷𝑚along 𝑒1. Theorem 3.1 states the error bound.
+Theorem 3.1 (Prefix estimator). b𝛽𝐷𝑚=
+𝐷
+𝐷𝑚
+⟨¯𝑜𝐷𝑚,𝑞⟩
+⟨¯𝑜,𝑜⟩
+is an un-
+biased estimator of ⟨𝑜,𝑞⟩. For 0 < 𝜖≤√𝐷𝑚/3, the error bound of the
+estimator is given as
+Pr
+( b𝛽𝐷𝑚−⟨𝑜,𝑞⟩
+ >
+𝜖
+√𝐷𝑚
+)
+≤2𝑒−𝑐1𝜖2,
+where 𝑐1 is a constant.
+The proof is given in Appendix A. As in RaBitQ, the error bound
+can be concisely presented as an estimation error of 𝑂(1/√𝐷𝑚)
+with high probability.
+Lower bound. Substituting the estimate b𝛽𝐷𝑚+ 𝜖/√𝐷𝑚for ⟨𝑜,𝑞⟩
+in 𝑑(𝑞𝑟,𝑜𝑟) gives the lower bound LB𝐷𝑚(𝑞𝑟,𝑜𝑟), which lies below
+the true distance with high probability 1 −2𝑒−𝑐1𝜖2. Appendix A.4
+examines the empirical error distribution and the frequency of
+lower-bound violations.
+Reducing 𝐷𝑚saves memory and computation during the pruning
+phase but widens the error bound, potentially increasing SSD reads
+and re-ranking work. We evaluate this trade-off in §5.3.
+4
+Search Pipeline
+4.1
+Overview
+Figure 2 gives an overview of the search pipeline.
+Storage. The in-memory coarse quantizer routes a query to its
+𝑛probe nearest clusters. Each cluster stores, for every vector, the 𝐷𝑚-
+bit prefix of its binary code together with its three factors (§3.1),
+stored in batches of size 32. The SSD holds one fixed-size record
+per vector, consisting of the suffix bits of the binary code, the ex-
+code, and the two re-ranking factors. The records of a cluster are
+packed into contiguous 4 kB pages (§2.3), with some padding so
+that they don’t cross page boundaries. The in-RAM and SSD vectors
+are stored in the same order (by ascending distance to the centroid),
+so that the page containing a record can be determined directly.
+Searching. A KNNSet keeps track of the nearest 𝑘vectors seen
+so far and their distances to the query, whose maximum is dist𝑘.
+One query proceeds as follows.
+1○The rotated query passes the
+coarse quantizer, an in-memory IVF-RaBitQ (IRQ) over the cluster
+centroids (§4.2), which returns the 𝑛probe nearest clusters, visited
+from near to far.
+2○Within a cluster, the scan proceeds by FastScan
+batches of 32 vectors. For each vector, the prefix codes yield the
+lower bound and a point “survives” if it is below the current dist𝑘.
+3○Surviving points of the same page coalesce into a page candidate,
+4○which enters the priority set keyed by the page lower bound, the
+minimum over its members.
+5○Reads are issued asynchronously
+4
+
+
+from the priority set while the scan continues. After each batch,
+the search polls for completions and issues additional reads while
+keeping at most 𝑄reads in flight per query. Before issuing a read,
+the search re-checks the page candidate against the current dist𝑘.
+6○A completed page is harvested: members that fail the current
+dist𝑘are dropped, and the rest are re-ranked from the fetched data
+and may update the KNNSet. The details of pipelining the inverted-
+list search will be presented in §4.3.
+7○After the last cluster, the
+search drains the set and the reads in flight, popping only candidates
+whose bound falls below the tighter 𝛼-quantile threshold (§4.4).
+4.2
+IRQ: In-Memory IVF-RaBitQ as the Coarse
+Quantizer
+80
+85
+90
+95
+100
+Recall@10 (%)
+103
+104
+Throughput / QPS (log)
+IRQ (ours)
+HNSW
+flat
+IRQ (ours)
+HNSW
+flat
+0
+20000
+40000
+60000
+avg latency (us)
+per query, @recall 0.95
+coarse quantizer
+inverted list
+2,836 us
+coarse 28%
+3,925 us
+coarse 29%
+65,636 us
+coarse 95%
+Figure 3: Coarse quantizers on YFCC-100M (𝐶= 96,422, 𝑘= 10,
+𝑇= 64). Left: throughput against recall. Right: average query
+latency at recall 0.95, split into the coarse step and the rest
+(“inverted list”).
+Before any inverted list is visited, the coarse quantizer finds
+the 𝑛probe nearest of the 𝐶= 𝑛list centroids. A flat scan spends 𝐶
+full-precision distance computations on this regardless of 𝑛probe,
+while the work that follows scales with 𝑛probe. On YFCC-100M
+(𝐶= 96,422, some 103 points per cluster), the flat scan accounts
+for 95% of the query latency at recall@10 = 0.95: 62 of the 66 ms
+spent on a query go to routing alone (Fig. 3, right). Building a graph
+index over the centroids is the standard remedy [6, 11]: with HNSW,
+average query latency falls to 3.9 ms, of which the coarse step is
+29%.
+We adopt another coarse quantizer, an in-memory IVF-RaBitQ
+built over the centroids, IRQ for short. Centroids are quantized to
+𝐵= 9 bits per dimension by default, which is sufficient for high
+accuracy [16], and a query retrieves its 𝑛probe nearest centroids
+through the prune-and-re-rank flow of §2.3. IRQ reduces the aver-
+age query latency to 2.8 ms (23× below the flat scan, better than
+the graph index; Fig. 3, right) and achieves the best end-to-end
+performance (Fig. 3, left). Storing the centroids as 𝐵-bit codes also
+keeps the coarse quantizer smaller.
+4.3
+Pipelining the Inverted-List Search
+RaBitQ-SSD scans the 𝑛probe inverted lists, for which we design
+several pipelines of increasing complexity, starting from the naive
+extension of §2.3. See Table 1 for the experimental setup and I/O
+numbers cited below.
+Naive. The naive extension of §2.3 issues one read per surviving
+candidate and blocks on it. It has one virtue: every pruning decision
+sees the tightest dist𝑘available so far, because it is fully causal. The
+query thread, however, waits out every read: a query issues 102
+page reads at 𝑘=10 and 614 at 𝑘=100 on average, each delivering
+one useful record out of the three a page holds, and the thread waits
+on I/O for 95–99% of the list-search time (Table 1).
+Coalesced. Points of the same page that survive pruning can share
+one read ( 3○in Fig. 2): because the scan visits the points of a page
+consecutively (§4.1), the surviving points of a page emerge con-
+secutively, and its read is issued when the scan crosses the page
+boundary. The speedup is due to fewer page reads: for 𝑘= 10, 102
+reads per query become 81, or 1.30× throughput (1.66× throughput
+for 𝑘=100). The tightest-threshold property of Naive is preserved
+at page granularity.
+Overlapped. Blocking is what stalls the query thread (the grey
+strips of Naive and Coalesced in Fig. 4), and this step removes it.
+The scan no longer waits for reads: the surviving points of a page
+form a page candidate, whose read is submitted when all points of
+a page have been scanned. After each batch, the search polls for
+completed reads without blocking and harvests them ( 6○in Fig. 2):
+every member is re-screened against the current dist𝑘, and those
+that pass are re-ranked. When the last cluster has been scanned,
+the search keeps harvesting until every outstanding read returns,
+i.e., the drain ( 7○in Fig. 2). As dist𝑘may have tightened since
+the read was submitted, some pages may have been fetched for
+nothing, which Table 1 reports as waste. How Overlapped performs
+depends on whether the SSD is saturated. Below its IOPS ceiling
+(𝑇=1), the overlap is a clear gain: over Coalesced, throughput rises
+another 5.1× at 𝑘=10 (9.4× at 𝑘=100), even though 156 reads are
+issued where Coalesced needed 81. These 46% wasted reads are
+acceptable because the benefit of overlapping I/O outweighs the
+cost of the extra reads. Once the device is saturated (𝑇=64, where
+the 64 threads together drive the SSD at its IOPS ceiling), additional
+reads begin to queue. I/O completions slow down, delaying both
+harvesting and tightening of dist𝑘. The resulting stale threshold
+allows more candidates to survive pruning and triggers still more
+reads. In our trace, the number of outstanding reads for one query
+peaks at 677 in Fig. 4b. In this regime a query wastes 83% of the
+reads and spends 89% of its list-search time in the drain (Table 1).
+Throughput falls below Coalesced at both 𝑘(0.45× and 0.84×) and,
+at 𝑘=10, below even the blocking Naive.
+Scheduled. This step bounds the number of reads in flight and
+moves each read decision from scan time to issue time, when the
+threshold is tighter. Instead of having its read submitted as soon as
+the scan leaves the page, a page candidate is deposited in the priority
+set ( 4○in Fig. 2), ordered by page lower bound. Reads are issued in
+that order, keeping at most 𝑄in flight ( 5○). After each batch, the
+search polls and harvests as before, and conditionally submits new
+reads by order of lower bound: (a) if fewer than 𝑄are in flight and
+(b) if each candidate lower bound is lower than the current dist𝑘.
+The issuance stops at the first candidate that fails check (b) as the
+remaining candidates would fail too or the set is emptied. While a
+candidate waits in the set the threshold keeps tightening, and most
+candidates are pruned there without a read (drop column of Table 1).
+Because Scheduled keeps fewer reads in flight than Overlapped, its
+threshold is slightly more stalled and more points survive the scan,
+but many page candidates are still dropped before incurring I/Os.
+Fewer fetched pages also mean less harvest work, visible in Fig. 4b
+5
+
+
+Table 1: Page reads for five I/O pipeline designs of RaBitQ-SSD, on YFCC-100M at recall 0.90 (per-query means). QPS× is relative
+to Naive at the same 𝑇and 𝑘. issued: 4 KB page reads submitted. drop: page candidates discarded in the pending set before any
+read. waste: issued reads whose every member the re-screen pruned (zero re-rank). re-rank/surv.: records re-ranked over points
+surviving the scan. io-wait: share of the list-search wall blocked on reads (blocking designs). drain: share of the same wall
+spent finishing outstanding I/O after the scan (async designs). †See §4.4.
+𝑇= 1 thread
+𝑇= 64 threads
+design
+QPS× issued drop waste re-rank/surv. io-wait drain QPS× issued drop waste re-rank/surv. io-wait drain
+𝑘= 10
+Naive
+1.00
+102
+—
+—
+102/102
+95%
+—
+1.00
+102
+—
+—
+102/102
+93%
+—
+Coalesced
+1.30
+81
+—
+—
+102/103
+94%
+—
+1.30
+81
+—
+—
+102/103
+96%
+—
+Overlapped
+6.67
+156
+—
+72
+104/334
+—
+4%
+0.58
+483
+—
+400
+103/833
+—
+89%
+Scheduled
+8.35
+53
+797
+8
+61/2292
+—
+6%
+6.98
+40 1204
+1
+52/3414
+—
+21%
+Full
+8.36
+54
+779
+8
+61/2247
+—
+5%
+7.32
+38 1078†
+1
+50/3056†
+—
+10%
+𝑘= 100
+Naive
+1.00
+614
+—
+—
+614/614
+99%
+—
+1.00
+614
+—
+—
+614/614
+99%
+—
+Coalesced
+1.66
+439
+—
+—
+614/615
+98%
+—
+1.41
+439
+—
+—
+614/615
+98%
+—
+Overlapped
+15.62
+482
+—
+39
+623/750
+—
+2%
+1.18
+1382
+—
+941
+615/2773
+—
+66%
+Scheduled
+19.94
+241 1432
+1
+363/4367
+—
+13%
+6.89
+236 6042
+0
+357/17040
+—
+73%
+Full
+21.89
+212 1495
+0
+333/4457
+—
+5%
+12.35
+131 5076†
+0
+248/13738†
+—
+19%
+as the shorter blue bar of Scheduled: Overlapped fetches 483 pages
+to Scheduled’s 40 (103 vs. 52 re-ranks).
+Discussion. Figure 4 shows the SSD reads in flight and CPU activity
+for each of the pipelines, depending on the number of threads 𝑇.
+Below the IOPS ceiling (𝑇=1), the gain over Overlapped is modest,
+1.25× at 𝑘=10 and 1.28× at 𝑘=100, because wasted reads add little
+wall time when the device is not saturated. The number of reads,
+however, falls from 156 to 53 per query, fewer than even the blocking
+Coalesced (81).
+Once the device is saturated (𝑇=64), the advantage is decisive:
+40 reads per query, essentially none wasted, and the in-flight count
+stays flat at 𝑄(8 here, 16 at𝑇=1) instead of rising into the hundreds
+(Fig. 4); the traces show 27.9 ms for Overlapped and 1.5 ms for
+Scheduled, and throughput is 12× Overlapped at 𝑘=10 and 5.8×
+at 𝑘=100 (Table 1).
+We further evaluate the effect of lower-bound ordering by re-
+placing it with FIFO while keeping all other settings of Scheduled
+unchanged. At 𝑇= 64 and recall 0.90, FIFO issues roughly twice
+as many reads per query, reducing throughput to 43% and 53% of
+Scheduled’s for 𝑘= 10 and 𝑘= 100, respectively.
+4.4
+𝛼-Quantile Threshold to Alleviate Drain
+A drainage problem. The drain runs after the last cluster, as no
+scanning is left to run in parallel with reads. Below the IOPS ceiling
+(𝑇=1) reads complete promptly, little remains after the scan, and the
+drain represents 6–13% of the list-search time (Table 1). Once the
+device is saturated (𝑇=64), completions slow down (in our traces
+the median read completes in 186 µs), so fewer reads are issued
+during the scan under the bound 𝑄, more page candidates are left
+when it ends, and the drain takes 21% of the list-search time at 𝑘=10
+and even 73% at 𝑘=100.
+Full. This pipeline issues fewer reads by tightening the drain’s
+threshold. Once the last cluster is scanned ( 7○in Fig. 2), a pending
+candidate is issued only if it could still place among the best 𝛼𝑘of
+the current results, with 𝛼∈(0, 1] and 𝛼𝑘an integer. This means
+its lower bound falls below the 𝛼-quantile of the KNNSet. 𝛼= 1
+recovers dist𝑘and hence Scheduled, and 𝛼< 1 gives a tighter
+threshold. The tighter threshold applies only to reading decisions;
+harvested pages are still re-screened against dist𝑘.
+The threshold comes with a guarantee: with exact re-ranking
+and valid lower bounds, every point among the true top-𝛼𝑘keeps
+its lower bound below the 𝛼-quantile threshold and is never pruned.
+In this way, the search guarantees a recall of at least 𝛼over the
+points the probed clusters contain. In practice a far larger fraction
+of the true top-𝑘survives the 𝛼-quantile. We measured this in the
+tightest possible setting on YFCC-100M, with the running KNNSet
+replaced by the true top-𝑘so that the threshold is the 𝛼𝑘-th smallest
+true distance: at 𝛼= 0.4, about 85% of the true top-𝑘neighbors have
+a lower bound below this threshold and would not be pruned (84.2%
+at 𝑘=10, 85.1% at 𝑘=100), against the 40% the guarantee promises,
+and we adopt 0.4 as the default.
+Impact on recall and determinism. In the actual search, the
+recall loss incurred by the 𝛼-quantile threshold is even smaller
+than suggested by this measurement, for three reasons: (1) the
+running KNNSet typically gives a looser threshold than the true
+top-𝑘; (2) only the candidates still pending when the drain begins
+face the 𝛼-quantile threshold; and (3) pruning is per page candidate,
+against the smallest lower bound among its members, so one strong
+surviving point keeps its whole page.
+We note that, with exact re-ranking and valid lower bounds,
+I/O completion order does not affect the top-𝑘set returned by
+Scheduled (𝛼= 1), but can affect that returned by Full (𝛼< 1).
+In Full, depending on the order reads finish, re-ranking these
+candidates can tighten the 𝛼-quantile threshold sooner or later.
+Thus, I/O completion order can affect which neighbors are retained
+at ranks (𝛼𝑘,𝑘]. Appendix B shows that the effect of I/O completion
+order on the returned neighbor sets and recall is low.
+6
+
+
+1
+4.8 ms
+1
+3.7 ms
+1
+10
+100
+peak 72
+0.8 ms
+1
+10
+peak 16
+0
+1
+2
+3
+4
+5
+(a)  time (ms),  T = 1 thread
+0.5 ms
+1
+15.4 ms
+1
+12.0 ms
+1
+10
+100
+peak 677
+27.9 ms
+1
+10
+peak 8
+0
+10
+20
+30
+(b)  time (ms),  T = 64 threads
+1.5 ms
+SSD reads in flight
+Naive
+Coalesced
+Overlapped
+Scheduled
+CPU: compute
+CPU: waiting on I/O
+read, re-ranked
+read, discarded by re-screen
+Figure 4: Measured timeline of one query under each pipeline, at (a) 𝑇=1 and (b) 𝑇=64 (YFCC-100M, 𝑘=10, recall 0.90; the
+median-latency query of a full 10k-query run). Per pipelining step, the lower strip shows the CPU state over time, compute
+(blue) or waiting on I/O (grey), and the area above counts SSD reads in flight (log scale), split into reads whose page fed a re-rank
+(orange) and reads discarded whole by the re-screen (violet). Annotations give the peak in-flight count and the total latency.
+The gain follows the drain. Below the IOPS ceiling (𝑇=1), where
+the drain is light, Full matches Scheduled at 𝑘=10 (1.00×) and
+gains 1.10× at 𝑘=100. Once the device is saturated (𝑇=64), Full
+reads 131 pages per query at 𝑘=100 where Scheduled reads 236,
+the drain share falls from 73% to 19%, and throughput rises 1.8×.
+As every query’s drain issues fewer reads, contention on the SSD
+decreases, allowing scan-phase reads to complete sooner and the
+scan threshold to tighten earlier, so fewer points survive the scan
+(the daggered counts of surviving points in Table 1: 13,738 versus
+17,040 at 𝑘=100), which leaves fewer pending candidates to drain.
+Table 2: Datasets. All vectors are float32 except those in
+DINO-10B, which are uint8; the columns give the modal-
+ity, the dimensionality 𝐷, base count, the search metric and
+whether queries are distributed with the dataset.
+Dataset
+Modality
+𝐷
+#Base
+Metric
+queries?
+OpenAI-5M [43]
+Text
+1536
+5 M
+ℓ2
+no
+Wiki-10M [46]
+Text
+768
+10 M
+ℓ2
+yes
+DPR-100M [1]
+Text
+768
+101.2 M
+IP
+no
+LAION-100M [50]
+Image
+768
+102.1 M
+ℓ2
+yes
+YFCC-100M [7]
+Image
+1280
+98.7 M
+ℓ2
+yes
+DataComp-1B [15]
+Image
+512
+1 B
+ℓ2
+no
+DINO-10B [40]
+Image
+1024
+10 B
+ℓ2
+yes
+5
+Experimental Study
+5.1
+Experimental Setup
+Platform. All experiments run on a server with an AMD Ryzen
+Threadripper PRO 9975WX (32 cores, 64 threads), 768 GB of
+DDR5 memory (8 × 96 GB, 8 channels), and a Samsung PM9D3a
+15.36 TB NVMe SSD attached over PCIe 4.0 ×4, under Ubuntu
+24.04 (Linux 6.17); all binaries are compiled with GCC 13.3 at
+-O3 -march=native. We measured that this configuration sustains
+𝑟max=1.63M random 4 KB reads per second. We use this rate as the
+device reference in the I/O analysis. All SSD accesses, ours and ev-
+ery baseline’s, go through libaio under O_DIRECT [37], bypassing
+the page cache. Each query vector is run on one thread, and the
+number 𝑇≤64 of concurrent threads depends on the experiment.
+Datasets and queries. Table 2 lists the seven datasets used in
+our evaluation.1 The first six datasets are evaluated with 10,000
+queries. For datasets that do not provide a dedicated query set we
+sample queries disjoint from the base. Ground truth is computed by
+exhaustive search. DINO-10B and its evaluation setup are described
+separately in §5.4.
+Our configuration. Unless stated otherwise, RaBitQ-SSD uses
+𝐵= 9 bits per dimension (i.e., 8-bit ex-codes) and𝐶= 𝑛list = 𝑁/1024
+clusters. Coarse quantization uses IRQ (§4.2), which encodes the 𝐶
+centroids at 9 bits per dimension and organizes them into 𝐶/1000
+inverted lists. It probes𝛾·𝑛probe of these lists with𝛾= 0.5. The drain
+threshold is 𝛼= 0.4 (§4.4); the per-thread in-flight I/O budget is
+𝑄= 16 pages for𝑇≤16 and𝑄= 8 for𝑇> 16 (§4.3). We conduct the
+parameter study on the in-flight budget 𝑄and the drain threshold
+𝛼in Appendix C.3.
+Baseline methods. In the main evaluation, we compare against
+three graph-based SSD-resident systems: DiskANN [41, 53], Star-
+ling [63, 76], and PipeANN [22, 55]. We follow prior work [10, 22]
+in configuring these graph baselines and use their default on-disk
+representations, which store full-precision vectors. Each disk graph
+is built with maximum out-degree 𝑅= 64 and construction list size
+𝐿= 200; Starling and PipeANN build their in-memory navigation
+graphs from 1% data samples; DiskANN’s node cache is provisioned
+with 1% of the raw dataset size; and the search beam widths are 8,
+8, and 32 for DiskANN, Starling, and PipeANN, respectively. We
+report comparisons with SPANN [9] and AlayaLaser [3, 10] in §5.6,
+together with their configurations.
+Memory budgets. We consider two memory regimes: low memory
+sets 𝐷𝑚= 𝐷/2 and high memory is 𝐷𝑚= 𝐷. We equalize the
+per-vector in-memory storage across RaBitQ-SSD and the three
+graph baselines. For each setting of 𝐷𝑚, the per-point PQ bytes
+of DiskANN, Starling, and PipeANN equal the per-point size of
+our in-memory prefix code and factors, i.e., 𝐷𝑚/8 + 12 bytes. All
+indexes are built with the same temporary memory budget: 128 GB
+per dataset, and 512 GB for DataComp-1B.
+1All data access and experiments were performed by Nanyang Technological
+University.
+7
+
+
+104
+QPS
+OpenAI-5M
+104
+Wiki-10M
+103
+104
+DPR-100M
+104
+LAION-100M
+104
+YFCC-100M
+80
+90
+100
+Recall@10 (%)
+104
+QPS
+80
+90
+100
+Recall@10 (%)
+103
+104
+80
+90
+100
+Recall@10 (%)
+102
+103
+104
+80
+90
+100
+Recall@10 (%)
+103
+104
+80
+90
+100
+Recall@10 (%)
+104
+Dm = D
+Dm = D/2
+RaBitQ-SSD (ours)
+DiskANN
+PipeANN
+Starling
+Figure 5: Main evaluation at 𝑘= 10 on the five datasets (columns): throughput against recall at 𝑇= 64 (log scale, up is better),
+under two memory budgets, 𝐷𝑚= 𝐷(top row) and 𝐷𝑚= 𝐷/2 (bottom row), with baselines using matched per-point memory
+budgets (§5.1).
+Metrics. We report recall@𝑘, per-query latency at 𝑇= 1 and
+throughput (queries per second, QPS) for 𝑇> 1. When QPS is
+indicated in plots, it is reported in log scale. To quantify SSD traffic,
+we also report the mean number of 4 KB pages read per query.
+We aggregate this number into the read rate (pages / s), obtained
+by multiplying the QPS with the average number of page reads per
+query. The read rate is capped by 𝑟max. Curves sweep each method’s
+accuracy parameter (𝑛probe for RaBitQ-SSD, the search list size for
+the graph baselines). For comparisons at fixed recall, we pick the
+smallest setting of 𝑛probe or search list size that achieves this recall.
+5.2
+Main Evaluation
+Figure 5 shows that RaBitQ-SSD achieves the highest throughput on
+all five datasets at recalls 0.90 and 0.95 under both memory budgets.
+RaBitQ-SSD’s advantage is strongest for the limited memory budget
+(𝐷𝑚= 𝐷/2) at recall 0.95, where the speedup is 1.64–2.52× w.r.t.
+the best baselines, and even 16.18× for DPR-100M.
+Page reads. Table 3 reports the pages read per query. RaBitQ-SSD
+reads fewer pages per query than every baseline. The lowest base-
+line page count is still 1.1–3.8× ours. We combine in-memory prun-
+ing and page-level I/O scheduling with compact on-disk records,
+which reduce the number of page reads issued per query and in-
+crease the observed throughput. On the four datasets other than
+DPR-100M, and for all methods, the read rate is 1.4–1.7M/s, close to
+𝑟max. When the device is saturated, fewer pages per query translate
+into higher throughput: on YFCC-100M, our 37.8 pages against
+PipeANN’s 62.2 accompany a 1.58× throughput advantage.
+High recall operating points. At recall 0.98 and when 𝐷𝑚= 𝐷,
+the fastest graph baseline overtakes RaBitQ-SSD on each of the four
+datasets other than DPR-100M . In this regime, fewer page reads do
+not always yield higher throughput. On Wiki-10M, RaBitQ-SSD still
+reads fewer pages per query than DiskANN (73.2 versus 108.7), and
+sustains a lower page-read rate (0.97M versus 1.54M per second).
+However, reaching this recall requires a larger 𝑛probe, increasing
+Table 3: 4 KB pages read per query at recall 0.90 (𝑘= 10,𝑇= 64,
+𝐷𝑚= 𝐷). In bold: the lowest (best) per column.
+OpenAI
+Wiki
+DPR
+LAION
+YFCC
+RaBitQ-SSD
+37.5
+37.9
+112.6
+32.3
+37.8
+DiskANN
+64.1
+41.2
+555.7
+40.4
+72.3
+PipeANN
+62.3
+51.5
+426.5
+38.9
+62.2
+Starling
+63.3
+43.0
+489.3
+38.0
+63.1
+in-memory scanning work, so computation becomes the limiting
+factor for throughput.
+Smaller memory budget. At 𝐷𝑚= 𝐷/2 and recall 0.98, how-
+ever, RaBitQ-SSD achieves 2.11–2.80× the throughput of the graph
+baselines on the four datasets other than DPR-100M. Reducing 𝐷𝑚
+loosens the lower bounds, allowing more candidates to survive
+pruning. On Wiki-10M, RaBitQ-SSD reads 141.7 pages per query
+and sustains 1.61M page reads per second, close to the device limit.
+The increased I/O limits throughput to about 11.4K QPS, below
+the 13.3K achieved at 𝐷𝑚= 𝐷. Similarly, for the graph baselines,
+shorter in-memory PQ codes yield less accurate distance estimates,
+requiring more graph exploration and page reads to reach the same
+recall: DiskANN reads 329.3 pages per query and achieves only
+4.8K QPS, leaving RaBitQ-SSD with a 2.37× advantage.
+The DPR-100M outlier. The larger throughput advantage on DPR-
+100M at the smaller memory budget reflects a particularly large
+increase in the graph baselines’ I/O cost. At recall 0.90, shortening
+their in-memory PQ codes from 108 to 60 bytes increases page
+reads per query by 6.5–9.6×. Their page-read rates remain close to
+1.6M per second, so throughput falls by 6.5–9.9×. In comparison,
+RaBitQ-SSD resists better: page reads per query increase by a factor
+of only 1.73 (from 112.6 to 194.8). The shorter prefix also reduces
+FastScan work, allowing throughput to increase by 24% despite
+the additional I/O (§5.3). Consequently, RaBitQ-SSD’s throughput
+8
+
+
+Table 4: Per-query latency (ms) at 𝑇= 1: P50 / P95 / P99 at recall 0.90, 𝑘= 10, under both memory budgets.
+OpenAI-5M
+Wiki-10M
+DPR-100M
+LAION-100M
+YFCC-100M
+𝐷𝑚= 𝐷
+RaBitQ-SSD
+0.61 / 0.79 / 0.86
+0.64 / 0.80 / 0.87
+3.79 / 4.27 / 4.52
+0.53 / 0.69 / 0.76 0.63 / 0.79 / 0.87
+DiskANN
+0.80 / 1.05 / 1.22
+0.81 / 1.09 / 1.26
+8.72 / 9.47 / 10.5
+0.76 / 1.05 / 1.25
+0.87 / 1.22 / 1.42
+PipeANN
+0.60 / 0.82 / 0.96
+0.64 / 0.95 / 1.15
+2.63 / 3.02 / 3.25
+0.62 / 0.89 / 1.12
+0.67 / 0.94 / 1.11
+Starling
+0.91 / 1.22 / 1.42
+0.83 / 1.10 / 1.29
+7.71 / 8.45 / 9.14
+0.82 / 1.13 / 1.42
+0.97 / 1.34 / 1.56
+𝐷𝑚= 𝐷/2
+RaBitQ-SSD
+0.66 / 0.89 / 1.04
+0.76 / 1.01 / 1.27
+3.80 / 5.23 / 5.93
+0.62 / 1.00 / 1.53
+0.68 / 0.90 / 1.00
+DiskANN
+0.98 / 1.23 / 1.40
+1.40 / 1.67 / 1.87
+78.6 / 83.4 / 86.4
+1.34 / 1.64 / 1.89
+1.09 / 1.43 / 1.64
+PipeANN
+0.70 / 0.92 / 1.07
+0.85 / 1.12 / 1.32
+17.0 / 18.9 / 20.2
+0.82 / 1.11 / 1.37
+0.78 / 1.06 / 1.25
+Starling
+1.12 / 1.42 / 1.62
+1.51 / 1.77 / 1.97
+97.9 / 103.2 / 105.8
+1.39 / 1.74 / 2.05
+1.23 / 1.61 / 1.86
+advantage over the fastest baseline increases from 1.74× at 𝐷𝑚= 𝐷
+to 14× at 𝐷𝑚= 𝐷/2.
+Latency variance. Tail latency matters at production request vol-
+umes, as even a small fraction of slow requests translates to a large
+absolute number. Table 4 reports P50, P95, and P99 per-query la-
+tencies (i.e., the 50%, 95% and 99% latency quantiles) at recall 0.90
+with 𝑇= 1 under both memory budgets. RaBitQ-SSD also achieves
+the lowest P95 and P99 latencies in most settings.
+5.3
+Performance under Varying Operating
+Conditions
+Increasing 𝑘. Figure 6 extends the throughput comparison to
+𝑘= 100 and 𝑘= 1000 on all five datasets. RaBitQ-SSD maintains
+higher throughput than the baselines. At recall 0.90, its advantage
+over the fastest baseline increases with 𝑘on every dataset, reach-
+ing 1.31–3.31× at 𝑘= 100 and 1.65–4.01× at 𝑘= 1000. Raising 𝑘
+increases the computations and SSD page reads required to retrieve
+more neighbors: for RaBitQ-SSD, the larger distance threshold al-
+lows more candidates to survive pruning, and graph baselines need
+to explore more nodes to find a larger result set. For example, on
+YFCC-100M at recall 0.90, RaBitQ-SSD reads 37.8, 132, and 957
+pages per query at 𝑘= 10, 100, and 1000 while the fastest baseline
+at each 𝑘reads 62.2, 326, and 2,803. Since in this regime, the SSD
+throughput saturates, this translates to a larger throughput advan-
+tage for RaBitQ-SSD: from 1.58× at 𝑘= 10 to 2.42× at 𝑘= 100 and
+then to 2.86× at 𝑘= 1000. RaBitQ-SSD benefits from the IVF data
+layout: the candidates to be fetched are more likely to be co-located
+in the same SSD page than with graph based methods.
+Query concurrency. An ANN service must use its available SSD
+read capacity efficiently, particularly when it shares the device with
+other service instances on the same machine. We examine how
+throughput changes as increasing query concurrency drives the
+SSD from low utilization toward saturation.
+Figure 7(a) reports the throughput against the read rate. At low
+query concurrency, the achieved read rates are well below 𝑟max.
+More concurrent queries can sustain more outstanding I/O requests,
+better exploiting the SSD’s internal parallelism and raising both
+its utilization and query throughput. Once the device is saturated,
+additional query concurrency yields little further increase in the
+SSD read rate. Query throughput is then limited by 𝑟maxdivided by
+the number of pages read per query. Additional query concurrency
+can increase I/O queuing delays and hence per-query latency. At
+80
+90
+100
+Recall@100 (%)
+103
+104
+QPS
+OpenAI-5M
+80
+90
+100
+Recall@100 (%)
+104
+Wiki-10M
+80
+90
+100
+Recall@100 (%)
+102
+103
+DPR-100M
+80
+90
+100
+Recall@100 (%)
+103
+104
+LAION-100M
+80
+90
+100
+Recall@100 (%)
+104
+YFCC-100M
+80
+90
+100
+Recall@1000 (%)
+103
+QPS
+80
+90
+100
+Recall@1000 (%)
+103
+80
+90
+100
+Recall@1000 (%)
+101
+102
+103
+80
+90
+100
+Recall@1000 (%)
+102
+103
+80
+90
+100
+Recall@1000 (%)
+103
+k = 100
+k = 1000
+RaBitQ-SSD (ours)
+DiskANN
+PipeANN
+Starling
+Figure 6: Throughput against recall on the five datasets (columns) at 𝑇= 64 and 𝐷𝑚= 𝐷, for 𝑘= 100 (top row) and 𝑘= 1000
+(bottom row). The QPS axes use a log scale.
+9
+
+
+0
+0.4M
+0.8M
+1.2M
+1.6M
+0.5
+1
+2
+5
+10
+80
+90
+100
+0.5
+1
+2
+5
+10
+20
+(b) Varying Dₘ
+RaBitQ-SSD
+DiskANN
+PipeANN
+Starling
+D
+3D/4
+D/2
+D/4
+SSD read rate (4 KB pages/s)
+Recall@10 (%)
+QPS (×10³)
+(a) Varying query concurrency
+rmax
+Figure 7: Throughput (QPS, log scale) under varying operat-
+ing conditions.
+(a) Varying query concurrency on YFCC-100M (𝐷𝑚= 𝐷,
+𝑘= 100, recall 0.90). Curves are obtained by sweeping 𝑇∈
+{1, 4, 8, 16, 32, 64}. Vertical line = maximal SSD read rate 𝑟max.
+(b) Varying 𝐷𝑚on DPR-100M (𝐷= 768, 𝑘= 10, 𝑇= 64)
+𝑇= 64, all four methods sustain 1.63–1.67M page reads per second,
+close to 𝑟max. RaBitQ-SSD reads about 132 pages per query against
+the baselines’ 326–329, accounting for its 12,371 QPS against their
+5,049–5,118. The graph baselines approach saturation at lower query
+concurrency, so most points cluster near the right end of the curves.
+For these baselines, increasing 𝑇from 32 to 64 hardly increases
+throughput, while mean query latency approximately doubles, from
+6.3–6.4 ms to 12.4–12.6 ms.
+Varying the in-memory size. Figure 7(b) compares Split-RaBitQ
+with 𝐷𝑚∈{𝐷/4, 𝐷/2, 3𝐷/4, 𝐷}. The per-point in-memory foot-
+print is 𝐷𝑚/8 + 12 bytes; reducing 𝐷𝑚from 𝐷to 𝐷/4 shrinks
+it from 108 to 36 bytes (3.0×), and moves more data to SSD.
+This cuts the FastScan work per candidate but loosens the bound
+(width ∝1/√𝐷𝑚, §3.2), increasing SSD reads and re-ranking work
+for the same recall.
+On DPR-100M at recall 0.90, search at 𝐷𝑚= 𝐷is compute-bound,
+with an SSD read rate of only 0.75M pages per second. Reducing
+𝐷𝑚relieves this computational bottleneck. Although the looser
+bound increases reads per query, the SSD can accommodate the
+additional I/O, allowing throughput to improve. At 3𝐷/4, the read
+rate is still only 1.13M pages per second; at 𝐷/2, it reaches 1.62M,
+close to 𝑟max. Throughput at 𝐷/2 reaches 8,298 QPS, 24% above 𝐷
+and the highest among the four settings, despite the increase from
+113 pages per query at 𝐷𝑚= 𝐷to 195 at 𝐷𝑚= 𝐷/2. With the SSD
+near saturation at 𝐷𝑚= 𝐷/2, further shortening FastScan provides
+little benefit: reducing 𝐷𝑚to 𝐷/4 increases the pages to read to
+769, so the throughput consequently falls to 2,117 QPS.
+5.4
+Scaling to Billions of Points
+We evaluate RaBitQ-SSD’s behavior closer to the memory and disk
+capacity of our test machine.
+1B scale. We evaluate this scale on DataComp-1B. We set 𝐷𝑚= 𝐷=
+512, so the in-memory codes and factors occupy 76 bytes per point.
+We compare against DiskANN and PipeANN with per-point PQ
+size matched at the same 76 bytes. Figure 8 shows the comparison
+80
+90
+100
+103
+104
+QPS
+k = 10
+80
+90
+100
+102
+103
+104
+k = 100
+80
+90
+100
+102
+103
+k = 1000
+Recall@k (%)
+RaBitQ-SSD (ours)
+DiskANN
+PipeANN
+Figure 8: DataComp-1B: throughput against recall at 𝑇= 64
+and 𝐷𝑚= 𝐷= 512, for varying 𝑘.
+at 𝑇= 64. RaBitQ-SSD retains its throughput advantage at this
+scale. At recall 0.90, its throughput is 1.48×, 2.96×, and 3.9× that
+of the fastest baseline for 𝑘= 10, 100, and 1000, respectively. As in
+§5.3, the advantage increases with 𝑘.
+10B scale. DINO-10B [40] holds 1010 vectors of 1024 dimensions in
+uint8 under ℓ2, and comes with 100,000 queries and ground truth
+at 𝑘= 10, on which we evaluate at 𝑇= 64. With 8-byte point
+IDs, the full-prefix codes, factors, and IDs alone require 1.48 TB,
+exceeding our server’s 768 GB of DRAM. Setting 𝐷𝑚= 256 reduces
+the resident index to 545 GB including the coarse quantizer (with
+𝐶≈𝑁/4096 clusters). We store the raw uint8 vectors on SSD
+instead of ex-codes for re-ranking, occupying 10.24 TB. We do not
+evaluate DiskANN or PipeANN at this scale, as 10B nodes cannot be
+represented in their 32-bit internal node IDs [41, 55]. An extension
+to 64-bit IDs, retaining their existing disk layouts, would require
+an estimated 20.48 TB for the main disk index alone, exceeding our
+SSD’s capacity. The bulkiness of the edge storage is a fundamental
+limitation of graph based methods.
+(a) QPS vs. recall
+(b) scaling behavior
+80
+90
+100
+200
+500
+1000
+2000
+5000
+QPS
+Recall@10 (%)
+Recall 0.90
+Recall 0.95
+Size
+QPS
+p/q
+QPS
+p/q
+100k
+13,501 119.8 10,978 147.4
+1M
+11,074 147.7
+8,759 186.6
+10M
+7,875 205.6
+5,895 274.5
+100M
+5,795 282.2
+4,197 389.5
+1B
+4,289 381.2
+3,004 544.2
+10B
+3,210 509.4
+2,226 734.8
+Figure 9: RaBitQ-SSD on DINO-10B, 𝐷𝑚= 𝐷/4 = 256, 𝑘= 10,
+and 𝑇= 64. (a) throughput against recall (b) throughput and
+pages per query on subsets of the dataset.
+Figure 9(a) shows throughput against recall on DINO-10B.
+RaBitQ-SSD achieves approximately 3,210 and 2,226 QPS at recall
+0.90 and 0.95, respectively. To examine how performance scales
+with dataset size, we also evaluate subsets containing the first 100k,
+1M, 10M, 100M, and 1B vectors, still with 𝐷𝑚= 256 and𝐶≈𝑁/4096.
+Figure 9(b) and Figure 1 summarize the results. As the dataset grows
+from 100k to 10B points, a 100,000-fold increase in size, through-
+put decreases by just of 4.21× and 4.93× at recalls 0.90 and 0.95,
+respectively.
+10
+
+
+With 𝐷𝑚= 𝐷/4, the shorter in-memory code prefix loosens the
+lower bounds, allowing more candidates to survive pruning and
+increasing SSD reads. Across all six scales, the achieved read rates
+are about 1.55–1.64M pages per second, close to 𝑟max, indicating
+I/O-bound search. This is consistent with the tradeoff observed in
+the varying-𝐷𝑚experiment (§5.3).
+5.5
+Ablation Study
+The ablation varies three design choices: (1) which code is held in
+memory, (2) which representation is stored on the SSD, and (3) the
+precision used for re-ranking. Each variant changes one component
+while keeping the other index and system settings fixed. Table 5
+reports QPS and pages read per query at recall 0.90 (𝑘= 10, 𝑇= 64,
+𝐷𝑚= 𝐷). The results at other recalls are presented in Appendix C.2.
+Table 5: Ablation of the in-memory code, on-disk representa-
+tion, and re-ranking precision, with recall 0.90, 𝑘= 10, 𝑇= 64,
+𝐷𝑚= 𝐷; bits/dim = bits per dimension on disk, p/q = pages
+read per query.
+YFCC-100M
+LAION-100M
+Variant
+bits/dim
+QPS
+p/q
+QPS
+p/q
+RaBitQ-SSD (𝐵= 9)
+8
+42,057
+37.8
+50,509
+32.3
+RaBitQ-SSD-fp
+32
+24,952
+61.7
+43,805
+36.8
+RaBitQ-SSD (SQ8)
+8
+41,659
+37.5
+50,051
+32.6
+RaBitQ-SSD (𝐵= 5)
+4
+40,688
+38.3
+48,099
+33.2
+RaBitQ-SSD (SQ4)
+4
+30,824
+48.3
+38,178
+42.7
+PipeANN (PQ)
+32
+26,701
+62.2
+40,233
+38.9
+PipeANN (RaBitQ)
+32
+25,591
+64.9
+38,811
+40.4
+DiskANN
+32
+23,017
+72.3
+39,366
+40.4
+DiskANN (disk-PQ)
+8
+37,580
+36.5
+37,102
+41.2
+The in-memory code. We evaluate several combinations of in-
+memory representations for the different methods. PipeANN sup-
+ports both PQ and RaBitQ codes [55], allowing to compare them
+directly. Running it with 1-bit RaBitQ codes instead of PQ codes,
+with its disk graph and layout unchanged, lowers throughput by
+∼4% on both datasets: merely replacing the in-memory code for
+navigation offers no throughput benefit. The superior results of
+RaBitQ-SSD come from the bound provided by Split-RaBitQ (§3.2)
+to prune candidates.
+The on-disk representation. RaBitQ-SSD-fp stores the raw fp32
+vector in place of our ex-codes, to match the default storage of the
+baselines, whereas DiskANN (disk-PQ) replaces the full-precision
+vector inside each graph node with a PQ code of one byte per dimen-
+sion. On YFCC-100M, a compressed on-disk representation reduces
+the pages needed per record from two to one, lowering page reads
+per query. This improves throughput by 60+% for both DiskANN
+and RaBitQ-SSD relative to their fp32 variants, and RaBitQ-SSD
+still achieves 12% higher throughput than DiskANN (disk-PQ).
+On LAION-100M, fp32 records already fit in one page, so this
+effect does not apply: at recall 0.90, DiskANN (disk-PQ) achieves
+6% lower throughput than fp32 DiskANN. This, in turn, stems from
+the quantization error introduced by disk-PQ, which necessitates
+additional search work to reach the same recall. However, in RaBitQ-
+SSD, compact ex-codes stored contiguously within inverted lists
+allow more surviving candidates to share a page read, which yields
+15% higher throughput over RaBitQ-SSD-fp.
+Re-ranking precision. With SQ8 and SQ4, we replace ex-codes
+with 8-bit or 4-bit scalar quantization with residual encoding [11] on
+both datasets. At recall 0.90, 𝐵= 9 and SQ8 have similar throughput,
+whereas 𝐵= 5 achieves 1.32× and 1.26× the throughput of SQ4
+on YFCC-100M and LAION-100M, respectively. SQ4 requires more
+probing and page reads to reach the same recall. This shows that
+RaBitQ-SSD combines the 1-bit RaBitQ code and the 4-bit ex-code
+to produce a more accurate representation than just 4-bit SQ4.
+5.6
+Additional baselines
+SPANN. SPANN partitions the base into a large number of in-
+verted lists, keeps their centroids in memory, and reads the probed
+lists from SSD [9]. Figure 10(a) reports the comparison on Wiki-
+10M. Memory budgets are not matched: SPANN’s in-memory index
+takes 6.6 GB against our 1.1 GB. At recall 0.90, RaBitQ-SSD delivers
+21.3× SPANN’s throughput, because SPANN reads 870 pages per
+query, compared to ∼38 for RaBitQ-SSD. SPANN fetches whole
+selected posting lists, while RaBitQ-SSD performs finer-grained
+SSD accesses.
+AlayaLaser. AlayaLaser [10] is a graph-based index that accelerates
+distance estimation using PCA and a SIMD-friendly layout that
+stores neighbors’ quantized codes in each node’s on-disk record.
+It caches node records in memory. We use the graph parameters
+specified in §5.1, with beam width 16 and PCA dimension 256.
+Therefore, for AlayaLaser, there is a throughput against memory
+usage tradeoff, which Figure 10(b) shows. Under the memory budget
+matched to our 𝐷𝑚= 𝐷configuration, AlayaLaser caches about
+2.8% of the nodes. AlayaLaser achieves 8,592 QPS, compared with
+28,571 QPS for RaBitQ-SSD. Limited cache coverage leaves many
+node accesses to SSD, with each cache miss reading a two-page node
+record. To reach RaBitQ-SSD’s QPS performance, AlayaLaser needs
+to cache ∼50% of the nodes (30 GB of memory), at which point the
+relevance of a hybrid memory-SSD setting becomes questionable.
+5.7
+Indexing Cost and Footprints
+Table 6 reports the end-to-end build time and the on-SSD index size
+of RaBitQ-SSD and the three main graph baselines on six datasets,
+at 𝐷𝑚= 𝐷. All builds run on CPU only, with 64 threads and the
+build-memory budget of §5.1.
+RaBitQ-SSD builds indexes at least 5.0× faster than the fastest
+graph baseline on each dataset. On DataComp-1B, it takes 9.2 hours,
+compared with 45.6 hours for DiskANN. Our build has three stages:
+training the coarse quantizer, assignment, and encoding. Training
+runs two-level 𝑘-means [13] on a sample of the training vectors;
+assignment uses HNSW search over the centroids rather than an
+exhaustive centroid scan for each point. On DataComp-1B, the
+three stages take 1.8, 5.2, and 2.2 hours, respectively.
+RaBitQ-SSD stores compact ex-codes and factors on SSD,
+whereas the default graph indexes store full-precision vectors and
+adjacency lists. Using compact codes and omitting per-point ad-
+jacency lists reduces our on-SSD index size by a factor of 4.0–7.0
+relative to these baselines. On DataComp-1B, RaBitQ-SSD’s on-SSD
+11
+
+
+80
+90
+100
+0.05
+0.1
+0.2
+0.5
+1
+2
+5
+10
+20
+50
+(a) SPANN
+Recall@10 (%)
+1
+2
+5
+10
+20
+50
+10
+20
+50
+(b) AlayaLaser
+Peak memory usage (GiB)
+matched
+10%
+20%
+30%
+50%
+RaBitQ-SSD (ours)
+SPANN
+AlayaLaser
+QPS (×10³)
+Figure 10: Comparisons on Wiki-10M (𝑇= 64, 𝑘= 10; RaBitQ-
+SSD at 𝐷𝑚= 𝐷). (a) Throughput against recall; SPANN uses
+its default configuration. (b) Throughput against peak mem-
+ory usage at recall 0.95. “matched” denotes AlayaLaser’s con-
+figuration under the matched memory budget; percentages
+denote cached nodes.
+index occupies 587 GB, compared with 4,096 GB for DiskANN and
+PipeANN. DiskANN’s disk-PQ variant, which stores PQ codes on
+the SSD in place of the vectors, narrows this storage gap to 1.5–1.7×
+on YFCC-100M and LAION-100M (§5.5).
+Table 6: End-to-end build time (hours) / on-SSD index size
+(GB), at 𝐷𝑚= 𝐷. Results use each method’s default disk rep-
+resentation. “–”: not built.
+dataset
+OpenAI
+Wiki
+DPR
+LAION
+YFCC DataComp
+𝑁
+5M
+10M
+100M
+100M
+100M
+1B
+RaBitQ-SSD 0.05/10.2 0.06/8.2
+0.9/83.1
+0.8/83.8
+1.5/135
+9.2/587
+DiskANN
+0.5/40.9
+0.5/41.0
+7.9/414
+5.5/418
+9.1/809
+45.6/4,096
+PipeANN
+0.4/40.9
+0.5/41.0
+8.8/414
+6.3/418
+9.3/809
+45.9/4,096
+Starling
+0.9/40.9
+1.0/41.0 19.6/414 12.1/418 18.7/809
+–
+6
+Related Work
+SSD-resident vector search. Among graph-based methods,
+DiskANN [53] sets the pattern most later methods follow: com-
+pressed codes stay in memory to guide a best-first traversal, while
+the graph itself resides on SSD. Subsequent graph-based methods
+reorganize the on-disk layout so that each fetched page serves more
+of the search [30, 34, 42, 63, 68, 69, 75] and overlap the traversal
+with asynchronous reads [22, 31]. AlayaLaser accelerates distance
+computation [10]. A recent study explores this design space [35].
+Among partitioning-based methods, SPANN [9] keeps centroids
+in memory and reads probed lists from SSD; HELMSMAN [27]
+rebuilds the I/O path on SPDK to saturate its NVMe arrays and
+uses learned models to choose the probed lists; and OrchANN [8]
+orchestrates out-of-core search under skewed partitions. Among
+other methods, LM-DiskANN [44] and AiSAQ [54] move even the
+compressed codes to the SSD; VeloANN [73] stores RaBitQ ex-codes
+on the SSD, with its in-memory 1-bit code ordering the graph walk;
+and SkipDisk [52] prunes reads with a triangle-inequality bound
+tightened by per-point pivots. Furthermore, some disk-resident in-
+dexes have been extended to support updates [23, 49, 51, 66, 74]. In
+RaBitQ-SSD, the in-memory prefix of the 1-bit RaBitQ code gives
+every point its own bound (§3), and only the pages of surviving
+candidates are read (§4).
+Vector quantization. A substantial body of work has investigated
+the quantization of high-dimensional vectors across multiple fields,
+including machine learning, computer vision, and data manage-
+ment [2, 5, 14, 16, 17, 19, 20, 24, 28, 29, 38, 45, 56–58, 64, 70, 72].
+We refer readers to existing surveys, experimental studies, and
+textbooks for more comprehensive overviews of related tech-
+niques [12, 36, 39, 47, 60, 62, 71]. This paper builds on RaBitQ [17],
+which provides probabilistic bounds on distance-estimation error,
+and its extension supporting flexible bit budgets [16] (§2.2). In
+particular, RaBitQ has been integrated with in-memory graph in-
+dexes [21], made GPU-native [48], and run as a heterogeneous
+NPU–CPU system [26]. Some recent quantization methods are
+built on top of RaBitQ: MRQ [67] truncates PCA-projected dimen-
+sions and quantizes the kept dimensions with RaBitQ; and SAQ [33]
+allocates bits across segments of PCA-projected dimensions non-
+uniformly and quantizes each segment with a variant of RaBitQ.
+Split-RaBitQ instead derives an unbiased distance estimator and a
+probabilistic error bound from a prefix of the 1-bit RaBitQ code.
+7
+Conclusion
+We presented RaBitQ-SSD, a partitioning-based algorithm for SSD-
+resident vector search. Its Split-RaBitQ design retains a configurable
+code prefix in memory, enabling fine-grained pruning under differ-
+ent memory budgets. Its asynchronous pipeline overlaps computa-
+tion with I/O while reducing unnecessary SSD reads. Experiments
+show that RaBitQ-SSD provides higher throughput, fewer SSD
+reads, smaller indexes, and faster construction than comparable
+graph-based systems from the state of the art. It also searches 10
+billion vectors using a single server and one NVMe SSD, demon-
+strating its scalability.
+References
+[1] Cecilia Aguerrebere, Ishwar Bhati, Mark Hildebrand, Mariano Tepper, and Ted
+Willke. 2023. Similarity search in the blink of an eye with compressed indices.
+Proceedings of the VLDB Endowment 16, 11 (2023), 3433–3446.
+[2] Cecilia Aguerrebere, Ishwar Singh Bhati, Mark Hildebrand, Mariano Tepper,
+and Theodore Willke. 2023.
+Similarity Search in the Blink of an Eye with
+Compressed Indices. Proc. VLDB Endow. 16, 11 (July 2023), 3433–3446. https:
+//doi.org/10.14778/3611479.3611537
+[3] AlayaDB AI. [n.d.]. AlayaLite. https://github.com/AlayaDB-AI/AlayaLite. v1.0.0
+branch.
+[4] Fabien André, Anne-Marie Kermarrec, and Nicolas Le Scouarnec. 2015. Cache
+locality is not enough: high-performance nearest neighbor search with product
+quantization fast scan. Proc. VLDB Endow. 9, 4 (Dec. 2015), 288–299.
+https:
+//doi.org/10.14778/2856318.2856324
+[5] Artem Babenko and Victor Lempitsky. 2014. Additive Quantization for Extreme
+Vector Compression. In 2014 IEEE Conference on Computer Vision and Pattern
+Recognition. 931–938. https://doi.org/10.1109/CVPR.2014.124
+[6] Dmitry Baranchuk, Artem Babenko, and Yury Malkov. 2018. Revisiting the
+inverted indices for billion-scale approximate nearest neighbors. In Proceedings
+of the European Conference on Computer Vision (ECCV). 202–216.
+[7] Big-ANN Benchmarks. 2025. YFCC-Images Dataset. https://github.com/harsha-
+simhadri/big-ann-benchmarks/blob/main/dataset_preparation/yfccimages_
+dataset.md. Accessed: 2026-06-08.
+[8] Lizheng Chen, Pinhuan Wang, Shaonan Ma, Jie Zhang, Qing Wang, Zhengyi
+Yang, Heng Zhang, Mingxing Zhang, Fan Yang, Guihai Chen, Chen Tian, and
+Chengying Huan. 2026. OrchANN: Hierarchical Orchestration for Skewed Out-of-
+Core Vector Search. arXiv:2512.22838 [cs.DB] https://arxiv.org/abs/2512.22838
+12
+
+
+[9] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li,
+Mao Yang, and Jingdong Wang. 2021. SPANN: highly-efficient billion-scale
+approximate nearest neighbor search. In Proceedings of the 35th International
+Conference on Neural Information Processing Systems (NIPS ’21). Curran Associates
+Inc., Red Hook, NY, USA, Article 398, 14 pages.
+[10] Weijian Chen, Haotian Liu, Yangshen Deng, Long Xiang, Liang Huang, and Bo
+Tang. 2026. AlayaLaser: Efficient Index Layout and Search Strategy for Large-
+scale High-dimensional Vector Similarity Search.
+arXiv:2602.23342 [cs.DB]
+https://arxiv.org/abs/2602.23342
+[11] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy,
+Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. 2026.
+The Faiss Library. IEEE Transactions on Big Data 12, 2 (2026), 346–361. https:
+//doi.org/10.1109/TBDATA.2025.3618474
+[12] Karima Echihabi, Kostas Zoumpatianos, Themis Palpanas, and Houda Benbrahim.
+2018. The Lernaean Hydra of Data Series Similarity Search: An Experimental
+Evaluation of the State of the Art. Proc. VLDB Endow. 12, 2 (oct 2018), 112–127.
+https://doi.org/10.14778/3282495.3282498
+[13] Faiss wiki. 2026. 2-level clustering. https://github.com/facebookresearch/faiss/
+wiki/K%E2%80%90means-clustering#2-level-clustering. Accessed: 2026-10-01.
+[14] Hakan Ferhatosmanoglu, Ertem Tuncel, Divyakant Agrawal, and Amr El Abbadi.
+2000. Vector Approximation Based Indexing for Non-Uniform High Dimensional
+Data Sets. In Proceedings of the Ninth International Conference on Information and
+Knowledge Management (McLean, Virginia, USA) (CIKM ’00). Association for
+Computing Machinery, New York, NY, USA, 202–209. https://doi.org/10.1145/
+354756.354820
+[15] Samir Yitzhak Gadre, Gabriel Ilharco, Alex Fang, Jonathan Hayase, Georgios
+Smyrnis, Thao Nguyen, Ryan Marten, Mitchell Wortsman, Dhruba Ghosh, Jieyu
+Zhang, Eyal Orgad, Rahim Entezari, Giannis Daras, Sarah Pratt, Vivek Ramanu-
+jan, Yonatan Bitton, Kalyani Marathe, Stephen Mussmann, Richard Vencu, Mehdi
+Cherti, Ranjay Krishna, Pang Wei Koh, Olga Saukh, Alexander Ratner, Shuran
+Song, Hannaneh Hajishirzi, Ali Farhadi, Romain Beaumont, Sewoong Oh, Alex
+Dimakis, Jenia Jitsev, Yair Carmon, Vaishaal Shankar, and Ludwig Schmidt. 2023.
+DataComp: In search of the next generation of multimodal datasets. arXiv
+preprint arXiv:2304.14108 (2023).
+[16] Jianyang Gao, Yutong Gou, Yuexuan Xu, Yongyi Yang, Cheng Long, and Raymond
+Chi-Wing Wong. 2025. Practical and Asymptotically Optimal Quantization of
+High-Dimensional Vectors in Euclidean Space for Approximate Nearest Neighbor
+Search. Proc. ACM Manag. Data 3, 3, Article 202 (June 2025), 26 pages. https:
+//doi.org/10.1145/3725413
+[17] Jianyang Gao and Cheng Long. 2024. RaBitQ: Quantizing High-Dimensional
+Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor
+Search. Proc. ACM Manag. Data 2, 3, Article 167 (May 2024), 27 pages. https:
+//doi.org/10.1145/3654970
+[18] Jianyang Gao and Cheng Long. 2024. RaBitQ: Quantizing High-Dimensional
+Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search
+(Technical Report). https://github.com/gaoj0017/RaBitQ/blob/main/technical_
+report.pdf.
+[19] Tiezheng Ge, Kaiming He, Qifa Ke, and Jian Sun. 2013. Optimized product
+quantization for approximate nearest neighbor search. In Proceedings of the IEEE
+Conference on Computer Vision and Pattern Recognition. 2946–2953.
+[20] Yunchao Gong, Svetlana Lazebnik, Albert Gordo, and Florent Perronnin. 2013.
+Iterative Quantization: A Procrustean Approach to Learning Binary Codes for
+Large-Scale Image Retrieval. IEEE Transactions on Pattern Analysis and Machine
+Intelligence 35, 12 (2013), 2916–2929. https://doi.org/10.1109/TPAMI.2012.193
+[21] Yutong Gou, Jianyang Gao, Yuexuan Xu, and Cheng Long. 2025. SymphonyQG:
+Towards Symphonious Integration of Quantization and Graph for Approximate
+Nearest Neighbor Search. Proc. ACM Manag. Data 3, 1, Article 80 (Feb. 2025),
+26 pages. https://doi.org/10.1145/3709730
+[22] Hao Guo and Youyou Lu. 2025. Achieving Low-Latency Graph-Based Vector
+Search via Aligning Best-First Search Algorithm with SSD. In 19th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI 25). USENIX
+Association, Boston, MA, 171–186. https://www.usenix.org/conference/osdi25/
+presentation/guo
+[23] Hao Guo and Youyou Lu. 2026. OdinANN: Direct Insert for Consistently Stable
+Performance in Billion-Scale Graph-Based Vector Search. In 24th USENIX Confer-
+ence on File and Storage Technologies (FAST 26). USENIX Association, Santa Clara,
+CA, 133–147. https://www.usenix.org/conference/fast26/presentation/guo
+[24] Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern, and
+Sanjiv Kumar. 2020. Accelerating large-scale inference with anisotropic vector
+quantization. In Proceedings of the 37th International Conference on Machine
+Learning (ICML’20). JMLR.org, Article 364, 10 pages.
+[25] Gabriel Haas and Viktor Leis. 2023. What Modern NVMe Storage Can Do,
+and How to Exploit it: High-Performance I/O for High-Performance Storage
+Engines. Proc. VLDB Endow. 16, 9 (May 2023), 2090–2102.
+https://doi.org/10.
+14778/3598581.3598584
+[26] Fujun He, Chuyue Ye, Huaxiang Cai, Zetao Lv, Baolong Cui, Wenru Yan, Chao
+Zhan, Zigang Zhang, Hao Yi, Jie Xiang, Xiabing Li, Yuhang Gai, Ziyang Zhang,
+Pengfei Zheng, and Yunfei Du. 2026. Ascend-RaBitQ: Heterogeneous NPU-
+CPU Acceleration of Billion-Scale Similarity Search with 1-bit Quantization.
+arXiv:2605.16007 [cs.IR] https://arxiv.org/abs/2605.16007
+[27] Yuchen Huang, Baiteng Ma, Yiping Sun, Yang Shi, Xiao Chen, Xiaocheng Zhong,
+Zhiyong Wang, Yao Hu, Erci Xu, and Chuliang Weng. 2026. The Clustering
+Strikes Back: Building Cost-Effective and High-Performance ANNS at Scale
+with Helmsman (Operational Systems). In 20th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI 26). USENIX Association, Seattle, WA,
+1623–1639.
+https://www.usenix.org/conference/osdi26/presentation/huang-
+yuchen
+[28] Herve Jegou, Matthijs Douze, and Cordelia Schmid. 2011. Product Quantization
+for Nearest Neighbor Search. IEEE Trans. Pattern Anal. Mach. Intell. 33, 1 (Jan.
+2011), 117–128. https://doi.org/10.1109/TPAMI.2010.57
+[29] Wenqi Jiang, Shigang Li, Yu Zhu, Johannes De Fine Licht, Zhenhao He, Runbin
+Shi, Cedric Renggli, Shuai Zhang, Theodoros Rekatsinas, Torsten Hoefler, and
+Gustavo Alonso. 2023. Co-design Hardware and Algorithm for Vector Search.
+In Proceedings of the International Conference for High Performance Computing,
+Networking, Storage and Analysis (Denver, CO, USA) (SC ’23). Association for
+Computing Machinery, New York, NY, USA, Article 87, 15 pages. https://doi.
+org/10.1145/3581784.3607045
+[30] Dingyi Kang, Dongming Jiang, Hanshen Yang, Hang Liu, and Bingzhe Li. 2025.
+Scalable Disk-Based Approximate Nearest Neighbor Search with Page-Aligned
+Graph. arXiv:2509.25487 [cs.LG] https://arxiv.org/abs/2509.25487
+[31] Dingyi Kang, Juncheng Yang, and Bingzhe Li. 2026.
+LAANN: I/O-Aware
+Look-Ahead Search for Disk-Based Approximate Nearest Neighbor Search.
+arXiv:2606.02784 [cs.DB] https://arxiv.org/abs/2606.02784
+[32] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir
+Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim
+Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-augmented
+generation for knowledge-intensive NLP tasks. In Proceedings of the 34th Inter-
+national Conference on Neural Information Processing Systems (Vancouver, BC,
+Canada) (NIPS ’20). Curran Associates Inc., Red Hook, NY, USA, Article 793,
+16 pages.
+[33] Hui Li, Shiyuan Deng, Xiao Yan, Xiangyu Zhi, and James Cheng. 2025. SAQ:
+Pushing the Limits of Vector Quantization through Code Adjustment and Di-
+mension Segmentation. Proc. ACM Manag. Data 3, 6, Article 359 (Dec. 2025),
+25 pages. https://doi.org/10.1145/3769824
+[34] Huiling Li, Xin Huang, Byron Choi, and Jianliang Xu. 2026. BAMG: A Block-
+Aware Monotonic Graph Index for Disk-Based Approximate Nearest Neighbor
+Search. arXiv:2509.03226 [cs.DB] https://arxiv.org/abs/2509.03226
+[35] Liang Li, Shufeng Gong, Yanan Yang, Yiduo Wang, and Jie Wu. 2026. I/O Opti-
+mizations for Graph-Based Disk-Resident Approximate Nearest Neighbor Search:
+A Design Space Exploration. arXiv preprint arXiv:2602.21514 (2026).
+[36] Edo Liberty, Ashwin Padaki, and Amir Ingber. [n.d.]. VQ-bench: A Composable
+Vector Quantization Framework. In The 2nd Workshop on Vector Databases.
+[37] Linux man-pages project. [n.d.]. open(2) — Linux Manual Page. https://man7.
+org/linux/man-pages/man2/open.2.html. Accessed 2026-07.
+[38] Julieta Martinez, Shobhit Zakhmi, Holger H. Hoos, and James J. Little. 2018.
+LSQ++: Lower Running Time and Higher Recall in Multi-Codebook Quantization.
+In Computer Vision – ECCV 2018: 15th European Conference, Munich, Germany,
+September 8-14, 2018, Proceedings, Part XVI (Munich, Germany). Springer-Verlag,
+Berlin, Heidelberg, 508–523. https://doi.org/10.1007/978-3-030-01270-0_30
+[39] Yusuke Matsui, Yusuke Uchida, Hervé Jégou, and Shin’ichi Satoh. 2018. A Survey
+of Product Quantization. ITE Transactions on Media Technology and Applications
+6, 1 (2018), 2–10.
+[40] Meta AI. 2025. The DINO-10B Dataset. https://github.com/facebookresearch/
+faiss/blob/main/contrib/datasets.py.
+[41] Microsoft. [n.d.]. DiskANN: Graph-structured Indices for Scalable, Fast, Fresh and
+Filtered Approximate Nearest Neighbor Search. https://github.com/microsoft/
+DiskANN. cpp_main branch.
+[42] Jiongkang Ni, Xiaoliang Xu, Yuxiang Wang, Can Li, Jiajie Yao, Shihai
+Xiao, and Xuecang Zhang. 2023.
+DiskANN++: Efficient Page-based Search
+over Isomorphic Mapped Graph Index using Query-sensitivity Entry Vertex.
+arXiv:2310.00402 [cs.IR] https://arxiv.org/abs/2310.00402
+[43] OpenAI. 2024. New embedding models and API updates. https://openai.com/
+index/new-embedding-models-and-api-updates/. Accessed: 2026-06-08.
+[44] Yu Pan, Jianxin Sun, and Hongfeng Yu. 2023. LM-DiskANN: Low Memory
+Footprint in Disk-Native Dynamic Graph-Based ANN Indexing. In 2023 IEEE
+International Conference on Big Data (BigData). 5987–5996. https://doi.org/10.
+1109/BigData59044.2023.10386517
+[45] John Paparrizos, Ikraduya Edian, Chunwei Liu, Aaron J. Elmore, and Michael J.
+Franklin. 2022. Fast Adaptive Similarity Search through Variance-Aware Quanti-
+zation. In 2022 IEEE 38th International Conference on Data Engineering (ICDE).
+2969–2983. https://doi.org/10.1109/ICDE53745.2022.00268
+[46] RAPIDS Development Team. 2024. The Wiki-all Dataset. https://docs.rapids.
+ai/api/cuvs/stable/cuvs_bench/wiki_all_dataset/. 88M multilingual Wikipedia
+passage embeddings with 1M/10M subsets; part of the cuVS benchmark suite.
+Accessed July 2026.
+13
+
+
+[47] Hanan Samet. 2005. Foundations of Multidimensional and Metric Data Structures
+(The Morgan Kaufmann Series in Computer Graphics and Geometric Modeling).
+Morgan Kaufmann Publishers Inc., San Francisco, CA, USA.
+[48] Jifan Shi, Jianyang Gao, James Xia, Tamás Béla Fehér, and Cheng Long. 2026.
+GPU-Native Approximate Nearest Neighbor Search with IVF-RaBitQ: Fast Index
+Build and Search. arXiv:2602.23999 [cs.DB] https://arxiv.org/abs/2602.23999
+[49] Aditi Singh, Suhas Jayaram Subramanya, Ravishankar Krishnaswamy, and Har-
+sha Vardhan Simhadri. 2021.
+FreshDiskANN: A Fast and Accurate Graph-
+Based ANN Index for Streaming Similarity Search. CoRR abs/2105.09613 (2021).
+arXiv:2105.09613 https://arxiv.org/abs/2105.09613
+[50] SISAP Challenge Committee. 2024. The LAION2B and projections: SISAP 2024
+Indexing Challenge datasets. https://sisap-challenges.github.io/2024/datasets/.
+Accessed: 2026-06-08.
+[51] Jaeyong Song, Hongsun Jang, Changmin Shin, Seongyeon Park, Yong Jae Ryoo,
+Seo Jin Park, and Jinho Lee. 2026.
+NAVIS: Concurrent Search and Update
+with Low Position-Seeking Overhead in On-SSD Graph-Based Vector Search.
+arXiv:2605.11523 [cs.DC] https://arxiv.org/abs/2605.11523
+[52] Ziwen Song, Bin Wang, Xiaochun Yang, and Junhua Zhang. 2026. Low-Latency
+Out-of-Core ANN Search in High-Dimensional Space. arXiv:2605.05787 [cs.DB]
+https://arxiv.org/abs/2605.05787
+[53] Suhas Jayaram Subramanya, Devvrit, Rohan Kadekodi, Ravishankar Kr-
+ishaswamy, and Harsha Vardhan Simhadri. 2019. DiskANN: fast accurate billion-
+point nearest neighbor search on a single node. Curran Associates Inc., Red Hook,
+NY, USA.
+[54] Kento Tatsuno, Daisuke Miyashita, Taiga Ikeda, Kiyoshi Ishiyama, Kazunari
+Sumiyoshi, and Jun Deguchi. 2025. AiSAQ: All-in-Storage ANNS with Product
+Quantization for DRAM-free Information Retrieval. arXiv:2404.06004 [cs.IR]
+https://arxiv.org/abs/2404.06004
+[55] THU Storage Group. [n.d.]. PipeANN: A Low-latency, Billion-scale, and Updat-
+able Graph-based Vector Store on SSD. https://github.com/thustorage/PipeANN.
+[56] Ertem Tuncel, Hakan Ferhatosmanoglu, and Kenneth Rose. 2002. VQ-Index: An
+Index Structure for Similarity Searching in Multimedia Databases. In Proceedings
+of the Tenth ACM International Conference on Multimedia (Juan-les-Pins, France)
+(MULTIMEDIA ’02). Association for Computing Machinery, New York, NY, USA,
+543–552. https://doi.org/10.1145/641007.641117
+[57] Shay Vargaftik, Ran Ben Basat, Amit Portnoy, Gal Mendelson, Yaniv Ben-Itzhak,
+and Michael Mitzenmacher. 2022. EDEN: Communication-Efficient and Robust
+Distributed Mean Estimation for Federated Learning. arXiv:2108.08842 [cs.LG]
+https://arxiv.org/abs/2108.08842
+[58] Shay Vargaftik, Ran Ben-Basat, Amit Portnoy, Gal Mendelson, Yaniv Ben-Itzhak,
+and Michael Mitzenmacher. 2021. Drive: One-bit distributed mean estimation.
+Advances in Neural Information Processing Systems 34 (2021), 362–377.
+[59] VectorDB-NTU. 2025. The RaBitQ Library. https://github.com/VectorDB-NTU/
+RaBitQ-Library.
+[60] Jun Wang, Wei Liu, Sanjiv Kumar, and Shih-Fu Chang. 2016. Learning to Hash
+for Indexing Big Data - A Survey.
+Proc. IEEE 104, 1 (2016), 34–57.
+https:
+//doi.org/10.1109/JPROC.2015.2487976
+[61] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li,
+Xiangyu Wang, Xiangzhou Guo, Chengming Li, Xiaohai Xu, Kun Yu, Yuxing
+Yuan, Yinghao Zou, Jiquan Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang,
+Yihua Mo, Jun Gu, Ruiyi Jiang, Yi Wei, and Charles Xie. 2021.
+Milvus: A
+Purpose-Built Vector Data Management System. In Proceedings of the 2021 In-
+ternational Conference on Management of Data (Virtual Event, China) (SIGMOD
+’21). Association for Computing Machinery, New York, NY, USA, 2614–2627.
+https://doi.org/10.1145/3448016.3457550
+[62] Jingdong Wang, Ting Zhang, jingkuan song, Nicu Sebe, and Heng Tao Shen. 2018.
+A Survey on Learning to Hash. IEEE Transactions on Pattern Analysis and Machine
+Intelligence 40, 4 (2018), 769–790. https://doi.org/10.1109/TPAMI.2017.2699960
+[63] Mengzhao Wang, Weizhi Xu, Xiaomeng Yi, Songlin Wu, Zhangyang Peng, Xi-
+angyu Ke, Yunjun Gao, Xiaoliang Xu, Rentong Guo, and Charles Xie. 2024.
+Starling: An I/O-Efficient Disk-Resident Graph Index Framework for High-
+Dimensional Vector Similarity Search on Data Segment. Proc. ACM Manag.
+Data 2, 1, Article 14 (March 2024), 27 pages. https://doi.org/10.1145/3639269
+[64] Roger Weber, Hans-Jörg Schek, and Stephen Blott. 1998. A Quantitative Analysis
+and Performance Study for Similarity-Search Methods in High-Dimensional
+Spaces. In Proceedings of the 24rd International Conference on Very Large Data
+Bases (VLDB ’98). Morgan Kaufmann Publishers Inc., San Francisco, CA, USA,
+194–205.
+[65] Chuangxian Wei, Bin Wu, Sheng Wang, Renjie Lou, Chaoqun Zhan, Feifei Li,
+and Yuanzhe Cai. 2020. AnalyticDB-V: a hybrid analytical engine towards query
+fusion for structured and unstructured data. Proc. VLDB Endow. 13, 12 (Aug.
+2020), 3152–3165. https://doi.org/10.14778/3415478.3415541
+[66] Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li,
+Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, and Mao Yang. 2023. SPFresh:
+Incremental In-Place Update for Billion-Scale Vector Search. In Proceedings of
+the 29th Symposium on Operating Systems Principles (Koblenz, Germany) (SOSP
+’23). Association for Computing Machinery, New York, NY, USA, 545–561. https:
+//doi.org/10.1145/3600006.3613166
+[67] Mingyu Yang, Liuchang Jing, Wentao Li, and Wei Wang. 2026. Quantization
+Meets Projection: A Happy Marriage for Approximate k-Nearest Neighbor Search.
+arXiv:2411.06158 [cs.DB] https://arxiv.org/abs/2411.06158
+[68] Peiqi Yin, Xiao Yan, Qihui Zhou, Hui Li, Xiaolu Li, Lin Zhang, Meiling Wang,
+Xin Yao, and James Cheng. 2025. Gorgeous: Revisiting the Data Layout for
+Disk-Resident High-Dimensional Vector Search.
+arXiv:2508.15290 [cs.DB]
+https://arxiv.org/abs/2508.15290
+[69] Ziyang Yue, Bolong Zheng, Ling Xu, Kanru Xu, Shuhao Zhang, Yajuan Du,
+Yunjun Gao, Xiaofang Zhou, and Christian S. Jensen. 2025. Select Edges Wisely:
+Monotonic Path Aware Graph Layout Optimization for Disk-Based ANN Search.
+Proc. VLDB Endow. 18, 11 (July 2025), 4337–4349.
+https://doi.org/10.14778/
+3749646.3749697
+[70] Amir Zandieh, Majid Daliri, Majid Hadian, and Vahab Mirrokni. 2025. Tur-
+boQuant: Online Vector Quantization with Near-optimal Distortion Rate.
+arXiv:2504.19874 [cs.LG] https://arxiv.org/abs/2504.19874
+[71] Pavel Zezula, Giuseppe Amato, Vlastislav Dohnal, and Michal Batko. 2010. Simi-
+larity Search: The Metric Space Approach (1st ed.). Springer Publishing Company,
+Incorporated.
+[72] Ting Zhang, Chao Du, and Jingdong Wang. 2014. Composite Quantization for
+Approximate Nearest Neighbor Search. In Proceedings of the 31st International
+Conference on Machine Learning (Proceedings of Machine Learning Research),
+Eric P. Xing and Tony Jebara (Eds.), Vol. 32. PMLR, Bejing, China, 838–846.
+https://proceedings.mlr.press/v32/zhangd14.html
+[73] Weichen Zhao, Yuncheng Lu, Yao Tian, Hao Zhang, Jiehui Li, Minghao Zhao,
+Yakun Li, and Weining Qian. 2026. Optimizing SSD-Resident Graph Indexing for
+High-Throughput Vector Search. arXiv:2602.22805 [cs.DB] https://arxiv.org/
+abs/2602.22805
+[74] Shurui Zhong, Dingheng Mo, and Siqiang Luo. 2026. LSM-VEC: A Large-Scale
+Disk-Based System for Dynamic Vector Search. arXiv:2505.17152 [cs.DB] https:
+//arxiv.org/abs/2505.17152
+[75] Yijie Zhou, Shengyuan Lin, Shufeng Gong, Song Yu, Shuhao Fan, Yanfeng
+Zhang, and Ge Yu. 2025.
+GoVector: An I/O-Efficient Caching Strategy for
+High-Dimensional Vector Nearest Neighbor Search. arXiv:2508.15694 [cs.DB]
+https://arxiv.org/abs/2508.15694
+[76] Zilliz. 2024. Starling. https://github.com/zilliztech/starling.
+A
+Analysis of Split-RaBitQ
+o
+e1
+q̄
+oDm
+0
+βo
+projΠ̄ oDm
+⟂Π
+ℝD
+Π=span{o,q}=span{o,e1}
+q=βo+ √1−β 2 e1,
+β=⟨o,q⟩
+Figure 11: Geometry of Split-RaBitQ in R𝐷. The shaded plane
+Π = span{𝑜,𝑞} contains the orthogonal unit vectors 𝑜and
+𝑒1, and the unit query 𝑞; the ellipse depicts its unit circle.
+The prefix vector ¯𝑜𝐷𝑚, of norm
+√︁
+𝐷𝑚/𝐷, is projected onto Π.
+Its component perpendicular to Π contributes nothing to
+⟨¯𝑜𝐷𝑚,𝑞⟩.
+Throughout this appendix, all probabilities and expectations are
+over the random orthogonal matrix 𝑃, which, as in [18], is generated
+by Gram–Schmidt orthonormalization of a matrix with indepen-
+dent standard Gaussian entries; 𝑃−1𝑜then follows the uniform
+distribution on the unit sphere (Section B.2 of [18]). The constants
+𝑐0 and 𝑐are those in the coordinate tail bound (32) and the Lips-
+chitz concentration inequality (41) of [18], and, by the expression
+in Lemma B.3 of [18], E⟨¯𝑜,𝑜⟩exceeds 0.79 for every 𝐷≥2. Eq. (1),
+14
+
+
+i.e., (30) of [18], applied to ¯𝑥and to ¯𝑥𝐷𝑚gives
+⟨¯𝑜,𝑜⟩=
+1
+√
+𝐷
+𝐷
+∑︁
+𝑖=1
+(𝑃−1𝑜)[𝑖]
+,
+⟨¯𝑜𝐷𝑚,𝑜⟩=
+1
+√
+𝐷
+𝐷𝑚
+∑︁
+𝑖=1
+(𝑃−1𝑜)[𝑖]
+,
+(4)
+since ¯𝑥[𝑖] = sign (𝑃−1𝑜)[𝑖]/
+√
+𝐷and ¯𝑥𝐷𝑚keeps the first 𝐷𝑚of
+these entries. In particular ⟨¯𝑜,𝑜⟩≥1/
+√
+𝐷, because the ℓ1 norm of
+the unit vector 𝑃−1𝑜is at least its ℓ2 norm.
+A.1
+Joint Distribution of the Prefix’s
+Components
+Lemma B.3 of [18] states that the joint distribution of (⟨¯𝑜,𝑜⟩, ⟨¯𝑜,𝑒1⟩)
+is identical to that of (⟨¯𝑜,𝑜⟩,
+√︁
+1 −⟨¯𝑜,𝑜⟩2 𝑋1), where 𝑋1 follows the
+distribution 𝑝𝐷−1 of Lemma B.1 in [18] and is independent of ⟨¯𝑜,𝑜⟩.
+The following lemma extends it to the prefix.
+Lemma A.1. Let 𝑜and 𝑒1 be two unit vectors with 𝑜⊥𝑒1,
+and let ¯𝑥, ¯𝑜, ¯𝑥𝐷𝑚, and ¯𝑜𝐷𝑚be as in §3.1. The joint distribution of
+(⟨¯𝑜,𝑜⟩, ⟨¯𝑜𝐷𝑚,𝑜⟩, ⟨¯𝑜𝐷𝑚,𝑒1⟩) is identical to that of
+
+⟨¯𝑜,𝑜⟩, ⟨¯𝑜𝐷𝑚,𝑜⟩,
+√︁
+𝐷𝑚/𝐷−⟨¯𝑜𝐷𝑚,𝑜⟩2 𝑋1
+
+,
+(5)
+where 𝑋1 follows the distribution 𝑝𝐷−1 of Lemma B.1 in [18] and is
+independent of 𝑃−1𝑜, hence of the first two components.
+Proof. We follow the proof of Lemma B.3 in [18] step by step,
+with ¯𝑥𝐷𝑚in place of ¯𝑥where the two differ.
+Reduction. Let 𝑢1 := (1, 0, . . . , 0) and 𝑢2 := (0, 1, 0, . . . , 0). As
+in [18], since the distribution of 𝑈𝑃is identical to that of 𝑃for
+every orthogonal matrix 𝑈, it suffices to prove the lemma for 𝑜= 𝑢1
+and 𝑒1 = 𝑢2. Let 𝑝1 and 𝑝2 be the first two rows of 𝑃, as in [18]; then
+𝑃−1𝑜= 𝑃⊤𝑢1 = 𝑝1 and 𝑃−1𝑒1 = 𝑝2.
+Deferred decision. The rows of 𝑃are generated one by one
+((46) of [18]): 𝑝1 is a normalized standard Gaussian vector, and
+𝑝2 = (𝑔−⟨𝑔, 𝑝1⟩𝑝1)/∥𝑔−⟨𝑔, 𝑝1⟩𝑝1∥for a standard Gaussian vector
+𝑔independent of 𝑝1. Once 𝑝1 is sampled, ¯𝑥= arg max𝑥∈C⟨𝑥, 𝑝1⟩is
+fixed ((47)–(48) of [18]), and so is ¯𝑥𝐷𝑚, obtained from ¯𝑥by setting its
+coordinates beyond the first 𝐷𝑚to zero, an operation that does not
+involve 𝑃. Hence ⟨¯𝑜,𝑜⟩= ⟨¯𝑥, 𝑝1⟩and ⟨¯𝑜𝐷𝑚,𝑜⟩= ⟨¯𝑥𝐷𝑚, 𝑝1⟩are func-
+tions of 𝑝1, whereas ⟨¯𝑜𝐷𝑚,𝑒1⟩= ⟨𝑃¯𝑥𝐷𝑚,𝑢2⟩= ⟨¯𝑥𝐷𝑚, 𝑝2⟩involves
+𝑝2 as well. It remains to determine the conditional distribution of
+⟨¯𝑥𝐷𝑚, 𝑝2⟩given 𝑝1.
+Alignment. Conditional on 𝑝1, the vector ¯𝑥𝐷𝑚is fixed, with
+∥¯𝑥𝐷𝑚∥2 = 𝐷𝑚/𝐷(it has 𝐷𝑚entries of magnitude 1/
+√
+𝐷). Let
+𝑣1 := (1, 0, . . . , 0),
+𝑣2 :=
+
+⟨¯𝑥𝐷𝑚, 𝑝1⟩,
+√︁
+𝐷𝑚/𝐷−⟨¯𝑥𝐷𝑚, 𝑝1⟩2, 0, . . . , 0
+
+.
+The pairs (𝑝1, ¯𝑥𝐷𝑚) and (𝑣1, 𝑣2) have the same norms and the same
+inner product, so there is an orthogonal matrix 𝑉with 𝑉𝑝1 = 𝑣1
+and 𝑉¯𝑥𝐷𝑚= 𝑣2. This is the alignment step of [18], where ¯𝑥has unit
+norm and the second entry of 𝑣2 is
+√︁
+1 −⟨¯𝑥, 𝑝1⟩2; for the prefix the
+norm is
+√︁
+𝐷𝑚/𝐷. Then, as in (49)–(51) of [18],
+⟨¯𝑥𝐷𝑚, 𝑝2⟩=
+D
+¯𝑥𝐷𝑚, 𝑔−⟨𝑔, 𝑝1⟩𝑝1
+∥𝑔−⟨𝑔, 𝑝1⟩𝑝1∥
+E
+(6)
+=
+D
+𝑉¯𝑥𝐷𝑚, 𝑉𝑔−⟨𝑉𝑔,𝑉𝑝1⟩𝑉𝑝1
+∥𝑉𝑔−⟨𝑉𝑔,𝑉𝑝1⟩𝑉𝑝1∥
+E
+(7)
+=
+D
+𝑣2, 𝑔−⟨𝑔, 𝑣1⟩𝑣1
+∥𝑔−⟨𝑔, 𝑣1⟩𝑣1∥
+E
+,
+(8)
+where (6) is the Gram–Schmidt step, (7) holds because inner
+products and norms are invariant under 𝑉, and (8) substitutes
+𝑉𝑝1 = 𝑣1, 𝑉¯𝑥𝐷𝑚= 𝑣2, and 𝑉𝑔by 𝑔, since the standard Gauss-
+ian vector is rotation invariant and 𝑔is independent of 𝑝1. The
+vector 𝑔−⟨𝑔, 𝑣1⟩𝑣1 has first entry 0 and its remaining 𝐷−1 entries
+are independent standard Gaussians; after normalization, the re-
+maining 𝐷−1 entries follow the uniform distribution on the unit
+sphere in the (𝐷−1)-dimensional space and are independent of 𝑝1.
+Recall that 𝑣2 =  ⟨¯𝑥𝐷𝑚, 𝑝1⟩,
+√︁
+𝐷𝑚/𝐷−⟨¯𝑥𝐷𝑚, 𝑝1⟩2, 0, . . . , 0. Thus,
+⟨¯𝑥𝐷𝑚, 𝑝2⟩=
+√︁
+𝐷𝑚/𝐷−⟨¯𝑥𝐷𝑚, 𝑝1⟩2 · 𝑋1, where 𝑋1 follows the distri-
+bution 𝑝𝐷−1 and is independent of 𝑝1. Since ⟨¯𝑥𝐷𝑚, 𝑝2⟩= ⟨¯𝑜𝐷𝑚,𝑒1⟩
+and ⟨¯𝑥𝐷𝑚, 𝑝1⟩= ⟨¯𝑜𝐷𝑚,𝑜⟩, this is the third component of Eq. (5), and
+the independence of 𝑋1 from 𝑝1 gives its independence from the
+first two components, which are functions of 𝑝1.
+□
+A.2
+Concentration of the Prefix’s Share
+Lemma B.2 of [18] states that for an 𝐿-Lipschitz function 𝑓on
+the unit sphere and a uniformly random unit vector 𝑥, Pr{|𝑓(𝑥) −
+E𝑓(𝑥)| ≥𝑡} ≤2 exp(−𝑐𝐷𝑡2/𝐿2) ((41) there), and applies it with
+𝑓(𝑥) = ∥𝑥∥1/
+√
+𝐷and 𝑥= 𝑃−1𝑜to obtain, for every 𝑢> 0,
+Pr
+
+|⟨¯𝑜,𝑜⟩−E⟨¯𝑜,𝑜⟩| ≥𝑢/
+√
+𝐷
+	
+≤2𝑒−𝑐𝑢2
+(9)
+((54) there). The same inequality controls the prefix’s share.
+Lemma A.2. For every 𝑢> 0,
+Pr
+n⟨¯𝑜𝐷𝑚,𝑜⟩−𝐷𝑚
+𝐷E⟨¯𝑜,𝑜⟩
+ ≥𝑢√𝐷𝑚
+𝐷
+o
+≤2𝑒−𝑐𝑢2.
+Proof. By Eq. (4), ⟨¯𝑜𝐷𝑚,𝑜⟩
+=
+𝑓(𝑃−1𝑜) with 𝑓(𝑥)
+:=
+1
+√
+𝐷
+Í𝐷𝑚
+𝑖=1 |𝑥[𝑖]|, and 𝑃−1𝑜is a uniformly random unit vector, so
+its coordinates are exchangeable and E|(𝑃−1𝑜)[𝑖]| does not depend
+on 𝑖. By Eq. (4),
+E𝑓(𝑃−1𝑜) = 𝐷𝑚
+√
+𝐷
+E
+(𝑃−1𝑜)[1]
+
+= 𝐷𝑚
+𝐷·
+1
+√
+𝐷
+𝐷
+∑︁
+𝑖=1
+E
+(𝑃−1𝑜)[𝑖]
+
+= 𝐷𝑚
+𝐷E⟨¯𝑜,𝑜⟩.
+For unit vectors 𝑥and 𝑦, |𝑓(𝑥) −𝑓(𝑦)| ≤
+1
+√
+𝐷
+Í𝐷𝑚
+𝑖=1 |𝑥[𝑖] −𝑦[𝑖]| ≤
+√︁
+𝐷𝑚/𝐷∥𝑥−𝑦∥by the triangle inequality and the Cauchy–Schwarz
+inequality, so 𝑓is
+√︁
+𝐷𝑚/𝐷-Lipschitz on the unit sphere. Lemma B.2
+of [18] with 𝐿=
+√︁
+𝐷𝑚/𝐷and 𝑡= 𝑢√𝐷𝑚/𝐷gives the bound, since
+𝑐𝐷𝑡2/𝐿2 = 𝑐𝑢2.
+□
+15
+
+
+A.3
+Proof of Theorem 3.1
+Recall
+Eq.
+(3):
+with
+𝛽
+=
+⟨𝑜,𝑞⟩
+and
+𝐴𝐷𝑚
+=
+(𝐷/𝐷𝑚) ⟨¯𝑜𝐷𝑚,𝑜⟩/⟨¯𝑜,𝑜⟩,
+the
+error
+of
+the
+estimator
+is
+𝛽(𝐴𝐷𝑚−1) +
+√︁
+1 −𝛽2 (𝐷/𝐷𝑚) ⟨¯𝑜𝐷𝑚,𝑒1⟩/⟨¯𝑜,𝑜⟩. When 𝑜and
+𝑞are collinear, only the first term is present.
+Unbiasedness. We show that both terms have mean zero. For the
+first term, by Eq. (4),
+𝐴𝐷𝑚= 𝐷
+𝐷𝑚
+·
+Í𝐷𝑚
+𝑖=1 |(𝑃−1𝑜)[𝑖]|
+Í𝐷
+𝑗=1|(𝑃−1𝑜)[𝑗]|
+.
+(10)
+The coordinates of the uniformly random unit vector 𝑃−1𝑜are
+exchangeable, hence so are the ratios |(𝑃−1𝑜)[𝑖]|/Í
+𝑗|(𝑃−1𝑜)[𝑗]|,
+𝑖= 1, . . . , 𝐷, which sum to 1; each ratio therefore has expectation
+1/𝐷, the sum of the first 𝐷𝑚of them has expectation 𝐷𝑚/𝐷, and
+E[𝐴𝐷𝑚] = 1. (This uses that the prefix is a fixed set of coordinates,
+chosen without reference to 𝑃.) For the second term, Lemma A.1
+gives
+E
+ 𝐷
+𝐷𝑚
+⟨¯𝑜𝐷𝑚,𝑒1⟩
+⟨¯𝑜,𝑜⟩
+
+= E
+ 𝐷
+𝐷𝑚
+√︁
+𝐷𝑚/𝐷−⟨¯𝑜𝐷𝑚,𝑜⟩2
+⟨¯𝑜,𝑜⟩
+𝑋1
+
+(11)
+= E
+ 𝐷
+𝐷𝑚
+√︁
+𝐷𝑚/𝐷−⟨¯𝑜𝐷𝑚,𝑜⟩2
+⟨¯𝑜,𝑜⟩
+
+· E[𝑋1]
+(12)
+= 0,
+(13)
+where (11) is by Lemma A.1, (12) is due to the independence between
+𝑋1 and 𝑃−1𝑜(the first factor is a function of 𝑃−1𝑜, bounded because
+⟨¯𝑜,𝑜⟩≥1/
+√
+𝐷), and (13) is because 𝑝𝐷−1 has mean 0. Multiplied
+by
+√︁
+1 −𝛽2, the second term has mean zero, which completes the
+proof of the unbiasedness.
+Error bound. By Lemma A.1, the error has the same distribution as
+𝑍:= 𝛽(𝐴𝐷𝑚−1) +
+√︁
+1 −𝛽2 𝐷
+𝐷𝑚
+√︁
+𝐷𝑚/𝐷−⟨¯𝑜𝐷𝑚,𝑜⟩2
+⟨¯𝑜,𝑜⟩
+𝑋1,
+(14)
+so it suffices to bound 𝑍. Fix 0 < 𝜖≤√𝐷𝑚/3 and consider three
+events:
+• E1:
+⟨¯𝑜𝐷𝑚,𝑜⟩−(𝐷𝑚/𝐷) E⟨¯𝑜,𝑜⟩
+ ≤𝜖√𝐷𝑚/𝐷. By Lemma A.2
+with 𝑢= 𝜖, Pr{Ec
+1} ≤2𝑒−𝑐𝜖2.
+• E2:
+⟨¯𝑜,𝑜⟩−E⟨¯𝑜,𝑜⟩
+ ≤𝜖/
+√
+𝐷. By Eq. (9) with 𝑢= 𝜖,
+Pr{Ec
+2} ≤2𝑒−𝑐𝜖2. On E2, ⟨¯𝑜,𝑜⟩≥E⟨¯𝑜,𝑜⟩/2, because
+𝜖/
+√
+𝐷≤𝜖/√𝐷𝑚≤1/3 < 0.79/2 < E⟨¯𝑜,𝑜⟩/2.
+• E3: |𝑋1| ≤𝜖/
+√
+𝐷−1. By the tail bound (32) of [18] in di-
+mension 𝐷−1, Pr{Ec
+3} ≤2𝑒−𝑐0𝜖2.
+On E1 ∩E2, by Eq. (4) and the triangle inequality,
+|𝐴𝐷𝑚−1| =
+(𝐷/𝐷𝑚) ⟨¯𝑜𝐷𝑚,𝑜⟩−⟨¯𝑜,𝑜⟩
+
+⟨¯𝑜,𝑜⟩
+≤(𝐷/𝐷𝑚) · 𝜖√𝐷𝑚/𝐷+ 𝜖/
+√
+𝐷
+E⟨¯𝑜,𝑜⟩/2
+≤
+4
+E⟨¯𝑜,𝑜⟩·
+𝜖
+√𝐷𝑚
+,
+where the numerator bounds
+(𝐷/𝐷𝑚) ⟨¯𝑜𝐷𝑚,𝑜⟩−E⟨¯𝑜,𝑜⟩
+ by E1 and
+E⟨¯𝑜,𝑜⟩−⟨¯𝑜,𝑜⟩
+ by E2, and 𝜖/
+√
+𝐷≤𝜖/√𝐷𝑚gives the last step.
+On E2 ∩E3, the second term of 𝑍is at most (since
+√︁
+𝐷𝑚/𝐷−⟨¯𝑜𝐷𝑚,𝑜⟩2 ≤
+√︁
+𝐷𝑚/𝐷and
+√︁
+1 −𝛽2 ≤1)
+𝐷
+𝐷𝑚
+√︂
+𝐷𝑚
+𝐷· 𝜖/
+√
+𝐷−1
+E⟨¯𝑜,𝑜⟩/2 =
+2
+E⟨¯𝑜,𝑜⟩
+√︂
+𝐷
+𝐷−1 ·
+𝜖
+√𝐷𝑚
+≤
+2
+√
+2
+E⟨¯𝑜,𝑜⟩·
+𝜖
+√𝐷𝑚
+in magnitude, using 𝐷/(𝐷−1) ≤2. Hence, with |𝛽| ≤1, on E1 ∩
+E2 ∩E3,
+|𝑍| ≤4 + 2
+√
+2
+E⟨¯𝑜,𝑜⟩·
+𝜖
+√𝐷𝑚
+<
+9𝜖
+√𝐷𝑚
+,
+the last step because E⟨¯𝑜,𝑜⟩> 0.79 and (4 + 2
+√
+2)/0.79 < 9. By the
+union bound,
+Pr
+
+|𝑍| > 9𝜖/
+√︁
+𝐷𝑚
+	
+≤
+3
+∑︁
+𝑗=1
+Pr
+
+Ec
+𝑗
+	
+≤4𝑒−𝑐𝜖2 + 2𝑒−𝑐0𝜖2 ≤6𝑒−𝑐′𝜖2,
+(15)
+where 𝑐′ := min(𝑐0,𝑐). Since a probability is at most 1, the right-
+hand side of Eq. (15) can be replaced by 2𝑒−𝑐′′𝜖2 with 𝑐′′ :=
+𝑐′ ln 2/ln 6: when 𝑐′𝜖2 ≤ln 6 the new bound is at least 1, and other-
+wise 6𝑒−𝑐′𝜖2 ≤2𝑒−𝑐′′𝜖2 because (𝑐′ −𝑐′′)𝜖2 = (𝑐′ ln 3/ln 6) 𝜖2 > ln 3.
+Finally, applying the result with 𝜖/9 in place of 𝜖(which stays
+within the range 𝜖/9 ≤√𝐷𝑚/3) gives Pr{|𝑍| > 𝜖/√𝐷𝑚} ≤2𝑒−𝑐1𝜖2
+with 𝑐1 := 𝑐′′/81, which is the error bound of Theorem 3.1.
+A.4
+Empirical Error Distribution
+We examine the estimation error for synthetic unit-vector pairs
+in R768 with prescribed inner products 𝛽= ⟨𝑜,𝑞⟩∈{0.5, 0.9}. For
+each fixed pair, we evaluate both 𝐷𝑚= 𝐷and 𝐷𝑚= 𝐷/2 over 106
+independent Haar-distributed rotations, which preserve 𝛽while
+varying the quantization error. Figure 12 shows error distributions
+centered near zero, consistent with the estimator’s unbiasedness.
+Retaining half the coordinates broadens both distributions, reflect-
+ing the additional uncertainty introduced by the prefix.
+−0.2 −0.1
+0
+0.1
+0.2
+0
+10
+20
+30
+Density
+(a) Dm =D
+−0.2 −0.1
+0
+0.1
+0.2
+0
+10
+20
+30
+(b) Dm =D/2
+Estimation error Em =̃βm −β
+β=0.5
+β=0.9
+±ε/√Dm
+Figure 12: Empirical estimation-error distributions for 𝐷=
+768 with (a) 𝐷𝑚= 𝐷and (b) 𝐷𝑚= 𝐷/2. Dashed lines mark
+±𝜖/√𝐷𝑚for 𝜖= 1.9.
+We use 𝜖= 1.9, following RaBitQ [17], and count a lower-bound
+violation when b𝛽𝐷𝑚−𝛽< −𝜖/√𝐷𝑚. For 𝛽= 0.5, the violation rate
+increases from 0.18% at 𝐷𝑚= 𝐷to 2.17% at 𝐷𝑚= 𝐷/2. The errors
+at 𝛽= 0.9 are more concentrated: no violations are observed with
+16
+
+
+Table 7: Search-result determinism on YFCC-100M (𝑇= 64). Percentages give the fraction of queries with unchanged results
+across all eight runs, treating substitutions between points at the same true distance to the query as unchanged. The rank
+ranges refer to positions in the returned list, with 𝑟= 0.4𝑘for both variants; order within each set is ignored. Recall spread is
+the difference between the maximum and minimum recall across runs, in percentage points (pp).
+Queries with unchanged results (%)
+𝑘
+Variant
+Top-𝑘
+[1,𝑟]
+(𝑟,𝑘]
+Recall spread (pp)
+10
+Scheduled
+99.95
+100.00
+99.95
+0.003
+Full
+97.89
+99.98
+97.89
+0.022
+100
+Scheduled
+99.96
+100.00
+99.96
+0.0002
+Full
+35.85
+99.66
+35.85
+0.645
+the full code in 106 trials, while the half-length prefix yields a rate
+of 0.21%.
+B
+Search-Result Determinism
+We examine search-result determinism using the 𝑛probe selected for
+Full to achieve approximately 0.90 recall, keeping the same value
+for Scheduled. We execute the query workload eight times, three
+in the original order and five with shuffled query orders. Table 7
+compares the returned neighbor sets across these runs.
+Scheduled is nearly deterministic after accounting for distance
+ties. Among 10,000 queries, only 5 at 𝑘= 10 and 4 at 𝑘= 100
+return different top-𝑘results across the eight runs. The argument of
+search-result determinism assumes exact re-ranking and valid lower
+bounds. The remaining changes occur near the rank-𝑘boundary,
+where the affected candidates have lower bounds above their true
+distances and the final 𝑘-th distances in runs that omit them. Such
+violations reflect the probabilistic nature of the lower bound, also
+illustrated by the empirical error distributions in §A.4. Although
+a candidate’s lower bound is fixed across runs, the candidate may
+be re-ranked before the running threshold falls below that bound,
+or pruned if tested later. Recall varies by at most 0.003 percentage
+points across runs.
+Full’s output varies mainly in the tail. At 𝑘= 100, the unchanged-
+query fraction is 35.85% for both the entire top-𝑘and ranks (0.4𝑘,𝑘],
+compared with 99.66% for the first 40 positions. This pattern is con-
+sistent with the 𝛼-quantile threshold making retention of neighbors
+at ranks (𝛼𝑘,𝑘] sensitive to I/O completion order. Earlier re-ranking
+of closer candidates can tighten the threshold before these neigh-
+bors’ pages are issued, whereas a different completion order may
+allow those pages to be read. Although I/O completion order affects
+the returned neighbors, recall remains relatively stable across the
+eight runs, ranging from 0.9005 to 0.9069 at 𝑘= 100.
+C
+Additional Evaluation Results
+C.1
+Main Evaluation
+Table 8 reports throughput at recall 0.90 and 0.95 for all five datasets
+in the main evaluation (§5.2).
+C.2
+Ablation Study
+Figure 13 shows the throughput–recall curves for the three ablations
+on YFCC-100M and LAION-100M.
+On YFCC-100M, RaBitQ-SSD (𝐵= 9) is faster than DiskANN
+(disk-PQ) at recall 0.90, but the ordering reverses at recall 0.95
+(Figure 13(b)). Reaching the higher recall requires more probing,
+increasing the work spent scanning full-dimensional in-memory
+codes. FastScan becomes the main bottleneck for RaBitQ-SSD, lim-
+iting the throughput benefit of fewer SSD reads.
+The gap between 𝐵= 5 and SQ4 grows at higher recall on both
+datasets (Figure 13(c,f)). SQ4 requires substantially more probing to
+reach higher recall, reducing throughput. In the measured sweep,
+SQ4 reaches recall 0.95 on YFCC-100M at much lower throughput
+than 𝐵= 5, and does not reach recall 0.95 on LAION-100M.
+C.3
+Parameter Study
+The in-flight budget 𝑄. Figure 14 reports throughput at recall
+0.90 against 𝑄on YFCC-100M, one line per thread count (𝐷𝑚= 𝐷).
+When 𝑄is too small, a thread has too few reads in flight to use
+the SSD’s internal parallelism. At 𝑘= 1000, where a query issues
+hundreds of reads, throughput at 𝑇= 1 falls to about a third as
+𝑄goes from 16 to 4; at 𝑘= 10 the same change barely changes
+throughput, because the few reads hide behind compute, as the
+𝑇= 1 timeline of Fig. 4 showed. When 𝑄is too large, the pops
+reach deeper into the priority set and commit candidates that a
+slightly later threshold would have pruned (§4.3). Each such commit
+reads a page the query did not need: the page is fetched, swept,
+and re-screened, some of its members are re-ranked, and none of
+that work would have happened at a smaller 𝑄. Under a heavy I/O
+load the excess reads also lengthen completion latency (§4.4), so
+candidates are committed against a staler threshold and fewer of
+them are pruned. Past 𝑄= 16 throughput declines slightly at𝑇= 1;
+at 𝑇= 64 and 𝑘= 10 it falls to about a third of its value at the
+best 𝑄. The best 𝑄therefore rises with 𝑘and falls with 𝑇, and the
+deployed rule (𝑄= 16 for 𝑇≤16, 𝑄= 8 above) stays within 3.7%
+of the throughput at the best 𝑄at every 𝑇and 𝑘measured.
+The drain threshold 𝛼. Figure 15 reports throughput against recall
+for 𝛼∈{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0} on YFCC-100M at 𝑇= 64
+and 𝐷𝑚= 𝐷. 𝛼= 1 recovers Scheduled (§4.4); 𝛼= 0.4 is the default.
+A tighter 𝛼prunes more of the pages left pending when the scan
+ends, so a query reads fewer of them: at recall 0.90 and 𝑘= 100, the
+pages per query are 125 at 𝛼= 0.1, 132 at the default, and 236 at
+𝛼= 1; at 𝑘= 1000 they are 893, 957, and 1,699.
+Below the default the count barely moves, while above it nearly
+doubles. At recall 0.90 the default stays within 6.6% of the through-
+put at the best 𝛼at every 𝑘measured.
+17
+
+
+Table 8: Throughput (QPS) at recall 0.90 and 0.95 on the five datasets in Figure 5, at 𝑘= 10 and 𝑇= 64, under both memory
+budgets. Bold indicates the highest QPS for each dataset, memory budget, and recall.
+Recall 0.90
+Recall 0.95
+Budget
+Dataset
+RaBitQ-SSD DiskANN PipeANN Starling RaBitQ-SSD DiskANN PipeANN Starling
+𝐷𝑚= 𝐷
+OpenAI-5M
+43 418
+25 759
+26 484
+25 466
+22 931
+18 717
+18 360
+18 598
+Wiki-10M
+42 279
+36 847
+31 455
+35 965
+28 571
+25 209
+20 778
+24 181
+DPR-100M
+6 690
+2 946
+3 834
+3 333
+2 829
+1 291
+1 736
+1 512
+LAION-100M
+50 509
+39 366
+40 233
+36 109
+32 252
+27 175
+27 207
+25 740
+YFCC-100M
+42 057
+23 017
+26 701
+25 568
+22 418
+17 788
+19 231
+20 073
+𝐷𝑚= 𝐷/2
+OpenAI-5M
+32 818
+16 695
+16 561
+16 590
+24 345
+10 234
+9 700
+10 147
+Wiki-10M
+21 047
+18 559
+16 206
+17 283
+17 022
+10 388
+9 164
+9 827
+DPR-100M
+8 298
+310
+592
+338
+3 814
+142
+236
+97
+LAION-100M
+26 631
+18 976
+19 162
+19 177
+21 002
+9 383
+9 182
+9 858
+YFCC-100M
+36 465
+14 851
+16 360
+16 367
+26 120
+9 427
+9 961
+10 349
+80
+90
+100
+Recall@10 (%)
+104
+QPS
+(a) In-memory code (YFCC-100M)
+RaBitQ-SSD
+PipeANN (PQ)
+PipeANN (RaBitQ)
+80
+90
+100
+Recall@10 (%)
+104
+(b) On-disk representation (YFCC-100M)
+RaBitQ-SSD
+RaBitQ-SSD-fp
+DiskANN
+DiskANN (disk-PQ)
+80
+90
+100
+Recall@10 (%)
+103
+104
+(c) Re-ranking precision (YFCC-100M)
+RaBitQ-SSD (B=9)
+RaBitQ-SSD (B=5)
+RaBitQ-SSD (SQ8)
+RaBitQ-SSD (SQ4)
+80
+90
+100
+Recall@10 (%)
+104
+QPS
+(d) In-memory code (LAION-100M)
+RaBitQ-SSD
+PipeANN (PQ)
+PipeANN (RaBitQ)
+80
+90
+100
+Recall@10 (%)
+104
+(e) On-disk representation (LAION-100M)
+RaBitQ-SSD
+RaBitQ-SSD-fp
+DiskANN
+DiskANN (disk-PQ)
+80
+90
+100
+Recall@10 (%)
+103
+104
+(f) Re-ranking precision (LAION-100M)
+RaBitQ-SSD (B=9)
+RaBitQ-SSD (B=5)
+RaBitQ-SSD (SQ8)
+RaBitQ-SSD (SQ4)
+Figure 13: Ablation on YFCC-100M (top row) and LAION-100M (bottom row), at 𝐷𝑚= 𝐷, 𝑘= 10, and 𝑇= 64. The columns
+compare the in-memory code, on-disk representation, and re-ranking precision, respectively. All QPS axes use a log scale.
+80
+90
+100
+104
+QPS
+k = 10
+80
+90
+100
+104
+k = 100
+80
+90
+100
+103
+k = 1000
+Recall@k (%)
+=0.1
+=0.2
+=0.3
+=0.4 (default)
+=0.5
+=0.6
+=0.8
+=1.0 (Sched.)
+Figure 15: The drain threshold 𝛼on YFCC-100M at 𝑇= 64
+and 𝐷𝑚= 𝐷: throughput against recall, one panel per 𝑘, one
+curve per 𝛼(log scale). 𝛼= 1.0 disables the drain tightening
+and recovers Scheduled (§4.4); the heavier curve is the default
+𝛼= 0.4.
+4
+8
+16
+32
+64
+104
+QPS at recall 0.90
+k = 10
+4
+8
+16
+32
+64
+102
+103
+k = 1000
+per-thread in-flight budget  Q
+T=1
+T=4
+T=8
+T=16
+T=32
+T=64
+deployed rule
+Figure 14: The in-flight budget 𝑄on YFCC-100M (𝐷𝑚= 𝐷):
+QPS at recall 0.90 against the per-thread𝑄, one line per thread
+count. Stars mark the deployed rule (𝑄= 16 for 𝑇≤16, 8 for
+𝑇> 16).
+18

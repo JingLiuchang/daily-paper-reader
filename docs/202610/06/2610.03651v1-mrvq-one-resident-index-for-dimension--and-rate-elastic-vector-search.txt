@@ -1,0 +1,563 @@
+MRVQ: One Resident Index for Dimension- and
+Rate-Elastic Vector Search
+Sean Culatana
+Atlassian
+Mountain View, CA
+sculatana@atlassian.com
+Shang-En Huang
+National Taiwan University
+Taipei, Taiwan
+sehuang@csie.ntu.edu.tw
+Kang Li
+Atlassian
+Bellevue, WA
+kli3@atlassian.com
+Abstract
+Dense-retrieval services must switch among embedding-prefix dimensions and
+index bit rates as latency, quality, and memory budgets change. Tuning a quantizer
+separately for each rate gives the best quality, but the retrieval tier then holds several
+code streams and quantizer states at once. We introduce Matryoshka Residual
+Vector Quantization (MRVQ), a post-hoc residual quantizer for frozen embed-
+dings. Its maximum-rate code can be truncated two ways: dropping residual stages
+lowers the rate, and dropping embedding coordinates lowers the dimension. One
+resident artifact therefore serves every (dimension, rate) pair we evaluate. Across
+FiQA and NFCorpus, four embedding families, and {4, 8, 16}-byte codes, MRVQ
+is the lowest-RAM design we evaluate. It uses 17.8–22.0× less memory than three
+separately trained QINCo2 indices, and 1.89–2.02× less than a lean shared-model
+steelman. The saving is not free: per-rate QINCo2 is 0.026–0.107 nDCG@10
+better on FiQA. But MRVQ beats PQ, OPQ, and AdANNS-OPQ at matched code
+size. We also evaluate a low-build-cost PCA-scalar design that attains quality com-
+parable to RaBitQ and its extension while fitting 420× faster at the median. Finally,
+we report two negative results: QINCo2 collapses when trained at high rates, and a
+ranking-bound hypothesis misses its pre-specified acceptance criteria. MRVQ is
+therefore a low-memory operating point for elastic retrieval, not a universal quality
+winner.
+1
+Introduction
+Dense retrieval is a first-class component of retrieval-augmented generation and agentic systems.
+For large corpora, the document embeddings and index state—rather than the query encoder—often
+dominate resident memory: a 768–1024 dimensional fp32 vector occupies 3–4 KB before indexing.
+That state must also support more than one operating point. Dimension elasticity uses prefixes of
+Matryoshka representations to trade retrieval quality for query compute and bandwidth [Kusupati
+et al., 2022, Rege et al., 2023]; rate elasticity changes the document code size to trade quality for
+storage. A high-quality deployment can tune a quantizer independently for each rate, but then the
+retrieval tier retains several code streams and model states at once.
+We ask whether a single resident document code can cover both axes. MRVQ fits a residual vector
+quantizer post-hoc on frozen embeddings, weighting reconstruction error across the served prefix
+dimensions. Residual stages provide nested rates, and coordinate prefixes provide nested dimensions,
+so the same stored code supports every (m, b) ∈M × B (Figure 1). This differs from AdANNS,
+which targets dimension-adaptive search, and from MatQuant, which nests model-weight precision
+rather than document-index codes [Nair et al., 2025]; Appendix E places MRVQ among quantizers
+for approximate search.
+40th Conference on Neural Information Processing Systems (NeurIPS 2026). Workshop: NeurIPS 2026 Workshop on Machine
+Learning for Systems (MLForSys).
+arXiv:2610.03651v1  [cs.AI]  2 Oct 2026
+
+
+Rate-specialized deployment
+one quantizer state and one code stream per rate
+4 B/vec
+P4
+4n
+8 B/vec
+P8
+8n
+16 B/vec
+P16
+16n
+model state
+document codes (B)
+each rate-specific index still serves every prefix dimension
+MRVQ
+one maximum-rate code, truncated along two axes
+1.  stage prefix ⇒ rate
+4 B
+8 B
+16 B
+2.  coordinate prefix ⇒ dimension
+m1
+m2
+D
+Resident: P4 +P8 +P16 +28n bytes
+= 228.9 MiB
+Resident: 4LKD+16n bytes
+= 12.88 MiB
+17.8× less
+Figure 1: Amortizing a rate-and-dimension menu. A rate-specialized deployment keeps one
+quantizer state and one code stream per rate; each stream may still expose every embedding-prefix
+dimension. MRVQ stores one maximum-rate residual code: stage prefixes select 4/8/16 B/vector,
+and coordinate prefixes select the embedding dimension. The document-code term falls from 28n to
+16n bytes, and sharing the quantizer state produces the larger measured saving (Table 1). Quoted
+totals are FiQA at D=768.
+Our contribution is a systems trade-off, not a claim of universal quality dominance. First, we formalize
+resident-memory accounting for a full rate menu and show that one MRVQ artifact is the lowest-RAM
+configuration evaluated. Second, we measure the corresponding quality cost against QINCo2 and
+the gains over standard ANN quantizers. Third, we evaluate a separate, inexpensive PCA-scalar
+design for hosts on which iterative quantizer training is undesirable. Finally, we report two negative
+results—high-rate QINCo2 training failures and a ranking-preservation predictor that does not meet
+our pre-specified bar.
+2
+MRVQ and Resident-Memory Model
+Let {xi}n
+i=1 ⊂RD be frozen document embeddings. An L-stage residual vector quantizer with
+K = 256 codewords per stage produces indices z(1:L)
+i
+and reconstructions ˆx(ℓ)
+i
+= Pℓ
+j=1 C(j)
+z(j)
+i .
+Because each stage index occupies one byte, decoding the first b stages gives a b-byte code. MRVQ
+makes the same code dimension-elastic by fitting the codebooks under
+Lprefix =
+n
+X
+i=1
+X
+m∈M
+wm
+x[:m]
+i
+−ˆx(L)[:m]
+i
+
+2
+2 ,
+wm ≥0,
+X
+m
+wm = 1.
+(1)
+At serving time, (m, b) selects ˆx(b)[:m]
+i
+; no re-encoding and no additional document code is required.
+Queries remain in floating point and are scored asymmetrically, as in PQ/OPQ and RaBitQ.
+For the evaluated L = 16, MRVQ’s resident state is RMRVQ = 4LKD + 16n bytes: fp32 codebooks
+plus one 16-byte code per vector. A deployment with a separate QINCo2 artifact for each b ∈B =
+{4, 8, 16} costs Rsep = P
+b∈B(Pb + nb), where Pb is the corresponding model state; a shared-model
+steelman costs Rshared = P16 + 16n. The document-code term alone therefore changes from 28n to
+16n bytes (1.75× asymptotically), and at the corpus sizes we evaluate, sharing the fixed quantizer
+state produces a much larger ratio. Appendix A reports the fixed and per-vector terms separately so
+the accounting can be checked at any n.
+2
+
+
+Table 1: Resident RAM (MiB) for the complete {4, 8, 16} B/vector menu; ratios are relative to
+MRVQ. “Separate” retains one QINCo2 model and code stream per rate; “shared” is the leanest
+single-model steelman evaluated. Families that share an embedding width share a row because the
+accounting depends on D, not on the family.
+Dataset
+Family
+D
+MRVQ
+QINCo2 separate
+QINCo2 shared
+FiQA
+MPNet/Nomic/BGE
+768
+12.88
+228.9 (17.8×)
+25.17 (1.95×)
+FiQA
+Mxbai
+1024
+16.88
+354.6 (21.0×)
+31.85 (1.89×)
+NFCorpus
+MPNet/Nomic/BGE
+768
+12.06
+227.4 (18.9×)
+24.34 (2.02×)
+NFCorpus
+Mxbai
+1024
+16.06
+353.2 (22.0×)
+31.03 (1.93×)
+We also study a separate PCA-scalar operating point: rotate by PCA, allocate scalar bits by coordinate
+variance, and quantize each coordinate independently. It requires an eigendecomposition but no
+iterative learned-codebook training; it is not included in the MRVQ memory accounting.
+3
+Evaluation
+We use FiQA (57,638 documents, 648 queries) and NFCorpus (3,633 documents, 323 queries) from
+BEIR [Thakur et al., 2021]. The four embedding families are MPNet [Reimers and Gurevych, 2019]
+(D = 768), Mxbai [Lee et al., 2024] (D = 1024), Nomic [Nussbaum et al., 2024] (D = 768), and
+BGE [Xiao et al., 2023] (D = 768). Within each family, every method uses the same fixed, model-
+specific prefix menu M ⊆{128, 256, 384, 512, 768, 1024}, and a “menu mean” is the unweighted
+mean over that family’s evaluated prefix-rate cells. The prefix weights wm in Eq. (1) are uniform over
+M and all 16 residual stages are weighted equally; Appendix F lists the exact checkpoints, menus,
+and fitting budget. Rates are B = {4, 8, 16} B/vector, or 192–1024× smaller than the corresponding
+fp32 vector before fixed quantizer overhead.
+The metric is nDCG@10. Learned baselines use matched fitting budgets, and their aggregated
+per-rate results reproduce the stored runs to floating-point tolerance (maximum absolute deviation 0
+for MRVQ, 5 × 10−17 for QINCo2). We use paired per-query bootstrap confidence intervals (5000
+resamples; 10,000 for the RaBitQ study). Decision thresholds for the negative-result tests were fixed
+before the final aggregate analyses. Reported RAM is analytical accounting from the byte formulas
+above—parameter and code bytes only, with no optimizer or runtime buffers—rather than measured
+process RSS.
+4
+Results
+One artifact is the low-RAM corner.
+Table 1 prices the complete {4, 8, 16} B/vector menu.
+MRVQ uses 12.06–16.88 MiB and is the lowest-RAM configuration for all four families on both
+datasets. Relative to three separate QINCo2 models, the saving is 17.8–22.0×; relative to the leanest
+shared-model configuration (including reduced embedding width and fp16 variants), it is 1.89–2.02×.
+The first ratio is largest at these on-device and per-tenant corpus scales because neural parameter state
+dominates the resident footprint (Appendix A). As n grows, the separate-model ratio approaches
+the 28/16 = 1.75× code-stream ratio, while the shared-model gap becomes a fixed overhead and
+therefore less important; Figure 2(b) makes both limits explicit.
+Quality forms a two-corner Pareto.
+At matched code size, separately trained QINCo2 [Hui-
+jben et al., 2024, Vallaeys et al., 2025] beats MRVQ in every FiQA family-rate cell by 0.026–
+0.107 nDCG@10 (Appendix B). Conversely, even the shared-model QINCo2 steelman uses roughly
+1.9× MRVQ’s RAM at the evaluated corpus sizes. Figure 2(a) therefore shows two useful operating
+points rather than a single winner. The low-memory result repeats on NFCorpus for all four families.
+Against standard fixed-code ANN baselines, MRVQ is stronger at matched bytes. Across the
+aggressive 4–16 B/vector regime, paired-bootstrap intervals favor MRVQ over per-prefix OPQ by
+about 0.06–0.07 nDCG@10, over PQ by 0.10–0.12, and over AdANNS-OPQ [Rege et al., 2023]
+in every evaluated cell. The practical rule is therefore constraint-dependent: choose QINCo2 when
+quality dominates, and MRVQ when resident memory prevents keeping several specialized artifacts.
+3
+
+
+20
+50
+100
+200
+500
+Resident RAM for the full menu (MiB, log)
+0.15
+0.20
+0.25
+0.30
+0.35
+0.40
+FiQA menu-mean nDCG@10
+MPNet
+Mxbai
+Nomic
+BGE
+leanest shared-model
+QINCo2 (RAM only)
+(a) Neither design dominates both axes
+MRVQ (one artifact)
+QINCo2 (per-rate artifacts)
+10
+4
+10
+5
+10
+6
+10
+7
+10
+8
+10
+9
+Corpus size n (vectors, log)
+1×
+2×
+5×
+10×
+20×
+Baseline RAM / MRVQ RAM
+1.75× asymptote
+parity
+NFCorpus
+FiQA
+(b) The RAM advantage is corpus-size dependent
+vs. per-rate QINCo2
+vs. shared-model QINCo2
+Figure 2: (a) FiQA menu-mean nDCG@10 versus resident RAM for the full menu. MRVQ (◦)
+occupies the low-memory corner and per-rate QINCo2 (□) the high-quality corner; neither dominates
+on both axes. The dashed line marks the leanest shared-model QINCo2 RAM, whose quality we do
+not measure. (b) The same accounting as a function of corpus size at D=768. The advantage over
+per-rate QINCo2 decays from ∼18× at the evaluated corpora to the 1.75× code-stream asymptote,
+and the shared-model advantage falls below 1.1× at n=7.3M (▼).
+A low-build-cost scalar alternative.
+We compare PCA-scalar with RaBitQ and Extended-RaBitQ
+[Gao and Long, 2024, Gao et al., 2024] using native Faiss 1.13.2 asymmetric cosine search on
+ℓ2-normalized vectors. At nominal b ∈{1, 2, 4} bits/dimension, the RaBitQ representation receives
+an additional 8/20/20 B/vector, so the byte accounting is conservative for PCA-scalar. Across the
+two aggregate query grids, pooled PCA-scalar −RaBitQ deltas are +0.0076/ + 0.0029/ + 0.0010
+and −0.0009/ + 0.0012/ + 0.0006 nDCG@10 at b = 1/2/4. All absolute effects are below 0.008,
+and one Mxbai 1-bit cell favors RaBitQ by 0.0039; we therefore describe quality as comparable,
+not superior. Timed separately on three held-out BEIR corpora (18 cells, fixed 8-thread CPU),
+PCA training is 420× faster than matched OPQ fitting at the median and 686× at the mean, with
+a 47–1967× spread: 0.17–6.95 s against 72–416 s. That makes it attractive for in-place rebuilds
+(Appendix C).
+5
+Limitations and Conclusion
+Training reliability.
+On NFCorpus at 16 stages, per-rate QINCo2 suffers retrieval collapse—
+nDCG@10 below half the MRVQ value despite converged validation MSE—in 3/3 BGE seeds (best
+0.035) and 1/3 Nomic seeds. The best surviving Nomic seed is also non-monotone in rate: 0.294 at
+16 stages against 0.320 at 8. We retain these failures rather than silently dropping them.
+No ranking certificate.
+A parameter-free predictor based on residual energy is directionally useful
+but misses our pre-specified acceptance bar: pooled rank correlation is 0.825 against a required 0.85,
+and only 72% of cells yield a non-vacuous bound against a required 90% (Appendix D).
+Scope.
+The quality study covers two modest BEIR corpora and four embedding families. We
+measure resident memory and ranking quality, not end-to-end ANN latency, build energy, or recall–
+throughput curves; the RAM gains should not be read as speedups. At very large n the advantage
+over a shared-model baseline narrows as the accounting predicts.
+Within that scope, MRVQ converts a dimension-and-rate menu from several rate-specialized resident
+artifacts into one post-hoc code. It pays a measurable quality cost to QINCo2, but beats standard ANN
+quantizers at matched bytes and occupies a distinct low-memory Pareto point. That is the intended
+systems contribution: a simple deployment option for elastic retrieval when resident memory, rather
+than peak quality, is the binding resource.
+4
+
+
+References
+Artem Babenko and Victor Lempitsky. Additive quantization for extreme vector compression. In
+IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2014.
+Jianyang Gao and Cheng Long. RaBitQ: Quantizing high-dimensional vectors with a theoretical
+error bound for approximate nearest neighbor search. Proceedings of the ACM on Management of
+Data, 2024.
+Jianyang Gao, Yutong Gou, Yuexuan Xu, Yongyi Yang, Cheng Long, and Raymond Chi-Wing Wong.
+Practical and asymptotically optimal quantization of high-dimensional vectors in euclidean space
+for approximate nearest neighbor search. arXiv preprint arXiv:2409.09913, 2024.
+Tiezheng Ge, Kaiming He, Qifa Ke, and Jian Sun. Optimized product quantization for approximate
+nearest neighbor search. In IEEE Conference on Computer Vision and Pattern Recognition (CVPR),
+2013.
+Iris A. M. Huijben, Matthijs Douze, Matthew Muckley, Ruud J. G. van Sloun, and Jakob Verbeek.
+Residual quantization with implicit neural codebooks. In International Conference on Machine
+Learning (ICML), 2024.
+Hervé Jégou, Matthijs Douze, and Cordelia Schmid. Product quantization for nearest neighbor search.
+IEEE Transactions on Pattern Analysis and Machine Intelligence, 33(1):117–128, 2011.
+Aditya Kusupati, Gantavya Bhatt, Aniket Rege, Matthew Wallingford, Aditya Sinha, Vivek Ra-
+manujan, William Howard-Snyder, Kaifeng Chen, Sham Kakade, Prateek Jain, and Ali Farhadi.
+Matryoshka representation learning. In Advances in Neural Information Processing Systems
+(NeurIPS), 2022.
+Sean Lee, Aamir Shakir, Darius Koenig, and Julius Lipp. Open source strikes bread – new fluffy
+embedding model. Mixedbread research blog, 2024. URL https://www.mixedbread.com/
+blog/mxbai-embed-large-v1.
+Pranav Nair, Puranjay Datta, Jeff Dean, Prateek Jain, and Aditya Kusupati. Matryoshka quantization.
+arXiv preprint arXiv:2502.06786, 2025.
+Zach Nussbaum, John X. Morris, Brandon Duderstadt, and Andriy Mulyar. Nomic embed: Training
+a reproducible long context text embedder. arXiv preprint arXiv:2402.01613, 2024.
+Aniket Rege, Aditya Kusupati, Sharan Ranjit S, Alan Fan, Qingqing Cao, Sham Kakade, Prateek Jain,
+and Ali Farhadi. AdANNS: A framework for adaptive semantic search. In Advances in Neural
+Information Processing Systems (NeurIPS), 2023.
+Nils Reimers and Iryna Gurevych. Sentence-BERT: Sentence embeddings using Siamese BERT-
+networks. In Empirical Methods in Natural Language Processing (EMNLP), 2019.
+Nandan Thakur, Nils Reimers, Andreas Rücklé, Abhishek Srivastava, and Iryna Gurevych. BEIR: A
+heterogeneous benchmark for zero-shot evaluation of information retrieval models. In NeurIPS
+Datasets and Benchmarks Track, 2021.
+Théophane Vallaeys, Matthew Muckley, Jakob Verbeek, and Matthijs Douze. QINCo2: Vector com-
+pression and search with improved implicit neural codebooks. arXiv preprint arXiv:2501.03078,
+2025.
+Shitao Xiao, Zheng Liu, Peitian Zhang, Niklas Muennighoff, Defu Lian, and Jian-Yun Nie. C-Pack:
+Packed resources for general chinese embeddings. arXiv preprint arXiv:2309.07597, 2023.
+5
+
+
+A
+Resident-memory accounting and scaling
+Table 2 separates each configuration’s resident state into a fixed term and a per-vector term, so
+Table 1 can be reconstructed at any corpus size. The MRVQ fixed term is 4LKD bytes exactly. The
+separate-rate QINCo2 term counts three rate-specific models (de =D, dh =256, K =256, A=16,
+B =32, two sub-layers, fp32); at D =768 these hold 7.28M, 16.72M, and 35.60M parameters, so
+4 P
+b Pb = 227.3 MiB. The shared-model steelman is a single maximum-rate QINCo2 with de =128
+in fp16, prefix-truncated to serve 4/8/16 B/vector. All terms count parameter bytes only. Figure 3
+shows the resulting split at FiQA scale, where the fixed state accounts for over 93% of resident bytes
+in every configuration.
+Because MRVQ and the shared-model steelman carry the same 16n slope, their difference is a
+constant 12.29 MiB at D = 768: MRVQ stays more than 1.1× smaller through n ≈7.3M vectors,
+and the gap is under 8% beyond about 10M vectors. The separate-rate menu instead carries a 28n
+slope, so its ratio to MRVQ decays toward 28/16 = 1.75× rather than to parity.
+Table 2: Resident-state decomposition behind Table 1. L = 16 stages, K = 256 codewords per stage.
+Fixed term (MiB)
+Per-vector
+Configuration
+Resident state
+D = 768
+D = 1024
+(B/vector)
+MRVQ, one artifact
+4LKD + 16n
+12.00
+16.00
+16
+QINCo2, separate rates
+P
+b∈B Pb + 28n
+227.3
+353.1
+28
+QINCo2, shared model
+P16 + 16n
+24.29
+30.97
+16
+MRVQ, one artifact
+QINCo2, shared model
+QINCo2, separate rates
+228.87 MiB
+25.17 MiB
+12.88 MiB
+D=768  (MPNet, Nomic, BGE)
+fixed model / codebook state
+document codes (∝n)
+0
+50
+100
+150
+200
+250
+300
+350
+400
+Resident RAM for the full menu (MiB)
+MRVQ, one artifact
+QINCo2, shared model
+QINCo2, separate rates
+354.62 MiB
+31.85 MiB
+16.88 MiB
+D=1024  (Mxbai)
+Figure 3: FiQA (n = 57.6k) resident RAM for the full rate menu, split into fixed model or codebook
+state and the document codes that grow with n. The code term is a thin sliver at this corpus size,
+which is why the measured ratios in Table 1 are far above the asymptotic 1.75×.
+B
+Full matched-byte quality grid
+Table 3 reports FiQA MRVQ −QINCo2 nDCG@10 at matched code size. All paired-bootstrap
+intervals favor QINCo2; the values quantify the quality cost of sharing one code across the whole
+menu.
+C
+PCA-scalar versus RaBitQ
+Figure 4 plots the matched-nominal-bit deltas summarized in Section 4. The pre-specified practical-
+equivalence band was ±0.005 nDCG@10. The pooled results are small, but the 1-bit small-grid mean
+and its whole confidence interval lie above that band, which is why the main text says “comparable”
+rather than claiming formal equivalence. Note also that the two grids disagree in sign at 1 bit.
+6
+
+
+Table 3: FiQA MRVQ −QINCo2 nDCG@10 at matched bytes. Negative values favor QINCo2.
+Family
+4 B/vector
+8 B/vector
+16 B/vector
+Rate mean
+MPNet
+−0.042
+−0.051
+−0.069
+−0.054
+Mxbai
+−0.063
+−0.107
+−0.084
+−0.085
+Nomic
+−0.042
+−0.057
+−0.050
+−0.050
+BGE
+−0.026
+−0.053
+−0.070
+−0.050
+The fitting-speed comparison is timed on ArguAna, Quora, and SciDocs rather than on FiQA and
+NFCorpus, so it characterizes the two fitting procedures rather than the specific indices evaluated
+above. Across those 18 cells, PCA training takes 0.17–6.95 s against 72–416 s for matched OPQ
+fitting; the ratio has median 420× and mean 686×, ranging from 47× to 1967×. We quote the
+median in the main text because the mean is inflated by the largest corpus-model pairs.
+1 bit/dim
+2 bit/dim
+4 bit/dim
+−0.004
+−0.002
+0.000
+0.002
+0.004
+0.006
+0.008
+0.010
+0.012
+Δ nDCG@10
+(PCA-scalar − RaBitQ)
+PCA-scalar ahead
+RaBitQ ahead
+small-BEIR grid (nq ≈5.5k)
+high-power grid (nq ≈13.2k)
+Figure 4: PCA-scalar −RaBitQ / Extended-RaBitQ nDCG@10 at matched nominal bits per dimen-
+sion, with 95% paired-bootstrap intervals. Positive values favor PCA-scalar; the shaded region is the
+pre-specified ±0.005 practical-equivalence band.
+D
+Ranking-preservation predictor
+The tested predictor is ϵ(r) =
+p
+D(r), where D(r) = Ei∥xi −x(r)
+i ∥2
+2 and ∥q∥2 = 1; Cauchy–
+Schwarz then bounds RMS score perturbation by ϵ(r). The sweep covers 40 cells: two datasets,
+four families, and five rates {1, 2, 4, 8, 16} B/vector. This rate set deliberately extends below the
+B = {4, 8, 16} serving menu of the main text, because a bound that is only meaningful at generous
+rates would be of little use. Fixed-rate cross-geometry Spearman correlation is 0.66, pooled predictor–
+gap Spearman correlation is 0.825, and only 72% of cells have a non-vacuous bound. Both aggregate
+statistics miss the pre-specified acceptance thresholds. Normalizing by E∥x∥2
+2 removes a scale
+confound from unnormalized Mxbai embeddings but does not change the verdict.
+E
+Related work
+PQ, OPQ, and additive quantization are standard fixed-rate compressors [Jégou et al., 2011, Ge et al.,
+2013, Babenko and Lempitsky, 2014]. QINCo/QINCo2 use implicit neural codebooks to improve
+rate–distortion performance [Huijben et al., 2024, Vallaeys et al., 2025]. RaBitQ and its extension
+provide scalar-quantization methods with error guarantees [Gao and Long, 2024, Gao et al., 2024].
+Matryoshka representation learning and AdANNS expose dimension elasticity [Kusupati et al., 2022,
+Rege et al., 2023], while MatQuant nests model-weight bit widths [Nair et al., 2025]. MRVQ instead
+targets the resident document index: one post-hoc code is truncated along both the residual-stage and
+the embedding-coordinate axis.
+7
+
+
+F
+Experimental configuration
+Table 4 collects the settings needed to reproduce the reported numbers.
+Table 4: Experimental configuration.
+Setting
+Value
+Datasets
+BEIR FiQA (57,638 docs, 648 queries), NFCorpus (3,633 docs, 323 queries)
+MPNet
+sentence-transformers/all-mpnet-base-v2, D = 768
+Mxbai
+mixedbread-ai/mxbai-embed-large-v1, D = 1024
+Nomic
+nomic-ai/nomic-embed-text-v1.5, D = 768
+BGE
+BAAI/bge-base-en-v1.5, D = 768
+Prefix menu M
+MPNet, BGE: {128, 256, 384, 512, 768}; Mxbai: {128, 256, 512, 768, 1024};
+Nomic: {128, 256, 512, 768}
+Prefix weights wm
+uniform, wm = 1/|M|; all 16 residual stages weighted equally
+Rate menu B
+{4, 8, 16} B/vector
+MRVQ quantizer
+L = 16 stages, K = 256 codewords per stage, fp32 codebooks
+MRVQ fitting
+50 iterations, 50,000 sampled vectors, seed 0
+Retrieval
+asymmetric scoring, fp32 queries; Faiss 1.13.2 for the RaBitQ study
+Metric
+nDCG@10
+Uncertainty
+paired per-query bootstrap, 5000 resamples (10,000 for RaBitQ)
+RAM accounting
+analytical, from the byte formulas in Table 2
+Build-time protocol
+CPU, fixed 8 threads, sequential timing; 3 seeds × 3 bit budgets
+× {ArguAna, Quora, SciDocs} × {MPNet, Mxbai} = 18 cells
+Artifact
+[author: anonymous repository link]
+8

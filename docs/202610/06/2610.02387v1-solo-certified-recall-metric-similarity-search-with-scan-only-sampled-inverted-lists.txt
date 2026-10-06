@@ -1,0 +1,2169 @@
+SOLO: Certified-Recall Metric Similarity Search
+with Scan-Only Sampled Inverted Lists
+Edgar Ch´avez
+Computer Science Department, CICESE
+elchavez@cicese.edu.mx
+Draft of September 25, 2026
+Abstract
+We present SOLO, an index for approximate nearest-neighbor search in general metric spaces whose
+serving path contains no ranking heuristic of any kind: a query is routed to the ks nearest points of
+a random sample of the database, and every object in the touched posting lists is evaluated with the
+true distance. Because nothing must outrank anything, recall equals a coverage probability computable
+from the stored index: one ground-truth pass over a query sample certifies every operating point at once,
+without serving any of them — a recall certificate, and for a navigable graph no analogous object exists
+at any price. The whole index is one recursive rule — sample the collection, post each object to its b
+nearest sample points, split any list that outgrows a bound, always scan the leaves — and its operating
+surface obeys an equal-work law, recall ≈f(b · ks), whose level is a one-scalar signature of the dataset.
+The same scan-only structure gives a serving floor no graph architecture reaches once the router is itself
+indexed by the same rule: Deep-100M served at recall 0.9977 from 1 GB of resident memory (enforced
+cap, 10.7 bytes per object) and at 0.9964 from 256 MB, Deep-1B at recall 0.9925 from 512 MB (and from
+96 MB at depth 3), inserts that are one search, and deletes that are exact. Throughput is competitive
+where the hardware allows it — up to 1.8× a tuned HNSW at 108 on the machine of §5, with operating
+points to the right of where that graph saturates — and the tables report it against HNSW, DiskANN,
+GRAFT, NAPP, misi, and SPANN’s assignment rule on the same hardware and ground truth.
+1
+Introduction
+At 108 objects, the practical frictions of nearest-neighbor serving are no longer about raw speed. First,
+recall dials saturate: an exhaustively tuned HNSW on Deep-100M stops improving at recall@10 = 0.9989
+(ef=4000); beyond that point there is no operating point, at any cost.
+Second, recall is unpredictable:
+a graph’s recall is an emergent property of its construction, measurable only against ground truth after
+the fact.
+Third, serving floors are heavy: disk-resident graph systems pin gigabytes of navigation state
+(DiskANN needs 12 GB for Deep-100M in our measurements and fails below 9.6 GB). Fourth, dynamism is
+hard: deleting from a navigable graph is famously delicate, and update layers are systems in their own right
+[15, 20].
+SOLO (Scan-Only Lists, One rule)1 is built from the opposite end: make the serving path so simple that
+its recall is a theorem about the index rather than an outcome of search heuristics. The index is an inverted
+file over a vocabulary that is a uniform random sample S of the database itself, |S| = αn. Each object is
+posted to its b nearest sample points; a query is routed to its ks nearest sample points; the touched lists are
+scanned exhaustively with the true distance. There is no vote, no scoreboard, no beam, no pruning bound:
+the only approximation in the entire path is which lists are touched. Consequently (§2.2) recall equals a
+coverage probability computable from the stored signatures by integer set intersection: exact neighbors for
+one sample of queries — paid once, on the operator’s own workload — certify the recall of every (b, ks)
+configuration simultaneously, with no query served and no index rebuilt.
+1Officially SOLOVINO, after the archetypal stray of Spanish folk naming (“solo vino” — it came alone): no clustering, no
+training, no graph; a random sample and one rule.
+1
+arXiv:2610.02387v1  [cs.DB]  1 Oct 2026
+
+
+One rule completes the design. Random sampling does not balance list sizes, and a list too large to
+scan would break the cost model — so a list that outgrows a bound is treated as what it is, a database:
+sampled, split by the same rank-b assignment, routed the same way. Leaves are always scanned. On the
+most hub-skewed dataset we have (GloVe), coverage inside the oversized lists is, if anything, easier than
+globally (up to 0.9994 at depth 2), and the recursive index matches its own composed prediction to 2 × 10−4
+end to end.
+Scanning more candidates than a graph probes is the deliberate trade: the scan is a streaming, prefetch-
+able, SIMD-friendly computation, and replication forgives local error exponentially (a covered neighbor is
+re-found in a median of ∼13 touched lists). Both properties are cashed in twice. In RAM, a scalar-quantized
+screen with exact re-ranking of R survivors is lossless at every operating point we measure: 8-bit codes
+lift throughput up to 2.8×, and a list-major stream of 4-bit codes, scanned in the order objects rank their
+sample points, serves SIFT-1M at 0.9992 at 8,836 queries/s on a laptop — 2.1× a saturated HNSW. On
+disk, the same codes duplicated into posting-ordered leaf blocks turn a query into ∼ks sequential reads plus
+∼R row fetches — serving Deep-100M under an enforced 1 GB memory cap at full recall — and, with the
+router indexed by the same rule, under 256 MB.
+Contributions.
+1. A scan-only serving model for sample-vocabulary inverted files with a recall certificate: recall = cov-
+erage, measured to hold within 5 × 10−4 at 106–108 on three datasets (§2.2), and carrying a per-query
+provision for queries drawn from outside the certified distribution (§4).
+2. The equal-work law: coverage is a function of the touched posting mass b·ks, nearly independent of its
+factorization; its level is a one-scalar dataset signature, and the distance evaluations needed at fixed
+recall grow only as n0.4–0.6 over four measured decades (§3).
+3. The one-rule recursion that restores bounded lists without clustering, validated end to end against an
+ablation that attaches a graph index to each oversized list: the recursion wins on recall and throughput
+simultaneously, with a build cheaper by 25× (§2.3, §5.2).
+Two things carry these claims into practice rather than standing beside them as separate contributions.
+The serving stack — rank-truncated serve-time replication, bitmap-deduplicated fused scan kernels, lossless
+SQ8/SQ4 screen-and-refine, a list-major code stream with rank-ordered postings as a query-time dial, an
+mmap-able router, posting-ordered leaf blocks — is what makes the scan-only model of (1) fast enough to be
+interesting and small enough to serve 108 vectors from 1 GB resident (§2.5, §5.3) and, with the rule pointed
+upward once, 109 from 512 MB at recall 0.9925 (§5.8). And every number in this paper is measured on the
+same machines, queries, and ground truth as HNSW, DiskANN, GRAFT, NAPP, vote-based serving of the
+identical postings (misi), and SPANN’s closure assignment rule (§5.6); that comparison is the evidence for
+the three claims, not a fourth one.
+What this paper assumes.
+Nothing outside itself. Section 2 defines the index completely — vocabulary,
+assignment, serving, recursion, kernels — over a black-box distance [1] and one interchangeable subroutine:
+an approximate nearest-neighbor index over the αn sample points, used only to route. That subroutine is
+a constant factor in the design, not a dependency of it, and the paper measures the difference: replacing
+it with exhaustive search over the sample moves no recall reported here by more than 10−4 (§2.1). The
+representation SOLO inherits — a vocabulary drawn from the database itself at a fixed fraction of it, and
+each object’s ranked signature over it — was introduced by misi [6], which served it by voting; SOLO keeps
+that representation, discards that serving theory, and everything an implementer needs is in §2.
+2
+The SOLO index
+The index and its serving path are Algorithm 1 in full, and Figure 1 is the same thing as a picture. The
+subsections explain the four choices it contains — a sampled vocabulary, rank-b assignment, exhaustively
+scanned leaves, and the one recursion — and what each one buys.
+2
+
+
+database X
+n objects
+sample
+vocabulary S
+αn sampled points
+rank-b
+assign
+> τ
+posting lists Ls
+mean length b/α
+touched
+a list too big to scan is itself a database: the same rule again
+query q
+route to the ks nearest terms
+scan,
+merge
+exact top-k
+of everything scanned
+no vote, no beam,
+no pruning bound
+Figure 1: The whole index. A uniform random sample of the database is the vocabulary; each object is
+posted to its b nearest sample points; a query is routed to its ks nearest sample points and the touched lists
+are scanned with the true distance. The one rule that is not a straight line is the dashed one: a list that
+outgrows τ is treated as a database and decomposed by the same construction. Nothing in the serving path
+ranks anything except by d(q, ·), which is why recall is Proposition 1.
+Algorithm 1 SOLO. d is the black-box distance; Route(q, S, m) returns the m nearest points of S to q
+by any high-recall ANN index (Remark 1); and Ls(b) = {x : s ∈sig(x)[1..b]} is the posting list of s at
+replication b, a prefix restriction of the stored signatures.
+1: procedure Build(X, α, kb, τ)
+2:
+S ←uniform random sample of X, |S| = α|X|
+3:
+build a router over S
+4:
+for all x ∈X in parallel do
+5:
+sig(x) ←Route(x, S, kb)
+▷ranked; stored once, serves every b ≤kb
+6:
+for all s ∈S with |Ls(kb)| > τ do
+7:
+Build(Ls(kb), α′, k′
+b, τ)
+▷a list too big to scan is a database
+8: procedure Serve(q, b, ks, k)
+9:
+V ←∅
+10:
+for all s ∈Route(q, S, ks) do
+11:
+if Ls(b) is a leaf then
+12:
+V ←V ∪Ls(b)
+▷scan it all; no pruning
+13:
+else
+14:
+V ←V ∪ServeLs(q, b′, k′
+s, k)
+15:
+return the k objects of V with smallest d(q, ·)
+▷deduplicated; exact over V
+Two properties are visible in the pseudocode and are the source of everything that follows.
+Build
+contains no loop that revisits a decision: no clustering iteration, no graph refinement, no insertion order —
+the objects’ signatures are independent, so construction is embarrassingly parallel and bitwise reproducible.
+Serve contains no comparison between candidates other than the true distance: no vote, no scoreboard, no
+beam, no bound. The second property is what makes recall a theorem (§2.2); the first is what makes the
+index cheap to build and exact to update (§2.7).
+2.1
+Vocabulary and assignment
+Given X with |X| = n in a metric space with black-box distance d, draw a uniform sample S ⊆X, |S| = αn
+(all experiments: α = 2%). Build any high-recall ANN index over S (the router). For each x ∈X, one router
+search yields its ranked signature: the kb nearest sample points in order (we build with kb=64). Assignment
+is truncation: posting x to its b nearest sample points, b ≤kb, is a serve-time choice — the inverted file for
+any b is a prefix-restriction of the stored ranked signatures, so one build serves every b. Mean list length
+is b/α. Construction is n independent searches: embarrassingly parallel, deterministic for fixed seed, with
+3
+
+
+no iterative refinement of any kind. Sample points are indexed like any other object; each carries itself at
+rank 1 of its own signature, so a query whose true neighbor is a vocabulary point retrieves it from that
+point’s own list (measured: probability 1.0) — the double role costs 0.3% of scanned work in re-evaluated
+routing distances and one of b replication slots for the α fraction of objects that are sampled.
+Remark 1 (Router independence). The router is the only approximate subroutine in SOLO, and the index
+does not inherit its error. On Deep-100M we replaced query routing with exact top-ks over the two-million-
+point sample (chunked exhaustive search) and re-served every frontier configuration: the served recalls are
+identical to four decimals at b ∈{16, 32} and ks ∈{256, 384, 512} (the routed term sets themselves overlap
+at 0.9992–0.9999). Whatever recall SOLO attains is therefore a property of the assignment geometry, not of
+the router — which we report with GRAFT [7], and which any high-recall index over αn points may supply.
+The same holds on the build side by the insurance argument of §3.3: a signature that misses one sample
+point forfeits one of b replicas, and coverage depends on the union of b.
+2.2
+Scan-only serving and the recall identity
+A query is routed to its ks nearest sample points (ks is a per-query dial), the ks posting lists are scanned
+exhaustively with the true distance (duplicates removed), and the exact top-k of the scanned set is returned.
+Proposition 1 (Recall identity). Write Tb(x) ⊆S for the b nearest sample points of an object x and
+Rks(q) ⊆S for the ks nearest sample points of a query q, and let
+cov(b, ks) = Pr
+
+Tb(y) ∩Rks(q)̸ = ∅
+
+,
+y a true k-NN of q,
+the probability over the query distribution that a true neighbor and the query share at least one term. Under
+scan-only serving, recall@k = cov(b, ks), exactly, up to ties at rank k.
+Proof. Let V (q) = S
+s∈Rks(q) Ls be the scanned set, where Ls is the posting list of s. By construction y ∈Ls
+iff s ∈Tb(y), so y ∈V (q) iff Tb(y)∩Rks(q)̸ = ∅. Serving evaluates d(q, ·) on every element of V (q) — the true
+distance, no bound, no early exit — and returns the exact top-k of V (q). Hence a true k-NN y is returned
+iff y ∈V (q), i.e. iff y and q share a term; no other event can lose it and no other event can recover it. Taking
+expectations over queries and over the k true neighbors gives the identity. The only slack is at the boundary:
+if d(q, y) equals the k-th distance, another object at the same distance may be returned in its place, which
+is why the identity is stated up to ties.
+The proof is short because the design is: a scan-only path has exactly one failure mode, and it is a
+membership question about stored data rather than a question about search dynamics. Every quantity a
+graph must be trusted on — entry points, beam width, pruning, the order in which candidates are met —
+is absent, so there is nothing left for recall to depend on.
+Empirically the identity holds to four decimals on GloVe and Deep; on SIFT the residual (≤9 × 10−4)
+is fully attributed to ties (integer coordinates; zero membership misses; 28/2000 queries have tied 10-th
+distances within the exact ground truth itself). The sharpest test is the hardest corpus at the largest scale:
+on MS MARCO Web Search at 108 — 768-dimensional text embeddings under inner product, with queries
+drawn from a different distribution than the passages — the certificate computed from the stored signatures
+alone matches the served recall to 0.0001 at all 6 operating points, including those where the served recall is
+poor (0.8987 at best, §5.7). An index that predicts its own recall before serving predicts it when the answer
+is unwelcome too, which is the property that makes it worth deploying: routing exactly rather than with the
+router costs a further 0.0194 of coverage, so the two sources of loss are separately visible in the certificate.
+The certificate, and what it costs.
+We call a recall figure certified when it is computed from the
+stored index rather than observed by running the system, and Proposition 1 is what makes such a figure
+available: it turns an empirical question into an arithmetic one. It is worth being precise about the exchange
+rate. Evaluating cov requires knowing the true neighbors y, so it needs exact neighbors for a sample of
+representative queries — one brute-force pass, paid once. What it does not require is serving: given that
+one pass and the stored signatures, coverage at every (b, ks) is a set intersection over integers, so a single
+ground-truth computation certifies the entire operating surface, including configurations never deployed and
+4
+
+
+b values never materialized (assignment is a prefix, §2.1). Two consequences distinguish this from ordinary
+offline tuning. First, the certified quantity is the served recall rather than a proxy for it — Proposition 1
+is an identity, not a bound or a correlation. Second, the certificate is transferable: an operator computes
+it on their own query distribution, which is the distribution their recall will actually be drawn from, and
+re-certifies after a workload shift without touching the index. For a navigable graph no analogous object
+exists at any price: recall is a property of the traversal, so the only way to learn it is to run it.
+Out of sample.
+The certificate is an expectation over the query distribution it was computed on. A query
+drawn from outside that distribution needs a provision, and the index carries one — the ks routed distances
+are order statistics of a uniform sample of the query’s own distance distribution, so routing has already paid
+for a probe of the query’s neighborhood. Section 4 develops that provision and measures it across seven
+corpora and thirteen query sets, including a cross-modal shift where it fails.
+2.3
+One rule: recursive decomposition
+Hubness skews list sizes (max/mean ∼48× on GloVe at every b). SOLO does not fight skew at build time; it
+applies its own rule to any list larger than a bound τ: sample the list at α′, post members to their b′ nearest
+local sample points, and route queries that enter the list to k′
+s local cells. Leaves — lists below the bound, at
+any depth — are always scanned. Recall composes multiplicatively across levels, but so does the replication
+insurance (§3.3); measured inside GloVe’s oversized lists, local coverage reaches 0.9969 (b′=8, k′
+s=32) and
+0.9994 (k′
+s=64), and the depth-2 index lands on its composed prediction to 2 × 10−4.
+2.4
+Quantized leaves
+The leaf scan is a streaming pass over posting-ordered candidates — the computation SIMD integer arith-
+metic is best at. SOLO uses the simplest quantizer that could work: a global affine 8-bit grid (two constants,
+one pass over the data, no training), or — halving the bytes streamed — a per-dimension affine 4-bit grid
+(2d constants), packed two codes per byte. Serving screens with integer squared distances, keeps the R best
+distinct candidates, and re-ranks them at full precision; the returned ranking is exact over the screened set.
+At every operating point measured — three datasets, 106 to 108 — 8-bit codes with R=40 already reproduce
+the full-precision results exactly, and we serve with R=100; the coarser 4-bit screen needs R=200 to match
+on GloVe (SIFT is unchanged at R=100), and all SQ4 rows in this paper use R=200. For non-vector metric
+spaces the same architecture runs with plain distances; quantization is an accelerator of the verifier, never
+part of the core.
+How far down does the stream go?
+The screen is a sequential pass, so its cost is bytes, and the question
+is how coarse a code still recovers the pool’s own ceiling after exact refine. We measured a third rung below
+SQ4 — a 2-bit ternary code (keep the d/2 largest |ui| as ±1, zero the rest), scored against a float query,
+which leaves the op count of an SQ8 dot product and divides its bytes by four [24]. Inside a routed pool at
+ks=32, the pass set needed to recover 99.9% of the ceiling is R=20 for SQ8 but 200 at d=1024 and 2,000
+at d=100: two bits genuinely rank worse, by one to two orders of magnitude in R. It is still the cheaper
+design, because the pass set is two orders of magnitude smaller than the pool — counting bytes moved per
+query, a 2-bit screen feeding an SQ8 re-rank feeding the exact refine moves ∼3.6× less than an SQ8 screen
+at d=1024 and ∼2.9× less at d=100 — projected from the measured pool and pass-set sizes with the gather
+penalty taken from this paper’s own SQ8-gather-versus-SQ4-stream measurement, not measured end to end.
+The middle rung is what makes it work: it turns a wide exact gather into a wide SQ8 gather plus a narrow
+exact one. Two practical corollaries: quantizing the query as well (a fully bitwise product) is never worth
+it — the query is one vector and keeping it float buys one to seven points of coverage — and the object id
+should leave the code stream for a parallel array, since the screen never reads an id and only the survivors
+do, which is the difference between 146 and 170 records per 4 KB page at d=96, against 40 for SQ8. These
+are 106-scale laptop measurements (§8); the serving stack in this paper is SQ8 and SQ4 throughout.
+The screen/scorer distinction is load-bearing, and we measured its other side: SPANN built and served
+natively in Int8 on the identical 8-bit grid — quantized distances as the final scorer — saturates at 0.9561
+5
+
+
+on Deep-100M against float ground truth (58.2 h build, same machine), four points below its own float build,
+while the same grid used as a screen with exact refine is lossless. Quantization must screen, never score.
+2.5
+Serving kernels and the memory model
+Serving state: router, postings, codes, vectors. Three facts matter at n ≥108.
+Visited state must be bits. The scan deduplicates across ks lists. An epoch-stamped 32-bit visited array
+costs 4 B/object/thread — 25.6 GB at 108 with 64 threads: invisible in RAM benchmarks, fatal under a
+memory cap. A per-thread bitmap with touched-clearing costs 12.5 MB and is faster (cache-resident; +15%
+throughput). Deduplication must occur before the screen’s R-heap: the most duplicated candidates are
+exactly the nearest ones, and an undeduplicated heap fills with copies (we measured the failure: recall
+0.9982 →0.8394, worsening with ks).
+The scan must stream, not gather. With codes stored per object, scanning a list gathers one cache line
+per posting from a random address; with the codes duplicated in posting order (list-major: the record of
+list ℓ’s i-th member sits at position i of ℓ’s code stream) each of the ks lists is one sequential segment, and
+the same layout is what the disk mode reads (below). At 106 on one laptop core the stream costs ∼1.7 ns
+per record at either 8 or 4 bits (instruction-bound: the 4-bit form halves bytes, not instructions) plus 0.5–
+1.5 µs per segment of prefetcher ramp-up, against 9–25 ns per gathered record; at all ten cores the stream is
+bandwidth-bound and the 4-bit codes buy a further 1.4×. The layout is written once, at b=kb, with each list
+ordered by the rank its members assign to it — the objects for which ℓis the nearest sample point first, then
+those at rank 2, and so on. Two dials then cost nothing at build time: the served b is a prefix of every list,
+and the prefix may taper with routing position, b(t) = ⌈b0(1 −t/ks)p⌉for the t-th routed list, p=0 being the
+rectangle of Table 3. A tapered frontier reads fewer records than any rectangle of equal recall (on SIFT-1M,
+0.9991 from 54% of the records of the (16, 128) rectangle) — the rank-t lists far from the query contribute
+mostly rank-1 members, which the frontier keeps. The router is served at ef=ks: raising it to 4ks moves no
+recall by more than 10−3 and costs four times the routing time.
+Load must not rebuild. The router serializes to a flat, position-independent, mmap-able image; loading is
+43–90 µs at every scale measured, versus seconds-to-minutes of reconstruction, with bitwise-identical search.
+Under a memory cap the mapped router is file-backed and reclaimable; a rebuilt router is anonymous memory
+and is not.
+Disk wants layout, not paging. Serving the same index by letting vector reads fault through mmap reads
+6 TB in 80 minutes under a 4 GB cap (a 4 KB page per 384 B row, evicted before reuse): an ∼85× amplifica-
+tion. SOLO’s disk mode instead duplicates codes into the lists (SPANN’s trade — disk is the cheap resource):
+leaf blocks of [id | code] records in posting order, read sequentially into bounded per-thread buffers, screened,
+then refined by ∼R row reads from the single full-precision file. At (b, ks) = (16, 256) this is 37 MB sequential
++ 0.4 MB random per query, all explicit.
+2.6
+The codes as a proximity sketch
+The ranked signatures serve a second role beyond routing: for objects already indexed, company overlap
+is a calibrated proximity estimator computed by integer set intersection — no vector access. Measured on
+SIFT-1M (800 anchors), mean overlap at b=64 falls smoothly from 38.8 shared terms at neighbor rank 1
+through 23.4 at rank 100 to 16.3 at rank 1000, against a random-pair floor of 0.35 — a dynamic range of
+∼110:1, monotone across three decades of rank; at b=16 a ≥1-shared-term test captures 95% of rank-100
+pairs at a 1.8% false-pair rate. Three uses follow. (i) Result-set operations in the disk regime: re-ranking,
+diversification, or clustering of a returned candidate set by code overlap costs zero reads where vector fetches
+are the expensive resource (§5.3). (ii) Similarity self-joins: shared-term thresholds are a data-defined banding
+scheme over the inverted file the index already maintains. (iii) Standing queries: a subscription encoded once
+matches arriving objects’ codes — which their own inserts compute anyway — by intersection. A boundary
+honestly drawn: for a fresh query, encoding is a search, so code comparison cannot accelerate what produces
+it — data-adapted resolution costs a search to encode, the opposite end of the trade LSH [8] occupies; indeed
+misi’s vote was exactly code-overlap used as a ranking, and §5.6 shows scanning dominates it.
+6
+
+
+24
+26
+28
+210
+212
+214
+touched posting mass  b ⋅ks
+0.9
+0.99
+0.999
+0.9999
+coverage = recall@10
+no miss in 20,000 trials
+SIFT-1M
+Deep-10M
+Deep-100M
+GloVe-1.2M
+b ⋅ks=1024 on GloVe:
+5 factorizations of one mass,
+all covering 0.913–0.933
+Each point is one (b, ks); all values of b overlaid
+Figure 2: The equal-work law. Every measured (b, ks) pair is plotted against the posting mass it touches; the
+values of b (1–64 on the first three datasets, 8–32 on Deep-100M) are overlaid, not separated. That they fall
+on one curve per dataset is the law: within a contour the factorization is free. The curves’ horizontal offsets
+are the regime spectrum — SIFT reaches coverage 0.99 at b · ks ∼512, GloVe needs ≳8k. Deep-100M points
+are served recalls, equal to coverage by Proposition 1; the others are coverage computed from signatures.
+2.7
+Updates and determinism
+Insert: one router search, b list appends. Delete: removal from b lists — exact, no tombstones, no graph
+repair, no rebalancing protocol; no other object’s representation changes. Every build and every query is
+bitwise deterministic for a fixed seed at any thread count; recall is machine-independent (our d0 and laptop
+runs agree bit for bit, as they must).
+3
+Measured laws
+3.1
+The equal-work law and the regime spectrum
+Coverage collapses onto contours of the touched posting mass: cov(b, ks) ≈fX(b·ks) (Figure 2, Table 1). On
+GloVe at ∼140k scanned candidates, four different factorizations (b, ks) ∈{(4, 256), (8, 128), (16, 64), (64, 16)}
+cover 0.9126–0.9332; the law reappears at Deep-100M ((16, 256) ≈(32, 128) at 0.998, equal throughput).
+Inside a contour the split is free, so one chooses small b (storage, build) and buys recall with ks (routing over
+αn points is cheap). The level of fX is a one-scalar regime signature — b · ks for coverage 0.99: SIFT ∼512,
+Deep-10M ∼1–2k, GloVe ≳8k — the concentrated/spread dichotomy of metric spaces, measurable from the
+index itself.
+3.2
+Scale
+At fixed (b, ks) the level of f drifts down with n (0.9994 →0.9982 at (16, 256) from Deep-10M to Deep-
+100M). The drift is geometry, not router error (Remark 1): finer cells at |S| = 2M dilute the true neighbor’s
+membership. The remedy is the dial, and the dial is cheap because evaluations at fixed recall grow sublinearly.
+Over four decades at target 0.998 — each point interpolated on its own (evaluations, recall) frontier —
+30, 603 →76, 391 →185, 856 →696, 138 evaluations at n = 106 . . . 109, i.e. exponents 0.40, 0.39 and 0.57 per
+7
+
+
+cov(b, ks)
+b=4
+b=8
+b=16
+b=32
+b=64
+SIFT, ks=64
+0.9849
+0.9977
+0.9997
+1.0000
+1.0000
+SIFT, ks=128
+0.9965
+0.9996
+1.0000
+1.0000
+1.0000
+GloVe, ks=128
+0.8626
+0.9272
+0.9683
+0.9902
+0.9980
+GloVe, ks=256
+0.9126
+0.9635
+0.9890
+0.9977
+0.9997
+Table 1: Coverage under bounded assignment (α=2%, seed 1, 2,000 queries, true 10-NN). By Proposition 1
+these are served recalls.
+decade. The scanned fraction of the database falls throughout — 3.060% →0.764% →0.186% →0.070%
+— so at 109 a query at recall 0.998 touches roughly one part in 1400 of the collection, and the dial stays
+affordable as n grows. But the exponent is not constant and the last decade is the steepest of the four, so
+extrapolating past 109 with a fitted exponent is not the conservative choice we took it for: the honest reading
+is that work grows as n0.4–0.6 over the measured range, with the upper end at the top. Two caveats attach to
+the 109 point specifically: it is certified rather than served — coverage read off the stored signatures (§5.8),
+which Proposition 1 equates with recall; the served points at 109 stop at 0.9925, below this target, and there
+the identity holds to 0.0000 on the served queries — and its interpolation bracket is wide. At the looser
+target 0.995 the series is 21, 285 →50, 514 →· · · →373, 192; the 108 sweep never dipped below recall 0.998,
+so its 0.995 entry is an upper bound rather than a measurement and we fit no exponent through it.
+3.3
+Replication is insurance
+Among covered GloVe true neighbors at ks=64, the count j of touched lists containing the neighbor has
+median ∼13; only 2.5% have j=1. A neighbor is lost only if all j appearances are missed: a local miss
+rate ε costs ∼P
+j pjεj globally. This is why the lossless behavior of the SQ8 screen and the near-ceiling
+composition of the recursion are not luck; the same j-structure recurses (j median 3–8 inside decomposed
+lists).
+3.4
+Choosing the assignment rule
+Multi-assignment can also be done by distance ratio (“closure”, SPANN’s rule: assign to cells within (1 + ϵ)
+of the nearest). At equal mean replication, rank-b dominates closure on both datasets: SIFT, closure ϵ=0.1
+(¯b=7.3) covers 0.9960 at ks=128 vs. 0.9996 for rank-8; GloVe, closure ϵ=0.1 (¯b=42.6) covers 0.9788 vs. 0.9902
+for rank-32. The rank order of the signature is the better boundary detector at this vocabulary scale, and it
+is the representation the build already produces.
+4
+The certificate out of sample
+Proposition 1 certifies recall on the query distribution the certificate was computed on. Production query
+distributions drift, and an index whose selling point is a recall figure must say what that figure is worth
+when they do. This section develops the per-query provision sketched in §2.2, fits it on seven corpora and
+thirteen query sets, and reports the one regime in which it fails.
+The provision the index carries.
+The certificate is an expectation over the query distribution it was
+computed on; a query from outside that distribution needs a provision, and the index carries one. Because S
+is a uniform sample of X, the ks routed distances d(q, s(1)) ≤· · · ≤d(q, s(ks)) are order statistics of a uniform
+sample of q’s own distance distribution — an unbiased probe of the query’s neighborhood that routing has
+already paid for. The local intrinsic dimension they estimate (the maximum-likelihood estimator of Levina
+and Bickel [21], used as a query-hardness statistic by Amsaleg et al. [22]) stratifies coverage. On a 200,000-
+object corpus of text embeddings with in-distribution and out-of-distribution query sets (experiment gate o
+in the artifact; exact signatures, so the measurement is of the index rather than of the inner search), the shift
+raises the miss rate 1.8× at (b, ks) = (8, 64) (0.9959 to 0.9926) and moves the median estimated dimension
+from 35.6 to 40.0, while coverage conditioned on the estimate barely moves. A table of coverage per decile
+8
+
+
+of the statistic, fitted on the in-distribution certification sample alone, predicts the out-of-distribution recall
+to 0.0009 at (8, 64) and 0.0035 at (8, 32), against 0.0033 and 0.0094 for the unconditioned certificate. The
+same table drives the dial: choosing ks per query as the smallest value whose row meets a target of 0.99
+meets it on the shifted queries (0.9934–0.9948 for b ∈{8, 16, 32}) with 26–34% fewer misses than a fixed
+ks touching the same posting mass. A query whose statistic falls outside the calibrated range is served
+and reported as uncertified.
+Underneath the table is the level of fX resolved per query: the rate κ in
+1 −cov ≈exp(−κ bks/|S|), fitted per decile of the statistic at (4, 8), runs monotonically from 479 to 124 and
+agrees decile by decile across the two query sets. The triangle inequality also gives a deterministic exactness
+radius — if 2 d(q, y10) < d(q, s(ks)) −d(q, s(b)) the served answer is provably exact in any metric space —
+but at these dimensions it certifies under 0.1% of queries, and we do not rely on it.
+The rate is a property of the query; the curve, of the corpus.
+The certificate is per corpus; the
+statistic behind it need not be. Writing the touched mass as bks n/|S| objects, 1 −cov ≈exp(−(κ/n) ·
+mass): κ/n is the coverage bought per touched object, comparable across corpora of different n and |S|.
+Table 2 repeats the measurement on the corpora of §5 and on three larger ones: LAION-10M (CLIP image
+embeddings under cosine, the SISAP 2024 query set split in half), and two with a query shift built in —
+PubMed23 (24M abstract embeddings, with an out-of-distribution query file), and Yandex T2I-10M under
+ℓ2 and under inner product (maximum inner-product search through the standard augmentation), where
+the in-distribution queries are images and the shifted queries are text. On every set the estimate stratifies
+coverage (Spearman ρ from −0.46 to −0.71 at (4, 8)) and the rate falls monotonically from the first to the
+last decile of the statistic, by 4–18×.
+A decile table fitted on one query set predicts another to within
+0.0039 on every in-domain transfer — the other half of a random split (0.0003 on LAION-10M), the shifted
+wiki queries, and the shifted PubMed queries (0.0039 against 0.0084 for the unconditioned certificate). On
+PubMed23 the dial meets its 0.99 target on the shifted queries (0.9926–0.9940 for b ∈{8, 16, 32}) touching
+29–34% less posting mass than the fixed ks that reaches the same coverage.
+Figure 3 plots κ/n against the absolute value of the statistic. Within a corpus the curve is invariant
+to everything we varied. SIFT-1M and Deep-10M, ten times apart in n and |S|, agree bin by bin (median
+ratio 1.00 over 13 shared bins); the two halves of the LAION split coincide (ratio 0.99); the shifted wiki and
+PubMed queries land on their in-distribution curves (ratios 0.95 and 1.04); and T2I under inner product
+lands on T2I under ℓ2 (ratio 1.11) — the rate is a property of the query in its corpus, not of the distance
+function. Across corpora the curves are parallel but offset, by up to 3.27× at equal estimated dimension
+(GloVe 2.72×, LAION 2.31× and PubMed23 2.17× above SIFT, T2I 1.29× above Deep-10M). The offset is
+corpus-specific rather than a split by distance family — the three cosine corpora (wiki, LAION, PubMed23)
+sit at three levels between the ℓ2 descriptors and the angular GloVe — so the estimate is one of at least two
+statistics behind the local level of fX, and the table is fitted per corpus. The cross-modal shift is the case
+the table does not cover, and the certificate says so: text queries against the image corpus fall beyond the
+99th percentile of the image queries’ estimates for 86% (ℓ2) and 66% (inner product) of the set, and where
+the two overlap the text queries sit 2.70× above the image curve at equal estimate: the shift changes the
+neighborhood structure, not only its dimension. These queries are served uncertified; the decile table would
+predict them to 0.0440 and 0.0233, and the dial reaches 0.9523 and 0.9762 at its ks cap against a target of
+0.99. Certifying them takes a table fitted on a sample of text queries, which is the same construction with
+a different calibration set. The exactness radius is inert on every corpus (at most 1.1% of queries certified).
+5
+Evaluation
+Setup.
+Machines: a 10-core laptop (M5, 24 GB) and a 4-socket Xeon E7-4809 v3 (Haswell, 2 GHz, 8
+cores/16 threads per socket, 1.5 TB RAM, NVMe; “d0”), whose four NUMA nodes deliver ∼37 GB/s each
+and ∼50 GB/s in aggregate to one process interleaved across them. Datasets: SIFT-1M [10] (d=128), GloVe-
+1.2M [12] (d=200, angular), Deep-10M and Deep-100M [11] (d=96); 10,000 queries each; recall@10 vs. exact
+ground truth.
+Protocol: three interleaved repetitions, median throughput; fixed seeds; every number is
+written by its run into a versioned manifest. Every baseline is swept to saturation rather than reported at
+one operating point, so that comparisons are between frontiers and not between tunings [23]. The fanless
+laptop drifts by up to 1.7× in throughput between a cold and a hot run at identical work, so the laptop
+9
+
+
+20
+40
+60
+80
+query LID (MLE, ks = 64 routed sample distances)
+100
+101
+κ/n × 104   [cov = 1 −e−(κ/n) ⋅mass]
+(a) in-domain corpora and shifts
+SIFT-1M (ℓ2)
+Deep-10M (ℓ2)
+GloVe-1.2M (angular)
+wiki-bge-m3 in-dist.
+wiki-bge-m3 OOD
+PubMed23 in-dist.
+PubMed23 OOD
+LAION-10M split A
+LAION-10M split B
+20
+40
+60
+80
+100
+120
+query LID (MLE, ks = 64 routed sample distances)
+(b) T2I-10M: image queries vs. text queries
+Deep-10M (ℓ2)
+GloVe (angular)
+T2I ℓ2, image queries
+T2I ℓ2, text queries
+T2I MIPS, image queries
+T2I MIPS, text queries
+Figure 3: The coverage rate per touched object, κ/n in 1 −cov = exp(−(κ/n) · mass), against the query’s
+intrinsic-dimension estimate (bins of width 2 with at least 100 queries; κ fitted at (b, ks) = (4, 8), the lowest-
+mass grid point, where no bin is near saturation and the miss floor of approximate signatures cannot enter).
+(a) Within a corpus one curve: SIFT-1M and Deep-10M differ 10× in n; the second half of the LAION
+split and the shifted wiki and PubMed23 queries (hollow) fall on their first-half and in-distribution curves.
+Across corpora the curves are parallel with corpus-specific offsets. (b) On T2I-10M the inner-product curve
+coincides with the ℓ2 curve, and the text queries (hollow) sit above the image queries at equal estimate — a
+shift the estimate does not absorb.
+comparisons of Table 7 time both systems in the same interleaved repetitions (each repetition runs both
+sweeps back to back, the order alternating), and Table 3 reports the min–max spread over seed runs rather
+than a single figure. Seed stability over 5 seeds: σ(recall) ≤10−4 (SIFT), ∼5×10−5 (Deep-10M), ∼6×10−4
+(GloVe); Deep-100M rows are single-seed (a seed is a full signature build), with the 10M seed variance
+bounding the expected fluctuation.
+5.1
+Operating surface
+Table 3 shows representative SOLO operating points. The dial is monotone everywhere measured — recall
+never saturates short of scanning everything — and every recall agrees with the certificate of Proposition 1.
+5.2
+Ablation: recursion vs. per-list graphs
+Before adopting the one-rule recursion we built the natural alternative: attach a small graph index to
+every oversized list and answer by per-list graph searches.
+The recursion wins at every matched GloVe
+operating point on both axes: 0.9899 at 124 qps against the hybrid’s 0.9890 at 72 (ks=64), and 0.9978 at 52
+against 0.9976 at 35 (ks=128) — while replacing 58 minutes of graph construction with 2 minutes of GEMM
+assignments and 4.2 GB of graphs with postings. One caveat on the throughput half of that claim: the
+10
+
+
+corpus (metric, n)
+queries
+LID (p10–p90) cov(8, 64)
+κ/n×104 (dec. 1→10)
+ρ held-out err.
+SIFT-1M (ℓ2, 1M)
+in-dist.
+18.4 (11–25)
+0.9977
+26.7→5.03 (5×)
+−0.52 0.0003 (0.0004)
+Deep-10M (ℓ2, 10M)
+in-dist.
+21.1 (13–30)
+0.9851
+23.5→3.22 (7×)
+−0.57 0.0000 (0.0001)
+GloVe-1.2M (angular, 1.18M) in-dist.
+53.0 (26–75)
+0.8792
+20.0→1.08 (18×)
+−0.71 0.0021 (0.0055)
+wiki-bge-m3 (cosine, 0.2M)
+in-dist.
+35.6 (24–48)
+0.9959
+24.0→6.18 (4×)
+−0.52 –
+OOD
+40.0 (28–53)
+0.9926
+21.8→5.69 (4×)
+−0.48 0.0009 (0.0033)
+LAION-10M (cosine, 10M)
+split A
+24.5 (13–44)
+0.9913
+31.4→5.76 (5×)
+−0.59 –
+split B
+24.1 (13–43)
+0.9920
+34.0→5.43 (6×)
+−0.60 0.0003 (0.0006)
+PubMed23 (cosine, 24M)
+in-dist.
+22.8 (14–34)
+0.9937
+30.3→6.29 (5×)
+−0.55 –
+OOD
+25.8 (16–40)
+0.9853
+31.8→6.11 (5×)
+−0.58 0.0039 (0.0084)
+T2I-10M (ℓ2, 10M)
+image→image
+16.9 (9–27)
+0.9953
+31.6→5.39 (6×)
+−0.58 –
+text→image
+58.4 (36–107)
+0.9281
+24.1→6.04 (86% beyond) −0.47 0.0440 (0.0672)
+T2I-10M (MIPS, 10M)
+image→image
+18.3 (10–30)
+0.9964
+34.7→6.15 (6×)
+−0.57 –
+text→image
+57.4 (36–98)
+0.9543
+27.0→6.38 (66% beyond) −0.46 0.0233 (0.0421)
+Table 2: The per-query certificate across corpora (α=2%, seed 1, true 10-NN, 104 queries per set; exact
+signatures on SIFT-1M, GloVe and wiki, GRAFT signatures on Deep-10M, PubMed23 and T2I-10M). LID
+is the Levina–Bickel estimate over the ks=64 routed sample distances; κ/n is the rate fitted at (4, 8) in the
+first and last decile of the estimate, with the ratio between them, or, for the text queries binned on the
+image queries’ deciles, the share of queries beyond the calibrated range; ρ is Spearman’s correlation between
+the estimate and per-query coverage at (4, 8); the held-out error is the mean absolute error of the coverage
+predicted by the decile table at (8, 64) on queries it was not fitted on — the other half of a split for a single
+query set, the shifted set otherwise — with the error of the unconditioned certificate in parentheses.
+ks=64 rows of the two designs were measured in different sessions on the same laptop, so their ratio carries
+the machine’s thermal drift as well as the design difference; the ks=128 pair was measured interleaved, and
+the recall comparison — stable to 10−4 across re-runs — is unaffected at both settings. Uniformity costs
+nothing; the auxiliary structure retired.
+5.3
+Serving Deep-100M at 1 GB resident, and below
+Table 4 is the disk mode of §2.5 under enforced cgroup caps: swap off, every input evicted from the page
+cache before it is mapped, one operating point per process, the scope’s own memory.peak. The object level
+is the same in every row — posting-ordered SQ8 leaf blocks on NVMe, read by explicit pread, results bit-
+identical to RAM serving — and what changes is the router. At depth 1 it is the flat 2M-point image,
+963 MiB, file-backed and reclaimable page by page. At depth 2 it is the index’s own rule pointed upward
+(§8.1): a 2% sample of the vocabulary, 18.3 MiB resident (53× less), with the vocabulary’s own posting lists
+as an SQ4 stream on NVMe read by the same kernel, so a query routes in two hops — 4.8 MB of counted
+IO — and then scans the object level exactly as before.
+Three readings. The flat router does not fit 1 GB at 108. At 2 GB depth 1 serves at its uncapped rate;
+at 1 GB it reads 8.0 qps cold and 1.7 warm, with routing at 547.3 ms per query, recall unchanged: the beam
+paging its graph while the scan’s own reads evict it. Its floor sits between 1.5 and 2 GB and depends on the
+operating point — Table 5 — 16–21 B/object against the 8.96 B/object router term of §8.1, the difference
+being the scratch and the reads in flight. Depth 2 removes the wall and costs nothing above it. At 2 GB the
+two routes read the same recall and rate (0.9977 at 9.8 vs. 0.9979 at 10.5 qps at ks=512); at 1 GB depth
+2 serves 0.9977 at 8.7 qps where depth 1 collapsed, and the route costs 18.4 ms of the query. That is 10.7
+resident bytes per object at recall 0.9977. Below 1 GB the cap is on the threads, not the index. With an
+18.3-MiB router the resident state is per-thread scratch and buffers — the dedupe bitmap alone is n/8 bytes
+a thread, 200 MB at 16 threads — so the floor moves with the thread count: 512 MB at 8 threads serves
+12.8 qps (5.4 B/object) and 256 MB at 4 threads 7.3 qps (2.7 B/object), both at recall 0.9964. The resident
+budget is router plus threads times (scratch plus reads in flight), the three-term law of §8.1, and at 108 the
+second term is the whole of it once the router recurses.
+11
+
+
+dataset (machine)
+configuration
+recall@10
+qps
+SIFT-1M (laptop)
+b=2, ks=192, SQ4
+0.9917
+27,306–28,115
+b0=8, ks=64, p=0.5, SQ4
+0.9939
+21,639–34,240
+b=8, ks=64, SQ4
+0.9964
+16,874–29,188
+b0=16, ks=64, p=1, SQ4
+0.9973
+15,169–26,756
+b0=8, ks=128, p=0.5, SQ4
+0.9986
+10,664–19,259
+b=8, ks=128, SQ4
+0.9990
+8,063–15,628
+b0=16, ks=128, p=0.5, SQ4
+0.9993
+6,285–11,890
+GloVe-1.2M (laptop)
+b0=32, ks=128, p=0.5, SQ4
+0.9793
+993–1,217
+b=16, ks=256, SQ4
+0.9860
+773–932
+b0=32, ks=256, p=1, SQ4
+0.9881
+709–881
+b0=32, ks=256, p=0.5, SQ4
+0.9910
+570–694
+b=32, ks=256, SQ4
+0.9936
+426–503
+b0=32, ks=512, p=1, SQ4
+0.9942
+414–484
+b0=32, ks=512, p=0.5, SQ4
+0.9950
+338–393
+b=32, ks=512, SQ4
+0.9955
+251–287
+depth-2, ks=64, k′
+s=16, exact
+0.9883
+150
+depth-2, ks=64, k′
+s=32, exact
+0.9899
+124
+depth-2, ks=128, k′
+s=16, exact
+0.9973
+68
+depth-2, ks=128, k′
+s=32, exact
+0.9978
+52
+Deep-10M (laptop)
+b=8, ks=128, SQ8
+0.9952
+3,659
+b=8, ks=256, SQ8
+0.9982
+1,754
+b=16, ks=128, SQ8
+0.9985
+1,884
+b=16, ks=256, SQ8
+0.9994
+685
+Deep-100M (d0)
+b=16, ks=256, SQ8
+0.9982
+427
+b=16, ks=384, SQ8
+0.9988
+320
+b=16, ks=512, SQ8
+0.9990
+252
+b=32, ks=128, SQ8
+0.9981
+471
+b=32, ks=256, SQ8
+0.9991
+268
+Table 3: SOLO operating points. Deep rows use the SQ8 screen at the serving default R=100; their recalls
+are bit-identical to the full-precision scan of the same configuration, and every measured row is listed. SQ4
+rows are the list-major 4-bit stream with rank-ordered postings (§2.5; R=200, router ef=ks, all ten cores,
+104 queries), from signatures built at kb=16 (SIFT) and kb=32 (GloVe); a row with p is a tapered frontier
+b(t) = ⌈b0(1 −t/ks)p⌉, and the rows shown are the non-dominated points of each sweep, thinned to recall
+steps of 2 × 10−4. Depth-2 GloVe rows are full-precision scans of the recursive index (§2.3). Deep rows were
+served from signatures built once at kb=64 — b is serve-time. SIFT SQ4 recall is the median over 5 seeds
+and its throughput the full min–max spread across them (laptop thermal drift), GloVe SQ4 over 3; other
+rows are single-seed.
+What the previous draft measured.
+The 1 GB row of the August draft — 19.8 qps at ks=256 through
+the flat router — was real but mis-accounted: the router image was already in page cache from an earlier
+process, charged to nobody, so the cap bounded the scan’s page cache and not the router. Table 5 re-measures
+that row under the protocol above: evicting the image first gives 7.7 / 1.7 qps, and reading it once inside
+the scope reproduces the draft’s cold figure (20.5) and then halves (10.9) as the scan evicts it. We keep the
+row here because the same trap is easy to fall into with any mapped index under a cgroup, and because the
+correction is what motivated serving the recursion at this scale.
+5.4
+The same cap, four other systems
+Table 6 runs SPANN, DiskANN, vote-served misi and a Faiss IVF-PQ index through the identical protocol,
+each swept to its own recall ceiling. Two things separate the arms, and only one of them is the memory
+floor.
+The floors are 2.7, 56.1, 80, 80 and 96 bytes per object, and they order the systems exactly: below 8 GB
+12
+
+
+depth
+cap
+thr.
+ks
+recall@10
+qps cold / warm
+route ms
+router MiB
+B/obj.
+1
+2 GB
+16
+256
+0.9965
+20.9 / 20.2
+1.0
+963
+21.5
+1
+2 GB
+16
+512
+0.9979
+10.7 / 10.5
+1.3
+963
+21.5
+1
+1 GB
+16
+256
+0.9965
+8.0 / 1.7
+547.3
+963
+10.7
+1
+1 GB
+16
+512
+timed out (thrashing)
+963
+10.7
+2
+2 GB
+16
+256
+0.9964
+19.9 / 19.9
+3.6
+18
+21.5
+2
+2 GB
+16
+512
+0.9977
+10.2 / 9.8
+7.5
+18
+21.5
+2
+1 GB
+16
+256
+0.9964
+17.6 / 16.3
+12.8
+18
+10.7
+2
+1 GB
+16
+512
+0.9977
+9.1 / 8.7
+18.4
+18
+10.7
+2
+768 MB
+16
+256
+0.9964
+16.5 / 15.1
+16.2
+18
+8.1
+2
+768 MB
+16
+512
+OOM-killed
+18
+8.1
+2
+512 MB
+8
+256
+0.9964
+13.8 / 12.8
+30.4
+18
+5.4
+2
+512 MB
+8
+512
+OOM-killed
+18
+5.4
+2
+384 MB
+8
+256
+0.9964
+13.0 / 12.3
+33.5
+18
+4.0
+2
+384 MB
+8
+512
+OOM-killed
+18
+4.0
+2
+256 MB
+4
+256
+0.9964
+7.2 / 7.3
+66.8
+18
+2.7
+2
+256 MB
+4
+512
+OOM-killed
+18
+2.7
+Table 4: Deep-100M under enforced cgroup caps through the flat router (depth 1) and through the router
+indexed by SOLO (depth 2). b=16, R=100, 1,000-query subset, cold / warm reps; “route” is the warm rep’s
+routing time. Resident B/object is the cap divided by n; the cgroup peak equals the cap in every finished
+row. A row that did not finish says why: the flat router at 1 GB thrashed past a 40-minute limit, and the
+depth-2 points below 1 GB were killed at ks=512 by the larger pass set’s buffers, not by the router. Rows
+at different thread counts are never compared.
+cap
+router image at start
+recall@10 (ks=256/512)
+qps cold/warm, ks=256
+ks=512
+2 GB
+evicted
+0.9965 / 0.9979
+20.3 / 20.5
+10.5 / 10.3
+1.5 GB
+evicted
+0.9965 / 0.9979
+20.3 / 19.9
+5.3 / 1.1
+1 GB
+evicted
+0.9965 / –
+7.7 / 1.7
+timed out
+1 GB
+pre-read in scope
+0.9965 / 0.9979
+20.5 / 10.9
+1.5 / 0.8
+1 GB (Table 4)
+cached before the scope
+0.9965 / 0.9979
+19.8 / 19.3
+10.2 / 10.0
+Table 5: The flat router’s floor at 108, 16 threads, 1,000 queries, one process per cap. “Evicted”: the router
+image is fadvised out before mapping, so its pages are charged to the scope; “pre-read in scope”: read once
+before the timed reps; the last row is the August draft’s measurement, with the image cached before the
+scope existed. Recall is identical in every row; the cap moves throughput only.
+the graph and cluster indexes stop — not degrade, stop. SPANN is killed at 6 GB and every cap under it,
+misi at 4, DiskANN at 8; above their floors they pay almost nothing for the cap, SPANN serving 0.9911 at
+185 qps under an 8 GB cap against 186 uncapped. That is the shape of a resident working set: it fits or it
+does not, and page cache is the only thing the surplus was buying.
+The second separation is the interesting one, because it is not about memory at all. IVF-PQ does run
+at 1 GB — it is the only baseline that does — so the region is not empty for want of a small enough index.
+It is empty because the small index cannot answer: at 56.1 B/object its recall saturates at 0.8747 and stays
+there at every cap and every nprobe from 8 to 512, since PQ distances are the final score rather than a screen
+— the same ceiling SPANN’s Int8 scorer meets at 0.9561 (§5.6). And what the cap costs it is throughput,
+catastrophically: the same configuration runs at 4.5 qps at 1 GB and 182 at 8, a 40× collapse, because a
+probed list is a random read. SOLO under the same reduction of cap moves by 12% (8.7 vs. 9.8 qps through
+the depth-2 route), because its reads were sequential and counted before the query began. The 85× read
+amplification of §2.5 is not a property of graphs; it is a property of not knowing the access order, and it
+13
+
+
+system
+B/obj
+recall@10 / qps under an enforced cap
+1 GB
+2 GB
+4 GB
+6 GB
+8 GB
+12 GB
+SOLO (scan, depth 2)
+2.7
+0.9977 / 9.1
+0.9977 / 10.2
+·
+·
+·
+·
+Faiss IVF-PQ
+56.1
+0.8747 / 4.5
+0.8747 / 6.0
+0.8747 / 15.4
+0.8747 / 178
+0.8747 / 182
+0.8747 / 182
+SPANN
+80
+—
+—
+—
+—
+0.9911 / 185
+0.9981 / 46.6
+misi (votes)
+80
+—
+—
+—
+0.9936 / 7.2
+0.9936 / 8.1
+·
+DiskANN
+96
+—
+—
+—
+—
+—
+0.9984 / 568
+Table 6: Deep-100M under enforced cgroup caps (E5: swap off, inputs evicted, the scope’s own memory.peak),
+each system at the setting reaching its highest recall at that cap. A dash is an OOM kill; a dot is a cap
+not run, which for SOLO is every cap above 4 GB (its recall is already at ceiling and its rate within 12% of
+uncapped at 1 GB) and for misi is 12 GB. Bytes per object are the measured floor: SOLO’s is the 256 MB
+depth-2 point of Table 4 (at 4 threads, ks=256), the others the smallest cap each survived — IVF-PQ’s
+codes plus ids, SPANN’s and misi’s postings, DiskANN’s PQ table and graph.
+reappears here in a system with no graph in it.
+5.5
+Build and asset ledger
+From scratch: one router build plus n independent searches — SIFT-1M in 5 s (laptop), Deep-10M in ∼5 min
+(d0, 64 threads); assignment for every b is free thereafter. Assets at Deep-100M (b=16): postings 6.4 GB;
+SQ8 codes 9.6 GB (158 s); optional disk leaf blocks 160 GB (830 s, sequential); router image 1.0 GB. No
+codebooks, no graphs, no training anywhere in the pipeline.
+5.6
+Comparison with prior indexes
+Table 7 places SOLO against the strongest systems we could run on the same machines, queries, and ground
+truth, and Figure 4 draws the Deep-100M in-RAM frontier.
+Three readings. Throughput depends on the kernel, not the architecture. At 108, served by the gather
+kernel, hnswlib holds a 2–5× RAM-throughput advantage at recalls it can reach, and GRAFT — with a
+quality-tuned build — attains 0.9992. Served by the list-major 4-bit stream with rank-ordered postings
+(§2.5), the same index is the faster system at every recall the tuned graph reaches above 0.9974 at 108
+(Deep-100M: 1.1–1.8× in one process; at hnswlib’s ceiling, 0.9989 at 531 qps against SOLO’s 0.9989 at 936,
+and 0.9990 at 755 where the graph has stopped) and above 0.9893 at 106 (SIFT-1M: 1.4–2.1×; at hnswlib’s
+ceiling, 0.9991 at 4,166 qps against SOLO’s 0.9992 at 8,836) and above 0.9533 on GloVe (1.4–3.0×; at the
+graph’s ceiling 0.9863 at 268 qps, SOLO serves 0.9881 at 808), and its dial continues to 0.9955 where the
+graph has stopped. The single-process 108 rows are bound by d0’s memory system: the stream draws ∼70%
+of the ∼50 GB/s its four sockets deliver to one interleaved process, while hnswlib’s random walk is latency-
+bound. Serving both systems as four socket-local replicas (one process per NUMA node, its own copy of
+index and stream, queries split four ways) lifts hnswlib by 1.6× and SOLO by 2.2× — the stream becomes
+compute-bound at ∼20 ns per record per core — and the matched-recall ratio to 1.2–2.2× (1,918 against
+876 qps at the graph’s ceiling). Recall is bit-identical between the two protocols. Beyond throughput, SOLO
+offers what graphs do not: a monotone dial (hnswlib has no operating point above 0.9989 on this dataset at
+any ef), an a-priori certificate, one-search inserts and exact deletes (both graphs are static or repair-based),
+a build without clustering or graph refinement (5 min at 107 vs. 19 min for GRAFT’s tuned build at the same
+scale; 5.5 h for its quality build at 108), and the 1 GB serving mode of Table 4. The claim there is capability,
+not efficiency per gigabyte: DiskANN serves 0.9984 at 568 qps from 12 GB and is the faster system per
+unit of memory it is given, but it does not run at all below 9.6 GB, where SOLO still serves this dataset.
+Vote-based serving of the identical postings — misi’s path, top-C by shared-term count then verification —
+reaches 0.9803 on GloVe where the same data scanned reaches 0.9978: ranking, not content, was the binding
+constraint, consistent with the vote-resolution analysis of [6]. SPANN, measured at Deep-10M under its
+authors’ configuration, confirms the family diagnosis: its dial, like SOLO’s, does not saturate (it is a scan
+architecture), but its high-recall cost is steeper — SOLO serves matched recall at 2–4.6× the throughput
+(e.g. 0.9994 at 460 qps vs. 0.9993 at 99), with a build of ∼5 minutes against SPANN’s 3.66 hours (3.1 h
+14
+
+
+0.98
+0.99
+0.995
+0.998
+0.999
+0.9995
+recall@10 (scale: −log10 (1 −recall))
+102
+103
+104
+queries per second (one process, 64 threads)
+tuned HNSW stops here
+(ef = 4000, recall 0.9989);
+no operating point exists
+to the right, at any cost
+hnswlib M = 32
+GRAFT (quality build)
+SPANN
+SOLO (exact scan)
+SOLO (SQ8 screen)
+SOLO (SQ4 stream, rank-ordered)
+Figure 4: Deep-100M in RAM, same machine, queries, and ground truth; every system swept to saturation;
+one process, 64 threads. Served with the gather kernel and 8-bit codes (hollow circles), SOLO is slower
+than the graphs wherever they can go; served with the list-major 4-bit stream and rank-ordered postings
+of §2.5 (triangles; timed against hnswlib in the same interleaved repetitions — the hnswlib curve drawn is
+its saturation sweep, which the interleaved rerun reproduces within 6%, identical recall), the same index is
+the faster system at every recall above 0.9974, by 1.1–1.8×, and continues to 0.9990 past the orange wall,
+where the tuned graph runs out of dial: hnswlib has no operating point to its right at any ef. The scan
+architectures do not have that wall — SPANN climbs past it too, at a steeper price. DiskANN is not plotted:
+it belongs to the capped-memory regime of Table 6 (0.9984 at 568 qps from 12 GB — faster than SOLO
+there, and unable to run below 9.6 GB).
+of it k-means head selection) — consistent with rank-b dominating closure at equal replication (§3.4). At
+Deep-100M the pattern repeats at scale: SPANN’s dial climbs past everything (to 0.9996 at 24 qps — scan
+architectures do not saturate), but at matched recall SOLO serves 5–7× the throughput (0.9988 at 320 vs.
+0.9989 at 47), and the build asymmetry becomes stark: 57.5 h (48.4 h of it k-means head selection) and a
+235 GB store against SOLO’s minutes from signatures and 160 GB of leaf blocks — same machine, data, and
+ground truth.
+5.7
+MS MARCO Web Search at 108: where the architecture is weakest
+Every corpus above is either low intrinsic dimension (SIFT, Deep) or 106 (GloVe). MS MARCO Web Search
+is neither: 100, 000, 000 passage embeddings of 768 dimensions under inner product, with queries that are
+queries while the database is passages — the out-of-distribution case of §4 at scale. We report it because
+it is the hardest case we could find for a coverage-based index, and because what survives there is more
+informative than another win on Deep.
+Three things had to be got right before the numbers meant anything, and two of them were defects in our
+own serving path that only an end-to-end run exposed. Maximum inner product is reduced to a metric by
+the sphere augmentation x′ = [x,
+p
+M 2 −∥x∥2], q′ = [q, 0], so that ∥q′ −x′∥2 = ∥q∥2 + M 2 −2⟨q, x⟩and the
+existing L2 machinery orders by inner product exactly; objects are routed as [x, 0], which costs nothing and
+yields the plain ⟨x, s⟩assignment kernel. The screen needed two corrections. First, its integer SSD weights
+dimension j by 1/step2
+j, so a per-dimension grid serves a reweighted metric: invisible where the per-dimension
+ranges are homogeneous (SIFT, Deep), fatal at 768 dimensions where they span 0.51–2.00. One step for
+every coded dimension is required. Second, the augmented coordinate must not be coded at all — ∥x∥-
+15
+
+
+scale
+system
+recall@10
+qps
+note
+Deep-100M (d0, RAM)
+hnswlib M=32
+0.9989
+531
+saturated (ef=4000)
+GRAFT
+0.9992
+506
+quality build, ef=4000
+SOLO
+0.9991
+268
+SQ8 gather, dial monotone
+SOLO
+0.9989
+936
+b0=32, ks=512, p=1, SQ4, matched
+SOLO
+0.9990
+755
+b0=32, ks=512, p=0.5, SQ4
+SPANN
+0.9916
+182
+authors’ cfg, SIR = 512
+SPANN
+0.9989
+47
+SIR = 2048
+SPANN
+0.9996
+24
+SIR = 4096
+SPANN, native Int8
+0.9561
+73
+saturated (scorer, not screen)
+Deep-100M (d0, 4× socket-local)
+hnswlib M=32
+0.9989
+876
+saturated (ef=4000)
+SOLO
+0.9989
+1,918
+b0=32, ks=512, p=1, SQ4, matched
+SOLO
+0.9990
+1,631
+b0=32, ks=512, p=0.5, SQ4
+Deep-100M (d0, capped)
+DiskANN
+0.9984
+568
+12 GB; OOM < 9.6 GB
+misi (vote, disk)
+0.9936
+8–30
+8–16 GB
+SOLO (leaf blocks)
+0.9982
+20
+1 GB
+Deep-10M (d0)
+SPANN
+0.9921
+384
+authors’ cfg, SIR = 256
+SPANN
+0.9993
+99
+SIR = 1024
+SOLO
+0.9994
+460
+b=16, ks=256, f32
+GloVe-1.2M (laptop)
+hnswlib M=32
+0.9863
+268
+saturated (ef=3442)
+misi (vote)
+0.9803
+149
+ks=256, C=50,000
+SOLO
+0.9881
+808
+b0=32, ks=256, p=1, SQ4, matched
+SOLO
+0.9955
+271
+b=32, ks=512, SQ4
+SOLO
+0.9978
+52
+depth-2, exact
+SIFT-1M (laptop)
+hnswlib M=32
+0.9991
+4,166
+saturated (ef=452)
+SOLO
+0.9992
+8,836
+b0=16, ks=128, p=1, SQ4, matched
+SOLO
+0.9993
+6,977
+b0=16, ks=128, p=0.5, SQ4
+Table 7: Same-machine comparisons. Each row is a system at the ceiling of its own sweep, pooled over every
+seed run, so no system is penalised for an unlucky one; where SOLO’s sweep passes the baseline’s ceiling,
+its fastest row at or above that ceiling is added (“matched”). The hnswlib and SOLO SQ4 rows — laptop
+and Deep-100M — were timed in the same interleaved repetitions (Setup), laptop SOLO rows being medians
+over 3 (SIFT) and 3 (GloVe) index seeds; SQ4 rows are the list-major stream at ef=ks, R=200 on the
+laptop and R=2000 with a 0.1%-clipped grid at 108. The “4× socket-local” block serves both systems as
+four processes pinned one per NUMA node, each with its own copy of its index (and stream), queries split
+four ways, aggregate throughput; the single-process block above it is the conservative row. NAPP [4, 5],
+discussed in the text, reaches 1.0 at 106 with a constant-size vocabulary that does not scale its resolution
+with n.
+derived, query-independent, and with a range that dwarfs the data dimensions’ — so M2 −∥x∥2 is carried
+as a per-record bias added to the screen’s integer SSD, with the f32 refinement reading the augmented rows.
+With the grid per-dimension and the coordinate coded, recall is flat in ks and rises with R (the signature
+of a screen ranking by noise); with both corrections it is flat in R — R=100, 500 and 2000 agree to four
+decimals — and tracks coverage.
+The result, including the part that does not favour us.
+At 108 the best point we measured is
+0.8987 at 235 qps, where tuned graph indexes on this corpus operate near 0.99. The cause is visible in the
+table: at matched work the coverage level drifts down with n by 0.055 per decade here (0.9539 →0.8987
+at b=16, ks=256) against 0.0012 on Deep over the same step. This is the spread regime of §3 compounding
+with scale: where coverage is a slow function of b · ks, a decade of n costs real recall, and buying it back
+needs b=32 — a stream we could not hold — or a much larger ks. On this corpus, at this scale, SOLO
+is not competitive at high recall, and no amount of kernel work changes that; it is a property of how the
+16
+
+
+107
+108
+b
+ks
+recall
+qps
+certificate
+recall
+qps
+p99 (ms)
+8
+64
+0.7983
+928
+0.7696
+0.7695
+1,057
+37
+8
+128
+0.8623
+640
+0.8200
+0.8199
+575
+51
+8
+256
+0.9111
+386
+0.8602
+0.8602
+308
+78
+16
+64
+0.8728
+862
+0.8179
+0.8178
+820
+47
+16
+128
+0.9212
+506
+0.8644
+0.8644
+440
+71
+16
+256
+0.9539
+275
+0.8987
+0.8987
+235
+110
+Table 8: MS MARCO Web Search, α=2%, exact top-10 by inner product. certificate is coverage computed
+from the stored signatures under the deployed router, before serving. Candidates per query are n-independent
+by construction (285, 892 at 107 vs. 309, 191 at 108 for b=16, ks=256), and the latency tail stays tight; what
+changes with n is the level of the coverage curve.
+b
+ks
+cov. (exact route)
+cov. (router)
+cand./query
+MB/query
+8
+64
+0.9388
+0.9389
+52,449
+2.5
+8
+128
+0.9709
+0.9711
+102,304
+4.9
+8
+256
+0.9883
+0.9885
+198,846
+9.5
+8
+512
+0.9955
+0.9955
+385,355
+18.5
+16
+64
+0.9726
+0.9725
+105,492
+5.1
+16
+128
+0.9889
+0.9889
+206,311
+9.9
+16
+256
+0.9960
+0.9960
+401,879
+19.3
+16
+512
+0.9986
+0.9986
+780,212
+37.5
+Table 9: Deep-1B (109 × 96, L2), α=2%, kb=16, the track’s 104 queries against published ground truth.
+Coverage is the recall scan-only serving would deliver (Proposition 1); MB/query is the SQ4 scan the posting
+budget implies. Lists average 800 objects with a max/mean of 47.
+neighbours of a 768-dimensional text embedding distribute over a 2% sample.
+What survives is the claim the paper is actually about.
+The certificate column is computed from
+the stored signatures alone — no serving, no stream, no kernels — and it matches the served recall to 0.0001
+at all 6 operating points.
+Proposition 1 therefore holds at 108, on 768-dimensional inner-product data,
+with out-of-distribution queries, in the regime where the index performs worst: an operator running this
+workload would have known these recalls from one ground-truth pass, before deploying anything, and would
+have rejected the configuration for that reason. An index that predicts its own recall only when the answer
+is favourable would not be worth much. The same computation separates the two losses: routing exactly
+rather than with the router would raise coverage by 0.0194 (to 0.9069 at b=16, ks=256), so the ceiling and
+the router’s share of the gap are each visible before a query is served.
+5.8
+Deep-1B: the surface certified before it is served, then served
+At 109 the asymmetry the certificate exploits is at its widest. A serving artifact for a billion objects is
+hundreds of gigabytes and a day of machine time; the signatures are 60 GiB and answer, from one ground-
+truth pass, what recall the index would give at every (b, ks) — before any of that is built. We ran exactly
+that much first: a uniform 2% vocabulary (20,000,000 points, GRAFT-indexed in 1.29 h) and one signature
+per object (60 GiB at kb=16), and read the operating surface off it (Table 9). Then we built the stream and
+served it (Table 10).
+The certificate.
+Three readings. First, the surface is comfortable: recall 0.9960 costs 19.3 MB of scan per
+query — four hundredths of one percent of the database — and 0.9986 costs 37.5 MB. Second, the router is
+free at this scale: coverage under the 20,000,000-point GRAFT router matches exact routing over the whole
+vocabulary to within 0.0002 at every point, so the approximation we make for speed costs nothing certifiable
+17
+
+
+depth
+cap
+thr.
+queries
+ks
+recall@10
+qps
+route
+scan
+resident B/obj.
+(ms/query)
+1
+16 GB
+64
+500
+512
+0.9912
+25.44
+12.4
+26.9
+17.18
+1
+12 GB
+64
+500
+512
+0.9912
+1.84
+516.6
+27.2
+12.88
+1
+8 GB
+64
+500
+512
+0.9912
+0.40
+2442.2
+38.0
+8.59
+2
+16 GB
+64
+500
+512
+0.9904
+30.15
+9.1
+24.1
+17.18
+2
+8 GB
+64
+500
+512
+0.9904
+25.18
+9.2
+30.5
+8.59
+2
+4 GB
+64
+500
+512
+0.9904
+19.59
+11.4
+39.6
+4.29
+2
+2 GB
+64
+500
+256
+0.9832
+20.52
+12.8
+35.9
+2.15
+2
+1 GB
+16
+200
+512
+0.9925
+11.92
+28.2
+55.7
+1.07
+2
+1 GB
+8
+200
+512
+0.9925
+7.14
+46.5
+93.5
+1.07
+2
+512 MB
+8
+200
+512
+0.9925
+6.93
+47.7
+96.6
+0.54
+Table 10: Deep-1B served: depth 1 (flat 20,000,000-point router, 9,882 MiB) against depth 2 (the router
+indexed by SOLO: a 2% sample of it, 189 MiB) under falling cgroup caps, b=8, R=2000, explicit pread of
+the ks list segments on both levels. Resident B/object is the cap divided by n (the cgroup peak equals the
+cap in every row). Rows at different thread or query counts are reported but never compared: the 200-query
+subset reads 0.9925 where the 500-query set reads 0.9904.
+here (contrast MS MARCO, §5.7, where the same substitution costs 0.0194). Third, the flat router at this
+n is 9,882 MiB of resident state — above any sane cap — so a deployed billion-scale index is necessarily the
+depth-2 design of §8.1, not the flat one. The rest of this subsection measures both.
+Served, flat router (depth 1).
+The b=8 SQ4 stream is 358 GB and lives on a rotational hardware RAID
+— the slowest storage in this paper, chosen because it was the only one large enough — with the 9.65 GB
+router mapped, under a 16 GB cgroup cap, 64 threads. At (b, ks, R) = (8, 512, 2000) the served recall@10
+is 0.9912 on 500 queries; the certificate’s account of the same queries is coverage 0.9944 less a screen loss
+of 0.0032, and the residual is 0.0000 — Proposition 1 holds at 109 as it did at 106–108. Throughput is
+22.3 qps, 20.0 MB of counted IO per query, and where it comes from matters more than the number: the
+same artifact served through page faults on the mapped stream reads 7.81 qps (2.9× slower; scan 116.0
+against 32.0 ms/query), because the kernel’s readahead and fault path, not the array, were the bottleneck.
+Serving is explicit pread of the ks list segments. A three-stage cascade with an SQ8 re-rank on NVMe
+between the 4-bit screen and the exact refine is lossless and worth 1.03× — once readahead is fixed the
+refine is cheap enough that a 96 GB side-index buys nothing.
+Served, depth 2, and the collapse it removes.
+The router is a database of 20,000,000 points, so we
+indexed it with the same rule: a 2% sample of it (400k points) is the resident router, and the vocabulary’s
+own posting lists are an SQ4 stream on NVMe served by the same kernel as the object level. The resident
+router falls from 9,882 to 189 MiB (52×, the 1/α the law predicts), and the second hop costs 9.2 MB of
+counted IO. Depth 2 is not a throughput sacrifice: at 16 GB it serves 30.15 against depth 1’s 25.44 qps
+(1.19×), because a two-hop route whose second hop is a counted read beats walking a mapped graph of ten
+gigabytes (routing 9.1 vs. 12.4 ms/query). And depth 1 does not degrade below its footprint, it collapses:
+25.44 →1.84 →0.40 qps at 16/12/8 GB, all of it in routing, recall unchanged — the beam traversal paging
+its graph, the cliff of §5.4 reproduced inside SOLO. Depth 2 at 8 GB serves 25.18 qps, 63× depth 1 at the
+same cap, and at 4 GB 19.59. (Thrashing rows carry a ∼2× run-to-run spread; the collapse is one to two
+orders of magnitude, not a value.)
+The floor.
+Below 4 GB the cap is no longer a cap on the router but on the per-thread scratch, and two
+resident terms the law of §8.1 did not have surfaced there; both were found by measurement and both are
+fixed. The scan kernels’ dedupe scratch was a bitmap of n bits per thread — 119 MiB at 109, 7.45 GiB across
+64 threads, against a 189 MiB router — and is now an open-addressed set sized by the candidates a query
+18
+
+
+cap
+route
+thr.
+queries
+coverage
+recall@10
+qps
+route ms
+router MiB
+B/obj.
+16 GB
+depth 2 (control)
+64
+500
+0.9936
+0.9904
+25.60
+9.1
+188.7
+17.18
+16 GB
+depth 2, 8-bit router
+64
+500
+0.9936
+0.9904
+30.00
+9.1
+188.7
+17.18
+16 GB
+depth 3
+64
+500
+0.9936
+0.9904
+29.14
+10.0
+3.6
+17.18
+512 MB
+depth 2 (control)
+8
+200
+0.9925
+0.9925
+6.88
+48.7
+188.7
+0.54
+512 MB
+depth 2, 8-bit router
+8
+200
+0.9925
+0.9925
+6.99
+47.9
+188.7
+0.54
+512 MB
+depth 3
+8
+200
+0.9925
+0.9925
+6.73
+50.5
+3.6
+0.54
+256 MB
+depth 2 (control)
+4
+200
+0.9925
+0.9925
+3.66
+91.5
+188.7
+0.27
+256 MB
+depth 3
+4
+200
+0.9925
+0.9925
+3.19
+128.0
+3.6
+0.27
+128 MB
+depth 2 (control)
+4
+200
+OOM-killed
+188.7
+0.13
+128 MB
+depth 3
+4
+200
+0.9925
+0.9925
+3.12
+136.5
+3.6
+0.13
+128 MB
+depth 2 (control)
+2
+200
+0.9925
+0.9925
+0.49
+1645.7
+188.7
+0.13
+128 MB
+depth 3
+2
+200
+0.9925
+0.9925
+1.59
+270.3
+3.6
+0.13
+96 MB
+depth 3
+2
+200
+0.9925
+0.9925
+1.64
+269.8
+3.6
+0.10
+Table 11: Deep-1B, stage 4: the depth-2 router rebuilt over 8-bit copies of its points, and depth 3 (an 8,000-
+point router, the depth-2 router’s lists as a third SQ4 stream), each beside a same-day depth-2 float control
+at the same cap, thread count and query count. b=8, ks=512, k′
+s=256, k′′
+s =128, R=2000, explicit pread at
+every level. Coverage is computed on the served queries from the stored signatures. Rows at different thread
+or query counts are never compared.
+can touch. The rank-starts array of the layout is Θ(αn) and does not recurse (1,373 MiB loaded); serving
+at a fixed b reads two of its b+1 columns and lists are contiguous, so one CSR offsets array (153 MiB, 9×)
+carries both, mapped rather than held. With both, 109 objects serve at recall@10 0.9925 from a 512 MB
+cap (8 threads, 6.93 qps, 0.54 resident bytes per object). Against the same cap and thread count at 108
+(Table 4: 5.4 B/object at recall 0.9964), a decade more data costs 10× fewer resident bytes each; against
+the flat router’s floor at 108 (16–21 B/object), thirty to forty times fewer. That inversion is the recursion,
+and it is measured rather than projected; what it does and does not say about n is the subject of §8.1.
+Depth 3, and the 8-bit router.
+Two more things were built on the same deployment, each answering
+a question the ceiling section had left as arithmetic (Table 11). Depth 3: a 2% sample of the 400k-point
+depth-2 router — 8,000 points, 3.6 MiB resident, 53× below depth 2 — with the depth-2 router’s own posting
+lists as a third SQ4 stream on NVMe. A query now routes in three hops, the third a counted 4.2 MB. At
+16 GB it costs 10.0 against 9.1 ms of routing and returns the same coverage and recall to four decimals
+(+0.0000, +0.0000), at 29.1 vs. 25.6 qps against the same-day depth-2 control. Down to 256 MB the two
+depths are indistinguishable, because the depth-2 router is file-backed and a 189 MiB image still mostly fits;
+at 128 MB it does not — depth 2 is killed at 4 threads and, at 2 threads, pages its beam at 0.5 qps — while
+depth 3 serves 109 at recall 0.9925 from 96 MB (2 threads, 1.6 qps, 0.10 resident bytes per object). That is
+the recursion doing at 109 what the law says a level does: the router term divided by 1/α again, the floor
+handed over entirely to the threads. The 8-bit router: the depth-2 router rebuilt over 8-bit-quantized copies
+of its points (§8.1) routes to coverage and recall identical to the float router’s at every cap tried, in the same
+time; our GRAFT stores float32, so the resident saving it would bring (171 →61 MiB analytic at depth 2)
+is not measured here, only the absence of any cost.
+6
+Where SOLO sits
+Table 7 reports throughput against HNSW because a reader expects it, but a throughput contest is a contest
+over a region both architectures already reach, decided by kernels and by the machine (§5). The claim this
+paper actually makes is different: SOLO has operating points that no measured system has at all, and the
+single rule that produces them extends them. Four legs, in the order the evidence supports them.
+19
+
+
+1. It serves where nothing else fits, and the paper measured why.
+At Deep-100M SOLO serves
+recall 0.9979 from 10.7 bytes of resident memory per object under an enforced cgroup cap, with peak equal to
+cap at 1, 2 and 4 GB and bit-identical results (Table 4). Four other systems were run through the identical
+protocol (Table 6): SPANN, DiskANN and vote-served misi are killed below 8, 12 and 6 GB respectively, and
+the one baseline that does run at 1 GB, a Faiss IVF-PQ index at 56.1 B/object, saturates at 0.8747 recall. At
+a 1 GB budget that is the difference between indexing 107 objects and indexing 108: an order of magnitude
+in capacity, not in speed.
+The reason is structural, and the counterfactual is on record. Paging a random-access navigation structure
+amplifies reads ∼85× — letting vector reads fault through mmap pulls 6 TB in 80 minutes under a 4 GB cap
+(§2.5) — because a beam goes where the graph leads, so the access order is not known until the query is over.
+A scan’s access order is known before the query starts, which is what makes explicit, sequential, counted
+IO possible at all. The alternative that would fit under the cap, scoring with quantized codes instead of
+verifying with the true distance, cannot reach the recall: SPANN’s native Int8 scorer saturates at 0.9561 on
+Deep-100M against float ground truth (§5.6) — on the identical grid that is lossless when used as a screen
+with exact refinement (§2.4). So at high recall under a tight memory budget the field is empty, and it is
+empty for a reason we can state as a mechanism rather than observe as a gap.
+2.
+The load decomposes vertically, which is what a graph cannot do.
+Every non-leaf list in
+SOLO is a complete SOLO index behind a two-argument interface: given a query and a local budget, return
+candidates. Nothing crosses a level except a candidate set. A beam search exposes no such interface — it
+goes where the graph leads — which is why distributed graph systems replicate whole indexes rather than
+split them, and why a partitioned graph pays a network hop per traversal step.
+The evidence that the decomposition behaves is already in this paper. Recall composes multiplicatively
+across levels, and the depth-2 index lands on its composed prediction to 2×10−4 (§2.3). Coverage inside the
+decomposed lists is not degraded but improved, up to 0.9994. The recursion beat the obvious alternative — a
+graph index attached to each oversized list — on recall and throughput simultaneously, with a build cheaper
+by 25× (§5.2). And the whole path is bitwise deterministic at any thread count and across machines (§2.7),
+so a sharded deployment can be verified against a single-node reference, object for object. The consequence
+for distribution is worth stating plainly: because per-level coverage multiplies and each level is certifiable on
+its own, the recall of a distributed deployment is predictable from per-level certificates before
+it is assembled. Split across two processes, with a 19.5 MiB routing tier and 1312 bytes per query on the
+wire, the depth-2 GloVe index returns answers identical to the single-process index, object for object (§6.1).
+3. Partitioning pays here and does not pay for the graph.
+Four socket-local replicas lift SOLO by
+2.2× and hnswlib by 1.6× on the same machine and queries (§5.6). The asymmetry is not incidental: a scan
+is bandwidth-bound and a walk is latency-bound, so replication converts memory controllers into throughput
+for one and buys much less for the other. The same asymmetry holds across sockets, NUMA nodes, threads
+and machines, for the same reason.
+4.
+The same rule pointed upward is a trillion-scale architecture.
+The one resident term that
+grows with n is the router, so resident(n, L) = αLn cr and each recursion level multiplies the capacity ceiling
+by 1/α = 50 (§8.1). That places n∗≈1.2 × 108 at depth 1 — exactly where the measured Deep-100M
+deployment of Table 4 sits — 5.6 × 109 at depth 2, and 1011–1012 at depth 3, each level adding a few
+megabytes of sequential IO per query. Depth 2 is no longer a projection: it is measured in §8.1 at 0.75× the
+throughput and 0.0009 of recall, for 50× less resident routing state. Work per query grows sublinearly on
+top of that: the scanned fraction of the database falls 5–8× per decade of n (§3), so the levels buy capacity
+without the scan growing in proportion.
+6.1
+What was projection here, and what closed it
+Three of these four legs rested on measurements already in this paper; the other parts were projections, and
+we name them — and what has since been run — because a reader should know which is which.
+The emptiness of the region: measured, and narrower than claimed. The projection here was that a table
+of resident bytes per object under identical caps, every baseline swept to its own ceiling, would convert “no
+20
+
+
+system we ran” into “no system”. It was run (Table 6, §5.4), and it does not say that. IVF-PQ runs at 1 GB;
+the graph and cluster indexes do not, by margins of 6 to 12× in bytes per object. So the correct claim is not
+that nothing fits under the cap but that nothing else fits and answers: the one architecture small enough
+is capped at 0.8747 recall by its own codes, and the architectures that reach 0.99 need 6–12 GB to do it.
+The region SOLO occupies is high recall and a tight budget, and it is the conjunction, not either half, that
+is empty. Measuring it also produced the mechanism a second time, in a system with no graph: capping
+IVF-PQ costs it 40× in throughput where it costs SOLO 3%, because a probed list is a random read and a
+scan is not.
+Vertical distribution: measured. The depth-2 GloVe index was served with its two levels in separate
+processes, the router tier holding only the level-1 router (19.5 MiB — each hub’s local sample belongs to
+the hub’s own index, at the leaf tier) and the wire carrying ks vocabulary ids, 1312 bytes per query. The
+split answers are identical to the single-process answers, object for object, at every operating point, which
+is the acceptance test that matters: nothing crosses a level except a candidate set. The prototype’s hop is
+synchronous and unpipelined and both tiers shared one machine’s cores, so its throughput cost (12–33%)
+measures the prototype, not the design; what the run establishes is the interface and the wire, which is what
+leg 2 claims.
+The upward recursion: measured at the step that matters. Indexing the 2M-point Deep-100M router with
+SOLO itself cuts resident routing state 50× (854 →17.1 MiB) for at most 0.0009 of end-to-end recall, with the
+certificate composing to 0.0008 at both depths (§8.1). That moves 5.6×109 from projection to demonstrated
+mechanism at depth 2; depth 3 remains arithmetic. The sublinear-work exponent the trillion-scale estimate
+leans on is now fitted over four decades rather than two (§3), and the fourth changed its reading: work grows
+as n0.4–0.6 with the steepest decade last, so a fitted exponent extrapolates optimistically, not conservatively.
+The scanned fraction still falls throughout (0.070% at 109).
+7
+Related work
+Cluster-routed lists. IVF and its quantized descendants [9] route to k-means cells and scan them; SPANN
+[18] scales this to storage with balanced hierarchical clustering, closure multi-assignment (≤8 replicas),
+and an in-memory centroid graph [19], with SPFresh [20] adding update protocols.
+SOLO occupies the
+same serving silhouette with a random vocabulary (no clustering; deterministic; metric-black-box), rank-b
+assignment (measured to dominate closure, §3.4), serve-time replication, recursion instead of balancing, an
+exact scan (its 8-bit screen re-ranks exactly, unlike lossy IVFPQ scoring), and a certificate. Permutation and
+pivot indexes. Objects can be described by the order in which a fixed pivot set is seen from them [2]; MI-File
+[3] indexes that description in an inverted file and NAPP [4, 5] keeps only the nearest pivots and intersects.
+All of them draw the pivots from a set of constant size: NAPP attains perfect recall at 106 (Table 7, text)
+but its resolution cannot grow with n, which is the property 108 demands. misi [6] made the vocabulary a
+linear-size sample and served by vote-then-verify; SOLO keeps the representation and replaces the serving
+theory: scan-only, certificate, recursion, quantized leaves. Navigable graphs. HNSW [13], DiskANN [14],
+and GRAFT [7] are the throughput frontier in RAM below their recall ceilings; their recall is emergent, their
+updates hard, and their disk incarnations pin navigation state. The comparison of §5.6 is deliberately against
+the strongest of each.
+8
+Limitations and future work
+8.1
+The resident-memory law and the recursive ceiling
+Three terms are resident when SOLO serves from storage, and the first draft of this section had only one of
+them. With sample fraction α, a per-sample-point cost cr (cr = 4d+g for a float router, cr = d+g with 8-bit
+router vectors; g ≈64 B of graph state, measured), T serving threads and an operating point op = (b, ks, R),
+resident(n, L, T, op) = αL n cr
+| {z }
+router
++ T · s(op)
+|
+{z
+}
+scratch
++ O(page cache for the ks list reads),
+21
+
+
+Table 12: The router term under quantization: cr and the depth-1 ceiling n∗at M = 1 GB, from cr =
+(bytes per router vector) + g with g ≈64 B and α = 2% (§8.1); coverage cost measured paired over 2,000
+queries per corpus.
+d = 96
+d = 1024
+router codes
+cr
+n∗
+cr
+n∗
+coverage cost at ks=32
+float32
+448
+1.2×108
+4,160
+1.3×107
+reference
+8-bit
+160
+3.4×108
+1,088
+4.9×107
+none: 0.0000 everywhere, ≤49/2,000 queries affected
+4-bit
+112
+4.8×108
+576
+9.3×107
+none, except -0.0072 on GloVe
+2-bit ternary
+88
+6.1×108
+320
+1.7×108
+-0.0018 (d=1024), -0.0121 (Deep-96), -0.0731 (GloVe)
+where L is the recursion depth of the router (§2.3, pointed upward; L = 1 is the flat router) and s(op) is the
+per-thread dedupe scratch, an open-addressed set of 8 B slots whose count is the next power of two above
+twice the candidates a query can touch. Everything else the layout needs — the rank-starts offsets (Θ(αn),
+and they do not recurse), the code stream, the base vectors — is mapped or read explicitly and reclaimable
+page by page. The router term is the one the first draft had; the other two were found at 109, where each of
+them dominated the router it was being compared against (§5.8: a bitmap of n bits per thread was 7.45 GiB
+against a 189 MiB router; the starts array 1,373 MiB before it was compacted).
+At depth 1, α = 2%, d = 96 the router term is 8.96 B/object, so the flat ceiling is n∗(1) = M/(αcr) ≈
+1.2 × 108 at M = 1 GB — and the flat router’s measured floor at 108 (Table 5), 16–21 B/object once scratch
+and the reads in flight are counted, sits above it: the flat-router design does not reach 1 GB at 108, and
+our Deep-100M deployment at that cap is the depth-2 one (Table 4).
+At 109 the same arithmetic gives
+8.34 GiB and the built router is 9,882 MiB, the difference being graph state above the 64-byte estimate.
+The ceiling cannot be dodged by shrinking α (a sublinear vocabulary is the constant-pivot regime whose
+resolution does not scale — the linear vocabulary is the recall engine) nor by paging the router: beam
+traversal is random access, the one pattern that thrashes under a cap, and Table 10 is what that looks like
+— 25.44 →1.84 →0.40 qps as the cap falls from 16 to 8 GB under a 9.65 GB router, with recall untouched.
+But cr itself is compressible, and the first step is free.
+The law above already admits an 8-bit router.
+What that costs is a question about the certificate, not the throughput: quantizing the router changes which
+vocabulary points a query routes to, and coverage is recall (Prop. 1). We measured it on four corpora
+spanning dimension and intrinsic dimension, ranking the vocabulary under each code. The comparison is
+paired — the same 2,000 queries under both routers — which is what makes it decidable: an absolute
+coverage estimate from a few hundred queries has a standard error near a coverage point, larger than the
+effect, while the paired difference is dominated by the many queries whose routed pool is identical under the
+two codes.
+An 8-bit router is free, and the pairing says so sharply: at ks=32 the paired cost is 0.0000 on
+every corpus, with a bootstrap interval no wider than ±0.0008, and the number of queries whose routed pool
+changes at all is 0 of 2,000 on wiki-1024, 5 on Deep-96, 4 on SIFT-128 and 49 on GloVe. Four bits is free on
+three of the four (+0.0000, −0.0001, −0.0002) and costs −0.0072 on GloVe.
+Two bits is a different matter, and the split is not the one dimension alone would predict. At essentially
+equal dimension the penalty differs six-fold — −0.0121 on Deep-96 against −0.0731 on GloVe-100 — so what
+governs it is how concentrated the data is, with dimension helping separately because the ternary code keeps
+d/2 coordinates: 512 survive at d=1024, where the cost is only −0.0018, and 50 at d=100. A 2-bit router is
+therefore safe on concentrated or high-dimensional corpora and expensive on spread ones, which is the same
+regime split the equal-work law draws (§3). Quantizing the query as well is never worth it: it costs a further
+−0.1456 on GloVe and −0.0335 on Deep, and the query is one vector.
+Table 12 prices the consequence. An 8-bit router multiplies the depth-1 ceiling by 2.8× at d=96 — n∗
+from 1.2 × 108 to 3.4 × 108 at M=1 GB — and by 3.8× at d=1024, for free, and it multiplies n∗(L) by
+the same factor at every depth. At embedding dimensions the 2-bit router is worth another 3.4× on top,
+for about 20% more scanned data: float to 2 bits is 13.0× the ceiling at d=1024. Two caveats bound the
+claim. These are 106-scale measurements on a laptop with 2,000 queries, one α and one b. The substitution
+22
+
+
+is confirmed end to end at 109 on the depth-2 router (Table 11): rebuilt over 8-bit copies of the same 400k
+points, it routes to the same coverage and recall to four decimals on the same queries (+0.0000, +0.0000)
+in the same time (9.1 vs. 9.1 ms); the resident saving there is arithmetic because our router stores float32.
+And at low d the 64-byte constant g becomes the binding term — it is 40% of an 8-bit cr at d=96 and 73%
+of a 2-bit one — so below 8 bits the graph state, not the vectors, is what must be attacked.
+The escape is the index’s own rule, pointed upward: the router is a database of αn points, so index it
+with SOLO — resident state becomes the sample-of-sample, and router posting lists move into a code stream
+on storage like everything else. The router term becomes αLn cr and the ceiling
+n∗(L) = M −T s(op)
+αLcr
+≈n∗(1) · (1/α) L−1
+when the scratch is small against M: each level multiplies the ceiling by 1/α = 50. At M = 1 GB and d = 96
+that is n∗≈5.6 × 109 at depth 2 and ∼3 × 1011–1012 at depth 3 (float/8-bit top router). Each level adds
+one routing stage that is a counted read of ∼ks · (br/α) codes — 9.2 MB per query at 109 — and at 109 that
+read is cheaper than the beam walk it replaces, so depth 2 is 1.19× faster than depth 1 at 16 GB and 63× at
+8 GB (Table 10); at 108, where the flat router fits comfortably, the same step cost 0.75× (next paragraph).
+The measured floor at 109 is 512 MB at recall 0.9925, 0.54 B/object — 10× below the same cap and thread
+count at 108 (Table 4) — and the whole of it is the 189 MiB depth-2 router plus eight threads of scratch.
+What the law does and does not say about n.
+Two readings of the floor are tempting and both are
+wrong. The router term is still linear in n: recursion divides its constant by 50 per level, it does not remove
+it, so the 189 MiB depth-2 router at 109 is ∼1.8 GiB at 1010 at the same depth (depth 3 makes it ∼38 MiB;
+at 109 depth 3 is built and served, §5.8, with a 3.6 MiB router). And the scratch is independent of n only
+at a fixed operating point, and holding recall fixed does not fix the operating point: the candidates a query
+must touch at a recall target grow with n as the exponents of §3 say — n0.4–0.6 over the measured range,
+steepest in the last decade — so T · s(op) grows the same way. It is small in bytes, a few MiB per thread
+at 109, but it is not a constant. “Deliverable at any database size” therefore means that for every n there is
+a depth L at which the resident state fits a fixed budget, each such L a build, and it is measured through
+depth 3 at 109, where depth 3 serves from 96 MB and depth 2 no longer fits 128 MB (Table 11). What
+would block 1010 in this implementation is not memory: the object identifiers are 32-bit in both kernels and
+in the layout builder, the layout build sorts n · b identifiers in RAM, and the stream and base together are
+∼7.6 TiB. Those are engineering, and they are stated here so that the ceiling is not read as a claim past the
+last measured point.
+The upward gate, measured.
+The step from depth 1 to depth 2 multiplies an additional router-level
+coverage factor into the certificate, and that factor is the whole of the projection. We ran it on Deep-100M:
+the vocabulary S (2M points, a 854 MiB flat router) was itself indexed by SOLO — a 2% sample of S (40k
+points, 17.1 MiB resident, 50× less) with the 2M vocabulary posted to it at br=8 — and queries routed in
+two hops, the router level scanned by the same fused kernel as the object level. The object level was left
+untouched.
+Routing loses what one would expect and the object level absorbs it: at ks=64 the two-hop route returns
+0.9843 of the exact top-ks vocabulary terms against the flat router’s 0.9995, yet end-to-end recall falls only
+from 0.9874 to 0.9866 — at most 0.0009 across the grid, because a covered neighbour sits in a median of
+several touched lists (§3.3) and losing one term rarely loses the object. Throughput costs 0.75× at ks=256
+(1,793 →1,341 qps) here, where the flat router fits in RAM; at 109, where it does not, the sign flips (above).
+And the certificate composes: coverage under the depth-2 route predicts the served recall to 0.0008, the
+same residual as at depth 1. The mechanism behind n∗(L) = n∗(1)(1/α)L−1 is therefore measured at the
+step where it starts, at 108 and at 109; beyond depth 2 it remains arithmetic.
+8.2
+Filtered search: what the identity gives, and what it still owes
+This subsection is analysis, not measurement.
+Predicate-constrained search — the top-k among objects
+satisfying a filter — is where navigable graphs are most awkward: the filtered subgraph of a graph built for
+the unfiltered set need not be navigable, and selective predicates disconnect it, which is why filtered variants
+23
+
+
+are separate systems [16, 17]. A scan-only inverted file has no such failure mode, because it has no traversal
+to break. Let F ⊆X be the surviving set of a predicate, given as a bitmap. Serving intersects each touched
+list with F and scans the survivors; the returned answer is the exact top-k of the scanned survivors, so
+Proposition 1 holds verbatim with every quantity conditioned on F:
+recall@k
+ F = Pr
+
+Tb(y) ∩Rks(q)̸ = ∅
+ y ∈F
+
+.
+Two consequences are worth stating because they are properties no graph index has. First, the cost of a
+filtered query is known before it runs: the scanned mass is P
+s∈Rks(q) |Ls ∩F|, a sum of bitmap popcounts
+over the touched lists, so a planner can price the query and, using the rank-ordered postings of §2.5, extend b
+at query time until the surviving mass reaches its target — the dial the unfiltered path already uses. Second,
+the certificate conditions the same way: coverage computed over the surviving objects certifies filtered recall,
+without serving the filter, provided the ground-truth sample is drawn under it.
+What this does not yet settle is the level of that conditional coverage. A predicate correlated with the
+geometry — a category that occupies a region of the space — removes neighbors and vocabulary mass
+unevenly, and at high selectivity the surviving mass per list falls faster than b · ks can be raised. The equal-
+work law predicts the compensation required; whether it is affordable at selectivities of 10−2 and below,
+and how the result compares with filtered-DiskANN and ACORN on the same corpus, is an experiment this
+paper does not contain, and we decline to claim the outcome before running it.
+8.3
+Other limitations
+The 108 throughput comparison is measured on one machine whose memory system (four 2 GHz Haswell
+sockets, ∼50 GB/s to one process) bounds a streaming kernel more than a latency-bound graph walk; the
+socket-local protocol removes most of that bound (§5.6), but the ratio between the two systems on current
+hardware — where the same kernel runs ten times faster per core on the laptop — remains to be measured.
+Query-batched scanning (int8 GEMM/ADC over per-list tiles, reuse nqks/|S|) remains unimplemented. Disk
+throughput is bandwidth-bound at ∼40 KB mean reads; batching and SQ4 project 50–100 qps at 1 GB. Deep-
+100M rows are single-seed. The out-of-sample provision (§4) is measured on 7 corpora, with one random
+split (LAION-10M), two in-domain distribution shifts (wiki, PubMed23) and one cross-modal shift (T2I-
+10M); the inner search adds a term the calibration table absorbs by construction, and the three corpora
+with GRAFT signatures are the measurement of it. The corpus-specific offsets in Figure 3 say the dimension
+estimate is one of at least two statistics, so the table is per corpus; the cross-modal shift lands beyond the
+table and is flagged rather than certified, and whether a table fitted on a sample of the shifted queries then
+transfers is untested. Per-object adaptive b (rank-gap statistics) may dominate both fixed-b and closure.
+9
+Conclusion
+Making the serving path trivial — route, scan, return — turns recall from an emergent property into a
+certificate, replication into insurance, quantization into lossless acceleration, and skew into a recursion. The
+result serves a hundred million vectors past the saturation point of a tuned HNSW, from one gigabyte of
+resident memory in its disk mode, with exact deletes and a build that is nothing but sampling and searching.
+At scale, the right primitive may not be a better navigator, but a better bill of what must be looked at.
+Artifact and reproducibility.
+Every number in this paper was written by the run that produced it into
+a versioned manifest recording the code commit, the machine, the complete parameter set, the seed, and
+the raw timings; baselines were run by us on the same machines, queries, and ground truth as SOLO, under
+saturation sweeps rather than at a single operating point. The implementation, the experiment drivers, and
+the manifests are at https://github.com/zevahcle/SOLO.
+References
+[1] E. Ch´avez, G. Navarro, R. Baeza-Yates, J. L. Marroqu´ın. Searching in metric spaces. ACM Computing
+Surveys 33(3):273–321, 2001.
+24
+
+
+[2] E. Ch´avez, K. Figueroa, G. Navarro. Effective proximity retrieval by ordering permutations. IEEE
+Trans. Pattern Analysis and Machine Intelligence 30(9):1647–1658, 2008.
+[3] G. Amato, C. Gennaro, P. Savino. MI-File: using inverted files for scalable approximate similarity
+search. Multimedia Tools and Applications 71(3):1333–1362, 2014.
+[4] E. S. Tellez, E. Ch´avez, G. Navarro. Succinct nearest neighbor search. Information Systems 38(7):1019–
+1030, 2013.
+[5] B. Naidan, L. Boytsov, E. Nyberg. Permutation search methods are efficient, yet faster search is possible.
+Proc. VLDB Endowment 8(12):1618–1629, 2015.
+[6] E. Ch´avez. misi: a metric inverted sample index. arXiv:2608.27422 [cs.IR], 2026. https://arxiv.org/
+abs/2608.27422.
+[7] E. Ch´avez. GRAFT: navigable graphs grown on spatial-approximation rootstock. Submitted, 2026.
+Code: https://github.com/zevahcle/graft-ann.
+[8] P. Indyk, R. Motwani. Approximate nearest neighbors: towards removing the curse of dimensionality.
+Proc. 30th ACM Symposium on Theory of Computing (STOC), pp. 604–613, 1998.
+[9] H. J´egou, M. Douze, C. Schmid. Product quantization for nearest neighbor search. IEEE Trans. Pattern
+Analysis and Machine Intelligence 33(1):117–128, 2011.
+[10] H. J´egou, R. Tavenard, M. Douze, L. Amsaleg. Searching in one billion vectors: re-rank with source
+coding. Proc. IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+pp. 861–864, 2011.
+[11] A. Babenko, V. Lempitsky. Efficient indexing of billion-scale datasets of deep descriptors. Proc. IEEE
+Conference on Computer Vision and Pattern Recognition (CVPR), pp. 2055–2063, 2016.
+[12] J. Pennington, R. Socher, C. D. Manning. GloVe: global vectors for word representation. Proc. Confer-
+ence on Empirical Methods in Natural Language Processing (EMNLP), pp. 1532–1543, 2014.
+[13] Yu. A. Malkov, D. A. Yashunin. Efficient and robust approximate nearest neighbor search using hierar-
+chical navigable small world graphs. IEEE Trans. Pattern Analysis and Machine Intelligence 42(4):824–
+836, 2020.
+[14] S. Jayaram Subramanya, Devvrit, H. V. Simhadri, R. Krishnaswamy, R. Kadekodi. Rand-NSG
+(DiskANN): fast accurate billion-point nearest neighbor search on a single node. Advances in Neural
+Information Processing Systems 32 (NeurIPS), pp. 13748–13758, 2019.
+[15] A. Singh, S. J. Subramanya, R. Krishnaswamy, H. V. Simhadri. FreshDiskANN: a fast and accurate
+graph-based ANN index for streaming similarity search. arXiv:2105.09613, 2021.
+[16] S. Gollapudi, N. Karia, V. Sivashankar, R. Krishnaswamy, N. Begwani, S. Raz, Y. Lin, Y. Zhang, N. Ma-
+hapatro, P. Srinivasan, A. Singh, H. V. Simhadri. Filtered-DiskANN: graph algorithms for approximate
+nearest neighbor search with filters. WWW, 2023.
+[17] L. Patel, P. Kraft, C. Guestrin, M. Zaharia. ACORN: performant and predicate-agnostic search over
+vector embeddings and structured data. SIGMOD, 2024.
+[18] Q. Chen, B. Zhao, H. Wang, M. Li, C. Liu, Z. Li, M. Yang, J. Wang. SPANN: highly-efficient billion-
+scale approximate nearest neighborhood search. Advances in Neural Information Processing Systems 34
+(NeurIPS), pp. 5199–5212, 2021.
+[19] Q. Chen, H. Wang, M. Li, G. Ren, S. Li, J. Zhu, J. Li, C. Liu, L. Zhang, J. Wang. SPTAG: a library
+for fast approximate nearest neighbor search, 2018. https://github.com/microsoft/SPTAG.
+25
+
+
+[20] Y. Xu, H. Liang, J. Li, S. Xu, Q. Chen, Q. Zhang, C. Li, Z. Yang, F. Yang, Y. Yang, P. Cheng, M. Yang.
+SPFresh: incremental in-place update for billion-scale vector search. Proc. 29th ACM Symposium on
+Operating Systems Principles (SOSP), pp. 545–561, 2023.
+[21] E. Levina, P. J. Bickel. Maximum likelihood estimation of intrinsic dimension. In Advances in Neural
+Information Processing Systems 17 (NIPS), pp. 777–784, 2004.
+[22] L. Amsaleg, O. Chelly, T. Furon, S. Girard, M. E. Houle, K. Kawarabayashi, M. Nett. Estimating local
+intrinsic dimensionality. In Proc. ACM SIGKDD, pp. 29–38, 2015.
+[23] M. Aum¨uller, E. Bernhardsson, A. Faithfull. ANN-Benchmarks: a benchmarking tool for approximate
+nearest neighbor algorithms. Information Systems 87, 2020.
+[24] R. Connor, A. Dearle, B. Claydon. Efficient similarity measurement for high-dimensional embeddings
+using geometrically-based 2-bit quantisation. Information Systems, to appear, 2026.
+26
