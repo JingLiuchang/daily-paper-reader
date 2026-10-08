@@ -1,18 +1,19 @@
 # 日报 · 2026-10-08
 
-- 最近生成时间：2026-10-08 00:09:37 UTC
-- 今日累计更新：1 次
-- 今日累计推荐总数：1
-- 精读区：0
+- 最近生成时间：2026-10-08 23:51:16 UTC
+- 今日累计更新：2 次
+- 今日累计推荐总数：3
+- 精读区：2
 - 速读区：1
 
 ## 今日简报（AI）
-今天扫了 1 篇速读、无精读，唯一入选的是《Learning Query Encoders Can Be Hard Even When Vector Retrieval Is Geometrically Easy》（7.0/10）。
-最值得关注的一点是：向量检索的几何结构看起来容易，并不代表查询编码器就好训练，二者难度可能脱节。
-普通读者若做检索或 RAG，建议优先检查 query encoder 的训练/微调环节，别只看向量检索本身的指标。
+10月8日日报成功收录3篇向量检索论文，2篇精读均达9.0分，主打RDMA内存解聚图遍历与免搜索可导航图构建。  
+最值得看的是《RiftANN》用RDMA内存解聚加速向量搜索图遍历，以及《Building Navigable Graphs...》用三阶段组合式方法构建可导航图；速读篇则提醒查询编码器学习可能比几何检索本身更难。  
+普通读者可先读这两篇9分精读，再按兴趣看7分速读，快速把握向量搜索的图索引与查询编码难点。
 
 ## 精读区
-- 本次无精读推荐。
+1. [RiftANN: Efficient Graph Traversal for Vector Search with RDMA-Based Memory Disaggregation](/202610/08/2610.08990v1-riftann-efficient-graph-traversal-for-vector-search-with-rdma-based-memory-disaggregation) （9.0/10）
+2. [Building Navigable Graphs Without Search in Three Composable Stages](/202610/08/2610.09041v1-building-navigable-graphs-without-search-in-three-composable-stages) （9.0/10）
 
 ## 速读区
 1. [Learning Query Encoders Can Be Hard Even When Vector Retrieval Is Geometrically Easy](/202610/08/2610.02749v1-learning-query-encoders-can-be-hard-even-when-vector-retrieval-is-geometrically-easy) （7.0/10）

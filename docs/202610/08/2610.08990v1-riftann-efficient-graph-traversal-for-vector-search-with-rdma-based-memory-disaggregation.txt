@@ -1,0 +1,675 @@
+Title: RiftANN: Efficient Graph Traversal for Vector Search with RDMA-Based Memory Disaggregation
+
+URL Source: https://arxiv.org/pdf/2610.08990v1
+
+Published Time: Thu, 08 Oct 2026 00:09:59 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# RiftANN: Efficient Graph Traversal for Vector Search with RDMA-Based Memory Disaggregation 
+
+Qi Lin 
+
+Arizona State University Tempe, Arizona, USA 
+
+qlin36@asu.edu 
+
+Zhenyu Zhang 
+
+Arizona State University Tempe, Arizona, USA 
+
+zzhan641@asu.edu 
+
+Jun Kong 
+
+Arizona State University Tempe, Arizona, USA 
+
+jkong123@asu.edu 
+
+Zhichao Cao 
+
+Arizona State University Tempe, Arizona, USA 
+
+zhichao.cao@asu.edu 
+
+Abstract 
+
+Billion-scale vector collections increasingly produce graph indexes that exceed the local DRAM capacity of a single server. Passive RDMA-based disaggregated memory offers scalable capacity without requiring computation at memory nodes, but executing conventional best-first graph search over this architecture introduces substantial overhead. Fine-grained and frequently unnecessary remote reads increase communication cost, while dependencies between candidate evaluation and subsequent expansion serialize traversal and leave CPU resources idle. We present RiftANN, a graph-based approximate nearest neighbor search system designed for passive RDMA memory pools. RiftANN first uses compact vectors at compute nodes to navigate the graph and selectively verifies exact vectors according to a threshold calibrated from observed approxi-mation errors. A bounded one-sided RDMA pipeline batches and overlaps the remaining remote accesses with local pro-cessing. RiftANN further evaluates returned neighbors in parallel and incrementally incorporates completed results. An impact gate estimates whether unfinished evaluations are likely to change the candidate set, allowing traversal to continue when their expected influence is small while pre-venting unsafe advancement from substantially incomplete search state. Finally, a lightweight feedback controller co-ordinates RDMA concurrency with background evaluation capacity as search configurations and query loads change. We evaluate RiftANN on SIFT, DEEP, and SPACEV at 100M scale and on the billion-vector SIFT1B dataset. At matched recall, RiftANN achieves 1 .6×–4 .3× latency speedups and 1.1×–2 .2× higher throughput than DistVS, while providing 1.6×–5 .6× latency speedups over the SSD-based DiskANN and PipeANN systems. These results demonstrate that pas-sive disaggregated memory can support low-latency graph-based vector retrieval without relying on query-time com-putation at memory nodes. 
+
+1 Introduction 
+
+Approximate nearest neighbor search (ANNS) is a fundamen-tal building block in modern AI and data systems, power-ing applications such as semantic search [24], recommenda-tion [3], and retrieval-augmented generation [17]. Among ANNS methods, graph-based approaches are widely used because they provide high recall at low latency [21, 33, 37], typically organizing vectors as a graph traversed using best-first search [8, 13]. However, the high performance of graph-based ANNS relies on a systems assumption: the index fits in fast local memory [13, 21]. However, as vector datasets grow from millions to billions of high-dimensional embeddings, graph indexes can easily reach hundreds of gigabytes or even terabytes [8, 13], exceeding the DRAM capacity of a single server and making high-performance search increasingly difficult to sustain on one machine. Disaggregated memory (DM) offers a path beyond this capacity limit by decoupling compute (e.g., graph traver-sal and distance evaluation) from memory (e.g., index stor-age) over widely deployed high-speed interconnects (e.g., RDMA [7, 25]). A natural approach is to retain graph indexes and best-first search procedures (e.g., Vamana [13]) while placing the index in remote memory and executing queries at a compute node. However, our measurements in §2.3 show that this straightforward approach increases query latency by 1 .9×–2 .1× over local execution at matched recall. Remote access overhead explains only part of the gap: the non-RDMA portion of latency also increases from 291 to 374 μs. This slowdown reflects the distinct cost model of RDMA-based DM between local DRAM and SSDs [8, 16, 26]. Lo-cal DRAM provides inexpensive random access, making graph search primarily compute-bound [5, 18, 21, 23, 37], whereas SSD systems amortize long block I/O through batch-ing, packing, and pipelining [8, 13, 32]. RDMA provides byte-addressable access, but fine-grained reads still incur microsecond-scale latency and per-request NIC overhead. On our testbed, a 128 B RDMA read takes 2–3 μs in isolation and 4–5 μs under contention. Moreover, best-first search can-not select subsequent expansions until returned candidates 
+
+> 1arXiv:2610.08990v1 [cs.DB] 6 Oct 2026
+
+are evaluated and incorporated into the search frontier, in-troducing approximately 69 μs of CPU idle time per query. Naive remote execution therefore exposes two bottlenecks: high remote-access costs from numerous fine-grained reads and CPU stalls caused by dependent graph search stages. Existing DM-based ANNS systems address only parts of these costs and follow two DM deployment models. Active-DM equips memory nodes or near-memory endpoints with compute capability, whereas passive-DM exposes stored data through remote reads and performs all query processing at compute nodes. Active-DM systems such as DistVS [35] and CXL-ANNS [12] reduce data transfer through query-time computation near memory, but their serving capacity is con-strained by the compute resources provisioned at the mem-ory tier. The passive-DM system like d-HNSW [20] keeps query processing at compute nodes and amortizes RDMA overhead through partition-level access, but preserving can-didate coverage and recall requires fetching more partitions, weakening the traffic savings. Existing systems therefore either rely on memory-side computation or trade remote traffic for search quality. These limitations motivate us to build a high-performance graph-based ANNS system for passive-DM to reduce both remote-access costs and stalls caused by search dependencies without sacrificing search quality. 
+
+Achieving this goal presents three challenges. First , on the communication side, fine-grained graph accesses incur substantial per-request overhead and collectively generate large volumes of remote traffic, posing the challenge of build-ing an efficient communication substrate over passive-DM that reduces both request overhead and remote traffic while preserving search quality. Second , on the computation side, the strict dependency between candidate evaluation and sub-sequent expansion serializes graph traversal and places local computation on the critical path. The challenge is to relax this dependency while preventing incomplete candidate infor-mation from misguiding traversal. Finally , the performance bottleneck shifts between communication and computation as workloads and execution conditions change, requiring adaptive coordination to sustain high throughput and low tail latency without workload-specific tuning. To address these challenges, we build RiftANN, a high-performance graph-based ANNS system for passive-DM. RiftANN first introduces a Calibrated One-Sided Search Pipeline that uses compact local representations to guide graph traversal, avoiding exact-vector reads for most discov-ered candidates. It then applies a verification rule calibrated from measured approximation errors to fetch exact vectors only for unexpanded candidates that may affect the final top-
+
+𝑘 results. The resulting requests retrieve only the required record fields through a unified RDMA path that batches them for asynchronous execution. This design reduces re-quest overhead, remote traffic, and exposed latency while preserving high recall. RiftANN addresses the compute-side bottleneck through 
+
+Impact-Aware Asynchronous Traversal , which uses impact-aware traversal control to safely overlap parallel neighbor evaluation with graph expansion. A shared background worker pool evaluates returned neighbors, while the main thread incrementally merges completed results and continues tra-versal whenever the partially updated candidate set remains sufficiently reliable. To assess this reliability, RiftANN com-bines the recent frequency of candidate-set updates with the number of unfinished evaluations to estimate how many potentially influential updates may remain hidden. This es-timate determines whether the main thread proceeds with subsequent expansion or waits for more evaluations to finish, thereby avoiding an unconditional wait-all barrier and reduc-ing compute-side serialization without allowing incomplete candidate information to misguide traversal. Finally, RiftANN introduces Feedback-Driven Pipeline Balancing to coordinate remote fetching and local neigh-bor evaluation as a producer-consumer pipeline. It measures pipeline imbalance using a per-query defer ratio that re-lates unfinished evaluation work to recently generated work, then jointly adjusts worker allocation and RDMA concur-rency. This feedback limits backlog growth and resource underutilization as search settings and query loads change, sustaining high throughput and low tail latency without workload-specific tuning. We evaluate RiftANN on three 100M-scale datasets and SIFT1B [1, 15, 27]. At 0.90 Recall@10, RiftANN provides 1.9–5 .6× latency speedups and 1 .1–4 .2× higher throughput than DistVS [35], PipeANN [8], and DiskANN [13] on the 100M-scale datasets. On SIFT1B, it achieves 1 .62–2 .40 × la-tency speedups and 1 .11–2 .47 × higher throughput than the same baselines. Compared with graph-matched in-memory Vamana [13] on the 100M-scale datasets, RiftANN incurs 1 .8– 2.7× the latency while supporting remotely stored indexes within a 24 GB compute-side memory budget. These results show that passive-DM can support low-latency graph search without query-time computation at memory nodes. RiftANN is designed and evaluated for passive RDMA-based DM. Its compute-side mechanisms may also apply to lower-latency CXL-based memory, although differences in access latency and endpoint capabilities require separate evaluation. 
+
+2 Background and Motivations 
+
+2.1 Graph-Based ANNS and Best-First Search Graph-Based ANNS. Given a query vector, 𝑘 -nearest neigh-bor search identifies the 𝑘 closest vectors in a dataset. Ex-act search is prohibitively expensive in high-dimensional spaces [11], motivating approximate nearest neighbor search (ANNS) [19] to retrieve approximate top-𝑘 results at substan-tially lower cost. We measure search accuracy using recall, 
+
+> 2
+
+the fraction of the true 𝑘 nearest neighbors returned. Among ANNS approaches, graph-based methods provide a strong balance between recall and search efficiency [21, 33]. They represent vectors as graph nodes, connect nearby vectors with edges, and answer queries through graph traversal. 
+
+Best-First Search. Graph-based ANNS commonly uses best-first search to traverse the graph and identify approximate top-𝑘 neighbors [8, 13]. It maintains a bounded candidate set ordered by distance to the query and repeatedly selects one or more closest unexpanded candidates. Processing a selected candidate consists of two logical stages. Expansion accesses the candidate’s adjacency list and exposes previously unseen neighbors, while evaluation computes their distances, inserts competitive neighbors, and prunes the candidate set to retain only the closest candidates. These updates determine which candidates may be expanded next. The search terminates when no unexpanded candidate can improve the current search bound, after which the closest top-𝑘 candidates are returned. Best-first search exhibits two key characteristics. First, conventional execution completes neighbor evaluation and candidate-set updates before selecting subsequent expan-sions, creating an evaluation-to-expansion ordering depen-dency. Second, graph traversal generates many fine-grained, random vector accesses (e.g., neighbor vectors). Although a node’s neighbor IDs are stored contiguously, the corre-sponding vectors are scattered across the index [6, 13, 21], so exploring a single node requires fetching multiple scattered vectors, often in fine-grained units (e.g., less than 1 KB). 
+
+2.2 In-Memory and SSD-Based ANNS 
+
+The same best-first search procedure exposes different bot-tlenecks when the index resides in local DRAM or on SSD, leading to distinct optimization strategies. With the index in local DRAM, fine-grained random ac-cesses are inexpensive and expose little latency across de-pendent search iterations, making distance computation and traversal major costs. In-memory systems therefore optimize vector processing through SIMD/AVX [5, 37] and reduce memory stalls or traversal work through prefetching [37], im-proved entry-point selection [23, 37], candidate pruning [37], and early termination [18]. Graph indexes such as HNSW, NSG, and Vamana further improve connectivity to reduce visited nodes at a target recall [6, 13, 21]. SSD-based systems support larger indexes but translate fine-grained graph accesses into high-latency random block reads, shifting search to an I/O-bound regime and causing I/O amplification [8, 13]. Existing systems reduce disk accesses through graph organization, memory-resident routing, and filtering [2, 13, 32], amortize each I/O through batching, node packing, and locality-aware layouts [13, 32], and hide the remaining latency through asynchronous pipelining [8]. 0 0.5 1     
+
+> Latency (ms)
+> 0.6 0.8 1.0
+> Recall@10
+> Vamana Remote-Vamana
+> Vamana Remote-Vamana 00.2 0.4 0.6
+> Latency (ms)
+> 100% 68% 31%
+> Compute Remote Access Overhead
+
+Figure 1. Performance of the naive solution. 
+
+Table 1. Sensitivity of existing DM-based ANNS designs. C/M denotes CN/MN threads.                 
+
+> DistVS (R@10 = 0.90)
+> Setting C/M KQPS Original 26/6 13.8 More CN 32/6 15.2 More MN 26/12 22.4
+> d-HNSW: routed partitions
+> Setting 𝑃 /𝑃 0.90 R@10 Lat. (ms) Fewer partitions 0.50 0.84 350 Target recall 1.00 0.90 620 More partitions 1.25 0.91 815
+
+2.3 Motivations 
+
+Disaggregated memory (DM) decouples compute from mem-ory and exposes a scalable memory pool through RDMA or CXL fabrics [12, 20, 25, 35]. It provides capacity beyond local DRAM and finer-grained access than block-oriented SSDs, but retains remote-access latency and per-request overhead, creating a distinct cost model for graph-based ANNS. DM deployments differ in whether the memory tier participates in query execution. Active-DM designs perform operations near memory [12, 35], whereas passive-DM designs leave all query processing to compute nodes [20]. We target passive RDMA-based DM, where the full graph index and vector dataset reside in remote memory. Compute nodes retain only budgeted auxiliary representations and per-query state while performing all query processing. A natural and straightforward baseline under this model is to retain an in-memory graph index and its best-first search procedure while replacing local index accesses with one-sided RDMA reads. We instantiate this baseline using Va-mana [13] and refer to it as Remote-Vamana . To give this baseline a favorable configuration, Remote-Vamana stores high-precision compressed vectors at the CN to guide tra-versal and minimize remote exact-vector accesses. As shown in Figure 1, Remote-Vamana incurs 1 .9×–2 .1× the query latency of in-memory Vamana at matched recall. Its approx-imately 170 𝜇 s of remote-access time explains only part of this gap, while the non-RDMA portion also increases from 291 to 374 𝜇 s. These measurements expose two distinct costs. Fine-grained random reads incur fixed RDMA request and completion overhead, while lock-step best-first execution requires the query thread to evaluate returned neighbors and update the candidate set before selecting subsequent ex-pansions, keeping evaluation serialized on the critical path rather than overlapping it with later remote accesses. However, existing systems address only portions of the aforementioned problems. Active-DM systems reduce data       
+
+> 3Default RCM BFS DFS Fennel Starling LP 0510 15 Visit Hit Rate (%) 12.3
+> (A)
+> Ordering Partitioning 64B 256B 1K 4K 16K Read Size 0246Latency (us)  (B) Knee
+
+Figure 2. Limits of coarser-grained fetching over RDMA. (a) Visit hit rate of co-packed nodes. (b) RDMA read latency versus read size. transfer through memory-side computation: DistVS [35] places high-precision distance evaluation and search state at memory servers, while CXL-ANNS [12] evaluates distances at compute-capable CXL endpoints. However, this design places memory-side computation on the query-serving criti-cal path. As shown in Table 1, on SIFT100M at 0.90 Recall@10, DistVS with 26 CN threads and 6 MN threads saturates at 13.8 KQPS, with 98% MN-thread utilization. Adding 6 CN threads increases throughput only to 15.2 KQPS, whereas adding 6 MN threads raises it to 22.4 KQPS. This asymmet-ric improvement identifies memory-side processing as the bottleneck and couples serving capacity to MN compute resources. The passive-DM system, d-HNSW [20], amortizes RDMA overhead by transferring selected sub-HNSWs as partitions. Here, 𝑃 0.90 denotes the number of partitions routed per query to reach 0.90 Recall@10. As shown in Table 1, under our 24 GB compute-side memory budget, increasing the routed partitions raises Recall@10 from 0.84 to 0.91 but more than doubles mean latency from 350 to 815 ms, while reaching 0.90 recall already requires approximately 620 ms. At this operat-ing point, partition transfer, deserialization, and sub-HNSW search account for 82% of the latency. Partition-granular access therefore amortizes RDMA requests at the cost of transferring and searching more remote data, coupling recall with latency. In general, these results motivate us to redesign best-first graph search for passive-DM to require no query-time computation at memory nodes, reduce remote-access overhead and serialization stalls, and preserve high search quality. 
+
+2.4 Challenges 
+
+Achieving this goal presents three key challenges. 
+
+Challenge 1. Reducing Remote-Access Costs under Lim-ited Local Memory. Best-first search exposes neighbor-ing node IDs whose vectors are scattered across the remote index, generating many fine-grained RDMA reads of 128– 512 B, depending on vector dimensionality and data type [20]. Coarser-grained fetching can amortize per-request overhead, but partition-level access, as in d-HNSW, restricts candidate coverage. A less restrictive alternative is to co-locate nodes likely to be visited together during graph-wide traversal. However, Figure 2(a) shows that representative ordering and 1 2 4 8 1 8 16 32 BW =2 BW =4 BW =2 BW =4 BW =2 0246
+
+> Compute/RDMA Ratio  Beam Width (BW) Query Threads SPACEV DEEP SIFT1B
+
+Figure 3. Pipeline balance under different settings. partitioning schemes (e.g., Fennel [29], Starling [32], and LP [30]) achieve a visit hit rate of at most 12.3%, measured as the fraction of co-packed nodes subsequently visited by the same query. Meanwhile, Figure 2(b) shows that read la-tency increases rapidly beyond approximately 1 KB. Coarser-grained fetching therefore amortizes request overhead only by transferring mostly unused data at increasing latency. Fine-grained reads avoid spatial overfetching but retrieve the exact vector of every newly discovered neighbor before determining whether it should enter the candidate set. On SIFT100M [15], increasing the graph degree from 32 to 128 raises exact-vector reads from 2,134 to 4,566 per query, yet 85.4%–90.4% of the fetched candidates are never expanded. These reads cannot simply be eliminated because their dis-tances may still affect candidate ranking, pruning, and fi-nal top-𝑘 results. Compact representations such as product quantization (PQ) [14] and scalar quantization (SQ) [5] en-able local distance estimates without fetching every exact vector [5, 13, 37], but introduce a memory-accuracy trade-off. More accurate representations require greater per-vector storage, while smaller representations may distort traversal and result selection. Under our passive-DM model, limited compute-side memory imposes a bounded per-vector bud-get, constraining the precision of representations retained for the full dataset. The challenge is therefore how to limit RDMA request overhead and transferred data within a bounded compute-side memory budget while preserving high recall. 
+
+Challenge 2. Overlapping Neighbor Evaluation and Graph Expansion. Even after reducing remote-access costs, handling the remaining accesses synchronously can stall graph search. We implement an asynchronous Remote-Vamana, termed Async-Vamana , which retains the same high-precision local compressed vectors and remote-access decisions but processes completed records while other one-sided RDMA reads remain in flight. On SIFT100M at matched recall, Async-Vamana reduces mean query latency from approximately 550 𝜇 s to 368 𝜇 s, a 1 .5× speedup. However, asynchronous RDMA hides remote-access latency without relaxing the evaluation-to-expansion dependency. The query thread still incorporates evaluated neighbors into the candidate set be-fore selecting subsequent expansions. Our profiling shows that candidate evaluation consequently becomes the dom-inant exposed cost, accounting for approximately 78% of Async-Vamana’s execution time. 
+
+> 4
+
+Parallelizing candidate evaluation can reduce this seri-alization but creates a synchronization dilemma. Waiting for all evaluations preserves a fully updated candidate set but retains a wait-all barrier, whereas proceeding earlier exposes traversal to incomplete candidate information. To quantify this risk, we delay each completed evaluation result by one expansion hop before inserting it into the candi-date frontier, while keeping the search budget and all other settings unchanged. On SIFT100M, this delay reduces Re-call@10 from 99.47% to 66.56%. Because best-first traversal is path-dependent, a temporarily hidden promising candi-date can alter both the next expansion and the graph region reached within the search budget. Parallel evaluation there-fore creates a tension between removing the wait-all barrier and maintaining a sufficiently complete search frontier. Prior systems relax related dependencies at different exe-cution boundaries. CoTra [36] tolerates delayed candidate in-formation through periodic coordination during distributed traversal, but it assumes compute-active servers and does not address the evaluation-to-expansion dependency in passive-DM. PipeANN [8] bounds missing neighbor information using pipeline width, but the amount of unfinished work does not indicate whether it may change the search fron-tier. CXL-ANNS [12] overlaps candidate maintenance with near-memory distance computation, while graph expansion still depends on the unfinished evaluations that determine node selection. The challenge is therefore how to overlap neigh-bor evaluation and graph expansion, reducing compute-side serialization while preserving high recall. 
+
+Challenge 3. Maintaining Pipeline Balance under Dy-namic Load. Once candidate evaluation and remote access are highly parallelized, pipeline efficiency depends on their relative pressure. As shown in Figure 3, the ratio of candidate-evaluation time to RDMA fetching time ranges from 1 .8×
+
+to 6 .1× across datasets, search configurations (e.g., different beam widths), and query-concurrency levels. A configura-tion tuned for one setting can therefore become unbalanced in another, causing either evaluation backlogs or idle com-pute resources and reducing effective overlap. The balance can shift even under the same configuration. As detailed in §4.7, temporarily doubling the query arrival rate under a fixed configuration causes the evaluation backlog to grow, increasing P99 latency from 1 .46 ms to 3 .02 ms. The challenge is therefore how to maintain pipeline balance as computation and communication pressures shift, sustaining high throughput and low tail latency without workload-specific tuning .
+
+3 The Design of RiftANN 
+
+3.1 Overview 
+
+We build RiftANN, an end-to-end graph-based ANNS system for passive disaggregated memory. As shown in Figure 4, passive memory nodes store unified graph records contain-ing each node’s exact vector and adjacency list. On compute nodes, a per-query main thread drives a closed-loop search. Traversal generates state-dependent expansion and verifica-tion reads through the calibrated pipeline. Returned exact vectors update the exact-result set, while returned adjacency lists generate evaluation tasks for the shared worker pool. The main thread incrementally merges completed evalua-tions, and the impact gate determines whether subsequent expansion may proceed. A feedback controller jointly ad-justs the RDMA window and worker allowance as pipeline pressure changes. RiftANN comprises three components: 
+
+Calibrated One-Sided Search Pipeline. Compact local representations guide traversal. Candidate state determines the required record fields, while an error-calibrated rule se-lects unexpanded candidates for exact verification. A bounded asynchronous RDMA path batches and issues the resulting reads, reducing request overhead, transferred data, and ex-posed remote latency. 
+
+Impact-Aware Asynchronous Traversal. Shared workers evaluate newly exposed neighbors while the main thread incrementally merges completed results. The impact gate estimates the candidate-set updates hidden by unfinished work and admits subsequent expansion only when this esti-mate remains within a safety budget, avoiding unconditional wait-all stalls while limiting candidate-set incompleteness. 
+
+Feedback-Driven Pipeline Balancing. A per-query defer ratio relates unfinished neighbor evaluation work to recent task generation. The controller uses this signal to jointly ad-just worker allowance and RDMA concurrency, maintaining effective overlap as search demand and query load change. 
+
+3.2 Calibrated One-Sided Search Pipeline 
+
+As shown in Figure 5, RiftANN coordinates three remote-access decisions: what fields to fetch from each remote record, which unexpanded candidates require exact verification, and when to issue the resulting reads. These decisions are driven by candidate state, calibrated approximation errors, and a bounded asynchronous RDMA pipeline, respectively. 
+
+State-Driven Remote Operations. Each remote graph record stores an exact-vector prefix followed by an adjacency-list suffix. Expansion requires the adjacency list to continue traversal, while verification requires the exact vector for final top-𝑘 selection. Based on the required operation and previ-ously retrieved data, RiftANN supports three read modes. 
+
+Expand-and-verify fetches both fields when an unverified candidate is selected for expansion. Verify-only fetches only the exact vector for an unexpanded candidate admitted by the verification gate. Expand-after-verification fetches only the adjacency list when a verified candidate is later expanded. These modes retrieve only the currently required fields and reuse previously fetched data, avoiding speculative cross-node packing and repeated exact-vector transfers. 
+
+Error-Calibrated Exact Verification. RiftANN uses com-pact local representations to estimate candidate distances for graph navigation, while exact distances determine the final top-𝑘 results. Candidates selected for expansion obtain     
+
+> 5Worker Thread Pool
+> Generated ( G)Deferred ( D)
+> Defer Ratio =D
+> G
+> Decrease RDMA window
+> Scale up Worker threads
+> (CPU Bound)
+> Release Workers to pool
+> Increase RDMA window
+> (IO Bound)
+> Disaggregated Memory Node Local Compute Node
+> High Defer Ratio Low Defer Ratio
+> RDMA Fetch Engine
+> Feedback-Driven Pipeline Balancing
+> Coordinated Feedback Control
+
+i          
+
+> Worker Thread Number RDMA Window
+> Task Queue
+> Worker 1
+> Main Thread
+> Worker 2 Evaluate
+> Deferred
+> Evaluate
+> Dispatch
+> Task
+> Evaluate
+> Merge
+> Fetch
+> on k
+> Candidate Set k+ 1 Candidate Set k
+> Impact-Aware Asynchronous Traversal
+> Check
+> Impact
+> NO Yes
+> Merge buffer
+> Obtain
+> Control
+> Signals
+> Feedback
+> Control
+> Calibrated One-Sided Search Pipeline
+> Requests
+> VNVerify-only
+> Expand-after-
+> verification
+> Expand-and-
+> verify VNVerification ？
+> Requests
+
+Y Asynchronous  
+
+> one-sided RDMA
+> Unified graph records
+> Exact Vector (V) Neighbor ID (N)
+
+.
+
+.    
+
+> Exact Vector (V) Neighbor ID (N)
+> Exact Vector (V) Neighbor ID (N)
+> Evaluate
+> Fetch
+> on k+1
+> Merge
+> Check
+> Impact
+> Dispatch
+> Task
+> Fetch
+> on k+1
+> k+2
+> Merge
+
+Figure 4. RiftANN Overview. Compute Node  Memory Node          
+
+> Query Top-k
+> Search Main Thread
+> 1
+> WHAT TO FETCH
+> State-driven Ops
+> V
+> N
+> 2
+> 3
+> WHEN TO ISSUE
+> 4
+> Verify-only
+> Expand-after-
+> verification
+> Expand-and-
+> verify VN
+> Low-Prec Compressed Vectors
+> WHICH TO VERIFY
+> Exact Verification? Asynchronous
+> one-sided RDMA
+> Error-Calibrated
+> Verification
+> Unified graph records
+> Exact Vector (V) Neighbor ID (N)
+> .
+> .
+> Y
+> Exact Vector (V) Neighbor ID (N)
+> Exact Vector (V) Neighbor ID (N)
+> Exact Vector (V) Neighbor ID (N)
+> Exact Vector (V) Neighbor ID (N)
+
+Figure 5. Calibrated One-Sided Search Pipeline. their exact vectors through Expand-and-verify , but discov-ered candidates that are not expanded may also belong to the final result and require Verify-only . Verifying all such can-didates would eliminate the traffic savings, while verifying too few could reduce recall. RiftANN therefore uses mea-sured approximation errors to calibrate which unexpanded candidates require exact verification. Once RiftANN has obtained exact distances for at least 
+
+𝑘 candidates, let 𝜏 denote the current 𝑘 -th smallest exact distance. Because the verified candidates form only a sub-set of the dataset, 𝜏 upper-bounds the ground-truth 𝑘 -th distance. Every discovered true top-𝑘 candidate therefore satisfies 𝑑 (𝑣, 𝑞 ) ≤ 𝜏 . Before 𝜏 is available, RiftANN obtains ex-act vectors only through Expand-and-verify . If approximate and exact distances were identical, verifying unexpanded candidates with ˆ𝑑 (𝑣, 𝑞 ) ≤ 𝜏 would be sufficient. In practice, approximation errors may place a result-relevant candidate outside this boundary. RiftANN therefore relaxes the bound-ary by a calibrated factor 𝛼 and performs Verify-only when ˆ𝑑 (𝑣, 𝑞 ) ≤ 𝛼𝜏 . (1) RiftANN calibrates 𝛼 offline using held-out queries. It runs the same approximate traversal used at runtime and records ˆ𝑑 (𝑣, 𝑞 )/ 𝑑 (𝑣, 𝑞 ) for every discovered candidate that belongs to the ground-truth top-𝑘 . Given a target verification miss rate 𝛿 , RiftANN sets 
+
+𝛼 = max 
+
+(
+
+1, 𝑄 1−𝛿 
+
+ˆ𝑑 (𝑣, 𝑞 )
+
+𝑑 (𝑣, 𝑞 )
+
+!) 
+
+(2) where 𝑄 1−𝛿 is the empirical (1 − 𝛿 )-quantile of the recorded ratios. The outer maximum prevents the verification bound-ary from becoming narrower than 𝜏 . This calibration is per-formed once for each dataset and compact-representation configuration. 
+
+Example. Suppose 𝛿 = 0.01 and the 99th percentile of the recorded ˆ𝑑 (𝑣, 𝑞 )/ 𝑑 (𝑣, 𝑞 ) ratios is 1.08. RiftANN sets 𝛼 =
+
+1.08, meaning that at least 99% of discovered ground-truth top-𝑘 candidates in the held-out queries satisfy ˆ𝑑 (𝑣, 𝑞 ) ≤ 
+
+1.08 𝑑 (𝑣, 𝑞 ). If the current threshold is 𝜏 = 100, the runtime verification boundary is 108. A candidate 𝑣 1 with ˆ𝑑 (𝑣 1, 𝑞 ) =
+
+105 triggers Verify-only , and a later expansion fetches only its adjacency list through Expand-after-verification . A candidate 
+
+𝑣 2 with ˆ𝑑 (𝑣 2, 𝑞 ) = 112 triggers no read unless expanded, in which case Expand-and-verify fetches both fields. For any discovered true top-𝑘 candidate satisfying the calibrated error bound, ˆ𝑑 (𝑣, 𝑞 ) ≤ 𝛼𝑑 (𝑣, 𝑞 ) ≤ 𝛼𝜏, (3) so the candidate passes the runtime verification gate. Se-lecting the smallest qualifying 𝛼 avoids widening the gate beyond the empirical coverage target. As closer candidates are verified, 𝜏 decreases and the gate becomes progressively more selective. This guarantee is conditional on candidate discovery. Graph traversal determines which candidates are discovered, while calibration determines which discovered candidates receive exact verification. We evaluate verifica-tion coverage, recall impact, and exact-vector-read reduction on disjoint test queries in §4.5. 
+
+Asynchronous One-Sided Execution. To implement the final decision in Figure 5, RiftANN issues remote reads through a bounded per-query window that keeps at most 𝑊 𝑅 one-sided RDMA reads in flight. Returned exact vectors update the exact-result set and 𝜏 , while returned adjacency lists expose new neighbors for graph traversal. As request slots become available, the current search state determines which expansion and verification reads should be issued. Because the search state may change while a request is waiting for issuance, RiftANN revalidates each request imme-diately before posting it. Requests that are no longer needed are discarded, while expansion and verification requests for the same candidate are combined into a single full-record 
+
+6CPU Evaluate (Iter  k - 1 )                  
+
+> Fetch ( Iter k+ 1 )Main Thread Pipeline Stall (Wait All)
+> Fetch based
+> on (Iter k)Merge Fetch based
+> on (Iter k+1 )
+> Worker 1
+> Worker 2
+> Dispatch
+> Task
+> Merge buffer
+> Evaluate (Iter k)
+> DM
+> Deferred
+> Result
+> Evaluate Neighbors
+> Deferred
+> Worker 3
+> Evaluate Neighbors
+> Ready
+> Result
+> Ready
+> Result
+> Merge Fetch （Iter k）
+> Main Thread
+> Eval. Neighbors
+> Candidate Set(Iter k)Candidate Set(Iter k+ 1 )
+> Traditional WaitAll Pipeline
+> Impact-Aware Asynchronous Traversal
+> Impact
+> Gate
+> NOT Pass
+> Impact
+> Gate
+> Fetch based
+> on (Iter k+1 )
+> Eval. Neighbors
+> Evaluate Neighbors
+> Pass
+> D
+> Ready
+> Result
+
+Figure 6. Pipeline execution under WaitAll and impact-aware traversal. WaitAll blocks subsequent expansion until all evaluations complete. RiftANN incrementally incorpo-rates completed results and admits the next expansion when the impact gate opens, while the remaining evaluation tail continues in parallel. read. The remaining requests are batched using standard RDMA optimizations (e.g., doorbell chaining and selective signaling). Search terminates only when the navigation condition is satisfied, no unverified candidate remains that satisfies the calibrated gate, and no outstanding read can change the navigation or exact-result state. Although this asynchronous execution hides much of the latency, the main thread still evaluates returned neighbors and incorporates their results before selecting subsequent expansions. Once remote access is largely overlapped, this evaluation-to-expansion depen-dency becomes the next critical-path bottleneck. 
+
+3.3 Impact-Aware Asynchronous Traversal 
+
+Impact-Aware Asynchronous Traversal overlaps candidate evaluation with subsequent expansion while constraining the estimated impact of unfinished evaluations on the can-didate set. A shared background worker pool evaluates re-turned neighbors, while the main thread incrementally merges completed results. Before each expansion, RiftANN estimates how many candidate-set updates may remain hidden and proceeds only when this estimate is sufficiently small. This state-dependent control removes the unconditional wait-all barrier while preventing unrestricted traversal from an in-complete candidate set. 
+
+Estimating Hidden Candidate-Set Updates. An unfin-ished evaluation can affect traversal only if it inserts its can-didate into the candidate set, but this likelihood changes sub-stantially during a query. On SIFT100M, the mean candidate-update ratio decreases from 41.0% over the first 20% of pro-cessed nodes to 0.23% over the final 40%, even though the latter stage still evaluates 64.8 neighbors per processed node on average. The unfinished backlog therefore measures the amount of pending work, but not its likely impact on the can-didate set. Bounding only the backlog can unnecessarily re-strict evaluation–expansion overlap as the search converges. Because the unfinished evaluations and the completed eval-uations in the rolling window originate from recent expan-sions, RiftANN uses the recent candidate-update ratio as an online proxy for their update likelihood at the current search stage. It counts every insertion because the inserted candidate may affect a later expansion decision even if it is not selected next. RiftANN then combines this ratio with the current unfinished-evaluation backlog to estimate how many candidate-set updates may remain hidden from traversal. Formally, let W𝑞 contain the 𝐻 most recently completed evaluations for query 𝑞 , and let 𝑥 𝑖 = 1 if evaluation 𝑖 inserts its candidate into the candidate set and 𝑥 𝑖 = 0 otherwise. RiftANN conservatively sets 𝜌 𝑞 = 1 until 𝐻 evaluation results are available. It then computes the candidate-update ratio as 
+
+𝜌 𝑞 = 1
+
+𝐻 ∑︁ 𝑖 ∈ W 𝑞 
+
+𝑥 𝑖 . (4) Let 𝑈 𝑞 denote the number of individual candidate evalua-tions submitted to background workers whose results have not yet been returned to the main thread. After incorporat-ing all currently completed results, RiftANN estimates the number of candidate-set updates still hidden from traversal: 
+
+Ψ𝑞 = 𝜌 𝑞 𝑈 𝑞 . (5) Consequently, the same unfinished backlog produces a smaller impact estimate as candidate updates become less frequent, rather than being treated as equally consequential throughout the search. 
+
+Impact-Aware Expansion. As illustrated in Figure 6, a wait-all pipeline blocks subsequent expansion until all eval-uations generated by the current expansion have completed. RiftANN instead incorporates evaluation results as they be-come available and, before each expansion decision, recom-putes 𝜌 𝑞 , 𝑈 𝑞 , and Ψ𝑞 . It admits the next expansion only when: 
+
+Ψ𝑞 ≤ 𝜖 and 𝑈 𝑞 ≤ 𝑈 max . (6) Here, 𝜖 bounds the estimated number of candidate-set up-dates hidden from traversal, while 𝑈 max provides a hard cap on the unfinished backlog. 
+
+Example. Consider the default setting 𝐻 = 64, 𝜖 = 1, and 
+
+𝑈 max = 128. Suppose 16 of the 64 most recently completed evaluations inserted candidates into the candidate set, giv-ing 𝜌 𝑞 = 0.25. If 𝑈 𝑞 = 8 evaluations remain unfinished, then 
+
+Ψ𝑞 = 0.25 × 8 = 2. The gate therefore follows the Not Pass branch in Figure 6, and the main thread continues merging completed results without starting another expansion. Af-ter four of these evaluations complete, suppose the updated ratio remains 0 .25. The remaining backlog becomes 𝑈 𝑞 = 4, giving Ψ𝑞 = 1, so the gate opens. The next expansion can then proceed while the remaining four evaluations continue in parallel. Near convergence, if only 8 of the recent 64 evalu-ations updated the candidate set, the same backlog of 𝑈 𝑞 = 8gives Ψ𝑞 = 1 and can pass immediately.          
+
+> 7124816 24 32 48 64 Query Threads 010k 20k 30k Throughput (Op/s)
+> Saturate Region
+> (A)
+> Throughput Latency 04812 Worker Threads (W) 010 20 30 Time per Iteration (us)
+> 5.1x 2.9x (B)
+> Compute RDMA 0123Latency (ms)
+
+Figure 7. Thread rebalancing between query processing and background workers. Completed results are never intentionally withheld and are incorporated before each expansion decision. If either gate condition fails, the main thread pauses new expansions and continues merging results until the gate reopens. Before terminating, RiftANN drains all unfinished evaluations and reevaluates the navigation and verification conditions, allow-ing any newly inserted candidate to resume traversal. Unlike the calibrated verification gate, which determines whether an exact vector should be fetched, the impact gate deter-mines only when the next graph expansion may proceed. All completed evaluation results are eventually incorporated. By regulating expansion with Ψ𝑞 rather than treating ev-ery unfinished evaluation equally, RiftANN bounds the esti-mated number of hidden candidate-set updates while expos-ing more evaluation–expansion overlap as the search stabi-lizes. This reduces the serialized evaluation dependency with-out unconditionally advancing from an incomplete candi-date set. The resulting execution forms a producer–consumer pipeline in which completed expansion reads generate neigh-bor evaluation tasks and shared workers process them. Be-cause the relative rates of these stages vary with workload and query concurrency, fixed resource allocation can cause evaluation backlogs or worker underutilization, motivating the feedback-driven control described next. 
+
+3.4 Feedback-Driven Pipeline Balancing 
+
+RiftANN treats remote fetching as the producer and can-didate evaluation as the consumer of a per-query pipeline. The RDMA window 𝑊 𝑅,𝑞 controls task generation, while the worker allowance 𝑇 𝑞 controls task processing. A per-query defer ratio coordinates the two to limit backlog growth and worker underutilization as execution conditions change. 
+
+CPU Budgeting across Query and Evaluation Paral-lelism. RiftANN operates within a fixed compute-node CPU budget. Each query is driven by one main thread, while candidate evaluations are executed by a background worker pool shared across queries at this CN. As shown in Figure 7(a), increasing query concurrency initially improves throughput but eventually yields diminishing returns as CPU, memory, and RDMA resources become contended. Meanwhile, Fig-ure 7(b) shows that assigning compute capacity to back-ground workers substantially reduces candidate-evaluation time while leaving RDMA time largely unchanged. RiftANN therefore bounds the number of active main threads and 
+
+Algorithm 1 Feedback-Driven Pipeline Balancing                                                                                    
+
+> 1: Input: query 𝑞 ,𝑁 deferred ,𝑞 ,𝑁 generated ,𝑞 ,𝑊 𝑅,𝑞 ,𝑇 𝑞
+> 2: Shared: worker pool P
+> 3: 𝑟 𝑞 ←𝑁 deferred ,𝑞
+> max (𝑁 generated ,𝑞 ,1)⊲relative computation backlog 4: if 𝑟 𝑞 >𝜃 high then ⊲computation pressure 5: if 𝑇 𝑞 <𝑇 max and shared-pool capacity is available then
+> 6: 𝑇 𝑞 ←𝑇 𝑞 +1⊲grant one worker slot 7: else
+> 8: 𝑊 𝑅,𝑞 ←max (𝑊 𝑅,𝑞 −1,𝑊 𝑅, min )⊲throttle producer 9: end if
+> 10: else if 𝑟 𝑞 <𝜃 low then ⊲low computation pressure 11: if 𝑇 𝑞 >𝑇 min then
+> 12: 𝑇 𝑞 ←𝑇 𝑞 −1⊲return capacity to shared pool 13: else
+> 14: 𝑊 𝑅,𝑞 ←min (𝑊 𝑅,𝑞 +1,𝑊 𝑅, max )⊲increase producer rate 15: end if
+> 16: else
+> 17: no adjustment ⊲balanced zone 18: end if
+
+assigns each query 𝑞 a worker allowance 𝑇 𝑞 , which limits how many shared workers may concurrently process its tasks, subject to pool availability, without reserving physical threads. 
+
+Per-Query Feedback Signal. Within this fixed CPU orga-nization, RiftANN coordinates two per-query control knobs. The outstanding request window 𝑊 𝑅,𝑞 bounds the number of one-sided RDMA reads in flight and thereby regulates the rate at which completed expansions generate evaluation tasks. The worker allowance 𝑇 𝑞 bounds the number of shared workers that may concurrently process those tasks, regulat-ing their consumption rate. To measure the relative pressure between these two stages, RiftANN computes the defer ratio 
+
+𝑟 𝑞 = 𝑁 deferred ,𝑞 
+
+max (𝑁 generated ,𝑞 , 1) . (7) Here, 𝑁 deferred ,𝑞 is the number of evaluation tasks that re-main queued or running, while 𝑁 generated ,𝑞 is the number generated since the previous control point. RiftANN invokes the controller after a fixed number of expansion completions and resets 𝑁 generated ,𝑞 after each decision. For example, if 20 tasks have been generated and 5 remain unfinished, then 
+
+𝑟 𝑞 = 0.25. Normalizing by recent task generation makes the signal less sensitive to search configuration, RDMA concur-rency, and query load. Unlike Ψ𝑞 , which determines whether traversal may advance with unfinished evaluations, 𝑟 𝑞 is a performance-control signal used only to adjust worker capacity and outstanding RDMA concurrency. 
+
+Coordinated Feedback Control. Rather than targeting a single 𝑟 𝑞 , RiftANN defines a balanced zone using 𝜃 low and 
+
+𝜃 high . It leaves 𝑊 𝑅,𝑞 and 𝑇 𝑞 unchanged within this zone, pro-viding hysteresis against short-lived fluctuations. RiftANN uses the same thresholds and event-based control interval across workloads, with their sensitivity evaluated in §4.7. Algorithm 1 summarizes the policy. When 𝑟 𝑞 exceeds the balanced zone, RiftANN grants additional worker capacity when available and otherwise reduces the RDMA window. 
+
+> 8
+
+When 𝑟 𝑞 falls below the zone, it releases workers before in-creasing RDMA concurrency. This ordering prioritizes com-pute reallocation before changing work generation. Query bursts naturally raise 𝑟 𝑞 and trigger the same feedback loop without a separate detector, while the adjustments reverse as the burst subsides. 
+
+4 Evaluation 
+
+We compare RiftANN with state-of-the-art DM- and SSD-based ANNS systems across datasets, quantify the effective-ness, incremental contribution, and trade-offs of its designs, and evaluate scalability across compute and memory nodes. 
+
+4.1 Experimental Setup Basic configuration. Unless otherwise stated, experiments use two servers connected by 100-Gbps Mellanox ConnectX-5 RNICs. Each server has two 28-core Intel Xeon Gold 6330 CPUs at 2.00 GHz and runs Ubuntu 22.04. One server acts as the MN with 768 GB of DRAM; the other acts as the CN with 128 GB of DRAM and a 2-TB Samsung 980 PRO SSD. The MN stores the full index, while the CN is limited to 24 GB for all local data and runtime state. This budget is applied uniformly and is comparable to the 22 .3–25 .0 GB per-CN footprints reported by DistVS [35]. RiftANN stores a 20-byte PQ code per vector at the CN, requiring approximately 2 GB for each 100M dataset and 20 GB for SIFT1B. §4.8 describes the multi-CN and multi-MN configurations. 
+
+Datasets and systems. We evaluate the four public datasets in Table 2 against the DM-based d-HNSW [20] and DistVS [35], and the SSD-based DiskANN [13] and PipeANN [8]. For each dataset, we calibrate 𝛼 on 1,000 held-out queries and evaluate on the listed disjoint query set. d-HNSW routes queries through a representative index and fetches selected sub-HNSW partitions from passive-DM, whereas DistVS performs part of the query processing at active memory nodes. DiskANN and PipeANN represent synchronous and pipelined SSD-based graph search, respectively. Because pub-lic implementations of d-HNSW and DistVS are unavailable, we implement them following their published designs and configurations. 
+
+Resource and index configurations. All experiments use a total budget of 32 CPU threads. To ensure fairness, Rif-tANN dynamically assigns up to 6 CN threads to its shared worker pool, DistVS uses 26 CN and 6 MN threads, and the other systems use 32 CN threads. We additionally use Remote-Vamana and graph-matched in-memory Vamana for breakdown and upper-bound comparisons. Vamana indexes use (𝑅, 𝐿 ) = (96 , 128 ) on the 100M datasets and (128 , 200 ) on SIFT1B, following prior work [8, 13]; d-HNSW and DistVS follow their respective configurations. 
+
+Metrics. Following prior work [8, 27], we report Recall@10 against mean latency and throughput, using Recall@10 =
+
+0.90 as the primary operating point. Selected experiments 
+
+Table 2. Evaluation datasets. Each 100M dataset is a subset of its corresponding 1B dataset. 
+
+Name Size Type Dim Queries SIFT100M [15] 100M uint8 128 10,000 DEEP100M [1] 100M float 96 10,000 SPACEV100M [27] 100M int8 100 29,316 SIFT1B [15] 1B uint8 128 10,000 
+
+Figure 8. Search latency on 100M-scale datasets. 50 60 70 80 90 100              
+
+> Recall@10 (%)
+> 020000 40000
+> Throughput (QPS)
+> (a) SIFT100M
+> 50 60 70 80 90 100
+> Recall@10 (%)
+> (b) DEEP100M
+> 50 60 70 80 90 100
+> Recall@10 (%)
+> (c) SPACEV100M
+> DiskANN PipeANN DistVS AlpsANN
+
+Figure 9. Search throughput on 100M-scale datasets. additionally report 0.95 recall and P99 latency. Unless other-wise stated, each data point is averaged over at least three independent runs. 
+
+4.2 Overall Performance 
+
+Figures 8 and 9 compare RiftANN with DiskANN, PipeANN, and DistVS under the same 32-thread CPU budget. We report d-HNSW only in the text because its results fall outside the plotted range. 
+
+Search Latency. At 0.90 Recall@10, RiftANN achieves mean query latencies of 0 .75 ms, 2 .11 ms, and 0 .88 ms on SIFT100M, DEEP100M, and SPACEV100M, respectively. These results provide 1 .9–4 .3× speedups over DistVS, 2 .1–4 .3× over Pi-peANN, and 2 .8–5 .6× over DiskANN. RiftANN remains the lowest-latency system throughout the measured recall range. At 0.90 recall, d-HNSW requires approximately 620 ms, 680 ms, and 570 ms on the three datasets. 
+
+Search Throughput. At 0.90 Recall@10, RiftANN sustains 30 .0 KQPS, 11 .0 KQPS, and 25 .9 KQPS, corresponding to 1 .1– 2.2× the throughput of DistVS, 1 .5–3 .0× that of PipeANN, and 2 .2–4 .2× that of DiskANN. d-HNSW remains below 100 QPS on all three datasets. RiftANN maintains the highest throughput throughout the measured recall range. The results reflect how each system maps graph traver-sal to its data-access architecture. DiskANN and PipeANN remain constrained by block-oriented SSD I/O despite Pi-peANN’s overlap of I/O and computation. d-HNSW amor-tizes RDMA requests at partition granularity, but cache misses 
+
+> 9
+
+require transferring, deserializing, and searching entire sub-HNSWs. With 32 concurrent query threads, limited parti-tion reuse leaves both latency and network/CPU costs high. DistVS reduces vector transfer through memory-side refine-ment, but iterative CN–MN coordination places shared-MN computation on the critical path and limits throughput un-der concurrency. RiftANN instead uses one-sided, record-granular reads and selective exact-vector fetching, avoiding SSD blocks, whole-partition transfers, and repeated memory-side processing. Its asynchronous pipeline overlaps the re-maining reads with local evaluation, while impact-aware traversal and shared workers reduce evaluation–expansion stalls and improve compute utilization. These differences explain RiftANN’s lower latency and higher throughput un-der the fixed CPU budget, with its advantage maintained as recall increases. For reference, at 0.90 Recall@10, RiftANN in-curs 1 .8–2 .7× the latency of fully in-memory Vamana while sustaining 26–39% of its throughput. 
+
+4.3 Billion-Scale Performance 
+
+We evaluate SIFT1B to determine whether RiftANN’s advan-tage persists as the dataset grows by 10 ×. We use the same system configurations and aggregate 32-thread CPU budget as in §4.2. d-HNSW is excluded because its SIFT1B index exceeds the 768 GB capacity of our MN. Figure 10 reports the results. 
+
+Search Latency. At 0.90 Recall@10, RiftANN achieves 2 .20 ms latency, compared with 3 .57 ms for DistVS, 3 .59 ms for Pi-peANN, and 5 .28 ms for DiskANN, providing 1 .62 ×, 1 .63 ×,and 2 .40 × speedups, respectively. At 0.95 recall, RiftANN retains 1 .49–2 .34 × speedups with 2 .97 ms latency. Its latency increases by only 2 .93 × from SIFT100M, despite the 10 ×
+
+larger dataset. RiftANN retains its compact navigation state at the CN and accesses remote data at record granularity, so its cost grows with the additional records visited rather than the total index size. In contrast, deeper traversal produces more SSD accesses for DiskANN and PipeANN and more memory-side refinement rounds for DistVS. 
+
+Search Throughput. At 0.90 Recall@10, RiftANN sustains 13 .9 KQPS, compared with 12 .5 KQPS for DistVS, 8 .86 KQPS for PipeANN, and 5 .62 KQPS for DiskANN. These results correspond to improvements of 1 .11 ×, 1 .57 ×, and 2 .47 ×, re-spectively. At 0.95 recall, RiftANN sustains 10 .2 KQPS, match-ing DistVS at 10 .1 KQPS while outperforming PipeANN and DiskANN by 1 .52 × and 2 .38 ×. Overall, RiftANN retains 46% of its SIFT100M throughput and remains the highest-throughput system across the evaluated recall range. 
+
+4.4 Breakdown Analysis 
+
+We progressively enable RiftANN’s three designs over Remote-Vamana on SIFT1B under the same 32-thread CPU budget. Figure 11 reports the resulting recall–latency and recall– throughput curves. Unless otherwise noted, the following results are measured at 0.90 Recall@10. 2 4 6 8       
+
+> Mean latency (ms)
+> 60 70 80 90 95
+> Recall@10 (%)
+> (a) Search latency
+> 60 70 80 90 95
+> Recall@10 (%)
+> 0510 15 20 25
+> Throughput (KQPS)
+> (b) Search throughput
+> DiskANN PipeANN DistVS AlpsANN
+
+Figure 10. Search performance on the 1B-scale dataset. 2 4 6      
+
+> Mean latency (ms)
+> 60 70 80 90
+> Recall@10 (%)
+> (a) Search latency
+> 60 70 80 90
+> Recall@10 (%)
+> 0510 15 20 25
+> Throughput (KQPS)
+> (b) Search throughput
+> Remote-Vamana + Calibration + Impact-Aware + Balancing
+
+Figure 11. Breakdown analysis of RiftANN. 
+
+Remote-Vamana. Remote-Vamana keeps exact-vector fetch-ing and candidate evaluation on the query critical path, re-sulting in 4 .08 ms latency and 6 .59 KQPS. 
+
++ Calibrated Pipeline. Fetching only required fields, avoid-ing unnecessary exact-vector reads, and asynchronously is-suing the remaining requests reduce latency to 3 .05 ms and increase throughput to 10 .49 KQPS, improvements of 25.2% and 59.2%. The larger throughput gain reflects reduced RNIC contention, although candidate evaluation remains serialized with subsequent expansion. 
+
++ Impact-Aware Traversal. Parallel neighbor evaluation and impact-aware expansion further reduce latency to 2 .32 ms and increase throughput to 13 .18 KQPS, improving them by 23.9% and 25.6%. The throughput gain over the calibrated pipeline grows to 33.6% at 0.95 recall because deeper searches expose more evaluation work that would otherwise remain serialized. 
+
++ Pipeline Balancing. Coordinating worker allocation and RDMA concurrency further improves latency and through-put to 2 .20 ms and 13 .90 KQPS, gains of 5.2% and 5.5%. Similar gains at 0.95 recall confirm its consistent benefit. Overall, the three designs reduce latency by 46.1% and improve through-put by 2 .11 × over Remote-Vamana. 
+
+4.5 Analysis of Calibrated Pipeline 
+
+We evaluate the pipeline’s three remote-access decisions, what data to fetch, which candidates to verify, and when to issue the resulting reads, through in-place ablations on SIFT100M. We vary one mechanism at a time while keep-ing all other settings fixed. Verification uses a fixed search configuration where Verify-all reaches 95% Recall@10. We calibrate 𝛼 using the held-out queries described in §4.1.     
+
+> 10 400 800 1.6k 3.2k
+> Exact-vector reads/query
+> 92 93 94 95 96
+> Recall@10 (%)
+> Expansion-only
+> Cal. 1.15
+> Verify-all
+> α= 1.00 1.05 1.10 1.20 1.25
+> (a) Calibrated Veri fi cation
+> Sync (WR= 1) Async (WR= 8) 0.0 0.5 1.0 1.5 2.0
+> Mean latency (ms)
+> Local RDMA wait 0.81 Other
+> 1.62 ms 14.0 KQPS 1.11 ms 20.1 KQPS
+> 1.46 ×faster
+> 0.28
+> (b) Async Execution
+
+Figure 12. Analysis of the calibrated pipeline. 
+
+State-Driven Remote Operations. We compare State-driven operations with Full-record, which fetches both the exact vector and adjacency list whenever either is required. Both re-trieve 813 exact vectors, expand 405 candidates, and achieve the same recall. By avoiding adjacency lists for verified but unexpanded candidates, State-driven reduces traffic from 410 to 255 KiB per query, a 37.7% reduction. Later expan-sion of 40 verified candidates requires separate adjacency reads, increasing the request count from 813 to 853, a 4.9% in-crease. Despite issuing more requests, State-driven increases throughput from 18 .9 to 20 .1 KQPS, a 6.3% improvement. The smaller throughput gain relative to the traffic reduc-tion reflects the remaining request-processing and local-computation costs. 
+
+Error-Calibrated Exact Verification. Figure 12(a) com-pares different verification policies under fixed search set-tings. Expansion-only reads the 405 expanded candidates and reaches 92.30% Recall@10. RiftANN selects 𝛼 = 1.15 on separate calibration queries for 99.90% target coverage. On held-out queries, it achieves 99.88% coverage, performs 813 exact-vector reads, and reaches 95.47% recall. Verify-all reads all 4,220 discovered candidates and reaches 95.59% recall. Calibrated verification therefore eliminates 80.7% of exact-vector reads with only 0.12 percentage points of recall loss. The selected 𝛼 also lies near the trade-off knee. Increas-ing it from 1.15 to 1.25 adds 447 reads but improves recall by only 0.11 percentage points. DEEP100M and SPACEV100M show similar results: the selected 𝛼 values of 1.13 and 1.17 achieve held-out coverages of 99.85% and 99.83% against the 99.90% target, reduce exact-vector reads by 80.9% and 78.1%, and incur only 0.13 and 0.16 percentage points of recall loss, respectively. These results show that calibration remains effective across different data distributions. 
+
+Asynchronous One-Sided Execution. Finally, Figure 12(b) compares one outstanding read per query with a request window of 𝑊 𝑅 = 8. The two variants perform the same search and remote-access work and achieve nearly identical recall. Asynchronous issuing reduces exposed RDMA wait time from 0 .81 to 0 .28 ms, a 65.4% reduction. Consequently, mean latency decreases from 1 .62 to 1 .11 ms, a 1 .46 × speedup, while throughput increases from 14 .0 to 20 .1 KQPS, a 43.6% improvement. Because the amount of work is unchanged, 0 25 50 75 100 Normalized search progress (%) 020 40 60 Update ratio  ρq (%)         
+
+> (a) State-dependent admission
+> Median Uq
+> UqP10 –P90 Ratio ρq
+> 012416 64 Realized hidden updates 20 40 60 80 100 CDF (%)
+> (b) Hidden-update distribution
+> Mean/P95 0.48/2 0.66/4 2.00/11 4.43/19 Impact-aware U-only
+> ρ-only Ungated 040 80 120 Admitted unfinished  Uq
+
+Figure 13. Analysis of Impact-Aware Traversal on SIFT100M. (a) State-dependent expansion admission. (b) Distribution of realized hidden updates across admission policies. these gains result from overlapping RDMA latency with local processing. 
+
+4.6 Analysis of Impact-Aware Traversal 
+
+We evaluate whether our design overlaps evaluation and expansion without making traversal decisions from an ex-cessively incomplete candidate set. All variants use the same SIFT100M graph, search configuration, and 32-thread CPU budget, differing only in their expansion-admission rules. 
+
+WaitAll requires 𝑈 𝑞 = 0, U-only requires 𝑈 𝑞 ≤ 𝐵 , 𝜌 -only 
+
+requires 𝜌 𝑞 ≤ 𝜃 , Impact-aware requires 𝜌 𝑞 𝑈 𝑞 ≤ 𝜖 and 𝑈 𝑞 ≤
+
+𝑈 max , and Ungated imposes no condition. All variants merge completed evaluations before each decision and drain out-standing work before termination. We use 𝐻 = 64, 𝜖 = 1, and 𝑈 max = 128 by default. 
+
+Expansion Admission. Figure 13(a) shows how the gate adapts as the search progresses. During the first 10% of a search, approximately 52% of completed evaluations update the candidate set, and the gate admits expansion with a median unfinished backlog of only 1.25. During the final 30%, the update ratio falls below 0.5%, allowing nearly 100 evaluations to remain unfinished. The gate is therefore con-servative when unfinished work is likely to affect traversal and exposes more overlap as its expected impact decreases. Figure 13(b) measures the realized impact by counting unfinished evaluations that eventually update the candidate set after each admitted expansion. Impact-aware control limits this number to a mean of 0.48 and a P95 of 2. Across the other admission policies, the mean ranges from 0.66 to 4.43 and the P95 from 4 to 19. Although 𝜖 bounds estimated rather than realized impact, combining update probability with backlog size substantially reduces both the average and tail of the candidate information hidden from traversal. 
+
+Admission-Policy Comparison. The default Impact-aware configuration achieves 95.47% Recall@10 at 1 .11 ms and 20 .1 KQPS, reducing latency by 28.5% and improving through-put by 28.7% relative to WaitAll (95.56%, 1 .55 ms, 15 .6 KQPS) with only 0.09 percentage points of recall loss. At compara-ble latency, U-only ( 𝐵 = 32) reaches 94.68% at 1 .17 ms, and 
+
+𝜌 -only ( 𝜃 = 0.05) reaches 95.12% at 1 .14 ms. Across all swept                
+
+> 11 0.15 0.20 0.30 0.40 0.50
+> θl
+> 92 94 96 98 100 102
+> Normalized performance (%)
+> (a) Lower threshold
+> 0.45 0.55 0.65 0.75 0.85
+> θh
+> 92 94 96 98 100 102
+> (b) Upper threshold
+> 816 32 64 128
+> Interval (queries)
+> 92 94 96 98 100 102
+> (c) Control interval
+> 0.5 1.5 2.5 3.5
+> Time (s)
+> 10 12 14 16
+> Throughput (KQPS)  (d) Open-loop burst
+> 0.5 1.5 2.5 3.5
+> Time (s)
+> 1.5 2.0 2.5 3.0
+> P99 latency (ms)  (e) Tail latency
+> 0.5 1.5 2.5 3.5
+> Time (s)
+> 0.4 0.6 0.8 1.0
+> Defer ratio
+> (f) Pipeline balance QPS P99 latency −1
+> Off ered Fixed Adaptive
+
+Figure 14. Analysis of Pipeline Balancing. settings, every U-only and 𝜌 -only configuration is matched by an Impact-aware configuration with equal or higher recall and equal or lower latency, except 𝜌 -only with 𝜃 = 0.2, which is 9 𝜇 s faster but 1.39 percentage points less accurate. Impact-aware control dominates because 𝑈 𝑞 alone does not capture the likelihood that unfinished work changes the candidate set, while 𝜌 𝑞 alone does not capture how much work remains. Ungated execution reaches 0 .95 ms but only 92.79% recall, confirming that uncontrolled overlap is unsafe. Sweeping 
+
+𝜖 from 0.25 to 4 reduces latency from 1 .43 to 0 .99 ms while recall falls from 95.55% to 94.96%; 𝜖 = 1 lies near the knee. 
+
+Robustness across Scale. At 0.95 Recall@10, without re-tuning, the default configuration improves SIFT1B latency from 4 .58 to 3 .24 ms (29.3%) and throughput from 6 .98 to 9.49 KQPS (36.0%), losing 0.11 percentage points of recall. 
+
+4.7 Analysis of Pipeline Balancing 
+
+We evaluate the controller’s robustness to its parameters and its ability to restore pipeline balance under changing load. All experiments use SIFT100M with the same search configuration and 32-thread CPU budget. We compare the complete controller ( Adaptive ) with Fixed , which holds the worker and RDMA request window at their initial values. 
+
+Parameter Robustness. Figure 14(a)–(c) independently vary 𝜃 low , 𝜃 high , and the control interval around their de-faults of 0.30, 0.65, and 32 completed expansions. The panels report normalized QPS and inverse P99 latency, for which higher is better, with 95% confidence intervals over five runs. Across all settings, QPS changes by at most 2.2%, P99 latency by at most 5.8%, and Recall@10 by less than 0.02 percentage points. The modest variations follow the expected control behavior. Short intervals add overhead, long intervals react more slowly, and 𝜃 high determines the tolerated evaluation backlog, while 𝜃 low mainly controls when excess workers are released. The broad plateau around the default shows that the controller does not require narrowly tuned parameters. 
+
+Table 3. SIFT1B scalability at 0.90 Recall@10. T/CN denotes the thread budget per CN. 
+
+Config. 1C1M 1C1M 1C1M 1C2M 1C3M 2C1M 3C1M 2C2M 
+
+T/CN 16 32 48 32 32 32 32 32 KQPS 9.9 13.90 14.6 13.12 12.68 23.75 28.36 25.94 Lat. (ms) 1.49 2.20 3.25 2.33 2.41 2.58 3.24 2.36 
+
+Response to Query Bursts. As shown in Figure 14(d)– (f), we temporarily double the open-loop query arrival rate while keeping it below system saturation, then return it to the steady level. Reported latency includes request queueing. Before the burst, Adaptive and Fixed exhibit nearly identical behavior. During the burst, Adaptive’s defer ratio rises to 0.69 and triggers the controller to increase the mean number of busy evaluation workers from 4.0 to 5.9 while reducing the mean RDMA window from 7.8 to 5.0. These adjustments return the defer ratio to 0.55, whereas Fixed remains between 0.91 and 1.01, indicating persistent evaluation pressure. Adap-tive reverses the adjustments after the burst. Both configurations sustain approximately 16 .9 KQPS. Adap-tive reduces P99 latency from 3 .02 to 2 .35 ms, a 22.2% reduc-tion, while Recall@10 differs by only 0.01 percentage points. The controller therefore reduces backlog-induced tail latency by coordinating evaluation capacity and RDMA concurrency, without increasing the CPU budget, dropping requests, or reducing completed throughput. 
+
+4.8 Scalability 
+
+We evaluate SIFT1B on up to four servers connected by a 100-Gbps RDMA switch. A configuration with 𝑥 CNs and 𝑦 
+
+passive MNs is denoted as 𝑥 C𝑦 M; each CN uses a 32-thread budget unless otherwise specified. Table 3 reports single-CN scale-up and cluster scale-out at matched recall. At 0.90 recall, increasing the single-CN budget from 16 to 32 threads improves throughput by 40.4%, whereas 48 threads provide only another 5.0% and raise latency, placing 32 threads near the scale-up knee. Sharding the index across three passive MNs reduces throughput by only 8.8% and increases latency by 9.5%, showing modest memory-side scale-out overhead. Adding CNs is more beneficial: 2C1M and 3C1M achieve 1 .71 × and 2 .04 × the throughput of 1C1M. Finally, 2C2M improves throughput by 9.2% and reduces latency by 8.5% over 2C1M, demonstrating further gains from coordinated CN and MN scaling. 
+
+5 Related Work 
+
+Graph-based and storage-scaled ANNS. Graph indexes such as HNSW, NSG, and Vamana support high-recall in-memory ANNS [6, 13, 21], while VSAG further optimizes their execution [37]. Beyond local DRAM capacity, DiskANN, FreshDiskANN, SPANN, SPFresh, Starling, PipeANN, and OdinANN place graph or hybrid indexes on SSDs or tiered storage [2, 8, 9, 13, 28, 32, 34], optimizing data layout, page-level I/O amortization, pipelining, and update maintenance. 
+
+> 12
+
+Distributed and disaggregated vector search. Distributed systems such as Pyramid and Milvus scale serving across shards [4, 31], while HAKES targets concurrent read-write workloads in a disaggregated architecture [10]. CoTra re-duces coordination in RDMA-based distributed graph traver-sal by tolerating delayed candidate information [36]. More closely related, d-HNSW combines index caching, RDMA-friendly layout, and query-aware batched loading [20]; DistVS combines progressive pruning over multi-tier storage with asynchronous execution, RDMA batching, and decoupled re-ranking [35]; and CXL-ANNS uses graph-aware caching, prefetching, and relaxed dependency execution over CXL-based memory [12]. 
+
+Relaxed-order execution and latency hiding. PipeANN relaxes inter-step dependencies to pipeline SSD I/O and computation [8], while DistVS decouples re-ranking in a disaggregated setting [35]. More broadly, AIFM and Leap demonstrate application-aware latency hiding and prefetch-ing for far memory [22, 25]. RiftANN builds on these ideas but jointly addresses their limitations. 
+
+6 Conclusion 
+
+We present RiftANN, a graph-based ANNS system for passive-DM that combines calibrated one-sided access, impact-aware asynchronous traversal, and feedback-driven pipeline balanc-ing. RiftANN substantially outperforms the evaluated DM-and SSD-based baselines while narrowing the performance gap to in-memory search. 
+
+References 
+
+[1] Artem Babenko and Victor Lempitsky. 2016. Efficient Indexing of Billion-Scale Datasets of Deep Descriptors. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition . 2055–2063. [2] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li, Mao Yang, and Jingdong Wang. 2021. SPANN: Highly-efficient Billion-scale Approximate Nearest Neighbor Search. In Ad-vances in Neural Information Processing Systems 34 . https://proceeding s.neurips.cc/paper/2021/hash/299dc35e747eb77177d9cea10a802da2-Abstract.html 
+
+[3] Paul Covington, Jay Adams, and Emre Sargin. 2016. Deep Neural Networks for YouTube Recommendations. In Proceedings of the 10th ACM Conference on Recommender Systems . 191–198. doi: 10.1145/2959 100.2959190 
+
+[4] Shiyuan Deng, Xiao Yan, Kelvin K. W. Ng, Chenyu Jiang, and James Cheng. 2019. Pyramid: A General Framework for Distributed Similar-ity Search on Large-Scale Datasets. In 2019 IEEE International Confer-ence on Big Data . 1066–1071. [5] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hos-seini, and Hervé Jégou. 2024. The Faiss Library. arXiv preprint arXiv:2401.08281 (2024). [6] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast Approximate Nearest Neighbor Search with the Navigating Spreading-out Graph. Proceedings of the VLDB Endowment 12, 5 (2019), 461–474. doi: 10.14778/3303753.3303754 
+
+[7] Juncheng Gu, Youngmoon Lee, Yiwen Zhang, Mosharaf Chowdhury, and Kang G Shin. 2017. Efficient memory disaggregation with infin-iswap. In 14th USENIX Symposium on Networked Systems Design and Implementation (NSDI 17) . 649–667. [8] Hao Guo and Youyou Lu. 2025. Achieving Low-Latency Graph-Based Vector Search via Aligning Best-First Search Algorithm with SSD. In 19th USENIX Symposium on Operating Systems Design and Im-plementation (OSDI 25) . USENIX Association, Boston, MA, 171–186. 
+
+https://www.usenix.org/conference/osdi25/presentation/guo 
+
+[9] Hao Guo and Youyou Lu. 2026. OdinANN: Direct Insert for Con-sistently Stable Performance in Billion-Scale Graph-Based Vector Search. In 24th USENIX Conference on File and Storage Technologies (FAST 26) . USENIX Association, Santa Clara, CA, 133–148. https: //www.usenix.org/conference/fast26/presentation/guo 
+
+[10] Guoyu Hu, Shaofeng Cai, Tien Tuan Anh Dinh, Zhongle Xie, Cong Yue, Gang Chen, and Beng Chin Ooi. 2025. HAKES: Scalable Vector Database for Embedding Search Service. Proceedings of the VLDB Endowment 18, 9 (2025), 3049–3062. doi: 10.14778/3746405.3746427 
+
+[11] Piotr Indyk and Rajeev Motwani. 1998. Approximate Nearest Neigh-bors: Towards Removing the Curse of Dimensionality. In Proceedings of the Thirtieth Annual ACM Symposium on the Theory of Computing 
+
+(Dallas, Texas, USA) (STOC ’98) , Jeffrey Scott Vitter (Ed.). ACM, New York, NY, USA, 604–613. doi: 10.1145/276698.276876 
+
+[12] Junhyeok Jang, Hanjin Choi, Hanyeoreum Bae, Seungjun Lee, Miryeong Kwon, and Myoungsoo Jung. 2023. CXL-ANNS: Software-Hardware Collaborative Memory Disaggregation and Computation for Billion-Scale Approximate Nearest Neighbor Search. In 2023 USENIX Annual Technical Conference (USENIX ATC 23) . USENIX Association, Boston, MA, 585–600. https://www.usenix.org/conference/atc23/pr esentation/jang 
+
+[13] Suhas Jayaram Subramanya, Fnu Devvrit, Harsha Vardhan Simhadri, Ravishankar Krishnawamy, and Rohan Kadekodi. 2019. Diskann: Fast accurate billion-point nearest neighbor search on a single node. 
+
+Advances in neural information processing Systems 32 (2019). [14] Hervé Jégou, Matthijs Douze, and Cordelia Schmid. 2011. Prod-uct Quantization for Nearest Neighbor Search. IEEE Transactions on Pattern Analysis and Machine Intelligence 33, 1 (2011), 117–128. doi: 10.1109/TPAMI.2010.57 
+
+[15] Hervé Jégou, Romain Tavenard, Matthijs Douze, and Laurent Amsaleg. 2011. Searching in One Billion Vectors: Re-rank with Source Coding. In 2011 IEEE International Conference on Acoustics, Speech and Signal Processing . 861–864. [16] Anuj Kalia, Michael Kaminsky, and David G. Andersen. 2016. Design Guidelines for High Performance RDMA Systems. In 2016 USENIX Annual Technical Conference (USENIX ATC 16) . USENIX Association, Denver, CO, 437–450. https://www.usenix.org/conference/atc16/tech nical-sessions/presentation/kalia 
+
+[17] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. In Ad-vances in Neural Information Processing Systems , Vol. 33. 9459–9474. [18] Conglong Li, Minjia Zhang, David G. Andersen, and Yuxiong He. 2020. Improving Approximate Nearest Neighbor Search through Learned Adaptive Early Termination. In Proceedings of the 2020 ACM SIGMOD International Conference on Management of Data . 2539–2554. [19] Wen Li, Ying Zhang, Yifang Sun, Wei Wang, Mingjie Li, Wenjie Zhang, and Xuemin Lin. 2020. Approximate Nearest Neighbor Search on High Dimensional Data—Experiments, Analyses, and Improvement. 
+
+IEEE Transactions on Knowledge and Data Engineering 32, 8 (2020), 1475–1488. [20] Yi Liu, Fei Fang, and Chen Qian. 2025. Efficient Vector Search on Disaggregated Memory with d-HNSW. In Proceedings of the 17th ACM Workshop on Hot Topics in Storage and File Systems (HotStorage ’25) .ACM, 1–8. doi: 10.1145/3736548.3737822 
+
+[21] Yu A. Malkov and Dmitry A. Yashunin. 2020. Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable 
+
+> 13
+
+Small World Graphs. IEEE Transactions on Pattern Analysis and Ma-chine Intelligence 42, 4 (April 2020), 824–836. doi: 10.1109/TPAMI.2018 .2889473 
+
+[22] Hasan Al Maruf and Mosharaf Chowdhury. 2020. Effectively Prefetch-ing Remote Memory with Leap. In 2020 USENIX Annual Technical Conference (USENIX ATC 20) . USENIX Association, 843–857. https: //www.usenix.org/conference/atc20/presentation/al-maruf 
+
+[23] Yutaro Oguri and Yusuke Matsui. 2024. Theoretical and Empirical Analysis of Adaptive Entry Point Selection for Graph-based Approxi-mate Nearest Neighbor Search. arXiv preprint arXiv:2402.04713 (2024). [24] Nils Reimers and Iryna Gurevych. 2019. Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks. In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP) . 3982–3992. [25] Zhenyuan Ruan, Malte Schwarzkopf, Marcos K. Aguilera, and Adam Belay. 2020. AIFM: High-Performance, Application-Integrated Far Memory. In 14th USENIX Symposium on Operating Systems Design and Implementation (OSDI 20) . USENIX Association, 315–332. https: //www.usenix.org/conference/osdi20/presentation/ruan 
+
+[26] Yizhou Shan, Yutong Huang, Yilun Chen, and Yiying Zhang. 2018. 
+
+{LegoOS }: A disseminated, distributed {OS } for hardware resource disaggregation. In 13th USENIX Symposium on Operating Systems De-sign and Implementation (OSDI 18) . 69–87. [27] Harsha Vardhan Simhadri, George Williams, Martin Aumüller, Matthijs Douze, Artem Babenko, Dmitry Baranchuk, Qi Chen, Lucas Hosseini, Ravishankar Krishnaswamy, Gopal Srinivasa, Suhas Jayaram Subramanya, and Jingdong Wang. 2022. Results of the NeurIPS’21 Challenge on Billion-Scale Approximate Nearest Neighbor Search. In 
+
+Proceedings of the NeurIPS 2021 Competitions and Demonstrations Track (Proceedings of Machine Learning Research, Vol. 176) . 177–189. [28] Aditi Singh, Suhas Jayaram Subramanya, Ravishankar Krishnaswamy, and Harsha Vardhan Simhadri. 2021. FreshDiskANN: A Fast and Accurate Graph-Based ANN Index for Streaming Similarity Search. 
+
+https://arxiv.org/abs/2105.09613 arXiv:2105.09613 [cs.IR]. [29] Charalampos E. Tsourakakis, Christos Gkantsidis, Bozidar Radunovic, and Milan Vojnovic. 2014. FENNEL: Streaming Graph Partitioning for Massive Scale Graphs. In Proceedings of the 7th ACM International Conference on Web Search and Data Mining . 333–342. doi: 10.1145/25 56195.2556213 
+
+[30] Johan Ugander and Lars Backstrom. 2013. Balanced Label Propaga-tion for Partitioning Massive Graphs. In Proceedings of the 6th ACM International Conference on Web Search and Data Mining . 507–516. [31] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li, Xiangyu Wang, Xiangzhou Guo, Chengming Li, Xiaohai Xu, Kun Yu, Yuxing Yuan, Yinghao Zou, Jiquan Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang, Yihua Mo, Jun Gu, Ruiyi Jiang, Yi Wei, and Charles Xie. 2021. Milvus: A Purpose-Built Vector Data Management System. In Proceedings of the 2021 International Conference on Management of Data . ACM, 2614–2627. doi: 10.1145/3448016.3457550 
+
+[32] Mengzhao Wang, Weizhi Xu, Xiaomeng Yi, Songlin Wu, Zhangyang Peng, Xiangyu Ke, Yunjun Gao, Xiaoliang Xu, Rentong Guo, and Charles Xie. 2024. Starling: An I/O-Efficient Disk-Resident Graph Index Framework for High-Dimensional Vector Similarity Search on Data Segment. Proceedings of the ACM on Management of Data 2, 1, Article 14 (2024), 27 pages. doi: 10.1145/3639269 
+
+[33] Mengzhao Wang, Xiaoliang Xu, Qiang Yue, and Yuxiang Wang. 2021. A Comprehensive Survey and Experimental Comparison of Graph-Based Approximate Nearest Neighbor Search. Proceedings of the VLDB Endowment 14, 11 (2021), 1964–1978. doi: 10.14778/3476249.3476255 
+
+[34] Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li, Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, and Mao Yang. 2023. SPFresh: Incremental In-Place Update for Billion-Scale Vector Search. In Proceedings of the 29th Symposium on Operating Systems Principles . ACM, 545–561. doi: 10.1145/3600006.3613166 
+
+[35] Peiqi Yin, Xiao Yan, Shiyuan Deng, Hui Li, Yifan Zhu, Xiangyu Zhi, Jingqi Mao, Ran Xu, Wenliang Zhang, and James Cheng. 2026. DistVS: Large-scale Vector Search with Compute-Memory Disaggre-gation. In 23rd USENIX Symposium on Networked Systems Design and Implementation (NSDI 26) . USENIX Association, Renton, WA. 
+
+https://www.usenix.org/conference/nsdi26/presentation/yin 
+
+[36] Xiangyu Zhi, Meng Chen, Xiao Yan, Baotong Lu, Hui Li, Qianxi Zhang, Qi Chen, and James Cheng. 2025. Towards efficient and scalable distributed vector search with RDMA. arXiv preprint arXiv:2507.06653 
+
+(2025). [37] Xiaoyao Zhong, Haotian Li, Jiabao Jin, Mingyu Yang, Deming Chu, Xiangyu Wang, Zhitao Shen, Wei Jia, George Gu, Yi Xie, Xuemin Lin, Heng Tao Shen, Jingkuan Song, and Peng Cheng. 2025. VSAG: An Optimized Search Framework for Graph-Based Approximate Nearest Neighbor Search. Proceedings of the VLDB Endowment 18, 12 (2025), 5017–5030. doi: 10.14778/3750601.3750624

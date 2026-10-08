@@ -51,14 +51,14 @@
       <span class="dpr-home-dashboard-kicker">2026-10-08</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 1 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 3 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
-    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>0</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>2 次</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>2</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>1</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-10-08 00:09:37 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-10-08 23:51:16 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,9 +69,9 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今天扫了 1 篇速读、无精读，唯一入选的是《Learning Query Encoders Can Be Hard Even When Vector Retrieval Is Geometrically Easy》（7.0/10）。</p>
-<p>最值得关注的一点是：向量检索的几何结构看起来容易，并不代表查询编码器就好训练，二者难度可能脱节。</p>
-<p>普通读者若做检索或 RAG，建议优先检查 query encoder 的训练/微调环节，别只看向量检索本身的指标。</p>
+<p>10月8日日报成功收录3篇向量检索论文，2篇精读均达9.0分，主打RDMA内存解聚图遍历与免搜索可导航图构建。</p>
+<p>最值得看的是《RiftANN》用RDMA内存解聚加速向量搜索图遍历，以及《Building Navigable Graphs...》用三阶段组合式方法构建可导航图；速读篇则提醒查询编码器学习可能比几何检索本身更难。</p>
+<p>普通读者可先读这两篇9分精读，再按兴趣看7分速读，快速把握向量搜索的图索引与查询编码难点。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -80,12 +80,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">0 篇</strong>
+    <strong class="dpr-home-dashboard-count">2 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p class="dpr-home-dashboard-empty">今日暂无推荐。</p>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="RiftANN: Efficient Graph Traversal for Vector Search with RDMA-Based Memory Disaggregation">RiftANN: Efficient Graph Traversal for Vector Search with RDMA-Based Memory Disaggregation</span></li><li><span class="dpr-home-dashboard-paper-title" title="Building Navigable Graphs Without Search in Three Composable Stages">Building Navigable Graphs Without Search in Three Composable Stages</span></li></ul>
   </div>
-
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>2</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
