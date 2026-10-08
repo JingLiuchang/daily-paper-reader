@@ -1,6 +1,9 @@
 * <a class="dpr-sidebar-root-link" href="#/">首页</a>
 * <a class="dpr-sidebar-root-link dpr-sidebar-noactive-link" href="javascript:void(0)" data-dpr-hash="#/tutorial/README">使用教程</a>
 * Daily Papers
+  * 2026-10-08 <!--dpr-date:20261008-->
+    * 速读区
+      * <a class="dpr-sidebar-item-link dpr-sidebar-item-structured" href="#/202610/08/2610.02749v1-learning-query-encoders-can-be-hard-even-when-vector-retrieval-is-geometrically-easy" data-sidebar-item="{&quot;title&quot;: &quot;Learning Query Encoders Can Be Hard Even When Vector Retrieval Is Geometrically Easy&quot;, &quot;link&quot;: &quot;https://arxiv.org/abs/2610.02749v1-learning-query-encoders-can-be-hard-even-when-vector-retrieval-is-geometrically-easy&quot;, &quot;score&quot;: &quot;7.0&quot;, &quot;tags&quot;: [{&quot;kind&quot;: &quot;query&quot;, &quot;label&quot;: &quot;vector-ann&quot;}], &quot;evidence&quot;: &quot;向量检索与冻结文档索引的召回上限&quot;}">Learning Query Encoders Can Be Hard Even When Vector Retrieval Is Geometrically Easy</a>
   * 2026-10-06 <!--dpr-date:20261006-->
     * 精读区
       * <a class="dpr-sidebar-item-link dpr-sidebar-item-structured" href="#/202610/06/2609.36359v1-better-nearest-neighbor-graph-indices-via-efficient-llm-guided-pruning" data-sidebar-item="{&quot;title&quot;: &quot;Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning&quot;, &quot;link&quot;: &quot;https://arxiv.org/abs/2609.36359v1-better-nearest-neighbor-graph-indices-via-efficient-llm-guided-pruning&quot;, &quot;score&quot;: &quot;9.0&quot;, &quot;tags&quot;: [{&quot;kind&quot;: &quot;query&quot;, &quot;label&quot;: &quot;ann-graph&quot;}], &quot;evidence&quot;: &quot;基于图的近似最近邻索引构建与搜索&quot;}">Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning</a>

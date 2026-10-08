@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-10-06</span>
+      <span class="dpr-home-dashboard-kicker">2026-10-08</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 7 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 1 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
-    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>2 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>3</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>0</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>1</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-10-06 22:56:45 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-10-08 00:09:37 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,9 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日7篇论文聚焦向量检索与索引优化，精读4篇、速读3篇。最值得看的是两篇9.0分精读：LLM引导剪枝的近邻图索引，以及带认证召回的扫描式采样倒排相似搜索。普通读者可先读这两篇，抓住“高效剪枝”和“召回保证”，再扫速读里的模型湖检索与LSH方向。</p>
+<p>今天扫了 1 篇速读、无精读，唯一入选的是《Learning Query Encoders Can Be Hard Even When Vector Retrieval Is Geometrically Easy》（7.0/10）。</p>
+<p>最值得关注的一点是：向量检索的几何结构看起来容易，并不代表查询编码器就好训练，二者难度可能脱节。</p>
+<p>普通读者若做检索或 RAG，建议优先检查 query encoder 的训练/微调环节，别只看向量检索本身的指标。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +80,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">4 篇</strong>
+    <strong class="dpr-home-dashboard-count">0 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning">Better Nearest Neighbor Graph Indices via (Efficient) LLM-Guided Pruning</span></li><li><span class="dpr-home-dashboard-paper-title" title="SOLO: Certified-Recall Metric Similarity Search with Scan-Only Sampled Inverted Lists">SOLO: Certified-Recall Metric Similarity Search with Scan-Only Sampled Inverted Lists</span></li><li><span class="dpr-home-dashboard-paper-title" title="RaBitQ-SSD: Split Codes and Pipelined I/O for SSD-Resident Vector Search">RaBitQ-SSD: Split Codes and Pipelined I/O for SSD-Resident Vector Search</span></li></ul>
+<p class="dpr-home-dashboard-empty">今日暂无推荐。</p>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vq-ann <strong>2</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +93,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">3 篇</strong>
+    <strong class="dpr-home-dashboard-count">1 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="ModelLakeFishing: Efficient Retrieval over Million-Scale Model Lakes">ModelLakeFishing: Efficient Retrieval over Million-Scale Model Lakes</span></li><li><span class="dpr-home-dashboard-paper-title" title="Locality Sensitive Hashing for p-Exponential Kernels with Applications to Density Estimation">Locality Sensitive Hashing for p-Exponential Kernels with Applications to Density Estimation</span></li><li><span class="dpr-home-dashboard-paper-title" title="Learning Query Encoders Can Be Hard Even When Vector Retrieval Is Geometrically Easy">Learning Query Encoders Can Be Hard Even When Vector Retrieval Is Geometrically Easy</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Learning Query Encoders Can Be Hard Even When Vector Retrieval Is Geometrically Easy">Learning Query Encoders Can Be Hard Even When Vector Retrieval Is Geometrically Easy</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>2</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 </div>
 
