@@ -1,0 +1,2469 @@
+Amora: Communication-Efficient Private Approximate Nearest
+Neighbors Search
+Qiuhao Wang
+Xi’an Jiaotong University
+Xi’an, China
+QiuHaoWang@stu.xjtu.edu.cn
+Zuowei Chen
+Xi’an Jiaotong University
+Xi’an, China
+chenzuowei_xjtu@163.com
+Xu Yang
+Xi’an Jiaotong University
+Xi’an, China
+yangxu@stu.xjtu.edu.cn
+Saiyu Qi∗
+Xi’an Jiaotong University
+Xi’an, China
+saiyu-qi@mail.xjtu.edu.cn
+Yong Qi
+Xi’an Jiaotong University
+Xi’an, China
+qiy@mail.xjtu.edu.cn
+Abstract
+Approximate nearest neighbors search (ANNS) over cloud-hosted
+vector databases raises a critical privacy concern: the query vec-
+tor, which often encodes sensitive user intent, is exposed to the
+server. Private ANNS (PANNS) allows a client to retrieve nearest
+neighbors without revealing its query. The state-of-the-art single-
+server scheme, Pacmann (ICLR’25), achieves high accuracy via
+graph-based search with private information retrieval (PIR), but
+incurs substantial communication overhead because each PIR query
+retrieves only a single vertex. We present Amora, a communication-
+efficient PANNS system that applies SimplePIR to a partitioned
+graph index so that one PIR query is amortized over many vertices.
+To retrieve as much of the distance and neighbor information the
+search needs under a limited communication budget, Amora adopts
+a dual-PIR split layout with two heterogeneous PIR matrices that
+stay balanced in dimension: VecPIR retrieves inner products for
+an entire partition of vertices as their distance at once, while Nbr-
+PIR retrieves necessary neighbor lists at subgroup granularity for
+graph traversal. This layout shifts the cost model of PIR query from
+per-vertex to per-partition, which significantly reduces the com-
+munication overhead. To further improve efficiency by reducing
+the number of scans and query rounds in the PIR database, Amora
+introduces batch PIR to pack multiple queries into one matrix mul-
+tiplication, centroid-based pruning to filter unpromising partitions,
+and TopCand exploration that seeds jump-style graph navigation
+with the closest vertices from each retrieved partition. We evaluate
+Amora on five datasets spanning 96 to 1024 dimensions and up to
+10 million vectors. Compared to Pacmann, Amora reduces online
+communication by 93–99% while achieving higher search accuracy.
+CCS Concepts
+• Security and privacy →Privacy-preserving protocols; • In-
+formation systems →Nearest-neighbor search; Information
+retrieval query processing.
+Keywords
+Vector database; Private information retrieval
+∗Corresponding Author
+1
+Introduction
+Vector similarity search has become a foundational operation in
+modern intelligent systems, underpinning recommendation en-
+gines [13, 19], semantic search [40, 43], and retrieval-augmented
+generation (RAG) [28, 33] for large language models. At its core
+lies the 𝑘-nearest neighbor search (𝑘-NNS) problem: given a high-
+dimensional database and a query, find the 𝑘vectors in the database
+closest to the query. Exact 𝑘-NNS is prohibitively expensive at scale,
+so practical systems rely on approximate nearest neighbors search
+(ANNS), which trades a small loss in accuracy for speedups via
+graph-based indices [15, 25, 37, 38, 51], hash-based [17, 24], or
+cluster-based partitioning [7, 26]. As these ANNS systems increas-
+ingly migrate to cloud-hosted vector databases [27, 52], a critical
+privacy concern arises: the search query, which often encodes sen-
+sitive user intent such as medical symptoms, legal questions, or
+personal preferences, is transmitted to the server, exposing what
+the client is searching for. Private ANNS (PANNS) addresses this
+by allowing a client to retrieve the 𝑘nearest neighbors of a query
+vector without revealing the query to the server.
+One line of work builds PANNS under a multi-server setting [46,
+49], where the database is replicated across servers assumed not
+to collude. However, since the non-collusion assumption is diffi-
+cult to enforce in practice, clients may trust such schemes less
+than single-server ones. Recent single-server schemes avoid this as-
+sumption and fall into two families: cluster-based and graph-based
+schemes. Cluster-based schemes SANNS [6], Panther [35], and Tip-
+toe [22] group similar vectors into clusters and use oblivious RAM
+(ORAM) [18, 50] or private information retrieval (PIR) [12, 34, 54]
+to privately search the clusters whose centroids are closest to the
+query. However, a centroid summarizes an entire cluster, and thus
+can only coarsely guide nearest neighbor searches. A plaintext
+ANNS system compensates by searching more clusters at little ex-
+tra cost, but in the private setting each additional cluster costs one
+expensive PIR query. As a result, coarse guidance and a limited com-
+munication budget together leave some true neighbors in unvisited
+clusters, fundamentally capping accuracy.
+Graph-based schemes Pacmann [56] and Compass [57] instead
+organize the vectors into a proximity graph such as HNSW [38], in
+which each vertex stores one vector and its neighbor list. The search
+maintains a candidate set and expands the closest candidate with
+PIR or ORAM at each hop to protect the query privacy. The edges
+1
+arXiv:2610.21174v1  [cs.DB]  15 Oct 2026
+
+
+Qiuhao Wang, Zuowei Chen, Xu Yang, Saiyu Qi, and Yong Qi
+provide finer and more precise guidance than centroid distances, so
+reaching the same accuracy requires visiting far fewer vertices. Pac-
+mann is the state of the art for query privacy over a public database
+and achieves high accuracy, but it incurs substantial communication
+overhead in both search and preprocessing, making it impractical
+for bandwidth-constrained clients. This stems from Pacmann’s un-
+derlying PIR scheme, Piano [55], whose preprocessing requires
+downloading the entire database. More critically, Pacmann exhibits
+low information density in its online search: each PIR query incurs
+𝑂(
+√
+𝑁) communication yet retrieves only a single vertex’s vector
+and neighbor list. We refer to this as the per-vertex cost model, and
+it is the fundamental source of Pacmann’s inefficiency.
+We observe that SimplePIR [23] offers an inherent information-
+density advantage. It organizes the database as a matrix in which
+one query retrieves an entire column, and attains the optimal com-
+munication on a balanced matrix. Thus, one target vertex costs
+the same 𝑂(
+√
+𝑁) communication, and every other vertex in that
+column comes for free. A direct application of SimplePIR partitions
+the graph and stores each partition’s vertices in one column, so a
+single PIR query returns a group of closely connected vertices. How-
+ever, this naive method fails to realize the advantage. Since each
+vertex carries its neighbor list together with its vector for graph
+navigation, the two payloads make a vertex heavy and fill many
+entries of a single column. Such heavy payloads create a dilemma in
+designing the PIR matrix layout. One option is to adopt a balanced
+PIR matrix for the optimal communication cost. However, the heavy
+payloads then allow only a small number of vertices per column,
+so each query returns little information, and the search needs far
+more queries and rounds to reach high accuracy. The other option
+stores more vertices per column to raise the information per PIR
+query, but the matrix then becomes unbalanced, and every query
+costs more. The first challenge is therefore: C1. how to organize
+the PIR database so that a single PIR query carries as much useful
+vertex information as possible for the nearest neighbor search while
+keeping the optimal communication cost. Moreover, graph-based
+ANNS requires multi-hop traversal, and each hop invokes PIR to
+protect query privacy. Although SimplePIR is built on lightweight
+Learning with Errors (LWE) [44], each query must scan the entire
+database, so it incurs 𝑂(𝑁) computation and makes memory band-
+width a bottleneck. The second challenge is therefore: C2. how to
+reduce the number of scans and query rounds in the PIR database
+to improve search efficiency.
+To address both challenges, we build Amora, a communication-
+efficient PANNS scheme with high accuracy. For C1, our insight is
+that a vertex’s two payloads serve the search differently: its distance
+can improve the candidate set, whereas its neighbor list matters
+only if the search expands it. Amora therefore adopts a dual-PIR split
+layout that organizes the two types of payloads into two separate
+PIR databases with vertices grouped by graph partition: (1) VecPIR
+spreads each vertex’s vector horizontally across columns, so that
+each partition holds far more vectors and one PIR query computes
+inner products with an entire partition to return its distance to every
+vertex in it; (2) NbrPIR stacks neighbor lists vertically and cuts each
+partition into subgroups to return the neighbor lists of only the can-
+didates that the search expands. As a result, both PIR matrices stay
+balanced, and the search alternates between them. A round of PIR
+queries now amortizes its communication over a whole partition,
+which shifts the cost model from per-vertex to per-partition. As
+for C2, we introduce three optimization techniques that reduce the
+PIR queries needed to reach a target accuracy: (1) Batch PIR merges
+concurrent PIR queries into a single matrix multiplication, reducing
+several communication rounds to one and amortizing SimplePIR’s
+linear database scan across queries; (2) Centroid-based pruning ranks
+pending partitions by the plaintext distance from the query to their
+centroids and processes only the most promising ones, avoiding PIR
+queries to distant regions; (3) TopCand exploration extracts the clos-
+est vertices (top candidates) from each retrieved partition as seeds
+in the candidate set, enabling jump-style navigation into distant
+regions rather than strictly following edges.
+In general, our contributions are as follows:
+• We design a dual-PIR split layout that combines SimplePIR with
+graph partitioning, storing vectors horizontally and neighbor
+lists in subgroup columns. Both PIR matrices stay balanced, so ev-
+ery PIR query keeps SimplePIR’s optimal communication, while
+a round of PIR queries amortizes its cost over a whole partition,
+shifting the cost model from per-vertex to per-partition.
+• We propose three optimization techniques to reduce rounds and
+database scans: batch PIR merges concurrent queries into a single
+matrix multiplication, centroid-based pruning ignores partitions
+with distant centroids, and TopCand exploration extracts seeds
+from each retrieved partition for jump-style graph navigation.
+• We open-source Amora1, prove query privacy, analyze commu-
+nication and computation complexity, and evaluate it on five
+datasets spanning 96–1024 dimensions and up to 10M vectors.
+Compared to Pacmann, Amora reduces online communication
+by 93–99% while achieving higher search accuracy.
+2
+Related Work
+2.1
+Approximate Nearest Neighbors Search
+Approximate nearest neighbors search (ANNS) algorithms can be
+broadly divided into cluster-based, hash-based and graph-based
+categories. Cluster-based methods such as IVF [26], ScaNN [21],
+and SPANN [7] partition the vector space and restrict the search
+to the most promising partitions. Their fixed access pattern is eas-
+ier to protect with PIR, but restricting search to a few clusters
+limits accuracy when the true neighbors span multiple partitions.
+Hash-based methods [17, 24] such as Locality Sensitive Hashing
+(LSH) [11] map vectors into hash buckets so that nearby vectors
+are likely to collide, offering sublinear query time with theoretical
+guarantees but requiring many hash tables to achieve high recall in
+practice. Graph-based methods build a navigable proximity graph
+and answer queries via greedy traversal, exploiting the small-world
+property to reach nearest neighbors in logarithmic hops; represen-
+tative schemes include NSW [37], HNSW [38], NGT [25], NSG [15],
+and DiskANN [51]. Graph-based methods currently achieve the best
+accuracy–throughput trade-off on most benchmarks, but their iter-
+ative, data-dependent traversal pattern makes privacy protection
+challenging, as each hop reveals which vertex is being accessed.
+1https://github.com/meander-wqh/Amora/.
+2
+
+
+Amora: Communication-Efficient Private Approximate Nearest Neighbors Search
+2.2
+Private Approximate Nearest Neighbors
+Search
+Some PANNS works adopt a multi-server setting. Servan-Schreiber
+et al. [46] combine LSH with distributed point functions [4] across
+two non-colluding servers, and Song et al. [49] further reduce the
+required subsets. However, the non-collusion assumption is difficult
+to enforce in practice, motivating single-server approaches.
+Among single-server schemes, cluster-based methods appear
+first. SANNS [6] combines ORAM [18] and garbled circuits [53]
+but incurs several gigabytes of communication per query. Pan-
+ther [35] replaces ORAM with a co-design of batch PIR [1], secret
+sharing [47], and homomorphic encryption [16], reducing commu-
+nication while protecting both query and database privacy. Tip-
+toe [22] focuses on query privacy only and uses somewhat ho-
+momorphic encryption [5] to privately compute distances within
+𝑘-means clusters in a single round. Wally [2] improves Tiptoe by
+batching anonymous queries and relaxing privacy to differential
+privacy [14]. However, all cluster-based schemes restrict the search
+to a small number of partitions and lack iterative refinement, fun-
+damentally limiting their accuracy.
+To overcome this accuracy barrier, graph-based schemes leverage
+multi-hop traversal. Pacmann [56] runs graph-based search using
+Piano PIR [55] to privately retrieve per-vertex information at each
+hop, achieving significantly higher accuracy than cluster-based
+methods. Compass [57] combines HNSW with Ring ORAM [45, 50]
+under a setting where the client owns the encrypted database,
+matching plaintext accuracy. However, both of them require signifi-
+cant client-side storage and communication overhead. PrivANN [8]
+uses a combination of ORAM and a Trusted Execution Environ-
+ment (TEE) [10] to provide high-accuracy and low communication
+PANNS, but its security assumptions rely on a TEE, which intro-
+duces additional side-channel attacks [30, 32, 41].
+3
+Background
+3.1
+Private Approximate Nearest Neighbors
+Search
+3.1.1
+Approximate Nearest Neighbors Search. Given a𝑑-dimensional
+metric space with a distance function 𝑓Δ(·, ·) and a database DB =
+{®𝑣1, ®𝑣2, . . . , ®𝑣𝑁} ⊂R𝑑containing 𝑁vectors, the ANNS problem is:
+given a query vector ®𝑣𝑞∈R𝑑, find an index set 𝐼= {𝑖1, . . . ,𝑖𝑘}
+such that the corresponding vectors {®𝑣𝑖1, . . . , ®𝑣𝑖𝑘} approximate the
+true 𝑘nearest neighbors of ®𝑣𝑞in DB under 𝑓Δ. The quality of the
+approximation is measured by Recall (the fraction of true nearest
+neighbors returned) or mean reciprocal rank (MRR).
+3.1.2
+Graph-Based ANNS. Graph-based ANNS builds a proximity
+graph 𝐺= (𝑉, 𝐸) over the database, where each vertex 𝑣∈𝑉
+corresponds to a database vector and each directed edge (𝑣,𝑢) ∈𝐸
+connects 𝑣to one of its approximate nearest neighbors. Every vertex
+maintains a neighbor list of at most 𝑀0 outgoing edges. Given a
+query ®𝑞(ANNS for vector ®𝑣𝑞), search proceeds by greedy traversal:
+starting from an entry vertex, the algorithm maintains a candidate
+heap W (a min-heap ordered by distance to ®𝑣𝑞) and a result set R
+(max-heap of capacity ef ≥𝑘). At each step, the closest unvisited
+vertex is popped from W, its neighbors are retrieved, their distances
+to ®𝑣𝑞are computed, and those closer than the current worst result
+in R are inserted into both W and R. The search terminates when
+W is empty, and the top-𝑘entries of R are returned.
+3.1.3
+Single-Server PANNS. In many applications the query vector
+encodes sensitive user intent and should not be revealed to the
+server hosting the database. The privacy requirement for a PANNS
+protocol focused on in this paper is query privacy only, the server
+learns negligible information about the query ®𝑞, and the database
+is public and does not require protection. Following prior work [22,
+56], we consider the single-server preprocessing model, in which the
+private protocol proceeds in two phases:
+(1) Preprocessing. The server holds the public database DB ∈
+R𝑑×𝑁. The client and server interact to generate a compact hint
+that the client stores locally for use during subsequent queries.
+(2) Query. The client issues a query ®𝑞. The client and server engage
+in one or more rounds of communication, after which the client
+outputs the index set 𝐼of 𝑘-approximate nearest neighbors.
+3.2
+Private Information Retrieval
+3.2.1
+LWE and Regev Encryption. SimplePIR’s security relies on
+the Learning with Errors (LWE) assumption [44]. Parameterized
+by a secret dimension 𝑛, a modulus 𝑞≥2, and an error distribution
+𝜒over Z, LWE asserts that for a random matrix 𝐴
+$←Z𝑚×𝑛
+𝑞
+, a
+secret 𝑠
+$←Z𝑛
+𝑞, and an error vector 𝑒
+$←𝜒𝑚, the pair (𝐴, 𝐴𝑠+
+𝑒) is computationally indistinguishable from (𝐴, 𝑟) where 𝑟
+$←
+Z𝑚
+𝑞. Based on LWE, Regev [44] constructs a secret-key encryption
+scheme with an additional plaintext modulus 𝑝. The secret key
+is 𝑠
+$←Z𝑛
+𝑞, and the encryption of a message 𝜇∈Z𝑝is: (𝑎, 𝑐) =
+(𝑎, 𝑎T𝑠+ 𝑒+ ⌊𝑞/𝑝⌋· 𝜇) ∈Z𝑛
+𝑞× Z𝑞, where 𝑎
+$←Z𝑛
+𝑞and 𝑒
+$←𝜒.
+Decryption computes 𝑐−𝑎T𝑠mod 𝑞and rounds to the nearest
+multiple of ⌊𝑞/𝑝⌋. A key property is additive homomorphism: the
+component-wise sum of two ciphertexts decrypts to the sum of the
+plaintexts, provided the accumulated error remains small.
+3.2.2
+SimplePIR. Private information retrieval (PIR) [9, 12, 23, 31,
+34, 39, 48, 54] allows a client to fetch record 𝑖from a server’s data-
+base of 𝑁records without revealing 𝑖to the server. SimplePIR [23]
+is a single-server PIR scheme that achieves high throughput by
+leveraging Regev encryption and server-side preprocessing. Sim-
+plePIR organizes the 𝑁-element database as a
+√
+𝑁×
+√
+𝑁balanced
+matrix db ∈Z
+√
+𝑁×
+√
+𝑁
+𝑝
+, and defines the scalar Δ := ⌊𝑞/𝑝⌋. Its protocol
+consists of four interfaces:
+• hint𝑐←Setup(db): The server computes hint𝑐←db · 𝐴where
+𝐴∈Z
+√
+𝑁×𝑛
+𝑞
+is a shared LWE matrix. This is a one-time offline
+phase; hint𝑐is sent to the client and reused across all queries.
+• (st,𝑞𝑢) ←Query(𝑖): The client first decomposes index 𝑖into
+(𝑖row,𝑖col), samples 𝑠
+$←Z𝑛
+𝑞and 𝑒
+$←𝜒
+√
+𝑁, and computes 𝑞𝑢←
+𝐴𝑠+ 𝑒+ Δ · 𝑢𝑖col ∈Z
+√
+𝑁
+𝑞
+, where 𝑢𝑖col is the unit vector with a “1”
+at index 𝑖col. The client stores st = (𝑖row,𝑠) and sends 𝑞𝑢to the
+server.
+• 𝑎𝑛𝑠←Answer(db,𝑞𝑢): The server computes 𝑎𝑛𝑠←db · 𝑞𝑢∈
+Z
+√
+𝑁
+𝑞
+and returns it to the client.
+3
+
+
+Qiuhao Wang, Zuowei Chen, Xu Yang, Saiyu Qi, and Yong Qi
+• 𝑑←Recover(st, hint𝑐,𝑎𝑛𝑠): The client first computes ˆ𝑑←
+𝑎𝑛𝑠[𝑖row] −hint𝑐[𝑖row, :] · 𝑠∈Z𝑞, and it recovers the plaintext
+𝑑= RoundΔ( ˆ𝑑)/Δ ∈Z𝑝.
+By the additive homomorphism of Regev encryption, 𝑎𝑛𝑠is an
+element-wise encryption of the 𝑖col-th column of db. Therefore, the
+client can run Recover for every row index to reconstruct the entire
+column from a single query.
+3.3
+Threat Model
+Amora targets the same setting as Pacmann [56]: a single server
+S holds a public vector database DB ∈R𝑑×𝑁of 𝑁vectors each
+with 𝑑dimensions, and a stateful client C wishes to perform ANNS
+without revealing the query vector to the server. The database is
+public and does not require protection, i.e., we focus exclusively on
+query privacy. We assume the adversary is semi-honest (honest-but-
+curious). That is, the adversary follows the protocol specification
+but may attempt to learn additional information about the query
+from leakages. The privacy of the protocol requires that the server
+learns negligible information about the query ®𝑞. Formally, we use a
+simulation-based definition for the privacy of the protocol:
+Definition 1 (Query Privacy). An ANNS protocol is private if there
+exists a simulator Sim such that for any probabilistic polynomial-
+time (PPT) adversary A acting as the server, the views of A in the
+following two experiments are computationally indistinguishable
+w.r.t. the security parameter 𝜆2:
+• Real: The client interacts with A(1𝜆, DB) who acts as the server.
+The client may issue multiple ANNS queries sequentially and
+each ANNS query ®𝑞takes a series of PIR searches as input and
+involves multiple rounds of communication between the client
+and the server. After observing the transcript of previous queries,
+A may adaptively choose the next query ®𝑞for the client.
+• Ideal: The simulated client Sim(1𝜆, 𝑁) interacts with A(1𝜆, DB).
+A still may adaptively choose the next query ®𝑞. However, the
+simulator is invoked with only the knowledge of the database
+size 𝑁, and without the information of the chosen query ®𝑞.
+We note that client-side timing side channels are out of scope: a
+server can observe how long the client takes to respond between
+rounds. If needed, they can be removed by padding the client’s
+per-round work to a fixed budget.
+4
+Design Overview
+Amora follows the graph-based paradigm: the client keeps a candi-
+date heap and, at each of a fixed number of hops, picks the vertex
+closest to the query and retrieves its neighbor list from the server
+via PIR. Each vertex therefore carries two payloads: its vector for
+distance computation and its neighbor list for traversal. To amor-
+tize one PIR query over many vertices, the direct design applies
+SimplePIR to a graph partitioned by METIS [29] into 𝐶partitions
+of at most 𝐾vertices each, and stores each partition’s vertices in
+a single column of the PIR matrix, forming the combined layout
+in Figure 1(a). Partitioning co-locates closely connected vertices,
+so one PIR query serves an entire partition. Moreover, it is only a
+2𝜆denotes the bit-security of the scheme and is conventionally set to 128: breaking the
+underlying LWE problem then requires on the order of 2128 operations, the standard
+security level of modern cryptographic systems.
+(a) Combined layout
+VecPIR database
+NbrPIR database
+·
+⋯
+⋯
+·
+·
+⋯
+⋯
+·
+·
+⋯
+⋯
+·
+·
+⋯
+⋯
+·
+·
+⋯
+⋯
+·
+·
+⋯
+⋯
+·
+·
+⋯
+⋯
+·
+·
+⋯
+⋯
+·
+⋮
+·
+⋯
+⋯
+·
+·
+⋯
+⋯
+·
+⋮
+⋱
+⋱
+⋮
+⋮
+⋯
+⋯
+⋯
+⋯
+⋱
+⋱
+⋮
+⋮
+⋮
+⋯
+⋯
+⋯
+⋯
+⋱
+⋮
+⋱
+⋮
+(b) Split layout
+Figure 1: Combined layout vs. dual-PIR split layout (𝑑=3 di-
+mensions, 𝑀0=2 neighbors). ®𝑣𝑖,𝑗and𝑢𝑖,𝑗are the 𝑗-th dimension
+and 𝑗-th neighbor of vertex 𝑖.
+Server
+① Graph Building
++ Partition
+Partition A
+Partition B
+Partition C
+③ Online:Dual-PIR
+Partition Access
+② Offline: 
+Hints + Centroids
+Client
+Local Hints
++ Centroids
+Figure 2: High-level overview of Amora. ①The server builds
+a graph index and partitions it. ②Offline: the server sends
+PIR hints and centroids to the client. ③Online: the client is-
+sues VecPIR queries for partition-level distances and NbrPIR
+queries for subgroup-level neighbor lists.
+logical assignment of vertices and removes no edge, so each vertex
+keeps its full neighbor list and the search can still reach other par-
+titions. Since a vertex carries both payloads, it fills many entries
+of a column, which creates a dilemma: (1) Keeping the PIR matrix
+balanced for the optimal communication cost limits each column
+to a few vertices, so one PIR query amortizes its cost over too few
+of them; (2) Packing more vertices per column instead makes the
+matrix unbalanced, raising the communication of every PIR query.
+The first challenge C1 is therefore: how to organize the PIR
+database so that a single PIR query carries as much useful vertex
+information as possible for the nearest neighbor search while keep-
+ing the optimal communication cost. Our key insight is that the
+search needs the two payloads in different amounts: every retrieved
+vertex contributes its distance, whereas only the few vertices that
+the search expands need their neighbor lists. The combined lay-
+out ignores this asymmetry by coupling one neighbor list to every
+vector, so each PIR query spends part of its communication budget
+on unnecessary neighbor lists. The two payloads therefore call for
+different arrangements, each retrieved at the granularity the search
+actually needs. Amora addresses C1 by splitting the two payloads
+into a dual-PIR split layout, as Figure 1(b) shows. The VecPIR matrix
+stores only vector information: each partition occupies a block of
+4
+
+
+Amora: Communication-Efficient Private Approximate Nearest Neighbors Search
+𝑑consecutive columns, and within that block every vertex takes
+one row, with its 𝑑-dimensional vector spread horizontally across
+the 𝑑columns. Each column then stores only one dimension per
+vertex, so a balanced matrix holds far more vectors per partition.
+One query computes inner products with all 𝐾vertices at once, giv-
+ing their distances to the query. The client then selects candidates
+from these distances and uses NbrPIR to retrieve only the neighbor
+lists it needs to expand the candidates. Storing an entire partition’s
+neighbor lists in one column, that is, 𝐾vertices with 𝑀0 neighbors
+each, would both exceed this need and make the NbrPIR matrix
+highly unbalanced. We therefore organize the NbrPIR matrix into
+fine-grained subgroups of 𝑆vertices within each partition, so that
+each subgroup occupies one column, keeping the matrix balanced.
+The dual-PIR layout improves the information density of PIR
+queries. The remaining cost is the number of scans and query
+rounds in the PIR database that the traversal needs, and how to
+reduce them is the second challenge C2. Amora introduces three
+optimization techniques: (1) Batch PIR packs multiple independent
+PIR queries into a single matrix multiplication, reducing multiple
+communication rounds to one and alleviating SimplePIR’s memory-
+bandwidth bottleneck; (2) Centroid-based pruning ranks pending
+partitions by the plaintext distance from the query to their centroids
+and discards the distant ones, which incurs zero privacy cost since
+centroids are public metadata; (3) TopCand exploration extracts the
+𝑡𝑐closest vertices from each retrieved partition and injects them as
+seeds into the candidate heap, enabling jump-style graph navigation
+that leaps into distant regions rather than strictly following edges.
+The system operates in two phases. In the offline phase (exe-
+cuted once), the server constructs the graph index, applies graph
+partitioning, decomposes each partition into subgroups, and builds
+the VecPIR and NbrPIR databases. The server also computes the
+partition centroids which will be sent to the client. The server then
+runs Setup for each PIR module, computing hint matrices that the
+client downloads and stores locally. In the online phase (per query),
+the client first performs centroid entry: it computes ®𝑣𝑞’s distance
+to all 𝐶partition centroids locally and selects the 𝐾𝑒nearest parti-
+tions as entry points, requiring zero communication. The search
+then proceeds for 𝑇iterations, each consisting of a batched NbrPIR
+query followed by a batched VecPIR query. Because the number
+of iterations and the batch sizes are determined by public system
+parameters, the communication pattern is identical for every query
+and leaks no information about the query content. Figure 2 illus-
+trates this two-phase workflow.
+5
+System Design
+In this section, we elaborate on the detailed system design of Amora,
+and summarize the notation used throughout the paper in Table 1.
+5.1
+VecPIR: Distance Computation
+In SimplePIR, querying column 𝑖returns all elements in that col-
+umn. If each vertex’s vector is stored as a single column element,
+one query would retrieve only a few vertices’ vectors. The key
+design of VecPIR is horizontal arrangement (Figure 3 (a)): each ver-
+tex’s 𝑑-dimensional quantized vector is spread across 𝑑consecutive
+columns, with vertices in the same partition stacked as rows. Con-
+cretely, the VecPIR database dbvec is a 𝐾× (𝐶·𝑑) matrix: partition 𝑐
+Table 1: Notation summary.
+Notation
+Meaning
+𝑁
+the number of database vectors
+𝑑
+the vector dimension
+𝑀0
+the maximum number of neighbors per vertex
+𝐶
+the number of partitions
+𝐾,𝑆
+the maximum sizes of a partition and a subgroup
+𝑔max
+the maximum number of subgroups per partition
+𝑡
+the number of parts in split encoding
+𝑛
+the LWE dimension
+log𝑞
+the LWE modulus
+𝜆
+the LWE security level (≈128-bit)
+𝑘
+the number of returned nearest neighbors
+ef
+the result-heap capacity (≥𝑘)
+𝐵𝑣, 𝐵𝑛
+the VecPIR and NbrPIR batch sizes (the numbers of par-
+titions and subgroups queried per iteration)
+𝑇
+the number of search iterations (each issues one batched
+NbrPIR and one batched VecPIR query)
+𝐾𝑒
+the number of entry partitions
+𝑡𝑐
+the number of TopCand seeds taken from each partition
+𝛼
+the pruning ratio
+occupies column block [𝑐·𝑑, (𝑐+1)·𝑑), and entry (𝑥, 𝑐·𝑑+𝑗) stores
+the 𝑗-th dimension of the 𝑥-th vertex’s quantized vector in partition
+𝑐. This layout transforms a column retrieval into an inner-product
+computation. Let ®𝑣𝑞∈Z𝑑
+𝑝be the quantized query vector, 𝐴∈Z𝑀×𝑛
+𝑞
+the shared random matrix with 𝑀= 𝐶·𝑑, 𝑠∈Z𝑛
+𝑞a fresh secret, and
+𝑒∈𝜒𝑀a noise vector. To query partition 𝑐, the client constructs:
+𝑞𝑢= 𝐴𝑠+ 𝑒+ Δ · 𝑞𝑐∈Z𝑀
+𝑞
+(1)
+where 𝑞𝑐∈Z𝑀places ®𝑣𝑞at positions [𝑐· 𝑑, (𝑐+ 1) · 𝑑) and is zero
+elsewhere, and Δ = ⌊𝑞/𝑝⌋is the scaling factor. The server computes
+ans = dbvec · 𝑞𝑢∈Z𝐾
+𝑞and returns it to the client.
+For row 𝑖, the answer contains ⟨®𝑣𝑞, dbvec[𝑖,𝑐· 𝑑: (𝑐+ 1) · 𝑑]⟩+
+noise, the noisy inner product between the query and the𝑖-th vertex.
+The client recovers the inner product:
+ˆ𝑑𝑖=
+ ans[𝑖] −hint𝑣[𝑖] · 𝑠
+Δ
+
+(2)
+where hint𝑣= dbvec · 𝐴is the precomputed hint matrix, and ⌊·⌉
+denotes rounding to the nearest integer. A single query thus yields
+inner products with all 𝐾vertices in the target partition. The plain-
+text modulus 𝑝is chosen to retain sufficient precision for ranking.
+5.2
+NbrPIR: Neighbor Retrieval
+5.2.1
+Split encoding. Each neighbor is identified by its partition
+index 𝑐∈{0, . . . ,𝐶−1} and its local index ℓ∈{0, . . . , 𝐾−1}
+within that partition. Let 𝑏ℓ= ⌈log2 𝐾⌉and 𝑏𝑐= ⌈log2 𝐶⌉denote
+the number of bits required for each field. The two indices are
+combined into a single non-negative integer 𝑖𝑑= 𝑐· 2𝑏ℓ+ ℓ, which
+occupies 𝑏𝑐+ 𝑏ℓbits in total. Because a single SimplePIR entry can
+hold at most 𝑏bits (the per-entry bit width), the integer 𝑖𝑑is split
+into 𝑡= ⌈(𝑏𝑐+ 𝑏ℓ)/𝑏⌉parts: denoting the 𝑖-th part (𝑖= 0, . . . ,𝑡−1)
+as 𝑖𝑑𝑖, each part is stored in a separate matrix row and recovered
+independently. The plaintext modulus for NbrPIR is 𝑝𝑛= 2𝑏, far
+smaller than VecPIR’s, so its scaling factor is correspondingly larger
+and NbrPIR has ample noise margin.
+5
+
+
+Qiuhao Wang, Zuowei Chen, Xu Yang, Saiyu Qi, and Yong Qi
+5.2.2
+Subgroup organization. Each vertex has at most 𝑀0 neigh-
+bors. If an entire partition’s neighbor lists are stored in one column,
+the column height would be 𝐾· 𝑀0 ·𝑡while the number of columns
+would be only 𝐶, producing an extremely unbalanced matrix that
+prevents SimplePIR from balancing upload and download costs.
+We resolve this by subdividing each partition into subgroups of at
+most 𝑆vertices (Figure 3 (b)). Each subgroup occupies one column,
+yielding at most 𝑔max = ⌈𝐾/𝑆⌉subgroup columns per partition. In
+this case, the NbrPIR database dbnbr has 𝑆· 𝑀0 · 𝑡rows and 𝐶· 𝑔max
+columns, a much more balanced shape. Vertices with fewer than
+𝑀0 neighbors and subgroups with fewer than 𝑆vertices are padded
+to maximums so that every column has exactly 𝑆· 𝑀0 · 𝑡entries.
+5.2.3
+Vertex-to-subgroup mapping. When VecPIR returns distances
+for partition𝑐, the client selects promising candidates by ranking the
+𝐾returned inner products. For a candidate at row ℓ(i.e., local index ℓ
+within partition 𝑐), its neighbor list resides in NbrPIR subgroup
+column𝑐·𝑔max+⌊ℓ/𝑆⌋, and its entries start at offset (ℓmod 𝑆)·𝑀0·𝑡
+within that column. The client issues a SimplePIR column query for
+this subgroup and extracts the target vertex’s 𝑀0 ·𝑡rows to recover
+its full neighbor list.
+5.3
+Efficient Private Search
+The dual-PIR split layout amortizes the communication of a private
+search: each VecPIR query returns distances to all 𝐾vertices in a
+partition, and each NbrPIR query retrieves neighbor lists for all 𝑆
+vertices in a subgroup, so one round trip yields far more information
+than in per-vertex PIR systems. The search proceeds iteratively:
+pop the closest candidate from the heap, issue one NbrPIR query
+for its subgroup to decode its neighbors, then issue one VecPIR
+query for each neighbor’s uncached partition to obtain distances.
+We further improve this basic search with the following techniques.
+5.3.1
+Batch PIR. The PIR database matrices dbvec and dbnbr can
+occupy multiple gigabytes of server memory, and each PIR query
+requires a full matrix-vector multiplication that scans the entire
+database. When 𝐵PIR queries are issued independently, the server
+must scan the database 𝐵times, making memory bandwidth the
+dominant performance bottleneck. Batch PIR addresses this by
+packing multiple queries into a single matrix multiplication. For
+VecPIR, to query 𝐵𝑣partitions {𝑐1, . . . ,𝑐𝐵𝑣} simultaneously, the
+client constructs a (𝐶· 𝑑) × 𝐵𝑣query matrix 𝑄where each column
+is one partition’s query vector as in Eq. (1). The server computes
+ans = dbvec · 𝑄∈Z𝐾×𝐵𝑣
+𝑞
+with a single database scan, amortizing
+the memory-bandwidth cost across all 𝐵𝑣queries while merging 𝐵𝑣
+round trips into one and resolving distances to 𝐾· 𝐵𝑣vertices. The
+same batching applies to NbrPIR: a (𝐶· 𝑔max) × 𝐵𝑛query matrix
+yields an (𝑆· 𝑀0 · 𝑡) × 𝐵𝑛answer matrix containing 𝐵𝑛subgroups’
+neighbor encodings in one round trip.
+5.3.2
+TopCand exploration. Standard graph search navigates solely
+by following edges, visiting one vertex at a time. In Amora, to pro-
+tect the query privacy, each VecPIR query privately selects one par-
+tition, and the server computes the distances to all vertices inside it
+within a single encrypted operation. The distances to all 𝐾vertices
+in the partition are thus a byproduct of one privacy-preserving
+query, providing a complete view of that partition without any
+additional queries. We call the 𝑡𝑐closest vertices per partition the
+TopCand (top candidates). These vertices are added to the candi-
+date heap W (min-heap) as additional navigation seeds, enabling
+jump-style exploration: the search can leap directly to promising
+regions of a partition without following graph edges step by step, ef-
+fectively supplementing neighbor-based navigation with partition-
+level shortcuts. The remaining 𝐾−𝑡𝑐vertices are not promoted
+to W (which would overwhelm subsequent NbrPIR rounds), but
+their distances, obtained for free from the amortized VecPIR query,
+are still valuable. Like standard graph search, Amora maintains W
+for exploration and a result heap R (max-heap, capacity ef ) for the
+answer set. The graph neighbors decoded from NbrPIR and the 𝑡𝑐
+TopCand vertices enter both W and R, while the top-𝑘vertices in
+the partition enter R. These free distances tighten the admission
+threshold of R faster, so that fewer candidates qualify in subsequent
+rounds and fewer PIR queries are wasted.
+5.3.3
+Centroid-based pruning. During neighbor processing, discov-
+ered neighbors may point to many uncached partitions. Without
+prioritization, all would compete for the limited VecPIR batch bud-
+get 𝐵𝑣, and distant or irrelevant partitions waste valuable slots.
+The saved partition centroids can naturally serve as directional
+indicators. We maintain the pending set P as an ordered set sorted
+by ascending centroid distance −⟨®𝑣𝑞, 𝜇𝑐⟩, where 𝜇𝑐is the centroid
+of partition 𝑐. Since centroids are public metadata, this sorting is
+performed entirely on the client without online communication.
+When selecting partitions for the next VecPIR batch, the sorted
+order ensures that the top-𝐵𝑣entries are always the closest parti-
+tions to the query, directing the communication budget toward the
+most promising regions. Before selection, the client prunes P by
+removing all partitions whose centroid distance exceeds 𝛼· 𝑑∗
+best,
+where 𝑑∗
+best is the closest distance seen so far, initialized from the
+entry partition and updated whenever a closer centroid appears.
+The pruning ratio 𝛼is a fixed per-dataset parameter, set once and
+not updated during the search. A larger 𝛼prunes more strictly,
+which suits datasets whose centroids lie close together, since it
+still keeps the useful partitions. When the centroids are spread
+out, a smaller 𝛼retains the potential partitions that may hold true
+neighbors. Together, sorting and pruning direct the limited VecPIR
+budget toward the most relevant partitions.
+5.3.4
+Selective decryption and caching. Each NbrPIR query retrieves
+an entire subgroup column containing 𝑆vertices’ neighbor data,
+but the search typically visits only a few vertices per subgroup.
+Decrypting all 𝑆· 𝑀0 · 𝑡entries would waste computation. Instead,
+the client caches the raw ciphertext and performs selective decryp-
+tion: only the rows of actually visited vertices are decrypted on
+demand. When later candidates fall into the same subgroup, the
+cached ciphertext is reused without additional communication.
+5.3.5
+Compressed storage. Server-side answer computation re-
+quires multiplying the (potentially multi-GB) PIR database by each
+query, making memory bandwidth the dominant cost. Since actual
+database values have small ranges (VecPIR stores uint8-quantized
+vectors in [0, 28 −1] and NbrPIR stores 𝑏-bit parts in [0, 2𝑏−1]),
+we keep the databases in a compact format and zero-extend each
+element to the LWE word size at query time.
+6
+
+
+Amora: Communication-Efficient Private Approximate Nearest Neighbors Search
+(a) VecPIR Database & Query
+Partition 
+Partition 
+Partition 
+×
+qu
+=
+ans
+(b) NbrPIR Database & Query
+×
+=
+ans
+Partition 
+Partition 
+Partition 
+⋮
+⋮
+⋮
+⋮
+⋮
+⋮
+⋮
+⋮
+⋯
+⋯
+⋯
+⋯
+⋯
+⋯
+⋯
+⋯
+⋯
+⋮
+⋮
+⋮
+⋮
+·
+·
+·
+⋮
+⋮
+⋮
+·
+·
+·
+⋮
+⋮
+⋮
+·
+·
+·
+⋮
+⋮
+⋮
+·
+·
+·
+⋮
+⋮
+⋮
+·
+·
+·
+gmax
+subgroups
+·
+·
+·
+·
+·
+·
+⋮
+⋮
+⋮
+·
+·
+·
+⋮
+⋮
+⋮
+·
+·
+·
+·
+·
+·
+⋮
+⋮
+⋮
+·
+·
+·
+qu
+⋮
+⋮
+⋮
+⋮
+⋮
+·
+·
+·
+·
+·
+·
+·
+·
+·
+·
+·
+·
+⋮
+⋮
+⋮
+⋮
+·
+·
+·
+·
+⋯
+⋯
+⋯
+⋮
+⋮
+⋮
+⋮
+⋯
+·
+·
+·
+·
+·
+·
+·
+·
+·
+·
+·
+·
+⋮
+⋮
+⋮
+⋮
+·
+·
+·
+·
+⋮
+⋮
+Figure 3: Dual-PIR split layout. (a): VecPIR arranges each vertex’s 𝑑-dimensional vector horizontally across 𝑑columns within a
+partition block, querying partition 𝑐returns inner products with all 𝐾vertices. (b): NbrPIR organizes each partition into 𝑔max
+subgroup columns, each subgroup stores 𝑆vertices’ 𝑀0 neighbors using split encoding with 𝑡parts.
+Algorithm 1: Offline Preprocessing
+Input: 𝑁vectors of dimension 𝑑, graph degree 𝑀0, number of
+partitions 𝐶, subgroup size 𝑆, part width 𝑏
+Output: PIR databases dbvec, dbnbr; hint matrices 𝐻𝑣, 𝐻𝑛; centroids
+{𝜇𝑐}
+/* Index construction
+*/
+1 Build proximity graph 𝐺with 𝑀0 neighbors per vertex;
+2 Partition 𝐺into 𝐶balanced partitions via graph partitioning;
+3 foreach partition 𝑐do
+4
+Divide into subgroups of at most 𝑆vertices;
+5 Quantize all vectors to uint8;
+6 Compute partition centroids {𝜇1, . . . , 𝜇𝐶};
+/* PIR database construction
+*/
+7 Build dbvec: horizontal layout, 𝐾× (𝐶· 𝑑) (§5.1);
+8 Split-encode all neighbors 𝑖𝑑into 𝑡parts of 𝑏bits (§5.2);
+9 Build dbnbr: subgroup-column layout, (𝑆· 𝑀0 · 𝑡) × (𝐶· 𝑔max);
+/* PIR setup (one-time distribution to client)
+*/
+10 Generate shared random matrices 𝐴𝑣,𝐴𝑛;
+11 Compute hint matrices: 𝐻𝑣←dbvec · 𝐴𝑣, 𝐻𝑛←dbnbr · 𝐴𝑛;
+12 Send (𝐴𝑣, 𝐻𝑣,𝐴𝑛, 𝐻𝑛, {𝜇𝑐}𝐶
+𝑐=1) to C;
+5.4
+Amora Protocols
+We now describe the Amora protocols: (1) Offline preprocessing (Al-
+gorithm 1) builds the PIR databases; (2) Online search (Algorithm 2)
+answers each query with a fixed communication pattern.
+5.4.1
+Offline preprocessing. Algorithm 1 summarizes server-side
+preprocessing, executed once before any queries. Lines 1–5 con-
+struct the search index. The server first builds a proximity graph 𝐺
+(e.g., HNSW) where each vertex has 𝑀0 neighbors (Line 1), then par-
+titions𝐺into𝐶balanced partitions using graph partitioning (Line 2).
+Within each partition, vertices are divided into subgroups of at most
+𝑆vertices (Lines 3–4). All vectors are quantized to uint8 for compact
+storage (Line 5), and partition centroids are computed as public
+metadata for centroid-based entry and pruning (Line 6). Then, the
+server builds the two PIR databases following the layouts described
+in Figure 3: dbvec stores quantized vectors in horizontal layout,
+and dbnbr stores split-encoded neighbor lists in subgroup columns
+(Lines 7–9). After that, the server performs the one-time SimplePIR
+setup. The server generates shared random matrices 𝐴𝑣,𝐴𝑛and
+computes hint matrices 𝐻𝑣, 𝐻𝑛by multiplying each database with
+its corresponding random matrix. These matrices, together with
+partition centroids, are sent to the client. This offline distribution
+is amortized over all subsequent queries; the client uses 𝐴and 𝐻
+to construct PIR queries and recover answers without additional
+server interaction (Lines 10–12).
+5.4.2
+Online PANNS. Algorithm 2 describes the online search exe-
+cuted by the client for a query vector ®𝑣𝑞. The parameters are: the
+number of results 𝑘, result heap capacity ef ≥𝑘, number of en-
+try partitions 𝐾𝑒, batch sizes 𝐵𝑛and 𝐵𝑣for NbrPIR and VecPIR,
+iteration count 𝑇, and TopCand count per partition 𝑡𝑐.
+Stage 1: Centroid entry (Lines 1–5). The client computes inner
+products between query vector ®𝑣𝑞and all 𝐶partition centroids
+locally, requiring zero online communication since centroids are
+distributed during offline setup (Line 1). The 𝐾𝑒partitions with
+the smallest distance are selected as entry points (Line 2), and a
+single BatchVecPir query retrieves distances to all vertices in these
+𝐾𝑒partitions (Line 3). The candidate heap W and result heap R
+are then initialized (Lines 4–5): the top-𝑡𝑐closest vertices per entry
+partition are inserted into W as initial navigation seeds, and the
+top-𝑘are inserted into R (Line 5).
+Stage 2: Fixed-iteration search loop (Lines 6–26). Each of the
+𝑇iterations consists of three phases:
+Phase A: Neighbor retrieval (Lines 7–9). The client pops candi-
+dates from W in distance order, collecting up to 𝐵𝑛distinct un-
+cached subgroups that these candidates belong to (Line 7). Candi-
+dates whose subgroup is already cached are also popped since their
+neighbors can be decoded immediately. If fewer than 𝐵𝑛uncached
+subgroups are needed, the remaining slots are padded with random
+uncached subgroups to maintain a fixed batch size (Line 8). A sin-
+gle BatchNbrPIR query retrieves all 𝐵𝑛subgroup columns, and the
+returned ciphertexts are cached for future reuse (Line 9).
+Phase B: Neighbor processing (Lines 10–17). For each popped
+candidate 𝑣, the client selectively decrypts only 𝑣’s 𝑀0 neighbor
+entries from the cached subgroup ciphertext (Line 11). For each
+7
+
+
+Qiuhao Wang, Zuowei Chen, Xu Yang, Saiyu Qi, and Yong Qi
+Algorithm 2: Online PANNS
+Input: query vector ®𝑣𝑞, result size 𝑘, heap capacity ef , entry
+partitions 𝐾𝑒, NbrPIR batch size 𝐵𝑛, VecPIR batch size 𝐵𝑣,
+iteration count 𝑇, TopCand count 𝑡𝑐
+Output: top-𝑘nearest neighbors
+/* Stage 1: Centroid entry
+*/
+1 Compute ⟨®𝑣𝑞, 𝜇𝑐⟩for all 𝑐∈[𝐶] locally;
+2 Select top-𝐾𝑒partitions as entry points;
+3 BatchVecPir(𝐾𝑒);
+4 Initialize candidate min-heap W, result max-heap R (size of ef ),
+pending sorted set P;
+5 Insert top-𝑡𝑐per entry partition into W, insert top-𝑘into R;
+/* Stage 2: Fixed-iteration search loop
+*/
+6 for iter = 1 to 𝑇do
+/* Phase A: Neighbor retrieval
+*/
+7
+Pop candidates from W until 𝐵𝑛uncached subgroups
+collected;
+8
+Pad to 𝐵𝑛with random uncached subgroups;
+⊲dummy
+9
+BatchNbrPIR(𝐵𝑛) and cache ciphertexts;
+/* Phase B: Neighbor processing
+*/
+10
+foreach popped candidate 𝑣do
+11
+Selectively decrypt 𝑣’s 𝑀0 neighbors from cached
+ciphertext;
+12
+foreach neighbor 𝑢of 𝑣do
+13
+if 𝑢’s partition is cached then
+14
+Read dist(𝑢, ®𝑣𝑞) from cache;
+15
+Update W and R if dist(𝑢, ®𝑣𝑞) < R.top();
+16
+else
+17
+Insert 𝑢’s partition into P;
+/* Phase C: Distance computation
+*/
+18
+Prune P by centroid-based partition scheduling (§5.3);
+19
+Pop first 𝐵𝑣entries from P, pad to 𝐵𝑣;
+⊲dummy
+20
+BatchVecPir(𝐵𝑣);
+21
+foreach newly queried partition 𝑐′ do
+22
+Insert top-𝑡𝑐vertices into W (TopCand);
+23
+Insert top-𝑘vertices into R;
+24
+foreach neighbor 𝑢in P with 𝑢∈𝑐′ do
+25
+Read dist(𝑢, ®𝑣𝑞) from cache;
+26
+Insert 𝑢into W and R if dist(𝑢, ®𝑣𝑞) < R.top();
+27 return top-𝑘from R;
+decoded neighbor 𝑢: if 𝑢’s partition has been previously queried via
+VecPIR, its distance dist(𝑢, ®𝑣𝑞) is already available in the distance
+cache, and 𝑢is inserted into W and R if competitive (Lines 13–15);
+otherwise, 𝑢’s partition is added to P, a cross-iteration priority
+queue sorted by centroid distance (Line 17).
+Phase C: Distance computation (Lines 18–26). The client first
+prunes P using centroid-based filtering (§5.3), removing partitions
+whose centroid distance exceeds the pruning threshold (Line 18).
+The top-𝐵𝑣closest partitions are selected for querying, padded if
+fewer than 𝐵𝑣are available (Line 19). A BatchVecPir query retrieves
+distances to all vertices in these 𝐵𝑣partitions (Line 20). For each
+newly queried partition, the top-𝑡𝑐vertices are inserted into W
+as TopCand navigation seeds, and the top-𝑘are inserted into R
+(Lines 22–23). Additionally, any neighbors from Phase B that are
+deferred because their partition was uncached can now be resolved
+from the distance cache (Lines 24–26).
+After 𝑇iterations, the client returns the top-𝑘entries from R
+(Line 27). Every ANNS executes exactly 1 +𝑇VecPIR rounds and
+𝑇NbrPIR rounds, with fixed batch sizes 𝐵𝑣and 𝐵𝑛per round. The
+dummy padding in Lines 8 and 19 ensures that the server observes
+an identical communication pattern regardless of query content.
+Besides, the LWE-encrypted query vectors are computationally
+indistinguishable from real queries, so the server cannot determine
+which slots carry real data and which are padding.
+6
+Theoretical Analysis
+6.1
+Communication Cost
+6.1.1
+Online communication. We analyze the per-query online
+communication cost. As described in §5.4, each ANNS executes
+1 +𝑇VecPIR rounds with batch size 𝐵𝑣and 𝑇NbrPIR rounds with
+batch size 𝐵𝑛. We denote the element size as 𝑤= ⌈log𝑞/8⌉bytes.
+Total online communication. Each VecPIR round involves an up-
+load of the query matrix and a download of the answer matrix.
+The dbvec has 𝐾rows and 𝐶· 𝑑columns, so each round uploads a
+(𝐶· 𝑑) × 𝐵𝑣query matrix and downloads a 𝐾× 𝐵𝑣answer matrix:
+Commvec = (1 +𝑇) · 𝐵𝑣· ( 𝐶· 𝑑
+|{z}
+upload
++
+𝐾
+|{z}
+download
+) · 𝑤
+(3)
+The dbnbr has 𝑆· 𝑀0 · 𝑡rows and 𝐶·𝑔max columns, where 𝑔max =
+⌈𝐾/𝑆⌉. Each round uploads a (𝐶· 𝑔max) × 𝐵𝑛query matrix and
+downloads an (𝑆· 𝑀0 · 𝑡) × 𝐵𝑛answer matrix:
+Commnbr = 𝑇· 𝐵𝑛· (𝐶· ⌈𝐾/𝑆⌉
+|     {z     }
+upload
++𝑆· 𝑀0 · 𝑡
+|    {z    }
+download
+) · 𝑤
+(4)
+The total per-query online communication is Commonline =
+Commvec + Commnbr.
+Optimal parameter selection. The total communication depends
+on the number of partitions 𝐶and the subgroup size 𝑆, which can
+be chosen to minimize communication. For VecPIR, the upload cost
+is proportional to 𝐶· 𝑑and the download cost is proportional to
+𝐾≈𝑁/𝐶. Setting the derivative of 𝐶· 𝑑+ 𝑁/𝐶with respect to 𝐶
+to zero yields the optimal number of partitions:
+𝐶∗=
+√︁
+𝑁/𝑑
+(5)
+For NbrPIR, the upload cost is proportional to 𝐶· ⌈𝐾/𝑆⌉≈𝑁/𝑆and
+the download cost is proportional to 𝑆·𝑀0 ·𝑡. Setting the derivative
+of 𝑁/𝑆+ 𝑆· 𝑀0 · 𝑡with respect to 𝑆to zero yields the optimal
+subgroup size:
+𝑆∗=
+√︁
+𝑁/(𝑀0 · 𝑡)
+(6)
+Amortization benefit. PIR schemes such as SimplePIR and Piano
+achieve per-query communication 𝑂(
+√
+𝑁) for a database of 𝑁en-
+tries. The critical difference between Amora and per-vertex PIR
+systems lies in the number of queries. Pacmann issues one PIR query
+per accessed vertex, so visiting 𝑛𝑎vertices incurs total communica-
+tion 𝑂(𝑛𝑎
+√
+𝑁). In Amora, each VecPIR query retrieves distances to
+all 𝐾vertices in a partition at once, so visiting vertices spread across
+𝑐distinct partitions requires only 𝑐queries with total communi-
+cation 𝑂(𝑐
+√
+𝑁). Since a typical search accesses multiple vertices
+within the same partition,𝑐≪𝑛𝑎, yielding a proportional reduction
+in communication. The benefit grows with the dimensionality 𝑑. A
+per-vertex cost model scheme downloads the full 𝑑-dimensional
+8
+
+
+Amora: Communication-Efficient Private Approximate Nearest Neighbors Search
+vector of every accessed vertex, so it pays 𝑂(𝑑) communication per
+compared vertex. In Amora, the optimal 𝐶∗=
+√︁
+𝑁/𝑑(Eq. 5) makes
+both the upload 𝐶·𝑑and the download 𝐾in Eq. 3 approximately
+equal to
+√
+𝑁·𝑑, so one VecPIR query spends about 2
+√
+𝑁·𝑑values on
+the distances to about
+√
+𝑁·𝑑vertices, and the amortized cost per
+compared vertex is a constant independent of 𝑑.
+6.1.2
+Offline communication. Before any queries, the client down-
+loads hint matrices and shared random matrices from the server.
+For VecPIR, the hint matrix 𝐻𝑣= dbvec · 𝐴𝑣∈Z𝐾×𝑛
+𝑞
+and the
+shared random matrix 𝐴𝑣∈Z(𝐶·𝑑)×𝑛
+𝑞
+. For NbrPIR, the hint ma-
+trix 𝐻𝑛= dbnbr · 𝐴𝑛∈Z(𝑆·𝑀0·𝑡)×𝑛
+𝑞
+and the shared random matrix
+𝐴𝑛∈Z(𝐶·𝑔max)×𝑛
+𝑞
+. The client also receives the 𝐶partition centroids.
+The total offline communication is:
+Commoffline =  𝐾+𝐶·𝑑+𝑆· 𝑀0 ·𝑡+𝐶·𝑔max
+ ·𝑛·𝑤+𝐶·𝑑·𝑤𝑐(7)
+where 𝑛is the LWE dimension and 𝑤𝑐is the per-element size
+of centroids. This one-time cost is amortized over all subsequent
+queries and also serves as the client-side storage requirement.
+6.2
+Computation Cost
+The dominant server-side cost is the matrix multiplication required
+to answer each PIR query. For VecPIR, the server computes dbvec ·
+𝑄∈Z𝐾×𝐵𝑣
+𝑞
+, which requires 𝐾· (𝐶·𝑑) ·𝐵𝑣multiplications per round.
+For NbrPIR, the server computes dbnbr ·𝑄∈Z(𝑆·𝑀0·𝑡)×𝐵𝑛
+𝑞
+, requiring
+(𝑆· 𝑀0 · 𝑡) · (𝐶· 𝑔max) · 𝐵𝑛multiplications per round. The total
+server-side computation per query is:
+Compsvr = (1 +𝑇) · 𝐾· 𝐶· 𝑑· 𝐵𝑣+𝑇· 𝑆· 𝑀0 · 𝑡· 𝐶· 𝑔max · 𝐵𝑛(8)
+The client-side cost is: generating a query vector requires 𝑂(𝑛)
+operations per column, and recovering the answer requires 𝑂(𝑛)
+operations per row via the precomputed hint.
+Comparison with per-vertex cost model. Let 𝑧denote the total
+size of a vertex’s vector and neighbor list. Amora multiplies each
+query against the entire database, so one round costs 𝑂(𝑁·𝑧) and
+returns information for 𝑂(
+√
+𝑁) vertices. The Piano [55] PIR used
+by Pacmann instead aggregates the records of 𝑂(
+√
+𝑁) vertices, so
+a query costs 𝑂(
+√
+𝑁·𝑧) but returns information for only one vertex.
+Pacmann is therefore faster per round, and the gap grows with 𝑁·𝑧,
+but it needs more rounds. The amortized per-vertex computation of
+the two schemes is comparable. On high-dimensional data, the vec-
+tor dominates 𝑧, so the gap is governed by 𝑁·𝑑. Amora’s workload
+is moreover a dense matrix multiplication that maps directly to
+GPU and SIMD (AVX-512) acceleration [20] for great improvement.
+6.3
+Security Analysis
+We prove that Amora satisfies the query privacy definition given
+in Definition 1 under the LWE assumption.
+Theorem 1. Assuming the hardness of LWE𝑛,𝑞,𝜒, Amora satisfies
+query privacy (Definition 1) in the semi-honest model.
+Proof. We construct a simulator Sim that, given only the data-
+base size 𝑁and the public system parameters (𝐶,𝑆,𝑇, 𝐵𝑣, 𝐵𝑛, 𝐾𝑒),
+produces a transcript indistinguishable from a real execution.
+Offline phase. The shared random matrices 𝐴𝑣,𝐴𝑛are public and
+independent of the query. The hint matrices 𝐻𝑣= dbvec · 𝐴𝑣and
+𝐻𝑛= dbnbr · 𝐴𝑛are deterministic functions of the public database
+and the public random matrices, so the simulator outputs them
+identically to the real protocol.
+Online phase. In each round, the client sends a query matrix 𝑄
+whose columns are of the form 𝑞𝑢𝑗= 𝐴·𝑠𝑗+𝑒𝑗+ Δ ·𝑢𝑖𝑗, where 𝑠𝑗is
+a fresh secret, 𝑒𝑗is drawn from the error distribution 𝜒, and 𝑢𝑖𝑗is
+a unit vector selecting the target column. By the LWE assumption,
+(𝐴,𝐴· 𝑠𝑗+ 𝑒𝑗) is computationally indistinguishable from (𝐴,𝑟𝑗)
+where 𝑟𝑗
+$←Z𝐶·𝑔max
+𝑞
+(or Z𝐶·𝑑
+𝑞
+for VecPIR). Adding the scaled unit
+vector Δ·𝑢𝑖𝑗does not help the adversary distinguish, because Δ·𝑢𝑖𝑗
+is masked by the LWE noise. Therefore, the simulator can replace
+each query column with a uniformly random vector 𝑟𝑗
+$←Z𝐶·𝑔max
+𝑞
+(or Z𝐶·𝑑
+𝑞
+for VecPIR), producing a query matrix indistinguishable
+from the real one. Since a fresh secret 𝑠𝑗is sampled for each query
+column, different columns (and different rounds) are independently
+distributed. Thus, each of the (1 +𝑇) · 𝐵𝑣VecPIR query columns
+and 𝑇· 𝐵𝑛NbrPIR query columns can be simulated independently.
+The server’s response ans = db · 𝑄is a deterministic function of
+the public database and the query matrix. Since the simulator can
+produce an indistinguishable query matrix, the resulting answer is
+also indistinguishable.
+Fixed communication pattern. Every query executes exactly 1 +𝑇
+VecPIR rounds and 𝑇NbrPIR rounds, with fixed batch sizes 𝐵𝑣and
+𝐵𝑛per round (Algorithm 2). When fewer than 𝐵𝑛real subgroups
+are needed, the client pads with random uncached subgroups. Sim-
+ilarly, when fewer than 𝐵𝑣real partitions are pending, it pads with
+already-cached partition IDs. Since all query columns are LWE sam-
+ples indistinguishable from uniform, the server cannot distinguish
+real query columns from dummy padding columns. The server
+therefore observes the same number of rounds, the same matrix
+dimensions, and identically distributed query matrices for every
+query, regardless of the query content.
+Combining the above, the simulated transcript is computation-
+ally indistinguishable from the real transcript under the LWE as-
+sumption. The server learns only the timing of each communication
+round. It does not learn which partitions or subgroups are queried
+(protected by LWE), the query vector, or individual distances. The
+centroid entry computation is performed entirely on the client side
+using locally stored centroids and produces no communication.
+□
+7
+Experimental Evaluation
+7.1
+Setup
+7.1.1
+Datasets. We use five datasets which are chosen to cover
+diverse scales, dimensionalities, and data distributions. SIFT1M and
+SIFT10M contain 128-dimensional SIFT [36] descriptors extracted
+from natural images, sharing the same feature space but differing
+by 10× in scale, which isolates the effect of dataset size on perfor-
+mance. Deep1M contains 96-dimensional CNN features from the
+Yandex Deep-1B benchmark [3], representing a different feature
+distribution at the 1M scale. MSMARCO [42] contains 8.8M full 768-
+dimensional passage vectors from a real-world information retrieval
+benchmark, representing the setting with high dimensionality and
+semantic text features. AGNEWS3 contains 769K 1024-dimensional
+3https://huggingface.co/datasets/vector-index-bench/vibe/blob/main/agnews-pplx-
+1024-cosine-int8.hdf5
+9
+
+
+Qiuhao Wang, Zuowei Chen, Xu Yang, Saiyu Qi, and Yong Qi
+text embeddings from the recent VIBE vector-search benchmark,
+representing higher-dimensional modern text-embedding models.
+Accuracy is measured by Recall@10 on SIFT1M, SIFT10M, Deep1M,
+and AGNEWS, and by MRR@10 on MSMARCO.
+7.1.2
+Baselines. We compare Amora against two single-server
+graph-based PANNS systems that follow the per-vertex cost model,
+Pacmann [56] and Compass [57]. Pacmann is the state-of-the-art
+single-server PIR-based PANNS scheme, which uses Piano PIR [55]
+and issues one PIR query per visited vertex during graph traversal.
+Compass protects the query with ORAM instead of PIR. We also
+compare against Tiptoe [22], a cluster-based scheme that achieves
+single-round search via somewhat homomorphic encryption. We
+further compare against Panther [35], the most recent cluster-based
+scheme, which co-designs a batched PIR over the clusters with ho-
+momorphic distance evaluation and a garbled-circuit top-𝑘. Amora,
+Pacmann, and Compass accumulate communication over rounds,
+whereas Tiptoe and Panther are single-round. We vary Panther’s
+budget by the number of clusters it accesses. Pacmann’s commu-
+nication and computation include the amortized cost of each PIR
+query, because without amortization it would have to rebuild the
+hint by downloading the entire database. Pacmann’s amortization
+computation is excluded from latency, since it runs after the result
+is returned. For Panther we count only the communication that pro-
+tects query privacy and omit the part that protects database privacy.
+We report latency only for Amora and Pacmann. The server index
+of Compass and Panther grows to ≥200 GB on several datasets and
+must be held on disk, which severely degrades their performance.
+7.1.3
+Implementation and environment. Amora is implemented in
+C++ with OpenMP parallelism. All experiments are conducted on
+a single machine equipped with an Intel Core i7-10700 CPU @
+2.60 GHz (8 cores / 16 threads) and 64 GB RAM, running Ubuntu
+20.04 Server. For PIR operations, we use 32-bit LWE ciphertexts
+with 𝑛= 1024 and log𝑞= 32, which attains 𝜆≈128-bit security, fol-
+lowing SimplePIR’s parameterization [23]. We build the proximity
+graph using HNSW [38] with degree 𝑀0 = 32 and construction pa-
+rameter efConstruction = 200, retaining only the level-0 graph. All
+vectors are scalar-quantized to 8 bits for compact PIR storage. Graph
+partitioning is performed using METIS [29] with 𝐶= ⌊
+√︁
+𝑁/𝑑⌋par-
+titions. For NbrPIR, each neighbor ID is split-encoded with 𝑏= 7
+bits per part and 𝑡= ⌈(⌈log2 𝐶⌉+ ⌈log2 𝐾⌉)/𝑏⌉parts, yielding 𝑡= 3
+for 1M-scale datasets and 𝑡= 4 for 10M-scale datasets. The sub-
+group size 𝑆= ⌊
+√︁
+𝑁/(𝑀0·𝑡)⌋. The default search configuration uses
+𝑘= 10, ef = 50, and 𝐾𝑒= 1. The per-dataset search parameters
+(𝐵𝑣, 𝐵𝑛, 𝛼,𝑡𝑐) are set to (2, 2, 0.82, 1) for SIFT1M, (2, 2, 0.78, 1) for
+SIFT10M, (3, 2, 0.50, 1) for Deep1M, (4, 3, 0.65, 1) for MSMARCO,
+and (2, 3, 0.50, 2) for AGNEWS. We choose the minimum (𝐵𝑣, 𝐵𝑛)
+beyond which the accuracy gain is negligible, and the maximum 𝛼
+whose accuracy loss is negligible. A search issues one VecPIR query
+for the entry partitions and then𝑇iterations, each with one NbrPIR
+and one VecPIR query, so it takes 1 + 2𝑇communication rounds.
+Increasing 𝑇accumulates communication in fixed increments and
+raises accuracy until it flattens. Latency is defined as computation
+time plus communication delay, where each communication round
+incurs a 50 ms round-trip time (RTT). All results are reported as
+the averages (mean±std) over 10 repeated executions.
+7.2
+Overall Comparison
+Table 2 presents the overall comparison between Amora and Pac-
+mann. For a fair comparison, we configure Amora and Pacmann
+with the minimum number of communication rounds that reaches
+Recall@10 = 0.9 and MRR@10 = 0.24
+7.2.1
+Online communication. Amora achieves a 93–99% reduc-
+tion in per-query online communication across all datasets: 93%
+on Deep1M (1.24 MB vs. 18.46 MB), 96% on SIFT1M (0.75 MB vs.
+17.17 MB) and SIFT10M (3.62 MB vs. 87.42 MB), 98% on MSMARCO
+(7.45 MB vs. 404.78 MB), and 99% on AGNEWS (0.89 MB vs. 82.88 MB).
+This improvement stems from the amortization effect: each VecPIR
+query returns distances to all 𝐾vertices in a partition simultane-
+ously, so Amora retrieves thousands of distances per round while
+Pacmann retrieves information for only one vertex per PIR query.
+The reduction is more pronounced on datasets with higher dimen-
+sionality, which matches the amortization analysis in §6.1.
+7.2.2
+Accuracy. Despite using far less communication, Amora ex-
+ceeds Pacmann’s accuracy on all datasets: Recall@10 rises by 0.017–
+0.025 on the four recall datasets (e.g., 0.936 ± 0.001 vs. 0.911 ± 0.011
+on AGNEWS), and MRR@10 from 0.240 ± 0.008 to 0.253 ± 0.007 on
+MSMARCO (Table 2). The advantage arises because each amortized
+VecPIR query returns distances to all vertices in a partition, provid-
+ing a far richer per-round view than Pacmann’s per-vertex retrieval.
+This richer view enables jump-style navigation such as TopCand
+exploration (§5.3) and thus higher accuracy in fewer rounds.
+7.2.3
+Preprocessing and storage. Amora’s offline communication
+(hint matrices + shared random matrices) is 82–98% smaller than
+Pacmann’s, since Pacmann requires downloading the entire data-
+base for Piano’s offline phase. Client-side storage exhibits the same
+advantage, as Amora stores only the hint and the centroids of all
+partitions rather than a database replica.
+7.2.4
+Computation and latency. Amora achieves 45–66% lower
+latency at matched accuracy on SIFT1M (0.289 ± 0.001 s vs. 0.855 ±
+0.005 s), Deep1M (0.405±0.001 s vs. 0.849±0.006 s), SIFT10M (0.824±
+0.011 s vs. 1.489 ± 0.023 s), and AGNEWS (0.241 ± 0.005 s vs. 0.544 ±
+0.002 s), because the reduction in communication rounds more
+than compensates for the SimplePIR computation overhead. On
+MSMARCO, however, Amora’s latency (1.771 s) slightly exceeds
+Pacmann’s (1.557 s). As §6.2 shows, the computation gap grows
+with 𝑁·𝑑, so the crossover between the two schemes is governed
+by this product. MSMARCO has the largest 𝑁·𝑑among the five
+datasets (≈6.8×109), while Amora remains faster on AGNEWS
+(𝑁·𝑑≈7.9×108) and SIFT10M (𝑁·𝑑≈1.3×109), so the crossover lies
+between 1.3×109 and 6.8×109. The small latency gap on MSMARCO
+further suggests that the crossover is close to 6.8×109. The crossover
+also depends on the network delay. Because Amora saves 19 rounds
+per query on MSMARCO against a latency gap of 0.21 s, it becomes
+faster again once the RTT exceeds about 61 ms.
+Scalability discussion. Table 2 also reveals how the costs scale.
+First, they grow sublinearly with 𝑁: from SIFT1M to SIFT10M (10×
+vectors), per-query communication at the same 7 rounds grows
+from 1.09 MB to 3.62 MB (3.3×), and hint storage from 92.79 MB to
+285.27 MB (3.1×), matching the 𝑂(
+√
+𝑁·𝑑) per-round cost in §6.1.
+10
+
+
+Amora: Communication-Efficient Private Approximate Nearest Neighbors Search
+Table 2: Overall comparison between Amora and Pacmann. Bold indicates the better result; Acc. denotes accuracy; Comp. and
+Comm. denote per-query computation and communication.
+Dataset
+Scheme
+Acc.
+Preprocessing
+Online (per query)
+Storage
+Graph
+PIR
+Comm.
+Comm.
+Rounds
+Comp.
+Latency
+SIFT1M
+Amora
+0.921±0.005
+111.8 s
+6.45 s
+92.79 MB
+0.75 MB
+5
+38.5±1.0 ms
+0.289±0.001 s
+92.79 MB
+Pacmann
+0.901±0.006
+78.19 s
+2.65 s
+610.35 MB
+22.89 MB
+16
+139.5±18.2 ms
+0.855±0.005 s
+212.43 MB
+SIFT10M
+Amora
+0.920±0.002
+32.4 min
+174.95 s
+285.27 MB
+3.62 MB
+7
+474.0±11.2 ms
+0.824±0.011 s
+285.27 MB
+Pacmann
+0.903±0.007
+38.09 min
+29.01 s
+5.96 GB
+87.42 MB
+24
+680.9±33.4 ms
+1.489±0.023 s
+776.94 MB
+Deep1M
+Amora
+0.922±0.003
+86.30 s
+5.57 s
+85.80 MB
+1.24 MB
+7
+55.4±1.4 ms
+0.405±0.001 s
+85.80 MB
+Pacmann
+0.902±0.003
+85.39 s
+1.84 s
+488.28 MB
+18.46 MB
+16
+116.2±4.5 ms
+0.849±0.006 s
+170.55 MB
+AGNEWS
+Amora
+0.936±0.001
+549.5 s
+45.48 s
+167.23 MB
+0.89 MB
+3
+90.7±5.2 ms
+0.241±0.005 s
+167.23 MB
+Pacmann
+0.911±0.011
+681 s
+7.05 s
+3.03 GB
+82.88 MB
+10
+222.8±11.4 ms
+0.544±0.002 s
+1.10 GB
+MSMARCO
+Amora
+0.253±0.007
+104.88 min
+724.03 s
+476.04 MB
+7.45 MB
+5
+1520.8±15.9 ms
+1.771±0.016 s
+476.04 MB
+Pacmann
+0.240±0.008
+193.91 min
+83.48 s
+26.35 GB
+404.78 MB
+24
+1534.9±21.1 ms
+1.557±0.012 s
+3.60 GB
+0
+4
+8
+12
+16
+20
+24
+Communication Rounds
+0.4
+0.6
+0.8
+1.0
+Recall@10
+Pacmann
+Amora
+Tiptoe
+100
+101
+Online Comm. (MB)
+0.4
+0.6
+0.8
+1.0
+Recall@10
+Panther
+Compass
+Pacmann
+Amora
+0.0
+0.5
+1.0
+Latency (s)
+0.4
+0.6
+0.8
+1.0
+Recall@10
+Pacmann
+Amora
+Tiptoe
+(a) SIFT1M
+0
+4
+8
+12
+16
+20
+24
+Communication Rounds
+0.2
+0.4
+0.6
+0.8
+1.0
+Recall@10
+Pacmann
+Amora
+Tiptoe
+100
+101
+102
+Online Comm. (MB)
+0.2
+0.4
+0.6
+0.8
+1.0
+Recall@10
+Panther
+Compass
+Pacmann
+Amora
+0.0
+0.5
+1.0
+1.5
+Latency (s)
+0.2
+0.4
+0.6
+0.8
+1.0
+Recall@10
+Pacmann
+Amora
+Tiptoe
+(b) SIFT10M
+0
+4
+8
+12
+16
+20
+24
+Communication Rounds
+0.2
+0.4
+0.6
+0.8
+1.0
+Recall@10
+Pacmann
+Amora
+Tiptoe
+100
+101
+Online Comm. (MB)
+0.2
+0.4
+0.6
+0.8
+1.0
+Recall@10
+Panther
+Compass
+Pacmann
+Amora
+0.0
+0.5
+1.0
+1.5
+Latency (s)
+0.2
+0.4
+0.6
+0.8
+1.0
+Recall@10
+Pacmann
+Amora
+Tiptoe
+(c) Deep1M
+0
+4
+8
+12
+16
+20
+24
+Communication Rounds
+0.6
+0.8
+1.0
+Recall@10
+Pacmann
+Amora
+Tiptoe
+100
+101
+102
+Online Comm. (MB)
+0.6
+0.8
+1.0
+Recall@10
+Panther
+Compass
+Pacmann
+Amora
+0.0
+0.5
+1.0
+Latency (s)
+0.6
+0.8
+1.0
+Recall@10
+Pacmann
+Amora
+Tiptoe
+(d) AGNEWS
+0
+4
+8
+12
+16
+20
+24
+Communication Rounds
+0.1
+0.2
+0.3
+MRR@10
+Pacmann
+Amora
+Tiptoe
+101
+102
+Online Comm. (MB)
+0.1
+0.2
+0.3
+MRR@10
+Panther
+Compass
+Pacmann
+Amora
+0
+1
+2
+3
+4
+5
+Latency (s)
+0.1
+0.2
+0.3
+MRR@10
+Pacmann
+Amora
+Tiptoe
+(e) MSMARCO
+Figure 4: Accuracy vs. communication rounds (top), online communication (middle), and latency (bottom) per query.
+Second, dimensionality shifts the cost composition without weak-
+ening the advantage: at the 1M scale, communication is dominated
+by the 𝑑-independent NbrPIR, so SIFT1M and Deep1M cost almost
+the same (1.09 MB vs. 1.24 MB at 7 rounds); on MSMARCO (𝑑= 768)
+and AGNEWS (𝑑= 1024), the wide dbvec columns become dominant
+(7.45 MB and 0.89 MB per query), yet the reductions over Pacmann
+are the largest of the five datasets (98% and 99%).
+7.3
+Accuracy vs. Online Communication
+Figure 4 shows how accuracy improves as the number of commu-
+nication rounds increases (top row) and as online communication
+accumulates (middle row).
+7.3.1
+Amora surpasses both graph-based baselines with far less
+communication. Amora surpasses Pacmann’s 24-round accuracy
+within 7 rounds on SIFT1M (0.956±0.001 vs. 0.947±0.002), SIFT10M
+(0.920±0.002 vs. 0.903±0.007), and MSMARCO (0.263±0.009 vs.
+0.240±0.008), and within 11 rounds on Deep1M (0.946±0.003 vs.
+0.935±0.002). On AGNEWS, 3 rounds already match Pacmann’s
+16-round result (0.936±0.001 vs. 0.935±0.014). Amora reaches these
+points with 93%–99% less online communication, for example 1.09 MB
+vs. 34.34 MB on SIFT1M and 0.89 MB vs. 132.61 MB on AGNEWS.
+The gap is not tied to one operating point. In the middle row of Fig-
+ure 4, Amora’s most expensive setting still costs less than Pacmann’s
+cheapest one on every dataset, 2.08 MB vs. 5.72 MB on SIFT1M and
+4.20 MB vs. 49.73 MB on AGNEWS. This gap stems from the amorti-
+zation effect: each VecPIR query returns distances to all 𝐾vertices
+in a partition simultaneously, providing a much denser view of
+the search space per round than Pacmann’s per-vertex retrieval.
+At matched accuracy, Amora saves 77%–98% of Compass’s online
+communication, for example 3.62 MB vs. 15.92 MB on SIFT10M and
+0.89 MB vs. 44.90 MB on AGNEWS. Compass also follows the per-
+vertex cost model, and Ring ORAM pads every bucket it touches
+with dummy blocks, so much of each transfer carries no useful data.
+Because each block holds a full vector, the saving grows with the
+dimension at a comparable scale, from 86% on Deep1M (𝑑=96) to
+93% on SIFT1M (𝑑=128) and 98% on AGNEWS (𝑑=1024), while the
+two larger datasets fall to SIFT10M’s 77% and MSMARCO’s 86%.
+11
+
+
+Qiuhao Wang, Zuowei Chen, Xu Yang, Saiyu Qi, and Yong Qi
+7.3.2
+Convergence speed is related to scale and dimensionality.
+SIFT1M (𝑑= 128) reaches 0.921±0.005 at 5 rounds and 0.967±0.002
+at 11 rounds, while Deep1M (𝑑= 96) starts slower (0.871 ± 0.003
+at 5 rounds) and reaches 0.946 ± 0.003 at 11 rounds. Scaling from
+SIFT1M to SIFT10M (10× more vectors, same 𝑑= 128) slows con-
+vergence to 0.871 ± 0.004 at 5 rounds, as the larger graph requires
+more partitions to be explored. In fact, scale and dimensionality act
+through the partition count 𝐶∗=
+√︁
+𝑁/𝑑(Eq. 5): each VecPIR query
+reveals one partition, so a smaller 𝑁or a larger 𝑑means fewer parti-
+tions and faster convergence. AGNEWS converges fastest (𝐶∗= 27,
+0.936±0.001 at 3 rounds), while Deep1M (𝐶∗= 102) and SIFT10M
+(𝐶∗= 279) are the slowest (0.733±0.001 and 0.744±0.004 at the
+same budget). MSMARCO (𝐶∗= 107) also gains little after 7 rounds
+(0.263 ± 0.009 at 7 rounds vs. 0.264 ± 0.006 at 11).
+7.3.3
+Iterative graph traversal outperforms single-round retrieval.
+Tiptoe’s single-round cluster-based approach achieves substantially
+lower accuracy on all five datasets: 0.39 on SIFT1M, 0.48 on Deep1M,
+0.40 on SIFT10M, 0.67 on AGNEWS, and 0.17 on MSMARCO, all be-
+low Amora at only 3 rounds. We enlarge Panther’s communication
+budget by accessing more clusters to achieve a higher accuracy. On
+the four recall datasets, Amora saves 97%–99% of the communica-
+tion and improves accuracy, e.g., 0.75 MB vs. 26.2 MB at 0.921±0.005
+vs. 0.907 on SIFT1M, and 0.89 MB vs. 120.5 MB at 0.936±0.001 vs.
+0.910 on AGNEWS. On MSMARCO, Amora saves 97% of the com-
+munication (7.45 MB vs. 253.3 MB) and improves MRR@10 by 0.006
+(0.253±0.007 vs. 0.247). The reason is that cluster-based retrieval
+scans only a small number of nearby clusters without iterative re-
+finement across partition boundaries, so nearest neighbors residing
+in other partitions are ignored.
+7.4
+Accuracy vs. Latency
+The bottom row of Figure 4 compares the accuracy-latency tradeoff
+by varying the number of rounds.
+7.4.1
+Fewer rounds translate into lower latency. Figure 4 shows that
+Amora’s accuracy results flatten early: by 0.41 s on SIFT1M, 0.52 s on
+Deep1M, 1.06 s on SIFT10M, and 0.72 s on AGNEWS, the remaining
+accuracy gain is within about 0.02. At 0.85, 0.84, 1.01, and 0.54 s, Pac-
+mann has reached only 0.899±0.006, 0.899±0.004, 0.857±0.007, and
+0.911±0.009, versus Amora’s 0.956±0.001, 0.939±0.003, 0.942±0.002,
+and 0.977±0.001 at the latencies above. The latency standard de-
+viation stays below 0.05 s at all these points. On these datasets,
+computation accounts for 13%, 14%, 58%, and 38% of Amora’s per-
+query latency, and for merely 6%, 6%, 19%, and 8% of Pacmann’s;
+the remainder is network round-trip delay. Latency is therefore
+governed by the round count, even on SIFT10M where computa-
+tion takes over half of Amora’s latency, and Amora’s fewer rounds
+translate directly into the 45–66% latency reductions.
+7.4.2
+Computation dominates latency on MSMARCO. MSMARCO’s
+product of scale and dimensionality is the largest among the five
+datasets (𝑁·𝑑≈6.8×109), making each matrix multiplication ex-
+pensive: server computation reaches 1.521 ± 0.016 s at 5 rounds,
+accounting for 86% of total latency, so each additional iteration
+costs Amora 0.62–0.75 s of computation, while Pacmann spends
+only about 0.06 s per round, mostly on the RTT. Even so, Amora
+matches Pacmann at the low-latency end (≈1.05 s) and reaches
+higher accuracy (0.253 ± 0.007 vs. 0.240 ± 0.008).
+7.5
+Ablation Study
+7.5.1
+Optimization techniques. We ablate three key optimization
+techniques described in §5.3 to quantify their individual contribu-
+tions. For each ablation, we disable one technique (denoted "w/o")
+while keeping all others enabled. Figure 5 reports accuracy against
+latency as the iteration count 𝑇grows.
+Batch PIR reduces latency. Without batching, each PIR query
+occupies its own communication round, so one search iteration
+costs 𝐵𝑣+ 𝐵𝑛rounds instead of two. At the operating points in
+Table 2, the unbatched search needs 9 rounds on SIFT1M, 13 on
+SIFT10M, 16 on Deep1M, 6 on AGNEWS, and 15 on MSMARCO,
+adding proportionally more RTT delays. Each unbatched round
+also requires an independent full database scan, whereas batching
+amortizes the scan across multiple queries in a single wider matrix
+multiplication and consumes less memory bandwidth. Across all
+datasets and round counts, disabling batching raises the computa-
+tion by 1.4–2.0×, and at the operating points it grows from 0.039 s
+to 0.059 s on SIFT1M and from 1.588 s to 3.022 s on MSMARCO.
+Figure 5 shows that the "w/o batch" results track Amora in accuracy
+but are shifted right along the latency axis. At matched accuracy,
+the latency rises by 1.6–2.3×, for example from 0.29 s to 0.51 s on
+SIFT1M and from 1.84 s to 3.77 s on MSMARCO. All standard devi-
+ations of computation and latency here are below 0.02 s.
+TopCand exploration improves accuracy under a tight budget.
+Disabling TopCand exploration forces the search to follow graph
+edges only. At the operating points in Table 2, Recall@10 drops by
+0.034±0.004 on Deep1M, 0.018±0.004 on SIFT10M, and 0.016±0.001
+on AGNEWS, and MRR@10 drops by 0.016±0.007 on MSMARCO,
+while on SIFT1M the gap stays within 0.007 at every round count.
+TopCand exploration seeds the candidate heap with each partition’s
+closest vertices, so the search reaches promising regions that the
+candidates’ edges cannot within the round budget.
+Centroid-based pruning improves accuracy under a tight
+budget. Disabling centroid-based pruning reverts to a first-come-
+first-served ordering with no pruning. At the operating points in
+Table 2, accuracy falls on all five datasets: Recall@10 by 0.118±0.006
+on AGNEWS, 0.088±0.002 on SIFT10M, 0.048±0.002 on SIFT1M,
+and 0.036±0.004 on Deep1M, and MRR@10 by 0.014±0.011 on MS-
+MARCO. Each round admits only 𝐵𝑣partitions, and centroid-based
+pruning directs this limited budget toward the closest partitions
+rather than toward whichever ones are discovered first. The gain is
+therefore largest under Amora’s tight round budgets.
+7.5.2
+Dual-PIR split layout. We validate the necessity of the dual-
+PIR split against a combined layout that stores the vector and the
+neighbor list of each vertex in the same column (Figure 1). We
+build the combined database with its own optimal column capacity
+𝑆𝑐=
+√︁
+𝑁/(𝑑+ 𝑀0 𝑡), and we drive it with the same centroid entry
+and graph navigation as Amora. We compare the two layouts under
+two conditions. First, we give the combined layout the same online
+communication budget that the split layout spends at its operating
+point in Table 2. Within this budget, the accuracy of the combined
+layout collapses to 0.004 on SIFT1M, 0.044 on SIFT10M, 0.027 on
+12
+
+
+Amora: Communication-Efficient Private Approximate Nearest Neighbors Search
+0.0
+0.5
+1.0
+Latency (s)
+0.7
+0.8
+0.9
+1.0
+Recall@10
+Amora
+w/o batch
+w/o prune
+w/o TopCand
+(a) SIFT1M
+0
+1
+2
+Latency (s)
+0.6
+0.8
+1.0
+Recall@10
+Amora
+w/o batch
+w/o prune
+w/o TopCand
+(b) SIFT10M
+0.0
+0.5
+1.0
+1.5
+Latency (s)
+0.6
+0.8
+1.0
+Recall@10
+Amora
+w/o batch
+w/o prune
+w/o TopCand
+(c) Deep1M
+0.0
+0.5
+1.0
+1.5
+2.0
+Latency (s)
+0.8
+0.9
+1.0
+Recall@10
+Amora
+w/o batch
+w/o prune
+w/o TopCand
+(d) AGNEWS
+0.0
+2.5
+5.0
+7.5
+10.0
+Latency (s)
+0.2
+0.3
+MRR@10
+Amora
+w/o batch
+w/o prune
+w/o TopCand
+(e) MSMARCO
+Figure 5: Optimization techniques ablation study.
+101
+103
+105
+Online comm. (MB)
+0.921
+0.920
+0.922
+0.936
+0.253
+0.922
+0.920
+0.922
+0.938
+0.257
+SIFT1M
+SIFT10M
+Deep1M
+AGNEWS
+MSMARCO
+10
+3
+10
+1
+101
+103
+105
+Compute per query (s)
+Comm. of Split (bars)
+Compute of Split (lines)
+Comm. of Combined (bars)
+Compute of Combined (lines)
+Figure 6: Combined layout vs. dual-PIR split layout.
+Deep1M, and 0 on MSMARCO, and one combined query on AG-
+NEWS already exceeds the whole budget. Second, we measure the
+cost for the combined layout to reach the same accuracy as the split
+layout, and Figure 6 reports the results. The combined layout pays
+25× to 161× more online communication and 58× to 286× more
+computation. The gap comes from the heavy per-vertex payload. A
+combined column carries 𝑑+ 𝑀0 𝑡values per vertex, so one query
+returns only a few vertices and the search issues far more queries.
+The dual-PIR split is therefore a necessary design.
+7.6
+Parameter Sensitivity Study
+7.6.1
+Result-heap capacity ef . Figure 7 sweeps ef from 𝑘= 10
+to 300 on all five datasets at their operating points in Table 2. In
+Figure 7(a), accuracy rises slightly from ef = 𝑘and then stays
+flat. The largest gain is on SIFT10M, where Recall@10 grows from
+0.895±0.002 at ef = 10 to 0.920±0.002 at ef = 50. Over the same
+range, the gain is 0.012±0.006 on MSMARCO, 0.009±0.005 on Deep1M,
+0.004±0.001 on SIFT1M, and below 0.001 on AGNEWS. Beyond
+ef = 50 and up to ef = 300, no dataset moves by more than 0.007,
+which is at the level of the standard deviation across the five re-
+peated runs (0.001–0.008). In Figure 7(b), the communication is
+exactly constant on each dataset (0.76, 3.62, 1.24, 0.89, and 7.45 MB)
+and the latency stays flat, because the number of PIR queries is
+fixed by 𝑇, 𝐵𝑣, and 𝐵𝑛. The accuracy trend follows from the role
+of ef as the admission threshold of the result heap. When ef is
+close to 𝑘, the tight threshold rejects some promising candidates,
+and the NbrPIR batch is padded with random subgroups, so part
+of the budget is wasted and accuracy drops slightly. Once ef is
+large enough for the closest candidates to fill 𝐵𝑛in every round, a
+larger ef only admits distant vertices that the search never pops,
+so the explored candidates and the accuracy stay the same. The
+number of popped and expanded candidate vertices confirms this.
+From ef = 10 to 30 the count rises from 122 to 131 on SIFT1M,
+180 to 201 on SIFT10M, 179 to 203 on Deep1M, and 199 to 268 on
+MSMARCO, and then changes by less than 4% up to ef = 300. On
+AGNEWS it stays at 62 throughout, so the accuracy does not move.
+We therefore set ef = 50, safely inside the flat range.
+10
+20
+30
+40
+50
+100
+200
+300
+ef
+90
+92
+94
+Recall@10 (%)
+SIFT1M
+SIFT10M
+Deep1M
+AGNEWS
+MSMARCO (right)
+22
+24
+26
+MRR@10 (%)
+(a) Accuracy.
+0
+2
+4
+6
+8
+10
+Online comm. (MB)
+10
+20
+30
+40
+50
+100
+200
+300
+ef
+0.0
+0.5
+1.0
+1.5
+2.0
+Latency (s)
+SIFT1M
+SIFT10M
+Deep1M
+AGNEWS
+MSMARCO
+(b) Online communication (bars) and latency (lines).
+Figure 7: Sensitivity of the result-heap capacity ef .
+1
+2
+4
+8
+tc
+85.0
+87.5
+90.0
+92.5
+95.0
+Recall@10 (%)
+SIFT1M
+SIFT10M
+Deep1M
+AGNEWS
+MSMARCO (right)
+22
+24
+26
+MRR@10 (%)
+Figure 8: Sensitivity of the TopCand count 𝑡𝑐.
+7.6.2
+TopCand count 𝑡𝑐. Figure 8 sweeps 𝑡𝑐∈{1, 2, 4, 8} on all five
+datasets at their operating points in Table 2, with all other parame-
+ters fixed. The communication is identical across the sweep, because
+the number of PIR queries is fixed by 𝑇, 𝐵𝑣, and 𝐵𝑛. Therefore, 𝑡𝑐
+affects only the accuracy. On SIFT1M, SIFT10M, and Deep1M, the
+accuracy declines as 𝑡𝑐grows, with Recall@10 on SIFT1M dropping
+from 0.921±0.005 at 𝑡𝑐= 1 to 0.866±0.001 at 𝑡𝑐= 8. On AGNEWS,
+𝑡𝑐= 2 performs best (0.936±0.001 vs. 0.919±0.001 at 𝑡𝑐= 1), and on
+MSMARCO 𝑡𝑐has little effect on the MRR@10, which stays between
+0.239 and 0.247. Competition inside the candidate heap explains
+why a large 𝑡𝑐degrades the accuracy. The TopCand seeds and the
+graph neighbors share the heap, and each iteration pops only 𝐵𝑛
+candidates for the NbrPIR batch. Seeds from the same partition lie
+close to one another and bring little new information, so a large 𝑡𝑐
+fills the limited slots with redundant seeds and displaces the edge
+expansion around the best candidates. On AGNEWS, the single-
+iteration budget (𝑇= 1) limits how far the edge expansion can
+proceed, so a second seed broadens the exploration. We therefore
+set 𝑡𝑐= 2 on AGNEWS and 𝑡𝑐= 1 on the other four datasets.
+13
+
+
+Qiuhao Wang, Zuowei Chen, Xu Yang, Saiyu Qi, and Yong Qi
+C * /4
+C * /2
+C *
+2C *
+4C *
+Number of partitions
+0.0
+0.5
+1.0
+1.5
+2.0
+Relative comm.
+SIFT1M
+SIFT10M
+Deep1M
+AGNEWS
+MSMARCO
+(a) Communication.
+C * /4
+C * /2
+C *
+2C *
+4C *
+Number of partitions
+80
+90
+100
+Recall@10 (%)
+16
+20
+24
+28
+MRR@10 (%)
+SIFT1M
+SIFT10M
+Deep1M
+AGNEWS
+MSMARCO (right)
+(b) Accuracy.
+Figure 9: Sensitivity of the partition count 𝐶.
+7.6.3
+Partition count 𝐶. Figure 9 sweeps the partition count over
+{𝐶∗/4,𝐶∗/2,𝐶∗, 2𝐶∗, 4𝐶∗} on all five datasets, where 𝐶∗= ⌊
+√︁
+𝑁/𝑑⌋
+is the default from Eq. 5. Each level uses a rebuilt index and a unified
+search protocol (𝑇= 3, 𝑡𝑐= 1). Figure 9(a) shows that the com-
+munication reaches its minimum at 𝐶∗on every dataset, and both
+𝐶∗/4 and 4𝐶∗pay 1.6× to 1.9× the communication of𝐶∗. Figure 9(b)
+shows that increasing 𝐶beyond 𝐶∗lowers the accuracy on every
+dataset, from 𝐶∗to 4𝐶∗by 0.120 on Deep1M, 0.103 on SIFT10M,
+0.067 on SIFT1M, and 0.022 on both AGNEWS and MSMARCO,
+because smaller partitions let one VecPIR query return fewer dis-
+tances. Decreasing 𝐶below 𝐶∗helps only on some datasets: at
+𝐶∗/4 the accuracy rises on SIFT10M (+0.054), MSMARCO (+0.009),
+and SIFT1M (+0.002), but falls on Deep1M (−0.009) and AGNEWS
+(−0.005). We therefore use 𝐶∗on all datasets, since it minimizes the
+communication and achieves a high level of accuracy.
+8
+Conclusion
+We presented Amora, a communication-efficient PANNS system
+with high accuracy. The core is a dual-PIR split layout built on
+SimplePIR and graph partitioning: VecPIR retrieves distances to all
+vertices in a partition at once, and NbrPIR retrieves neighbor lists at
+subgroup granularity, maximizing the information retrieved per PIR
+query. Based on the dual-PIR, batch PIR merges concurrent queries
+to reduce communication rounds and the number of database scans,
+centroid-based pruning directs the limited PIR budget toward the
+most promising regions, and TopCand exploration seeds jump-style
+graph navigation from each retrieved partition. Experiments on five
+datasets of different scales and dimensionalities show that Amora
+reduces online communication by 93–99% over the competitors
+while achieving higher search accuracy.
+References
+[1] Sebastian Angel, Hao Chen, Kim Laine, and Srinath T. V. Setty. 2018. PIR with
+Compressed Queries and Amortized Query Processing. In IEEE Symposium on
+Security and Privacy. IEEE Computer Society, 962–979.
+[2] Hilal Asi, Fabian Boemer, Nicholas Genise, Muhammad Haris Mughees, Tabitha
+Ogilvie, Rehan Rishi, Guy N. Rothblum, Kunal Talwar, Karl Tarbe, Ruiyu Zhu, and
+Marco Zuliani. 2024. Scalable Private Search with Wally. CoRR abs/2406.06761
+(2024).
+[3] Artem Babenko and Victor S. Lempitsky. 2016. Efficient Indexing of Billion-Scale
+Datasets of Deep Descriptors. In CVPR. IEEE Computer Society, 2055–2063.
+[4] Elette Boyle, Niv Gilboa, and Yuval Ishai. 2016. Function Secret Sharing: Im-
+provements and Extensions. In CCS. ACM, 1292–1303.
+[5] Zvika Brakerski, Craig Gentry, and Vinod Vaikuntanathan. 2014. (Leveled) Fully
+Homomorphic Encryption without Bootstrapping. ACM Trans. Comput. Theory
+6, 3 (2014), 13:1–13:36.
+[6] Hao Chen, Ilaria Chillotti, Yihe Dong, Oxana Poburinnaya, Ilya P. Razenshteyn,
+and M. Sadegh Riazi. 2020. SANNS: Scaling Up Secure Approximate k-Nearest
+Neighbors Search. In USENIX Security Symposium. USENIX Association, 2111–
+2128.
+[7] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li,
+Mao Yang, and Jingdong Wang. 2021. SPANN: Highly-efficient Billion-scale
+Approximate Nearest Neighborhood Search. In NeurIPS. 5199–5212.
+[8] Xuan Chen, Shujie Cui, Joseph K. Liu, Shifeng Sun, and Shangqi Lai. 2025. Pri-
+vANN: Practical and Efficient Private Approximate Nearest Neighbor Search. In
+TrustCom. IEEE, 1218–1226.
+[9] Benny Chor, Eyal Kushilevitz, Oded Goldreich, and Madhu Sudan. 1998. Private
+Information Retrieval. J. ACM 45, 6 (1998), 965–981.
+[10] Victor Costan and Srinivas Devadas. 2016. Intel SGX Explained. IACR Cryptol.
+ePrint Arch. 2016 (2016), 86.
+[11] Mayur Datar, Nicole Immorlica, Piotr Indyk, and Vahab S. Mirrokni. 2004.
+Locality-sensitive hashing scheme based on p-stable distributions. In SCG. ACM,
+253–262.
+[12] Fangming Dong, Pinghui Wang, Yuance Wang, Chen Zhang, and Lizhen Cui.
+2025. Fast Private Retrieval on Key-Value Store with Multiple Values per Key. In
+ICDE. IEEE, 2698–2711.
+[13] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy,
+Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. 2026.
+The Faiss Library. IEEE Trans. Big Data 12, 2 (2026), 346–361.
+[14] Cynthia Dwork, Frank McSherry, Kobbi Nissim, and Adam D. Smith. 2006. Cali-
+brating Noise to Sensitivity in Private Data Analysis. In TCC. Springer, 265–284.
+[15] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast Approximate
+Nearest Neighbor Search With The Navigating Spreading-out Graph. Proc. VLDB
+Endow. 12, 5 (2019), 461–474.
+[16] Craig Gentry. 2009. Fully homomorphic encryption using ideal lattices. In STOC.
+ACM, 169–178.
+[17] Aristides Gionis, Piotr Indyk, and Rajeev Motwani. 1999. Similarity Search in
+High Dimensions via Hashing. In VLDB. Morgan Kaufmann, 518–529.
+[18] Oded Goldreich and Rafail Ostrovsky. 1996. Software Protection and Simulation
+on Oblivious RAMs. J. ACM 43, 3 (1996), 431–473.
+[19] Mihajlo Grbovic and Haibin Cheng. 2018.
+Real-time Personalization using
+Embeddings for Search Ranking at Airbnb. In KDD. ACM, 311–320.
+[20] Daniel Günther, Maurice Heymann, Benny Pinkas, and Thomas Schneider. 2022.
+GPU-accelerated PIR with Client-Independent Preprocessing for Large-Scale
+Applications. In USENIX Security Symposium. USENIX Association, 1759–1776.
+[21] Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern,
+and Sanjiv Kumar. 2020. Accelerating Large-Scale Inference with Anisotropic
+Vector Quantization. In ICML (Proceedings of Machine Learning Research). PMLR,
+3887–3896.
+[22] Alexandra Henzinger, Emma Dauterman, Henry Corrigan-Gibbs, and Nickolai
+Zeldovich. 2023. Private Web Search with Tiptoe. In SOSP. ACM, 396–416.
+[23] Alexandra Henzinger, Matthew M. Hong, Henry Corrigan-Gibbs, Sarah Meik-
+lejohn, and Vinod Vaikuntanathan. 2023. One Server for the Price of Two:
+Simple and Fast Single-Server Private Information Retrieval. In USENIX Security
+Symposium. USENIX Association, 3889–3905.
+[24] Piotr Indyk and Rajeev Motwani. 1998. Approximate Nearest Neighbors: Towards
+Removing the Curse of Dimensionality. In STOC. ACM, 604–613.
+[25] Masajiro Iwasaki and Daisuke Miyazaki. 2018. Optimization of Indexing Based
+on k-Nearest Neighbor Graph for Proximity Search in High-dimensional Data.
+CoRR abs/1810.07355 (2018).
+[26] Hervé Jégou, Matthijs Douze, and Cordelia Schmid. 2011. Product Quantization
+for Nearest Neighbor Search. IEEE Trans. Pattern Anal. Mach. Intell. 33, 1 (2011),
+117–128.
+[27] Jeff Johnson, Matthijs Douze, and Hervé Jégou. 2021. Billion-Scale Similarity
+Search with GPUs. IEEE Trans. Big Data 7, 3 (2021), 535–547.
+[28] Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey
+Edunov, Danqi Chen, and Wen-tau Yih. 2020. Dense Passage Retrieval for
+Open-Domain Question Answering. In EMNLP. Association for Computational
+Linguistics, 6769–6781.
+[29] George Karypis and Vipin Kumar. 1998. A Fast and High Quality Multilevel
+Scheme for Partitioning Irregular Graphs. SIAM J. Sci. Comput. 20, 1 (1998),
+359–392.
+[30] Zili Kou, Sharad Sinha, Wenjian He, and Wei Zhang. 2023. Cache Side-channel
+Attacks and Defenses of the Sliding Window Algorithm in TEEs. In DATE. IEEE,
+1–6.
+[31] Eyal Kushilevitz and Rafail Ostrovsky. 1997. Replication is NOT Needed: SIN-
+GLE Database, Computationally-Private Information Retrieval. In FOCS. IEEE
+Computer Society, 364–373.
+[32] Fan Lang, Wei Wang, Lingjia Meng, Jingqiang Lin, Qiongxiao Wang, and Linli
+Lu. 2022. MoLE: Mitigation of Side-channel Attacks against SGX via Dynamic
+Data Location Escape. In ACSAC. ACM, 978–988.
+[33] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir
+Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim
+Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-Augmented
+Generation for Knowledge-Intensive NLP Tasks. In NeurIPS.
+[34] Baiyu Li, Daniele Micciancio, Mariana Raykova, and Mark Schultz. 2024. Hintless
+Single-Server Private Information Retrieval. In CRYPTO. Springer, 183–217.
+14
+
+
+Amora: Communication-Efficient Private Approximate Nearest Neighbors Search
+[35] Jingyu Li, Zhicong Huang, Min Zhang, Cheng Hong, Jian Liu, Tao Wei, and
+Wenguang Chen. 2025. Panther: Private Approximate Nearest Neighbor Search
+in the Single Server Setting. In CCS. ACM, 365–379.
+[36] David G. Lowe. 2004. Distinctive Image Features from Scale-Invariant Keypoints.
+Int. J. Comput. Vis. 60, 2 (2004), 91–110.
+[37] Yury Malkov, Alexander Ponomarenko, Andrey Logvinov, and Vladimir Krylov.
+2014. Approximate nearest neighbor algorithm based on navigable small world
+graphs. Inf. Syst. 45 (2014), 61–68.
+[38] Yury A. Malkov and Dmitry A. Yashunin. 2020. Efficient and Robust Approximate
+Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs. IEEE
+Trans. Pattern Anal. Mach. Intell. 42, 4 (2020), 824–836.
+[39] Samir Jordan Menon and David J. Wu. 2024. YPIR: High-Throughput Single-
+Server PIR with Silent Preprocessing. In USENIX Security Symposium. USENIX
+Association, 1–19.
+[40] Tomás Mikolov, Kai Chen, Greg Corrado, and Jeffrey Dean. 2013. Efficient
+Estimation of Word Representations in Vector Space. In ICLR (Workshop Poster).
+[41] Nimish Mishra, Kislay Arya, Sarani Bhattacharya, Paritosh Saxena, and Deb-
+deep Mukhopadhyay. 2025. "OOPS!": Out-Of-Band Remote Power Side-Channel
+Attacks on Intel SGX and TDX. In DAC. IEEE, 1–7.
+[42] Tri Nguyen, Mir Rosenberg, Xia Song, Jianfeng Gao, Saurabh Tiwary, Rangan
+Majumder, and Li Deng. 2016. MS MARCO: A Human Generated MAchine
+Reading COmprehension Dataset. In CoCo@NIPS (CEUR Workshop Proceedings).
+CEUR-WS.org.
+[43] Jeffrey Pennington, Richard Socher, and Christopher D. Manning. 2014. Glove:
+Global Vectors for Word Representation. In EMNLP. ACL, 1532–1543.
+[44] Oded Regev. 2009. On lattices, learning with errors, random linear codes, and
+cryptography. J. ACM 56, 6 (2009), 34:1–34:40.
+[45] Ling Ren, Christopher W. Fletcher, Albert Kwon, Emil Stefanov, Elaine Shi,
+Marten van Dijk, and Srinivas Devadas. 2015. Constants Count: Practical Im-
+provements to Oblivious RAM. In USENIX Security Symposium. USENIX Associ-
+ation, 415–430.
+[46] Sacha Servan-Schreiber, Simon Langowski, and Srinivas Devadas. 2022. Private
+Approximate Nearest Neighbor Search with Sublinear Communication. In SP.
+IEEE, 911–929.
+[47] Adi Shamir. 1979. How to Share a Secret. Commun. ACM 22, 11 (1979), 612–613.
+[48] Jie Song, Zhen Xu, Yan Zhang, Pengwei Zhan, Mingxuan Li, Shuai Ma, and Ru
+Xie. 2026. BKPIR: Keyword PIR for Private Boolean Retrieval. In NDSS. The
+Internet Society, 1–18.
+[49] Shang Song, Lin Liu, Rongmao Chen, Wei Peng, and Yi Wang. 2023. Secure Ap-
+proximate Nearest Neighbor Search with Locality-Sensitive Hashing. In ESORICS.
+Springer, 411–430.
+[50] Emil Stefanov, Marten van Dijk, Elaine Shi, T.-H. Hubert Chan, Christopher W.
+Fletcher, Ling Ren, Xiangyao Yu, and Srinivas Devadas. 2018. Path ORAM: An
+Extremely Simple Oblivious RAM Protocol. J. ACM 65, 4 (2018), 18:1–18:26.
+[51] Suhas Jayaram Subramanya, Devvrit, Harsha Vardhan Simhadri, Ravishankar
+Krishnaswamy, and Rohan Kadekodi. 2019. Rand-NSG: Fast Accurate Billion-
+point Nearest Neighbor Search on a Single Node. In NeurIPS. 13748–13758.
+[52] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li, Xi-
+angyu Wang, Xiangzhou Guo, Chengming Li, Xiaohai Xu, Kun Yu, Yuxing Yuan,
+Yinghao Zou, Jiquan Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang, Yihua
+Mo, Jun Gu, Ruiyi Jiang, Yi Wei, and Charles Xie. 2021. Milvus: A Purpose-Built
+Vector Data Management System. In SIGMOD Conference. ACM, 2614–2627.
+[53] Andrew Chi-Chih Yao. 1986. How to Generate and Exchange Secrets (Extended
+Abstract). In FOCS. IEEE Computer Society, 162–167.
+[54] Jiaoyi Zhang, Liqiang Peng, Mo Sha, Weiran Liu, Xiang Li, Sheng Wang, Feifei
+Li, Mingyu Gao, and Huanchen Zhang. 2025. Femur: A Flexible Framework for
+Fast and Secure Querying from Public Key-Value Store. Proc. ACM Manag. Data
+3, 3 (2025), 162:1–162:29.
+[55] Mingxun Zhou, Andrew Park, Wenting Zheng, and Elaine Shi. 2024. Piano:
+Extremely Simple, Single-Server PIR with Sublinear Server Computation. In SP.
+IEEE, 4296–4314.
+[56] Mingxun Zhou, Elaine Shi, and Giulia Fanti. 2025. Pacmann: Efficient Private
+Approximate Nearest Neighbor Search. In ICLR. OpenReview.net, 1–21.
+[57] Jinhao Zhu, Liana Patel, Matei Zaharia, and Raluca Ada Popa. 2025. Compass:
+Encrypted Semantic Search with High Accuracy. In OSDI. USENIX Association,
+915–938.
+15

@@ -1,0 +1,2176 @@
+RemoteANN: A Native Vector Search Engine for Cloud Object
+Storage
+Yutong Gou
+Nanyang Technological University
+Singapore
+yutong003@e.ntu.edu.sg
+Silu Huang
+ByteDance
+USA
+silu.huang@bytedance.com
+Yue Wang
+ByteDance
+USA
+yue.w@bytedance.com
+Jianjun Chen
+ByteDance
+USA
+jianjun.chen@bytedance.com
+Cheng Long
+Nanyang Technological University
+Singapore
+c.long@ntu.edu.sg
+Abstract
+Vector search engines built on cloud object storage have drawn
+growing attention from both academia and industry. These systems
+typically adopt a disaggregated storage-compute architecture, per-
+sisting the primary vector payload in object stores (e.g., Amazon
+S3) while retaining compact index metadata on compute nodes.
+However, conventional vector indexing structures are not natively
+tailored to the pronounced network latency and per-request access
+costs of cloud object stores, resulting in network I/O amplification,
+degraded query throughput, and higher API expenses.
+To resolve these challenges, we present RemoteANN, a vector
+search engine explicitly co-designed for cloud object storage across
+indexing and querying. To mitigate the dominant network I/O bot-
+tleneck, RemoteANN couples an Inverted File (IVF) index with
+RaBitQ quantization, further optimized by inter-cluster and intra-
+cluster data reordering for improved data locality. Building on this
+tailored data layout, RemoteANN’s query engine combines cluster
+pruning, fine-grained Range-GET requests, request merging, and
+local NVMe SSD caching, dramatically reducing discrete storage
+requests and network transfer volume without sacrificing accuracy.
+To address the index construction bottleneck, we further develop
+QGKMeans, which substantially reduces construction latency with-
+out compromising clustering quality. Extensive evaluations on real-
+world datasets demonstrate that, compared with representative
+baselines, RemoteANN achieves up to a 5.9× throughput speedup
+while issuing up to 16.1× fewer object storage requests at 97% target
+recall.
+1
+Introduction
+Cloud object storage platforms (e.g., Amazon S3 [3], Azure Blob
+Storage [50], and Torch Object Storage [12]) have become an attrac-
+tive storage backend for modern database systems, owing to their
+horizontal scalability, high data durability, and cost efficiency. By
+decoupling compute from storage, this architecture allows stateless
+compute instances (e.g., AWS EC2 [2]) to handle query execution
+while offloading primary data to elastic, remote object stores. Moti-
+vated by these infrastructure benefits, both academia and industry
+have sought to extend this paradigm to vector database systems
+and approximate nearest neighbor (ANN) search engines (e.g., Ama-
+zon S3 Vectors [4], Turbopuffer [61], Lance [46], Databricks [53]).
+In these systems, compact index metadata and routing structures
+reside in the compute nodes’ local storage, while the bulk of high-
+dimensional vector payloads is persisted in cloud object storage.
+However, conventional vector index structures are not natively
+suited to cloud object storage, and deploying them directly leads
+to suboptimal query performance and elevated operational cost.
+First, compared to local storage media (e.g., DRAM and local SSDs),
+data retrieval from cloud object stores incurs substantial time-to-
+first-byte (TTFB) network latency, which dominates total download
+latency for small payload requests [19]. As a result, graph-based
+index structures [22, 40, 49] suffer severe performance degradation
+due to their iterative, multi-hop routing patterns, and existing vector
+search systems on cloud object storage predominantly adopt cluster-
+based indices instead (e.g., IVF in Lance [46] and SPFresh [65] in
+turbopuffer [61]). Second, cloud providers charge substantially for
+the number of discrete storage requests issued, which is a cost
+dimension that traditional, locally-oriented index designs do not
+account for. A naive implementation can therefore trigger excessive
+request volumes, leading to prohibitive API costs. Despite this, no
+existing system jointly optimizes index layout, index construction,
+and query execution for the latency and cost characteristics of cloud
+object storage.
+To close this gap, we present RemoteANN, a vector search engine
+explicitly designed for cloud object storage. Through an algorithm-
+system co-design spanning indexing, querying, and the storage
+hierarchy, RemoteANN systematically mitigates the network I/O
+bottlenecks that limit vector search on cloud object storage. Specif-
+ically, RemoteANN makes the following contributions in both in-
+dexing and querying:
+• Query-Oriented Indexing and Data Layout.
+RemoteANN combines an IVF index with RaBitQ quanti-
+zation [25, 27]. Following existing frameworks, it keeps
+index metadata and 1-bit RaBitQ codes in DRAM while
+storing primary vector payloads in cloud object storage.
+The memory-resident codes support pruning before remote
+data retrieval, while inter-cluster and intra-cluster data
+reordering improve physical locality. These changes sub-
+stantially improve the effectiveness of our I/O optimization
+strategies during querying. To reduce the cost of index-
+ing, we develop QGKMeans, which uses SymphonyQG [31]
+to accelerate centroid assignment during 𝑘-means cluster-
+ing. This substantially reduces index construction latency
+without compromising clustering quality.
+1
+arXiv:2610.25172v1  [cs.DB]  18 Oct 2026
+
+
+Figure 1: Vector search on cloud object storage.
+• Co-Designed Query Engine.
+RemoteANN incorporates a multi-tier query optimization
+framework tailored to cloud object storage, including
+RaBitQ-driven cluster pruning that prunes clusters based
+on analytical error bounds provided by RaBitQ, range-
+optimized Range-GET requests that download only the
+minimal candidate byte slices, request merging to reduce
+API cost, and a local NVMe SSD caching layer that bypasses
+remote I/O. Built upon our co-designed data layout, these
+components jointly reduce cloud I/O overhead without
+sacrificing query performance.
+We evaluate RemoteANN on diverse real-world datasets span-
+ning a range of dimensions and scales. The results confirm the
+effectiveness of our environment-specific design for both index-
+ing and querying. In extensive experiments on real-world datasets,
+RemoteANN achieves up to a 5.9× throughput speedup while is-
+suing up to 16.1× fewer discrete storage requests compared with
+representative baselines.
+2
+Preliminary
+2.1
+Cloud Object Storage
+Cloud object storage refers to the online object storage service of-
+fered by cloud vendors [3, 12, 30, 37, 50, 52, 60]. By orchestrating a
+distributed environment across diverse storage nodes and servers,
+cloud object storage delivers high data durability, seamless hori-
+zontal scalability, and exceptional cost-efficiency, rendering it ideal
+for hosting massive scales of unstructured data.
+Cloud object storage differs fundamentally from local storage
+across two primary aspects: the pricing model and underlying I/O
+characteristics, both of which require careful design of the system
+built on it. First, regarding data retrieval operations, cloud vendors
+mainly charge the user by the number of requests 1. Second, the
+retrieval operations incur high latency due to the time-to-first-byte
+(TTFB) overhead (typically tens of milliseconds) introduced by
+network communication. As established in a previous study [19],
+this TTFB penalty dominates total latency for small payload sizes.
+2.2
+Vector Search on Cloud Object Storage
+The inherent advantages of cloud object storage have driven in-
+terest from both academia and industry in building ANN search
+engines on it (e.g., Amazon S3 Vectors [4], Turbopuffer [61]). As
+illustrated in Figure 1, these systems typically contain two core
+layers: (i) a compute instance utilizing local storage (memory and
+1Here, we assume the data retrieval request originates from instances co-located within
+the same cloud provider’s region. Otherwise, the data transfer cost can significantly
+exceed the request fees, which makes the system financially non-viable.
+disk) to cache index metadata, and (ii) a cloud object store respon-
+sible for persisting the primary index payload data. To mitigate
+the pronounced TTFB latency overhead intrinsic to cloud object
+stores, these engines predominantly adopt cluster-based ANN in-
+dices (such as IVF variants and SPFresh [4, 18, 61, 65]) rather than
+popular graph-based indices [22, 40, 49] for in-memory or disk-
+based scenarios. This is because cluster-based indices can fetch
+all target vector data within a single network round-trip from the
+cloud object storage. Conversely, the iterative routing pattern of
+graph-based indices necessitates multi-round-trip network traver-
+sals, leading to cumulative TTFB overhead and inflated end-to-end
+query latency.
+2.3
+RaBitQ Quantization
+For vector search, quantization constitutes a class of techniques de-
+signed to compress high-dimensional vectors into compact, low-bit
+quantization codes [6, 9, 10, 25, 27, 29, 33, 41, 62, 63, 66, 67]. During
+query processing, the system uses these compressed codes for dis-
+tance estimation. Recently, a novel quantization framework named
+RaBitQ [24, 25, 27] was proposed to address the limitation (i.e., the
+lack of theoretical support) of classical quantization methods.
+During indexing for 𝐷-dimensional vectors, RaBitQ constructs a
+codebook with 2𝐵·𝐷unit vectors using a uniform grid, where 𝐵de-
+notes the number of bits allocated per dimension. Subsequently, the
+codebook is randomly rotated via Johnson-Lindenstrauss Transfor-
+mation [42], and each data vector is normalized and then quantized
+to its nearest codeword within the codebook. For querying, RaBitQ
+estimates the distances between a query vector and data vectors
+based on their codewords. Based on rigorous theoretical analysis,
+the RaBitQ estimator provides an unbiased estimation with a theo-
+retical error bound, enabling superior empirical retrieval accuracy
+across real-world workloads [25].
+3
+Methodology
+In this section, we present the comprehensive system design of our
+cloud vector search framework called RemoteANN, discussing both
+index construction and query processing optimizations tailored for
+the specific environment. Due to the high I/O latency of the cloud
+object storage discussed in Section 2.1, we choose the IVF index
+since it enables single-round-trip target cluster retrieval for a given
+query. To mitigate the remaining cloud I/O overheads, we introduce
+coordinated architectural optimizations spanning both indexing
+and querying.
+We present details of our indexing pipeline in Section 3.1, in-
+cluding the heterogeneous storage layout configured with RaBitQ
+quantization (Section 3.1.1), our efficient IVF clustering acceler-
+ation (Section 3.1.2) and data reordering strategies to boost data
+locality and support query optimization strategies (Section 3.1.3).
+Section 3.2 then details our proposed query processing framework.
+Specifically, for an IVF index deployed on cloud object storage,
+the query engine initially identifies the 𝑛probe target clusters for
+a given query vector via the metadata resident on the compute
+node, subsequently fetching the corresponding data payloads from
+cloud object storage. To reduce cloud I/O overhead, our engine
+incorporates four optimization strategies: namely RaBitQ-based
+2
+
+
+cluster-level pruning (Section 3.2.1), fine-grained range optimiza-
+tion (Section 3.2.2), request merging (Section 3.2.3), and caching
+(Section 3.2.4). These multi-tier components are structurally co-
+designed; the layout properties established during index generation
+directly dictate and unlock the high-efficiency I/O primitives lever-
+aged throughout query processing. Section 3.3 provides a summary
+of the indexing and querying components of RemoteANN.
+3.1
+The Index Phase
+3.1.1
+Storage Layout of IVF index with RaBitQ Quantization. As
+established in Section 2, vector search on cloud object storage con-
+tains two components – the compute node and the cloud object
+storage, thereby establishing a distinct three-layer storage hierarchy
+consisting of local DRAM, local disk, and remote storage. To opti-
+mize operational costs, the system may persist all data exclusively
+within cloud object storage during periods of inactivity. When a
+query is initiated, the system needs to spin up a compute instance
+and pull required data from the cloud object storage through the
+network, which results in a severe cold-start penalty with prohibi-
+tive initial query latency. We note that this latency can be mitigated
+via strategic system-level co-design. For instance, when integrating
+vector search engines with interactive downstream applications
+(e.g., conversational AI agents), the user’s interaction (e.g., typ-
+ing) can serve as early pre-fetching signals. The backend system
+captures these initial signals to asynchronously initiate the down-
+load of index metadata, effectively hiding the cold-start latency.
+Therefore, in this study, we restrict our focus to the warm query
+processing paradigm, where the high-precision vector data resides
+permanently within the cloud object storage, whereas frequently
+accessed index metadata (e.g., the IVF cluster centroids) are pinned
+within the compute node’s main memory during query processing.
+We detail our data layout framework as follows.
+The compute node’s DRAM caches the high-dimensional cen-
+troid vectors and the low-precision quantized data vectors as a rout-
+ing index. Specifically, we leverage the RaBitQ quantization [25, 27]
+to compress high-dimensional raw vectors into a 9-bit representa-
+tion2. Furthermore, we partition this 9-bit code into a 1-bit prefix
+and an 8-bit suffix. The 1-bit prefixes are resident in local DRAM,
+whereas the corresponding 8-bit suffixes are persisted in cloud ob-
+ject storage. If the compute instance is configured with local NVMe
+SSD, the system can utilize it as an intermediate cache for the 8-bit
+suffixes of frequently accessed clusters. The primary objective of
+this decoupled quantization scheme is to optimize cloud object
+storage I/O – the dominant performance bottleneck of the whole
+system. The RaBitQ framework delivers high-accuracy distance
+estimation with rigorous theoretical guarantees. Consequently, the
+query engine can exploit the in-memory 1-bit prefixes to prune
+vectors and clusters, thereby reducing both the total number of
+distinct Range-GET requests issued to cloud object storage and the
+data volume downloaded (detailed in Section 3.2).
+3.1.2
+IVF Indexing Acceleration with QGKMeans. Conventionally,
+constructing the IVF index for ANN search relies on partitioning the
+2We configure a 9-bit quantization because empirical results reported in the paper [25]
+demonstrate that the 9-bit code successfully achieves similar retrieval accuracy as the
+uncompressed vectors across diverse datasets. Depending on the specific workload,
+users can reduce the bit allocation.
+Table 1: Evaluation of different 𝑘-means variants. The choice
+of 𝑘follows the recommendation in Faiss [18]. Downstream
+effectiveness is quantified via top-10 ANN search recall on
+the IVF index built from the generated clusters, evaluating a
+fixed 1% cluster inspection fraction. Results for baselines are
+omitted on Deep-1B since all of them exceeded the 12-hour
+time threshold.
+Dataset
+Method
+𝑘
+Time (s) Recall
+WCSS
+SIFT
+QGKMeans
+4096
+6.2
+0.941
+4.442 × 1010
+Faiss
+13.0
+0.940
+4.440 × 1010
+SuperKMeans
+8.9
+0.941
+4.442 × 1010
+SeededANN
+19.0
+0.940
+4.442 × 1010
+MSong
+QGKMeans
+4096
+9.2
+0.992
+5.086 × 108
+Faiss
+38.8
+0.994
+5.094 × 108
+SuperKMeans
+10.1
+0.991
+5.092 × 108
+SeededANN
+33.6
+0.992
+5.096 × 108
+Contriever
+QGKMeans
+4096
+12.9
+0.977
+6.281 × 105
+Faiss
+63.5
+0.978
+6.279 × 105
+SuperKMeans
+28.2
+0.978
+6.280 × 105
+SeededANN
+75.3
+0.978
+6.280 × 105
+GIST
+QGKMeans
+4096
+15.6
+0.821
+1.035 × 106
+Faiss
+80.7
+0.816
+1.035 × 106
+SuperKMeans
+23.2
+0.822
+1.035 × 106
+SeededANN
+94.9
+0.818
+1.036 × 106
+MXBAI
+QGKMeans
+4096
+14.0
+0.967
+9.938 × 107
+Faiss
+68.2
+0.967
+9.938 × 107
+SuperKMeans
+16.4
+0.965
+9.937 × 107
+SeededANN
+66.6
+0.967
+9.938 × 107
+OpenAI
+QGKMeans
+4096
+24.6
+0.895
+6.205 × 105
+Faiss
+130.4
+0.896
+6.204 × 105
+SuperKMeans
+29.4
+0.897
+6.203 × 105
+SeededANN
+142.5
+0.896
+6.203 × 105
+Cohere
+QGKMeans
+65536
+204.2
+0.947
+4.297 × 106
+Faiss
+13144.8
+0.953
+4.292 × 106
+SuperKMeans
+2330.3
+0.951
+4.293 × 106
+SeededANN
+1128.4
+0.951
+4.293 × 106
+Deep-1B
+QGKMeans
+1048576
+8973.5
+0.999
+1.678 × 107
+Faiss
+–
+–
+–
+SuperKMeans
+–
+–
+–
+SeededANN
+–
+–
+–
+dataset via the 𝑘-means clustering algorithm. However, as reported
+in established studies [8, 18, 25, 56], repeated vector-to-centroid
+assignments make 𝑘-means clustering a bottleneck in IVF index
+construction. To accelerate the indexing of IVF, prior works have
+applied techniques from ANN search to reduce the cost of centroid
+assignment in the 𝑘-means iterations [17, 44, 57, 64].
+Inspired by existing studies, we propose a new 𝑘-means variant
+named QGKMeans which adopts SymphonyQG [31] as the accel-
+erator for the expensive vector-to-centroid assignment. At each
+𝑘-means iteration, we construct a SymphonyQG index over the
+current centroids and query it with each data vector to find its
+approximate nearest centroid. This setting requires many searches
+over each 𝑘-means iteration, followed by rebuilding the search
+structure when the centroids are updated. As reported in previous
+3
+
+
+studies and benchmarks [31, 39], SymphonyQG has demonstrated
+very competitive efficiency for both querying and indexing, which
+makes it a good candidate for the accelerator.
+We compare QGKMeans with Faiss [18], SuperKMeans [44],
+and SeededANN [57] in terms of clustering time and the quality
+of the resulting clusters. Faiss provides a widely used reference
+implementation. SuperKMeans targets the same workload through
+dimension pruning [26] and an optimized data layout [45], while
+SeededANN represents an HNSW-based approach to accelerating
+centroid assignment. All variants use the full set of original vectors
+and run for 25 iterations. We disable data sampling and hierarchical
+clustering (as they are easy to combine with all 𝑘-means variants)
+to compare them under the same flat 𝑘-means workload. Following
+the evaluation criteria in [44], we measure total clustering time,
+Within-Cluster Sum of Squares (WCSS), and downstream IVF recall
+when probing a fixed fraction of clusters.
+All 𝑘-means variants are evaluated on an Intel(R) Xeon(R) Gold
+6418H CPU, pinning the execution workload to 48 concurrent
+threads. The empirical results are summarized in Table 1. As il-
+lustrated, QGKMeans achieves the lowest clustering time among
+the evaluated methods while maintaining comparable WCSS and
+downstream recall. Its speedup over the fastest baseline is 1.4× on
+SIFT and 5.5× on Cohere. We therefore use QGKMeans to generate
+clusters throughout all subsequent experiments.
+3.1.3
+Data Reordering for Facilitating Query Processing. In con-
+ventional in-memory or disk-based IVF storage layouts, multiple
+clusters share a large binary file, and the query engine retrieves the
+selected clusters from this file. Both the order of clusters within
+the file and the order of vectors within each cluster are typically
+arbitrary, as efficient random access in RAM and SSDs makes these
+layouts less sensitive to physical ordering. However, directly adopt-
+ing this layout and access pattern in cloud object storage introduces
+two issues.
+First, because the vendors charge users of cloud object storage
+by the number of requests, issuing discrete Range-GET requests
+for every target cluster becomes financially non-viable, particularly
+for high-recall queries that necessitate traversing many clusters. A
+straightforward solution is to consolidate multiple target clusters
+into a unified request, thereby substantially reducing the query
+cost. However, if the target clusters for a given query exhibit poor
+spatial locality (i.e., they are sparsely distributed across the index
+object), request consolidation becomes highly inefficient, as the
+growing request size amplifies the overall download latency. Second,
+monolithic downloading for every target cluster introduces severe
+I/O inefficiencies. An individual IVF cluster may contain hundreds
+or even thousands of vectors, yet a given query typically finds only
+a small fraction of them as promising nearest neighbor candidates.
+Consequently, always downloading the whole cluster results in a
+waste of network bandwidth and degraded throughput, especially
+for the workload with many concurrent queries.
+To address these two problems, we introduce two query-side
+optimization strategies: request merging and range optimization. The
+former consolidates disparate cluster requests into a unified one,
+while the latter reduces the data volume transferred per cluster.
+We detail these query processing mechanisms in Sections 3.2.3
+and 3.2.2, respectively; this section focuses on the indexing part
+Table 2: Evaluation of cluster reordering strategies. The
+Hamiltonian path length is normalized by the baseline.
+Hamiltonian Path Length (normalized)
+Dataset
+Nearest-
+neighbor
+MST
+Hilbert
+Z-order
+SIFT
+0.3667
+0.4157
+0.5733
+0.5798
+MSong
+0.3583
+0.4005
+0.5567
+0.5693
+Contriever
+0.6413
+0.6739
+0.8796
+0.8824
+GIST
+0.4636
+0.5261
+0.6470
+0.6560
+MXBAI
+0.5476
+0.5812
+0.8152
+0.8198
+OpenAI
+0.5685
+0.5980
+0.8261
+0.8332
+required to support them. Specifically, we examine how to reorder
+data at the inter-cluster and intra-cluster levels to boost our query
+optimizations.
+Inter-cluster reordering. To enable effective request merging,
+we need to reorder clusters within the IVF object so that clusters
+likely to be accessed together are placed close to one another. Recall
+that IVF selects target clusters based on the distances between the
+query vector and the cluster centroids. Intuitively, clusters with
+nearby centroids are more likely to be selected together by a query,
+motivating us to place them close to one another in the IVF object.
+Assuming no prior knowledge of the query workload, we deter-
+mine the cluster order solely from the centroids. Specifically, we
+seek an ordering that minimizes the sum of distances between the
+centroids of consecutive clusters. We formulate this objective as a
+minimum-weight Hamiltonian path problem, where each vertex
+represents a cluster and each edge is weighted by the Euclidean
+distance between the corresponding centroids. We then seek an
+approximate minimum Hamiltonian path under the Euclidean dis-
+tance metric. Because the minimum Hamiltonian path problem is
+NP-hard, exact solutions are impractical for large cluster counts
+(the best-known classical exact algorithm based on dynamic pro-
+gramming runs in 𝑂(𝑛22𝑛) time [28], where 𝑛is the number of
+vertices/clusters). Given that the edge weights satisfy the trian-
+gle inequality, we can leverage polynomial-time approximation
+frameworks to achieve high-quality results. Specifically, we adopt
+two foundational algorithms: the nearest-neighbor heuristic, which
+provides an 𝑂(log𝑛) worst-case approximation [54], and the MST-
+doubling algorithm, which provides a 2-approximation [35]. Both
+algorithms require an initial distance matrix computation, lead-
+ing to a total time complexity of 𝑂(𝑛2𝑑) for 𝑑-dimensional vectors.
+While more advanced algorithms achieve tighter theoretical bounds
+(e.g., [5, 68]), they introduce substantial computational overhead,
+which degrades the efficiency for index construction. Additionally,
+we evaluate space-filling curves, specifically the Hilbert and Z-order
+curves [34, 51, 55], as alternative baselines because of their estab-
+lished utility for data ordering and nearest-neighbor search [13, 48].
+As space-filling curves suffer from the curse of dimensionality, we
+introduce a dimensionality reduction by Principal Component Anal-
+ysis (PCA) to project the high-dimensional cluster centroids into a
+3-dimensional subspace before using them for reordering.
+We evaluate the four aforementioned cluster reordering strate-
+gies on six million-scale datasets. We utilize QGKMeans to construct
+4
+
+
+the initial IVF index with 4, 096 clusters, where the resulting cen-
+troid sequence naturally exhibits an arbitrary, randomized baseline
+order. We subsequently execute our four reordering strategies over
+these centroids. To quantify the quality of inter-cluster reordering,
+we compute the total Hamiltonian path length (i.e., the cumulative
+Euclidean distance across all adjacent pairs in the global cluster
+sequence) for both the baseline and optimized configurations. The
+results are presented in Table 2. As illustrated, the nearest-neighbor
+heuristic achieves the minimum Hamiltonian path length across all
+evaluated datasets, despite the fact that the MST-doubling algorithm
+offers a superior theoretical worst-case approximation. Conversely,
+the space-filling curves exhibit significantly longer Hamiltonian
+paths. Therefore, our framework implements the nearest-neighbor
+heuristic as the default cluster reordering method. Section 3.2.3
+evaluates how different inter-cluster reordering methods influence
+request merging during ANN search, which presents the effective-
+ness of reordering by reducing the Hamiltonian path length.
+To mitigate the 𝑂(𝑛2𝑑) computational overhead encountered
+on large-scale datasets with many centroids, we introduce a pre-
+liminary centroid partitioning process 3. Specifically, we employ
+a recursive bisection 𝑘-means strategy to progressively subdivide
+the centroids until the cardinality of each leaf node is less than a
+predefined constraint. Subsequently, the localized nearest-neighbor
+heuristic is applied independently within each partition, and the
+resulting sub-sequences are coalesced according to the hierarchical
+tree traversal order to finalize the global cluster sequence. When
+evaluated on 262, 144 centroids, the whole reordering process com-
+pletes in less than 1 minute, demonstrating operational viability for
+large datasets.
+Intra-cluster reordering. Range optimization aims to selectively
+download only the specific byte range within an IVF cluster that
+contains promising nearest-neighbor candidates for a given query.
+To boost the range optimization, we sort vectors within each cluster
+by their Euclidean distance to the centroid. Intuitively, when a clus-
+ter’s centroid is far from the query, vectors near the centroid are less
+likely to contribute to the final top-𝑘results, while peripheral vec-
+tors may remain relevant. This ordering groups peripheral vectors
+into a contiguous region, potentially reducing the byte range that
+needs to be downloaded. Moreover, our RaBitQ-based range opti-
+mization also benefits from distance-based intra-cluster reordering,
+which will be further explained and evaluated in Section 3.2.2.
+3.2
+The Query Phase
+3.2.1
+Cluster Pruning with Coarse Distance Estimator of RaBitQ. As
+established in Section 3.1, the 1-bit RaBitQ codes are resident within
+the main memory of the compute node, serving as a coarse-grained
+distance estimator to preclude downloading clusters that contain
+no viable candidates for the final ANN results. We formalize this
+process as cluster pruning and detail its mechanics below.
+By leveraging these 1-bit RaBitQ codes, the system can compute
+an estimated distance 𝑑𝑖𝑠𝑡𝑒𝑠𝑡for all vectors residing within the
+target clusters. Furthermore, because RaBitQ provides an unbiased
+estimator with a theoretical error bound 𝑒𝑟𝑟[25, 27], we can derive
+an analytical upper bound (𝑑𝑖𝑠𝑡𝑢𝑝) and lower bound (𝑑𝑖𝑠𝑡𝑙𝑜) for each
+3The approximation guarantee above applies to the unpartitioned heuristic; we use
+the partitioned variant as a practical optimization for large centroid sets.
+query-to-vector distance:
+𝑑𝑖𝑠𝑡𝑢𝑝= 𝑑𝑖𝑠𝑡𝑒𝑠𝑡+ 𝑒𝑟𝑟, 𝑑𝑖𝑠𝑡𝑙𝑜= 𝑑𝑖𝑠𝑡𝑒𝑠𝑡−𝑒𝑟𝑟.
+(1)
+If the true maximum distance of the final top-𝑘ANN results (de-
+noted as 𝑑𝑖𝑠𝑡𝑘) were known a priori, any vector satisfying 𝑑𝑖𝑠𝑡𝑙𝑜>
+𝑑𝑖𝑠𝑡𝑘could be immediately pruned, as it is non-viable for such a
+vector to qualify as one of the 𝑘nearest neighbors 4.
+Because 𝑑𝑖𝑠𝑡𝑘cannot be determined prior to retrieving the data
+from cloud object storage, we establish a conservative pruning
+threshold. Specifically, for all candidate clusters, we evaluate the up-
+per bounds of all constituent vectors to determine the 𝑘-th smallest
+upper distance bound, denoted as dist𝑢
+𝑘. By definition, dist𝑢
+𝑘≥𝑑𝑖𝑠𝑡𝑘.
+Consequently, if a vector’s lower bound distance exceeds this thresh-
+old (𝑑𝑖𝑠𝑡𝑙𝑜> dist𝑢
+𝑘), it will be non-viable under the true top-𝑘dis-
+tance constraint. Extending this logic to cluster-level granularity,
+if the condition 𝑑𝑖𝑠𝑡𝑙𝑜> dist𝑢
+𝑘holds for all vectors within a given
+cluster, the entire cluster can be pruned, bypassing the correspond-
+ing request to cloud object storage entirely. Because both dist𝑢
+𝑘and
+𝑑𝑖𝑠𝑡𝑙𝑜are evaluated strictly using the RaBitQ codes in DRAM, this
+mechanism effectively reduces request costs and network band-
+width consumption while preserving nearly identical empirical
+recall. Alternatively, the 𝑘-th smallest estimated distance dist𝑒
+𝑘can
+be employed as an aggressive pruning threshold. However, since
+dist𝑒
+𝑘is not guaranteed to be larger than 𝑑𝑖𝑠𝑡𝑘, its application may
+inadvertently discard valid nearest neighbors, incurring a recall
+degradation. For application scenarios which tolerate this trade-off
+in accuracy, adopting dist𝑒
+𝑘yields higher cluster pruning ratios and
+further reduces cloud I/O costs.
+We evaluate our cluster pruning strategy across six million-scale
+datasets using their designated query workloads, with the results
+compiled in Table 3. As illustrated, the proposed pruning framework
+significantly reduces the number of clusters to be downloaded, es-
+pecially for high-dimensional datasets. For example, on the OpenAI
+(1536-dimensional) dataset, the query engine retrieves an average
+of only 13.9 clusters from cloud object storage when 𝑛probe is set to
+240. Furthermore, employing the more aggressive distance pruning
+threshold dist𝑒
+𝑘further reduces the number of clusters, while the
+recall loss is less than 0.5% at a baseline of 97% recall.
+In addition, we exploit the RaBitQ distance estimators to perform
+dynamic pruning on active clusters (i.e., the clusters to be evaluated
+and not received yet) after dispatching the I/O requests. Specifically,
+while awaiting I/O responses from cloud object storage, data of
+distinct clusters inevitably arrives asynchronously over time. There-
+fore, the query engine can update the global ANN result set with
+completed requests, yielding a distance threshold which we set as
+the 𝑘-th distance of the vectors that have been evaluated so far and
+denote by 𝑑𝑖𝑠𝑡𝑐
+𝑘. This updated runtime threshold is then used to
+evaluate the remaining in-flight requests. If the 𝑑𝑖𝑠𝑡𝑙𝑜for all vectors
+within a pending cluster exceeds the newly established 𝑑𝑖𝑠𝑡𝑐
+𝑘, the
+query engine can safely skip that cluster. Because this optimization
+is applied after network dispatching, it does not reduce the total
+number of issued requests, meaning the cost of cloud object storage
+4Strictly speaking, the error bound provided by RaBitQ [25, 27] holds with high proba-
+bility. Our empirical analysis across multiple datasets confirms that fewer than 0.01%
+of vectors violate these analytical bounds per query workload. Given the approximate
+nature of ANN search, we observed no material change in final recall caused by this
+negligible bound violation rate.
+5
+
+
+Table 3: Number of remaining clusters after pruning. Each
+configuration is evaluated on an IVF index with 4, 096 clusters.
+The baseline recall for the No Prune configuration is omitted
+as pruning by dist𝑢
+𝑘preserves nearly identical accuracy.
+Prune by dist𝑢
+𝑘
+Prune by dist𝑒
+𝑘
+No Prune
+Dataset
+Remaining
+Clusters
+Recall
+Remaining
+Clusters
+Recall
+Remaining
+Clusters
+SIFT
+60.0
+0.9793
+33.0
+0.9781
+80.0
+MSong
+16.9
+0.9828
+10.6
+0.9819
+30.0
+Contriever
+12.3
+0.9751
+6.2
+0.9743
+40.0
+GIST
+53.8
+0.9705
+23.9
+0.9666
+180.0
+MXBAI
+9.5
+0.9756
+5.7
+0.9749
+60.0
+OpenAI
+13.9
+0.9716
+8.1
+0.9705
+240.0
+(a) Original order
+Retained
+Pruned
+v1
+v2
+v3
+v4
+v5
+v6
+v7
+v8
+v9
+Range-GET: 6 vectors (3 pruned)
+Sort by distance to centroid (ascending)
+(b) Sorted order
+v2
+v6
+v7
+v4
+v3
+v8
+v9
+v5
+v1
+Range-GET: 4 vectors (1 pruned)
+Figure 2: Illustration of range optimization. With intra-
+cluster reordering, the un-pruned vectors become more con-
+centrated within a cluster.
+remains unchanged. Nevertheless, it improves end-to-end query
+throughput by dropping some network stragglers.
+Our pruning strategy shares similar high-level goals with the
+query-aware dynamic pruning adopted in SPANN and SPFresh [14,
+65]. However, our approach diverges fundamentally in its pruning
+criterion and mathematical foundations. SPANN and SPFresh rely
+on a ratio-based heuristic (i.e., discarding clusters whose distances
+to the query exceed that of the nearest cluster by a predefined
+multiplier), and provide no theoretical guarantees. Furthermore,
+this ratio introduces an additional hyperparameter that complicates
+user configuration and system setting. In contrast, our mechanism
+leverages the error bounds of the RaBitQ estimator to establish
+high-probability analytical error bounds, providing a theoretically
+grounded pruning criterion while eliminating the overhead of pa-
+rameter tuning.
+3.2.2
+Range Optimization for Request Size Reduction. Range opti-
+mization aims to selectively download only the precise byte range
+containing valid nearest-neighbor candidates within each target
+cluster for a given query. Specifically, as detailed in Section 3.2.1,
+the system leverages the distance estimator of RaBitQ to generate
+pruning thresholds. With this pruning framework, the remaining
+un-pruned vectors typically occupy only a fractional slice of the
+cluster’s total physical address space. As illustrated in Figure 2, for
+a cluster, our method dynamically issues a bounded range request
+covering the minimum contiguous byte sequence that encompasses
+all un-pruned candidates, which reduces overall download latency
+and conserves valuable network bandwidth.
+As discussed in Section 3.1.3, we reorder the vectors within a
+cluster by their distances to the cluster centroid. Next, we provide
+more analysis on how this distance-based reordering facilitates the
+effectiveness of the aforementioned range optimization strategy.
+RaBitQ [25, 27] transforms distance estimation between two vectors
+to an estimation of the inner product of two normalized vectors, as
+formalized below:
+∥o𝑟−q𝑟∥2 = ∥(o𝑟−c) −(q𝑟−c)∥2
+= ∥o𝑟−c∥2 + ∥q𝑟−c∥2 −2∥o𝑟−c∥· ∥q𝑟−c∥· ⟨o, q⟩
+(2)
+where o𝑟and q𝑟represent the raw data and query vectors, re-
+spectively; c is the centroid vector used for normalization; and
+o :=
+o𝑟−c
+∥o𝑟−c∥and q :=
+q𝑟−c
+∥q𝑟−c∥denote the resulting normalized unit
+vectors. Within the IVF index, the vectors o𝑟within a cluster are
+normalized with the centroid of the cluster as the center c. During
+querying, the norms ∥o𝑟−c∥and ∥q𝑟−c∥are computed exactly,
+while RaBitQ provides an unbiased estimator for the inner prod-
+uct component ⟨o, q⟩subject to an analytical error bound. Con-
+sequently, the estimation error of the squared Euclidean distance
+equals the estimation error of the inner product, scaled by a factor
+of 2∥o𝑟−c∥· ∥q𝑟−c∥. For a fixed query and cluster, ∥q𝑟−c∥remains
+static, and a larger distance to the centroid (∥o𝑟−c∥) amplifies the
+inner-product estimation error. Therefore, vectors farther from the
+centroid would have looser distance error bounds and are harder
+to prune. This implies that vectors situated further from the clus-
+ter centroid inherently exhibit higher distance estimation error.
+Consider two data vectors within the same cluster that share a
+comparable true distance to the query vector. The vector positioned
+further from the cluster centroid would yield a looser distance lower
+bound (𝑑𝑖𝑠𝑡𝑙𝑜), rendering it more difficult to be safely pruned. Con-
+sequently, sorting intra-cluster data vectors by their distance to the
+centroid effectively assembles these hard-to-prune vectors in the
+data layout. This spatial localization enables range optimization to
+further reduce byte volume retrieved from the cloud object storage.
+Table 4 evaluates the effectiveness of range optimization under
+different intra-cluster layouts. Compared with disabling range opti-
+mization, enabling it reduces the volume of downloaded data by at
+least 44%. Intra-cluster reordering further increases this reduction.
+This consistent performance gain validates both our earlier analy-
+sis and the effectiveness of the intra-cluster reordering technique
+discussed in Section 3.1.3.
+3.2.3
+Request Merging for Cost Reduction. After we apply the clus-
+ter pruning and range optimization techniques, we only need to
+fetch those byte ranges in the un-pruned clusters. As introduced
+in Section 3.1.3, instead of issuing a distinct I/O request for each
+un-pruned cluster, which would incur high query costs, we merge
+several I/O requests into a consolidated one if the requests are
+closely situated within the index object. We call this the request
+merging strategy.
+Following existing systems (e.g., Databricks [53] and Lance [46]),
+we adopt a fixed threshold for request merging. Consequently, the
+size of any merged request is bounded by the threshold; requests
+6
+
+
+Table 4: Evaluating range optimization under varying data
+layouts at 97% target recall. For all datasets, the conserva-
+tive threshold dist𝑢
+𝑘is adopted for pruning. The data volume
+downloaded is normalized by the volume without range op-
+timization.
+Data Volume Downloaded
+Dataset
+Random Vector
+Layout
+Reordered
+SIFT
+55.8%
+48.8%
+MSong
+46.3%
+34.1%
+Contriever
+41.5%
+35.4%
+GIST
+30.7%
+19.3%
+MXBAI
+34.6%
+27.4%
+OpenAI
+22.2%
+19.8%
+(a) Baseline
+5 Range-GET requests
+GET
+GET
+GET
+GET
+GET
+A
+B
+C
+D
+E
+(b) Request merging
+2 Range-GET requests
+GET 1
+GET 2
+A
+B
+C
+D
+E
+0
+200
+400
+600
+800
+1000
+KB
+Target data
+Extra read
+Other data
+Figure 3: An illustrative example of request merging. The
+discrete Range-GET request count is curtailed by three after
+applying request merging with a 600 KB threshold.
+whose individual size exceeds this threshold are naturally excluded
+from merging. This is to prevent excessive payload sizes which
+may compromise end-to-end query throughput. Based on empirical
+results reported in our experimental setup, we set the maximum
+merged-request size to 600 KB to balance per-request latency over-
+head and additional data transfer. For latency-tolerant workloads,
+this threshold can be increased to further reduce the number of
+requests. Figure 3 illustrates the retrieval of target byte ranges from
+the cloud object storage. Because the byte ranges of some requests
+are close, they can be retrieved via a single merged request.
+We design a dynamic programming (DP) algorithm to merge the
+requests under a fixed threshold 𝑇, minimizing the request count
+and, for the same minimum count, the total downloaded bytes. We
+first sort all candidate requests by start offset. Let 𝐿(𝑖, 𝑗) be the span
+covering requests 𝑖, . . . , 𝑗, which form a feasible merged group if
+𝐿(𝑖, 𝑗) ≤𝑇. We define 𝐷[𝑗] = (𝐾𝑗, 𝐵𝑗) as the optimal result for the
+first 𝑗requests, recording the request count 𝐾𝑗and downloaded
+bytes 𝐵𝑗. Starting from 𝐷[0] = (0, 0), we compute
+𝐷[𝑗] =
+min
+1≤𝑖≤𝑗
+𝐿(𝑖,𝑗)≤𝑇
+ 𝐾𝑖−1 + 1, 𝐵𝑖−1 + 𝐿(𝑖, 𝑗),
+where the comparison first minimizes request count, then down-
+loaded bytes. Each transition considers 𝑖, . . . , 𝑗as the last merged
+group. We record the selected starting index and recover the group-
+ing by backtracking from 𝐷[𝑁].
+Table 5: Evaluation of request merging across different clus-
+ter ordering strategies. For each dataset, we build an IVF
+index with 4, 096 clusters and then measure the number of
+merged requests under a fixed number of scanned clusters
+(97% target recall).
+Requests After Merging
+Dataset
+Random
+Order
+Nearest
+Neighbor MST Hilbert Z-order
+No
+Merge
+SIFT
+60.3
+25.5
+24.6
+26.2
+27.0
+80.0
+MSong
+29.3
+18.3
+19.0
+23.3
+23.6
+30.0
+Contriever
+39.4
+27.5
+28.1
+34.8
+35.0
+40.0
+GIST
+175.9
+150.1 152.8
+159.8
+160.5
+180.0
+MXBAI
+58.7
+39.6
+40.7
+50.5
+50.6
+60.0
+OpenAI
+236.9
+218.4 219.0
+226.6
+227.4
+240.0
+We outline the proof of optimality below. Requests larger than
+𝑇are excluded from the DP and added back as individual requests
+after merging. Their fixed contribution to the request count and
+downloaded bytes does not affect optimality. For the first remaining
+request, 𝐷[1] is clearly optimal. Suppose that 𝐷[0], . . . , 𝐷[𝑗−1] are
+optimal. Let an optimal strategy for the first 𝑗requests use requests
+𝑖, . . . , 𝑗as its last merged group. By the induction hypothesis, 𝐷[𝑖−
+1] covers the preceding requests with no more requests and, if the
+request count is the same, no more downloaded bytes. Since the
+DP considers every feasible starting index 𝑖, it must find a solution
+at least as good as this optimal strategy. Therefore, 𝐷[𝑗] is also
+optimal. By induction, 𝐷[𝑁] minimizes the total number of requests
+and, among all consecutive groupings with that minimum count,
+the total downloaded bytes.
+Indeed, the spatial locality of clusters within the index object
+influences the effectiveness of request merging. If clusters are or-
+dered randomly, the target clusters for a given query would be
+sparsely distributed across the index layout, leading to poor merg-
+ing results. As established in Section 3.1.3, we explore four different
+inter-cluster reordering strategies, discovering that the nearest-
+neighbor heuristic achieves the smallest Hamiltonian path length
+across tested datasets. To validate this approach, we evaluate the
+end-to-end merging results for ANN search 5. As illustrated in Ta-
+ble 5, the nearest-neighbor heuristic achieves the smallest total
+request count across most datasets. This empirically validates the
+use of Hamiltonian path length as a useful proxy for quantifying
+cluster spatial locality for downstream IVF-based ANN search.
+3.2.4
+Local SSD Cache for Hot Clusters. When the compute node is
+configured with a local NVMe SSD, it can serve as an intermediate
+cache for cloud object storage payloads 6. When an individual clus-
+ter is required during a query execution, the system first conducts
+5To isolate the empirical impact of request merging, cluster pruning and range optimiza-
+tion techniques are intentionally deactivated in this experiment, since the proposed
+request merging pipeline operates as a decoupled, modular framework which can be
+seamlessly integrated into alternative systems.
+6Cloud vendors typically provide general-purpose block storage volumes (e.g., gp3
+for AWS EC2 [1, 2]) attached to compute instances. However, these baseline volumes
+deliver limited default I/O throughput (e.g., capped at 3, 000 IOPS for gp3 if not paying
+extra fees), rendering them unsuitable for high-throughput updates. Alternatively,
+users can provision specialized instances equipped with local, high-performance NVMe
+SSDs. Although these instances incur higher costs, for certain workloads the caching
+benefits can offset the overall system cost by reducing the API expenses of cloud object
+storage.
+7
+
+
+a lookup in the local SSD cache; a cache hit completely bypasses
+the network downloading to the cloud object storage. We detail the
+cache of RemoteANN as follows.
+The cache operates at cluster-level granularity mirroring the spa-
+tial access patterns executed during querying. To reduce physical
+fragmentation within the cache, each cluster is padded to align with
+standard 4 KB pages. A single, pre-allocated backing file opened
+using the O_DIRECT flag (to bypass the OS’s page cache) is used
+to cache all data. Storage allocations within the backing file are
+managed at 4 KB granularity via a best-fit free-extent map that dy-
+namically coalesces contiguous freed extents upon cluster eviction.
+Following an empirical evaluation of various cache strategies, we
+use a caching engine combines TinyLFU-inspired admission [20]
+with aging LFU replacement, using per-cluster frequency coun-
+ters with periodic halving. To improve I/O concurrency, we launch
+cache reads and writes asynchronously by leveraging the high-
+performance io_uring interface. Specifically, read operations are
+pooled, batched, and subsequently dispatched asynchronously; con-
+currently, cache insertion operations are completely decoupled from
+the critical query execution path and delegated to a background
+worker thread.
+Note that there is an inherent architectural conflict between
+the cluster-level caching and our range optimization strategy of
+downloading. Specifically, the cache manages data at cluster-level
+granularity, whereas range optimization aims to selectively retrieve
+minimal byte ranges of a cluster to conserve bandwidth. We resolve
+this tension by introducing an adaptive fallback threshold. When
+local NVMe caching is enabled, the range optimization is evaluated
+by a predefined threshold ratio𝛾(e.g.,𝛾= 0.8). The system executes
+a range-optimized download request if and only if the optimized
+range spans less than 𝛾of the total cluster volume. For any request
+exceeding this ratio, the system downloads the complete cluster,
+thereby trading marginal network overhead to populate the local
+SSD cache and benefit subsequent queries.
+Algorithm 1: Index Construction
+Input: Raw vector dataset X, number of target clusters 𝐾
+Output: RemoteANN index
+1 Use QGKMeans on X to obtain 𝐾clusters (Section 3.1.2)
+2 Reorder the clusters and the vectors in each cluster
+(Section 3.1.3)
+3 Quantize each vector wrt the cluster centroid by RaBitQ and
+store the clustering results and prefixes of RaBitQ codes on
+the compute node and the suffixes of RaBitQ codes on
+cloud object storage, subject to the cluster-level ordering
+and vector-level ordering (Section 3.1.1)
+4 return
+3.3
+Summary
+We summarize our indexing and querying process in Algorithm 1
+and Algorithm 2, respectively. Algorithm 1 details the offline index
+construction process, which uses our efficient QGKMeans to accel-
+erate IVF clustering and applies both intra-cluster and inter-cluster
+data reordering to improve data locality. Algorithm 2 presents how
+Algorithm 2: Query Processing
+Input: Query vector q, number of nearest neighbors 𝑘,
+number of target clusters 𝑛probe
+Output: ANN result
+1 Select the top 𝑛probe of clusters for q based on the IVF index
+2 Estimate distances for all vectors in target clusters based on
+the 1-bit RaBitQ codes
+3 Prune unpromising clusters for the query q (Section 3.2.1)
+4 For cache-hit clusters (un-pruned), retrieve data from local
+SSD (Section 3.2.4)
+5 Perform range optimization for remaining clusters
+(Section 3.2.2)
+6 Perform request merging (Section 3.2.3)
+7 Issue Range-GETs for merged requests to cloud object
+storage
+8 Wait for I/O completion
+△Disk and cloud
+9 Update cache
+△Background
+10 Update ANN result based on the retrieved data
+11 return ANN result
+the query processing engine utilizes the data layout at runtime. By
+leveraging the local, memory-resident 1-bit RaBitQ codes, the query
+execution engine dynamically triggers cluster-level pruning, range
+optimization, request merging and caching. Together, these two
+parts formalize an algorithm-system co-design tailored specifically
+for the cloud object storage.
+4
+Experiments
+In this section, we experimentally evaluate RemoteANN and base-
+lines across various modern vector datasets with different dimen-
+sionalities and scales. Moreover, we explore the effectiveness of our
+proposed strategies via an ablation study.
+4.1
+Setup
+Datasets: We employ six widely adopted million-scale datasets:
+SIFT, MSong, Contriever, GIST, MXBAI, and OpenAI. We also test
+the scalability of our method on larger datasets including Cohere
+and Deep-1B. These datasets span diverse vector dimensionalities,
+cardinalities, and types and have been widely used in existing stud-
+ies and benchmarks [8, 18, 44, 56] to validate ANN algorithms and
+libraries. For datasets with a native evaluation partition, we utilize
+the default query workloads. For those lacking explicit query splits,
+we sample 1, 000 vectors from the primary base dataset to serve
+as the evaluation query workload. The detailed statistics of these
+evaluation datasets are summarized in Table 6.
+Baselines: We evaluate RemoteANN against two representative
+baselines.
+Lance-RQ. Lance [46] is an open-source storage engine with sup-
+port for vector search over cloud object storage. We use Lance
+v13.0.0 with its IVF-RQ index, denoted as Lance-RQ, which com-
+bines IVF partitioning with RaBitQ quantization. To match Re-
+moteANN’s data placement, we keep the index metadata and RaBitQ
+codes (1-bit per dimension) in the EC2 instance’s DRAM during
+8
+
+
+Table 6: Statistics of datasets used for evaluation.
+Name
+Data Type
+# Vectors
+# Queries
+Dim.
+SIFT
+Image
+1,000,000
+10,000
+128
+MSong
+Audio
+992,272
+1,000
+420
+Contriever
+Text
+999,000
+1,000
+768
+GIST
+Image
+1,000,000
+1,000
+960
+MXBAI
+Text
+769,382
+1,000
+1024
+OpenAI
+Text
+999,000
+1,000
+1536
+Cohere
+Text
+10,000,000
+1,000
+1024
+Deep-1B
+Image
+1,000,000,000
+10,000
+96
+querying, while storing the full-precision vectors in cloud object
+storage for reranking.
+RemoteSPANN. We select SPANN [14] as the second representa-
+tive baseline since its dynamic extension, SPFresh [65], is utilized
+by turbopuffer [61], a commercial vector database built specifi-
+cally for object storage. However, turbopuffer’s implementation
+is closed-source, limiting our ability to instrument its execution
+and control its internal configuration. In this study, we focus on
+static ANN workloads, so we build RemoteSPANN from the open-
+source SPANN implementation. Specifically, we replace its local-
+disk I/O backend with the same cloud object storage layer used by
+RemoteANN, enabling a controlled and fair comparison.
+System Setup: Vector search contains two distinct phases: offline
+index construction and online query processing. A standard ap-
+proach is to leverage a high-performance, resource-heavy machine
+to build the index, while provisioning cost-effective, lightweight
+compute nodes to handle online query serving. Following this
+model, the indexing runs on an on-premise server equipped with
+an Intel Xeon Gold 6418H@4.0GHz CPU (Sapphire Rapids architec-
+ture, 24 cores and 48 threads) and 1 TB DRAM7. We select Amazon
+Web Services (AWS) as our primary cloud evaluation platform. Fol-
+lowing index construction, the memory-resident routing structures
+are deployed on an Amazon EC2 compute instance, while the re-
+maining data is persisted in an Amazon S3 bucket located within
+the same region as the compute node. Unless stated otherwise, all
+experiments are executed on an AWS EC2 instance m5dn.2xlarge
+(8 vCPUs, 32 GB DRAM, 300 GB local NVMe SSD, and up to 25 Gbps
+network)8. RemoteANN and RemoteSPANN are implemented in
+native C++, with cloud object storage I/O operations orchestrated
+by a download module built upon the official AWS SDK. The offline
+indexing pipeline is compiled utilizing GCC 14.3.0 on an Ubuntu
+22.04 LTS environment, whereas the online query execution engine
+is compiled via GCC 15.2.0 on the Ubuntu 26.04 LTS platform pro-
+vided by the AWS EC2 instances. For Lance-RQ, we use the official
+Python release which natively supports indexing, querying and
+remote I/O.
+7Although the underlying physical layout is a dual-socket server containing two
+identical CPUs, cross-socket overheads degrade indexing efficiency for both our method
+and the evaluated baselines. Consequently, we employ NUMA hardware affinity tools
+(numactl) to strictly pin execution on a single CPU for all methods.
+8To enforce environment uniformity across the experiments, we deploy the
+m5dn.2xlarge instance, as its local NVMe SSD allows us to validate the effective-
+ness of caching introduced in Section 3.2.4. Users can provision alternative instances
+lacking local NVMe SSD (e.g., c5n.2xlarge) for deployment that omits the cache
+layer.
+Parameter Settings: During indexing, RemoteANN uses 9-bit Ra-
+BitQ quantization on all datasets, with the number of IVF clusters
+set according to the empirical recommendations of Faiss, as listed
+in Table 1. For Lance-RQ, we use the same number of IVF clus-
+ters and retain the default values for all other indexing parameters.
+For RemoteSPANN, we use the default indexing parameters of the
+open-source SPANN implementation [14]. During querying, we
+vary the number of probed clusters (𝑛probe) for RemoteANN and
+RemoteSPANN to evaluate their throughput–accuracy trade-offs.
+For Lance-RQ, we follow the recommended tuning procedure by
+varying both 𝑛probe and refine_factor, which controls the num-
+ber of candidates reranked. We consider refine_factor values in
+{5, 10, 20}, extending this set to {5, 10, 20, 40, 80} for Deep-1B, and
+report the throughput–accuracy Pareto frontier across the evalu-
+ated configurations.
+Metrics for Query Performance: Following established indexing
+benchmarks [8, 14, 56], we evaluate query efficiency using through-
+put (quantified as queries per second (QPS)) and end-to-end latency,
+while search accuracy is measured via recall. Across all experiments
+in this section, the search targets the retrieval of the top-𝑘nearest
+neighbors, with 𝑘fixed at 10.
+4.2
+Experimental Results
+4.2.1
+Performance Study. This subsection presents end-to-end
+search performance, remote I/O statistics, index construction time,
+and memory footprint.
+End-to-end Query Performance: We systematically sweep the
+query-time parameters to evaluate throughput–recall trade-offs at
+concurrency levels of 1, 4, and 16. Figure 4 presents the resulting
+QPS–Recall curves, where curves closer to the top-right corner
+indicate better performance. Table 7 reports the corresponding
+latency profiles at 97% target recall 9.
+We derive the following key observations. (1) RemoteANN
+achieves better throughput–recall trade-offs than both Lance-RQ
+and RemoteSPANN across all evaluated datasets and concurrency
+levels. Its throughput advantage generally becomes more pro-
+nounced as concurrency increases, particularly on Contriever,
+MXBAI, and OpenAI. (2) At 97% target recall, RemoteANN achieves
+the lowest median (𝑝50) latency in all 18 configurations and the
+lowest tail (𝑝95) latency in 16 of them. Compared with Lance-RQ,
+its 𝑝50 and 𝑝95 latencies are lower by factors of 1.47–5.57 and
+1.19–5.15, respectively. The only exceptions to its lowest tail
+latency occur on MSong at concurrency levels of 1 and 4, where
+RemoteSPANN has slightly lower 𝑝95 latency. (3) The QPS–Recall
+curves exhibit fluctuations, unlike the typically smoother curves
+of in-memory ANN indices [8, 18, 26, 31]. These fluctuations are
+consistent with variability in cloud object storage I/O performance,
+as also reported in prior work [19]. (4) RemoteSPANN outperforms
+Lance-RQ on several datasets, demonstrating its competitiveness
+in these settings and supporting its inclusion as a complementary
+baseline.
+Cloud I/O Statistics: Table 8 reports the minimum average number
+of Range-GET requests per query achieved by each method under
+a recall constraint of at least 97%. As demonstrated, RemoteANN
+9For Lance-RQ, we report the latency at the configuration achieving the highest QPS
+among those reaching target recall.
+9
+
+
+10
+20
+30
+Concurrency=1
+QPS
+SIFT
+15
+30
+MSong
+15
+30
+Contriever
+8
+16
+24
+GIST
+10
+20
+30
+MXBAI
+10
+20
+30
+OpenAI
+40
+80
+120
+Concurrency=4
+QPS
+50
+100
+50
+100
+40
+80
+50
+100
+40
+80
+120
+0.80
+0.90
+0
+200
+400
+Concurrency=16
+QPS
+0.85 0.90 0.95
+0
+200
+400
+0.90
+0.95
+0
+200
+400
+0.85 0.90 0.95
+0
+80
+160
+0.85
+0.90
+0.95
+0
+200
+400
+0.85
+0.90
+0.95
+0
+150
+300
+Recall
+RemoteANN
+Lance-RQ
+RemoteSPANN
+Figure 4: End-to-end search performance comparison across six million-scale datasets under varying query concurrency. Each
+reported data point represents the mean throughput computed over three independent execution trials.
+Table 7: End-to-end query processing latency (𝑝50 and 𝑝95, in
+milliseconds) at 97% target recall under different concurrency
+levels (Conc.).
+RemoteANN
+Lance-RQ
+RemoteSPANN
+Dataset
+Conc.
+𝑝50
+𝑝95
+𝑝50
+𝑝95
+𝑝50
+𝑝95
+SIFT
+1
+35.6
+72.9
+86.8
+111.3
+40.8
+81.9
+4
+36.9
+74.4
+91.0
+119.7
+41.3
+84.3
+16
+62.6
+98.4
+314.1
+343.0
+89.7
+125.0
+MSong
+1
+35.7
+67.4
+68.1
+97.0
+38.2
+63.5
+4
+34.0
+65.3
+68.7
+105.1
+37.9
+64.5
+16
+38.6
+63.3
+188.9
+269.5
+64.6
+104.8
+Contriever
+1
+32.6
+53.5
+70.8
+97.8
+35.7
+70.7
+4
+32.8
+56.8
+70.0
+94.7
+37.4
+65.4
+16
+35.3
+54.1
+188.8
+271.2
+66.8
+84.7
+GIST
+1
+49.4
+84.2
+72.8
+102.1
+93.8
+141.9
+4
+49.2
+83.5
+72.8
+99.2
+168.3
+257.7
+16
+118.5
+221.4
+189.1
+272.9
+703.0
+803.8
+MXBAI
+1
+32.0
+50.8
+70.9
+98.7
+40.3
+71.3
+4
+31.6
+49.9
+69.8
+94.2
+40.7
+70.6
+16
+33.5
+51.7
+186.5
+266.3
+83.9
+118.5
+OpenAI
+1
+37.3
+68.3
+76.0
+103.4
+66.7
+106.8
+4
+37.6
+64.9
+76.6
+97.9
+87.8
+250.3
+16
+44.3
+70.4
+191.3
+280.4
+281.3
+397.6
+achieves the lowest number of distinct requests on all evaluated
+datasets, directly reducing the cost driven by the cloud object stor-
+age charging model.
+Indexing Time and Memory Footprint: We evaluate the in-
+dex construction latency and steady-state memory consumption10
+10In this evaluation, we report in-memory construction time for RemoteANN and
+RemoteSPANN. For Lance-RQ, we measure IVF training and shuffling, including their
+Table 8: Average number of Range-GET requests per query
+to the cloud object storage at 97% target recall.
+Number of Requests
+Dataset
+RemoteANN
+Lance-RQ
+RemoteSPANN
+SIFT
+18.5
+97.1
+58.5
+MSong
+10.7
+57.6
+39.9
+Contriever
+8.6
+57.6
+19.9
+GIST
+41.4
+56.4
+294.7
+MXBAI
+6.8
+57.1
+27.6
+OpenAI
+12.0
+57.7
+79.2
+Cohere
+18.6
+26.2
+300.0
+Deep-1B
+146.5
+810.2
+–
+across all compared methods and datasets, with the results summa-
+rized in Table 9.
+As demonstrated, RemoteANN achieves up to a 31× speedup
+in index construction over RemoteSPANN, aided by QGKMeans
+(Table 1). Although its construction takes longer than Lance-RQ, the
+times remain within the same order of magnitude. This additional
+construction cost stems from two factors: RemoteANN uses flat
+𝑘-means rather than Lance-RQ’s default hierarchical 𝑘-means 11,
+and it performs additional processes to improve query performance.
+This additional construction cost is a one-time investment that
+intermediate I/O but excluding the preliminary scan and final partition-index construc-
+tion. Concurrently, the memory footprint corresponds to the size required to maintain
+an active index. Under concurrent query workloads, memory consumption scales
+dynamically to accommodate buffers allocated for incoming cloud storage payloads.
+11Hierarchical 𝑘-means reduces training time but generally incurs higher cluster-
+ing distortion [21]. Any resulting loss in recall may require probing more clusters
+to reach the same target recall, potentially increasing remote storage requests. We
+therefore use flat 𝑘-means to prioritize query performance, while QGKMeans reduces
+its construction cost.
+10
+
+
+Table 9: Indexing time (T) and memory footprint (M).
+RemoteANN
+Lance-RQ
+RemoteSPANN
+Dataset
+T (s)
+M (GiB) T (s) M (GiB) T (s)
+M (GiB)
+SIFT
+9
+0.03
+7
+0.04
+116
+0.18
+MSong
+15
+0.08
+7
+0.09
+224
+0.52
+Contriever
+20
+0.12
+12
+0.13
+628
+0.93
+GIST
+27
+0.15
+15
+0.16
+596
+1.17
+MXBAI
+23
+0.13
+13
+0.14
+461
+0.96
+OpenAI
+43
+0.23
+23
+0.25
+1186
+1.85
+Cohere
+252
+1.72
+180
+1.91
+7230
+12.43
+Deep-1B
+11029
+32.40
+5176
+30.62
+-
+-
+10
+20
+30
+0
+8
+16
+40
+80
+120
+0
+40
+80
+0.80
+0.90
+0
+200
+400
+0.80
+0.90
+0
+150
+300
+Concurrency = 1
+Concurrency = 4
+Concurrency = 16
+Cohere
+Deep-1B
+QPS
+Recall
+RemoteANN
+Lance-RQ
+RemoteSPANN
+Figure 5: Evaluation of scalability.
+pays off through the querying, which we consider as a worthwhile
+trade-off for the substantial gains in query performance. As for
+the memory consumption, RemoteANN and Lance-RQ are similar
+under the data-placement settings described in Section 4.1, whereas
+RemoteSPANN consumes substantially more memory. This differ-
+ence arises primarily from their in-memory structures. Following
+SPANN [14], RemoteSPANN keeps cluster centroids and a routing
+graph in DRAM. Its bounded cluster sizes and vector replication re-
+sult in a large number of clusters, with the centroid count reaching
+approximately 20% of the dataset size in the default configuration.
+By comparison, memory usage in RemoteANN and Lance-RQ is
+dominated by the compact 1-bit RaBitQ codes, resulting in a much
+smaller footprint.
+24
+30
+10
+20
+30
+80
+120
+0
+50
+100
+0.90
+0.95
+200
+400
+0.85
+0.90
+0.95
+0
+150
+300
+Concurrency = 1
+Concurrency = 4
+Concurrency = 16
+Contriever
+OpenAI
+QPS
+Recall
+Naive
++Prune and Range
++Prune
+RemoteANN (Full)
+Figure 6: Ablation study of query optimization components.
+4.2.2
+Scalability Evaluation. We validate the scalability of our
+method and baselines on Cohere and Deep-1B datasets. The corre-
+sponding index construction parameters (i.e., number of clusters
+in IVF) are detailed in Table 1. For Deep-1B, we provision an AWS
+EC2 c5n.4xlarge compute node to accommodate the elevated run-
+time memory footprint. The end-to-end performance profiles are
+illustrated via the QPS-recall curves in Figure 5, whereas the cloud
+object storage I/O metrics, indexing time, and memory footprint
+are summarized in Table 8 and Table 9. Results for RemoteSPANN
+are omitted on Deep-1B since the indexing process of SPANN ex-
+ceeded the 24-hour time threshold. Consistent with the empirical
+trends established on the million-scale datasets, RemoteANN consis-
+tently outperforms evaluated baselines on the Cohere and Deep-1B
+across all query concurrency levels. The stable search performance
+validates the scalability and robustness of our method. Moreover,
+RemoteANN delivers substantial performance advantages in terms
+of the cloud I/O metrics, directly mirroring the presented empirical
+results on the million-scale datasets.
+4.2.3
+Ablation Study. We evaluate the individual contributions of
+our query optimization components via an ablation study on the
+Contriever and OpenAI datasets. Specifically, we strip all query
+optimization strategies discussed in Section 3.2 to establish a naive
+baseline. We then incrementally integrate cluster pruning, range
+optimization and request merging to systematically reconstruct
+the complete RemoteANN framework. The resulting QPS-recall
+11
+
+
+Table 10: Cache hit ratio with 1 concurrent query at 97%
+target recall across varying local cache capacities (normalized
+relative to the data volume in remote storage).
+Ratio of Clusters from Cache (%)
+Dataset
+10% Cache
+20% Cache
+30% Cache
+Contriever
+8.5%
+14.6%
+20.1%
+OpenAI
+7.3%
+11.6%
+13.1%
+Table 11: Query throughput comparison under varying con-
+currency levels (Conc.) at 97% target recall.
+Dataset
+Conc. RemoteANN Raw Lance-RQ RemoteSPANN
+Contriever
+1
+29.5
+27.5
+13.3
+24.4
+4
+120.0
+109.5
+54.2
+99.0
+16
+412.5
+305.2
+78.7
+221.1
+OpenAI
+1
+25.7
+22.7
+12.4
+14.6
+4
+104.7
+85.53
+49.9
+39.1
+16
+298.2
+199.2
+78.2
+50.7
+curves are presented in Figure 6. As demonstrated, both pruning and
+range optimization significantly elevate query throughput without
+compromising retrieval accuracy. Furthermore, incorporating the
+request merging mechanism introduces a minor throughput degra-
+dation under high-concurrency workloads due to the increased
+volume of downloaded data, but it would effectively reduce cloud
+API operational costs (e.g., achieving 30% reduction on Contriever
+and 14% reduction on OpenAI according to Table 3 and Table 8).
+For the local NVMe SSD caching layer (detailed in Section 3.2.4),
+during evaluations on the Contriever and OpenAI datasets, query
+throughput matched that of the cacheless baseline. Therefore, we
+omit the overlapping QPS-recall curves to isolate and analyze the
+cache hit ratio as the primary metric. As detailed in Table 10, the
+cache hit ratio scales monotonically with expanded cache capacity.
+Furthermore, caching efficacy is heavily dictated by the underlying
+query workload characteristics, where the Contriever dataset yields
+a higher hit ratio compared to OpenAI.
+Finally, we evaluate a variant of our framework, RemoteANN-
+Raw (denoted Raw in Table 11), which stores raw data vectors on
+cloud object storage instead of the compact RaBitQ quantization
+codes, while retaining all other query-side optimizations. As pre-
+sented in Table 11, it achieves lower QPS than vanilla RemoteANN.
+However, RemoteANN-Raw is still much more efficient than other
+baselines, which indicates that the bulk of RemoteANN’s speedup
+over the baselines stems mainly from our co-designed optimiza-
+tions for indexing and querying, which remain effective regardless
+of whether the underlying payload is quantized or raw.
+5
+Related Work
+Indices for Approximate Nearest Neighbor Search. Existing
+index structures for Approximate Nearest Neighbor (ANN) search
+predominantly encompass graph-based [22, 40, 49], quantization-
+based [6, 9, 25, 27, 29, 33, 41], hashing-based [16, 23, 36, 38, 58,
+59], cluster-based [14, 65], and tree-based [7, 11, 15, 32] methods.
+While prior research has predominantly focused on in-memory or
+disk-based scenarios, RemoteANN is specifically designed for both
+indexing and querying over the cloud object storage.
+Cloud Object Storage and Vector Search. Driven by the elastic-
+ity, durability, and cost-effectiveness of cloud object storage, both
+academia and industry have proposed different data management
+systems with an object store backend. AnyBlob [19] explored the
+potential of utilizing the cloud object storage for OLAP workloads
+and developed a high-performance download manager. A recent
+empirical study [47] benchmarked the performance of two repre-
+sentative disk-based ANN indices (SPANN [14] and DiskANN [40])
+deployed over cloud object storage backends. In industry, a series
+of vector search engines on cloud object storage has emerged, in-
+cluding Turbopuffer [61], Amazon S3 Vectors [4], Lance [46], and
+Databricks [53]. Both Turbopuffer and Amazon S3 Vectors adopt
+SPFresh [65] as their underlying index structure, whereas Lance
+and Databricks utilize Inverted File (IVF) index variants. We do
+not directly compare RemoteANN with the closed-source services
+turbopuffer and Amazon S3 Vectors, or with the full Databricks
+platform. Instead, we evaluate Lance’s IVF-RQ index as Lance-RQ,
+alongside RemoteSPANN, to compare representative indexing ap-
+proaches under controlled storage and data-placement settings,
+focusing on the algorithmic co-design of index structures and the
+cloud environment.
+Accelerating IVF Construction. Recent work accelerates the
+𝑘-means clustering in IVF construction by adopting techniques
+from ANN search. SuperKMeans [44] combines dimension prun-
+ing [26] with the PDX data layout [45] to reduce the cost of dis-
+tance computation. Graph-based approaches also accelerate this
+step [17, 57, 64]. For example, SeededANN [57] uses an HNSW-
+based index over centroids and exploits assignments from previous
+iterations to seed subsequent searches. Another direction performs
+clustering on compressed vectors to reduce computation and mem-
+ory overhead [43]. Input compression represents an orthogonal
+design dimension to the choice of centroid-assignment method and
+could potentially be combined with our QGKMeans. Our evalua-
+tion focuses on acceleration using the original input vectors; we
+therefore leave combinations with input compression outside the
+scope of this comparison.
+6
+Conclusion and Discussion
+In this paper, we presented RemoteANN, a vector search engine
+explicitly co-designed for cloud object storage. Motivated by the
+pronounced network latency and per-request pricing of the storage
+tier, RemoteANN couples an IVF index with RaBitQ quantization
+and a locality-aware data layout, accelerates index construction
+via QGKMeans, and introduces a query engine combining cluster
+pruning, range optimization, request merging, and caching. When
+evaluated on real-world datasets, RemoteANN consistently outper-
+forms all representative baselines in query throughput and incurs
+lower storage API expenses. Our ablation study further confirms
+the contribution of query-side optimizations, and our scalability
+evaluation demonstrates that these gains persist at billion-scale.
+Several limitations point to directions for future work. Currently,
+RemoteANN targets a static IVF index. Supporting efficient incre-
+mental updates and deletions remains an open challenge for vector
+search on cloud object storage. Moreover, our evaluation focuses on
+12
+
+
+the warm-query setting, where index metadata is already resident
+in the compute node’s memory. A deeper investigation of cold-start
+mitigation strategies, such as workload-driven prefetching, would
+further broaden RemoteANN’s applicability to bursty or intermit-
+tent workloads. We believe the co-design principles introduced
+in this work offer a general foundation for future systems in this
+space.
+References
+[1] Amazon Web Services. 2026. Amazon EBS. https://aws.amazon.com/ebs/. Ac-
+cessed: 2026-06-11.
+[2] Amazon Web Services. 2026. Amazon EC2. https://aws.amazon.com/pm/ec2/.
+Accessed: 2026-06-11.
+[3] Amazon Web Services. 2026. Amazon S3 - Cloud Object Storage - AWS. https:
+//aws.amazon.com/s3/. Accessed: 2026-06-11.
+[4] Amazon Web Services. 2026. Amazon S3 Vectors: Object Storage for Cloud-
+Native Vector Search. https://aws.amazon.com/s3/features/vectors/. Accessed:
+2026-06-11.
+[5] Hyung-Chan An, Robert Kleinberg, and David B Shmoys. 2015. Improving
+Christofides’ algorithm for the st path TSP. Journal of the ACM (JACM) 62, 5
+(2015), 1–28.
+[6] Fabien André, Anne-Marie Kermarrec, and Nicolas Le Scouarnec. 2016. Cache
+locality is not enough: High-performance nearest neighbor search with product
+quantization fast scan. In 42nd International Conference on Very Large Data Bases,
+Vol. 9. 12.
+[7] Sunil Arya and David M Mount. 1993. Approximate nearest neighbor queries in
+fixed dimensions.. In SODA, Vol. 93. Citeseer, 271–280.
+[8] Martin Aumüller, Erik Bernhardsson, and Alexander Faithfull. 2020. ANN-
+Benchmarks: A Benchmarking Tool for Approximate Nearest Neighbor Algo-
+rithms. Information Systems 87 (2020), 101374. doi:10.1016/j.is.2019.02.006
+[9] Artem Babenko and Victor Lempitsky. 2014. Additive quantization for extreme
+vector compression. In Proceedings of the IEEE Conference on Computer Vision
+and Pattern Recognition. 931–938.
+[10] Artem Babenko and Victor Lempitsky. 2014. The inverted multi-index. IEEE
+transactions on pattern analysis and machine intelligence 37, 6 (2014), 1247–1260.
+[11] Alina Beygelzimer, Sham Kakade, and John Langford. 2006. Cover trees for
+nearest neighbor. In Proceedings of the 23rd international conference on Machine
+learning. 97–104.
+[12] ByteDance. 2026. Torch Object Storage. https://www.byteplus.com/en/product/
+tos. Accessed: 2026-06-11.
+[13] Hue-Ling Chen and Ye-In Chang. 2005. Neighbor-finding based on space-filling
+curves. Information systems 30, 3 (2005), 205–226.
+[14] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong
+Li, Mao Yang, and Jingdong Wang. 2021.
+SPANN: Highly-efficient Billion-
+scale Approximate Nearest Neighborhood Search. In Advances in Neural
+Information Processing Systems, M. Ranzato, A. Beygelzimer, Y. Dauphin,
+P.S. Liang, and J. Wortman Vaughan (Eds.), Vol. 34. Curran Associates,
+Inc., 5199–5212.
+https://proceedings.neurips.cc/paper_files/paper/2021/file/
+299dc35e747eb77177d9cea10a802da2-Paper.pdf
+[15] Paolo Ciaccia, Marco Patella, and Pavel Zezula. 1997.
+M-tree: An Efficient
+Access Method for Similarity Search in Metric Spaces. In Proceedings of the 23rd
+International Conference on Very Large Data Bases (VLDB ’97). Morgan Kaufmann
+Publishers Inc., San Francisco, CA, USA, 426–435.
+[16] Mayur Datar, Nicole Immorlica, Piotr Indyk, and Vahab S Mirrokni. 2004. Locality-
+sensitive hashing scheme based on p-stable distributions. In Proceedings of the
+twentieth annual symposium on Computational geometry. 253–262.
+[17] Cheng-Hao Deng and Wan-Lei Zhao. 2018. Fast k-Means Based on k-NN Graph.
+In 2018 IEEE 34th International Conference on Data Engineering (ICDE). 1220–1223.
+doi:10.1109/ICDE.2018.00115
+[18] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy,
+Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. 2024.
+The Faiss library. arXiv:2401.08281 [cs.LG]
+[19] Dominik Durner, Viktor Leis, and Thomas Neumann. 2023. Exploiting cloud ob-
+ject storage for high-performance analytics. Proceedings of the VLDB Endowment
+16, 11 (2023), 2769–2782.
+[20] Gil Einziger, Roy Friedman, and Ben Manes. 2017. Tinylfu: A highly efficient
+cache admission policy. ACM Transactions on Storage (ToS) 13, 4 (2017), 1–31.
+[21] Faiss contributors. [n. d.]. Faiss FAQ. https://github.com/facebookresearch/faiss/
+wiki/FAQ. Accessed: 2026-10-18.
+[22] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast Approximate
+Nearest Neighbor Search with the Navigating Spreading-out Graph. Proceedings
+of the VLDB Endowment 12, 5 (2019), 461–474. doi:10.14778/3303753.3303754
+[23] Junhao Gan, Jianlin Feng, Qiong Fang, and Wilfred Ng. 2012. Locality-sensitive
+hashing scheme based on dynamic collision counting. In Proceedings of the 2012
+ACM SIGMOD international conference on management of data. 541–552.
+[24] Jianyang Gao, Yutong Gou, Yuexuan Xu, Jifan Shi, Zhonghao Yang, and Cheng
+Long. 2025. The RaBitQ Library. In The 1st Workshop on Vector Databases.
+[25] Jianyang Gao, Yutong Gou, Yuexuan Xu, Yongyi Yang, Cheng Long, and Raymond
+Chi-Wing Wong. 2025. Practical and asymptotically optimal quantization of
+high-dimensional vectors in euclidean space for approximate nearest neighbor
+search. Proceedings of the ACM on Management of Data 3, 3 (2025), 1–26.
+[26] Jianyang Gao and Cheng Long. 2023. High-dimensional approximate nearest
+neighbor search: with reliable and efficient distance comparison operations.
+Proceedings of the ACM on Management of Data 1, 2 (2023), 1–27.
+[27] Jianyang Gao and Cheng Long. 2024. RaBitQ: Quantizing High-Dimensional
+Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor
+Search. Proc. ACM Manag. Data 2, 3, Article 167 (May 2024), 27 pages. doi:10.
+1145/3654970
+[28] Michael R Garey and David S Johnson. 1979. Computers and Intractability: A
+Guide to the Theory of NP-Completeness. W. H. Freeman and Company.
+[29] Tiezheng Ge, Kaiming He, Qifa Ke, and Jian Sun. 2014. Optimized product
+quantization. IEEE transactions on pattern analysis and machine intelligence 36, 4
+(2014), 744–755.
+[30] Google Cloud. 2026. Google Cloud Storage. https://cloud.google.com/storage.
+Accessed: 2026-10-18.
+[31] Yutong Gou, Jianyang Gao, Yuexuan Xu, and Cheng Long. 2025. SymphonyQG:
+towards symphonious integration of quantization and graph for approximate
+nearest neighbor search. Proceedings of the ACM on Management of Data 3, 1
+(2025), 1–26.
+[32] Yan Gu, Zachary Napier, Yihan Sun, and Letong Wang. 2022. Parallel cover trees
+and their applications. In Proceedings of the 34th ACM Symposium on Parallelism
+in Algorithms and Architectures. 259–272.
+[33] Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern,
+and Sanjiv Kumar. 2020. Accelerating large-scale inference with anisotropic
+vector quantization. In International Conference on Machine Learning. PMLR,
+3887–3896.
+[34] David Hilbert. 1935. Über die stetige Abbildung einer Linie auf ein Flächenstück.
+In Dritter Band: Analysis· Grundlagen der Mathematik· Physik Verschiedenes: Nebst
+Einer Lebensgeschichte. Springer, 1–2.
+[35] JA Hoogeveen. 1991. Analysis of Christofides’ heuristic: Some paths are more
+difficult than cycles. Operations Research Letters 10, 5 (1991), 291–295.
+[36] Qiang Huang, Jianlin Feng, Yikai Zhang, Qiong Fang, and Wilfred Ng. 2015.
+Query-aware locality-sensitive hashing for approximate nearest neighbor search.
+Proceedings of the VLDB Endowment 9, 1 (2015), 1–12.
+[37] IBM. 2026. IBM Cloud Object Storage. https://www.ibm.com/products/cloud-
+object-storage. Accessed: 2026-10-18.
+[38] Piotr Indyk and Rajeev Motwani. 1998. Approximate nearest neighbors: towards
+removing the curse of dimensionality. In Proceedings of the thirtieth annual ACM
+symposium on Theory of computing. 604–613.
+[39] Elias Jääsaari, Ville Hyvönen, Matteo Ceccarello, Teemu Roos, and Martin
+Aumüller. 2026. VIBE: Vector Index Benchmark for Embeddings. Journal of Data-
+centric Machine Learning Research (2026). https://vector-index-bench.github.io/
+[40] Suhas Jayaram Subramanya, Fnu Devvrit, Harsha Vardhan Simhadri, Ravishankar
+Krishnawamy, and Rohan Kadekodi. 2019. Diskann: Fast accurate billion-point
+nearest neighbor search on a single node. Advances in Neural Information
+Processing Systems 32 (2019).
+[41] Herve Jegou, Matthijs Douze, and Cordelia Schmid. 2011. Product quantization
+for nearest neighbor search. IEEE transactions on pattern analysis and machine
+intelligence 33, 1 (2011), 117–128.
+[42] William B Johnson and Joram Lindenstrauss. 1984. Extensions of Lipschitz
+mappings into a Hilbert space 26. Contemporary mathematics 26 (1984), 28.
+[43] Leonardo Kuffo and Peter Boncz. 2026. Stop Indexing at Full Precision: Revisiting
+Clustering for Vector Embeddings. In Proceedings of the VLDB Workshop on Vector
+Databases. https://arxiv.org/abs/2608.14648
+[44] Leonardo Kuffo, Sven Hepkema, and Peter Boncz. 2026. A Super Fast K-means
+for Indexing Vector Embeddings. arXiv preprint arXiv:2603.20009 (2026).
+[45] Leonardo Kuffo, Elena Krippner, and Peter Boncz. 2025. PDX: A data layout for
+vector similarity search. Proceedings of the ACM on Management of Data 3, 3
+(2025), 1–26.
+[46] LanceDB. 2026. LanceDB: Developer-Friendly OSS Embedded Retrieval Library
+for Multimodal AI. https://docs.lancedb.com/. Accessed: 2026-06-11.
+[47] Zhaoheng Li, Wei Ding, Silu Huang, Zikang Wang, Yuanjin Lin, Ke Wu, Yongjoo
+Park, and Jianjun Chen. 2025. Cloud-Native Vector Search: A Comprehensive
+Performance Analysis. arXiv:2511.14748 [cs.DB] https://arxiv.org/abs/2511.
+14748
+[48] Swanwa Liao, Mario Alberto López, and Scott T Leutenegger. 2001. High dimen-
+sional similarity search with space filling curves. In Proceedings 17th international
+conference on data engineering. IEEE, 615–622.
+[49] Yu A Malkov and Dmitry A Yashunin. 2018. Efficient and robust approximate
+nearest neighbor search using hierarchical navigable small world graphs. IEEE
+transactions on pattern analysis and machine intelligence 42, 4 (2018), 824–836.
+13
+
+
+[50] Microsoft Azure. 2026. Azure Blob Storage | Microsoft Azure. https://azure.
+microsoft.com/en-us/products/storage/blobs. Accessed: 2026-06-11.
+[51] Guy M Morton. 1966. A computer oriented geodetic data base and a new technique
+in file sequencing. International Business Machines Company.
+[52] Oracle. 2026. Oracle Cloud Infrastructure Object Storage. https://docs.oracle.
+com/en-us/iaas/Content/Object/. Accessed: 2026-10-18.
+[53] Zero Qu, Erik Lindgren, Dima Kotlyarov, and Sergei Tsarev. 2026. Decoupled by
+Design: Billion-Scale AI Search. https://www.databricks.com/blog/decoupled-
+design-billion-scale-vector-search. Accessed: 2026-06-11.
+[54] Daniel J Rosenkrantz, Richard E Stearns, and Philip M Lewis, II. 1977. An
+analysis of several heuristics for the traveling salesman problem. SIAM journal
+on computing 6, 3 (1977), 563–581.
+[55] Hans Sagan. 2012. Space-filling curves. Springer Science & Business Media.
+[56] Harsha Vardhan Simhadri, George Williams, Martin Aumüller, Matthijs Douze,
+Artem Babenko, Dmitry Baranchuk, Qi Chen, Lucas Hosseini, Ravishankar Kr-
+ishnaswamy, Gopal Srinivasa, Suhas Jayaram Subramanya, and Jingdong Wang.
+2022. Results of the NeurIPS’21 Challenge on Billion-Scale Approximate Nearest
+Neighbor Search. In Proceedings of the NeurIPS 2021 Competitions and Demonstra-
+tions Track (Proceedings of Machine Learning Research, Vol. 176). PMLR, 177–189.
+https://proceedings.mlr.press/v176/simhadri22a.html
+[57] Jack Spalding-Jamieson, Eliot Wong Robson, and Da Wei Zheng. 2025. Scalable k-
+Means Clustering for Large k via Seeded Approximate Nearest-Neighbor Search.
+arXiv:2502.06163 [cs.LG] https://arxiv.org/abs/2502.06163
+[58] Yifang Sun, Wei Wang, Jianbin Qin, Ying Zhang, and Xuemin Lin. 2014. SRS:
+solving c-approximate nearest neighbor queries in high dimensional euclidean
+space with a tiny index. Proceedings of the VLDB Endowment 8, 1 (2014), 1–12.
+doi:10.14778/2735461.2735462
+[59] Yufei Tao, Ke Yi, Cheng Sheng, and Panos Kalnis. 2010. Efficient and accu-
+rate nearest neighbor and closest pair search in high-dimensional space. ACM
+Transactions on Database Systems (TODS) 35, 3 (2010), 1–46.
+[60] Tencent Cloud. 2026. Tencent Cloud Object Storage. https://www.tencentcloud.
+com/products/cos. Accessed: 2026-06-11.
+[61] Turbopuffer. 2026. Turbopuffer System Architecture: Serverless, Object-Storage-
+First Vector Search. https://turbopuffer.com/docs/architecture. Accessed: 2026-
+06-11.
+[62] Shay Vargaftik, Ran Ben-Basat, Amit Portnoy, Gal Mendelson, Yaniv
+Ben-Itzhak, and Michael Mitzenmacher. 2021.
+DRIVE: One-bit Dis-
+tributed Mean Estimation. In Advances in Neural Information Processing Sys-
+tems, Vol. 34. 362–377.
+https://proceedings.neurips.cc/paper/2021/hash/
+0397758f8990c1b41b81b43ac389ab9f-Abstract.html
+[63] Shay Vargaftik, Ran Ben-Basat, Amit Portnoy, Gal Mendelson, Yaniv Ben-Itzhak,
+and Michael Mitzenmacher. 2022. EDEN: Communication-Efficient and Robust
+Distributed Mean Estimation for Federated Learning. In Proceedings of the 39th
+International Conference on Machine Learning (Proceedings of Machine Learning
+Research, Vol. 162). PMLR, 21984–22014.
+https://proceedings.mlr.press/v162/
+vargaftik22a.html
+[64] Yan Wang, Jian Zhou, Sai Huang, Chao Dou, Hanwen Tian, Zhijie Jiang, Zongning
+Zhang, Xiaoqi Li, Zhencan Peng, Chunhui Shen, Wei Zhang, Feifei Li, and Dong
+Deng. 2026. LindormVector: A Distributed Vector Engine on a Cloud-Native
+Multi-Model NoSQL Database. In Companion of the International Conference on
+Management of Data (Bengaluru, India) (SIGMOD Companion ’26). Association
+for Computing Machinery, New York, NY, USA, 451–463. doi:10.1145/3788853.
+3803088
+[65] Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li,
+Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, and Mao Yang. 2023. SPFresh:
+Incremental In-Place Update for Billion-Scale Vector Search. In Proceedings of the
+29th Symposium on Operating Systems Principles (Koblenz, Germany) (SOSP ’23).
+Association for Computing Machinery, New York, NY, USA, 545–561. doi:10.
+1145/3600006.3613166
+[66] Mingyu Yang, Liuchang Jing, Wentao Li, and Wei Wang. 2026. Quantization Meets
+Projection: A Happy Marriage for Approximate 𝑘-Nearest Neighbor Search.
+Proceedings of the VLDB Endowment 19, 6 (2026), 1240–1249. doi:10.14778/3797919.
+3797931
+[67] Amir Zandieh, Majid Daliri, Majid Hadian, and Vahab Mirrokni. 2026. Tur-
+boQuant: Online Vector Quantization with Near-optimal Distortion Rate. In
+International Conference on Learning Representations (ICLR). https://openreview.
+net/forum?id=tO3ASKZlok
+[68] Rico Zenklusen. 2019. A 1.5-approximation for path TSP. In Proceedings of the
+thirtieth annual ACM-SIAM symposium on discrete algorithms. SIAM, 1539–1549.
+14

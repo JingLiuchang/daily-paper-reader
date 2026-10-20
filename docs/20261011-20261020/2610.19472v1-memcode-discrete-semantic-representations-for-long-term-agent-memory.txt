@@ -1,0 +1,2307 @@
+MemCode: Discrete Semantic Representations for
+Long-Term Agent Memory
+Xin Li1
+Liang Hu1
+Duoqian Miao1
+Ming Peng1
+Qi Zhang1,2∗
+1Tongji University
+2WorldMind
+{lx cs, lianghu, dqmiao, pengming, zhangqi cs}@tongji.edu.cn
+Abstract
+Long-term memory remains a fundamental bottleneck for large language model
+(LLM) agents across sessions. Existing systems typically adopt a write-then-
+retrieve paradigm, storing context-dependent dialogue fragments and retrieving
+them via nearest-neighbor search in continuous embedding space. This design
+yields unstable access units and systematically misses logically related but lexi-
+cally distant evidence. We propose MemCode, a long-term agent memory frame-
+work that couples retrieval-oriented writing with discrete associative retrieval.
+MemCode rewrites dialogue into self-contained atomic memory units (AMUs),
+maps AMUs into a learnable codebook with isomorphic semantic quantization
+(ISQ), and uses codebook co-occurrence topology as a retrieval path comple-
+mentary to vector search. For long-term memory stores, MemCode separates on-
+line atomic writes from asynchronous offline consolidation. On LongMemEval-S
+and LoCoMo with GPT-4o-mini and Qwen3-30B-A3B-Instruct-2507 backbones,
+MemCode achieves the best overall accuracy while keeping per-dialogue mem-
+ory construction within roughly 40∼130 seconds, making it 3∼21× faster than
+LightMem and over an order of magnitude faster than A-MEM and MemoryOS.
+1
+Introduction
+Large language model (LLM) agents are rapidly evolving from single-turn systems into persistent
+assistants that interact with users over extended sessions [1, 2]. However, neither model parameters
+nor context windows provide a satisfactory substrate for this need. Parameters are largely static
+after training, while long contexts incur quadratic attention costs [3] and exhibit degraded utilization
+as sequences grow [4]. It fundamentally elevates the role of agent memory that, distinct from both
+parameters and context, must accumulate, organize, and recall information across sessions to support
+personalization, consistency, and long-horizon reasoning.
+As a result, external memory has emerged as a central component for agent systems. Most memory
+systems follow a retrieval-augmented generation (RAG) paradigm [5, 6]: past interactions are writ-
+ten into storage, retrieved at query time, and re-injected into the model context. In this setting, two
+design choices are tightly coupled: 1) what to write, and 2) how to retrieve it. Prior systems address
+these choices primarily from memory persistence. Mem0 [7], LangMem [8], and A-MEM [9] im-
+prove writing and organization through Create, Read, Update, and Delete (CRUD) operations, typed
+memories, and evolvable note networks; MemoryOS [10] and LightMem [11] improve scalability
+through scheduling and compression. However, we argue that the key bottleneck for RAG-style
+long-term memory is not storage scale alone, but jointly modeling what to write and how to retrieve
+it, as illustrated in Figure 1.
+This coupling becomes sharper as conversations grow. A memory item may be easy to store but
+expensive to use if it lacks the necessary context, such as missing speakers or times. Conversely,
+∗Corresponding Author
+40th Conference on Neural Information Processing Systems (NeurIPS 2026).
+arXiv:2610.19472v1  [cs.AI]  14 Oct 2026
+
+
+no explicit atomization
+Continuous 
+vectors only no 
+discrete anchors
+Logically related, geometrically 
+distant
+Surface-similar 
+irrelevant
+write then retrieve (Dual-Path：Vector + Codebook)
+He said he’d 
+come back 
+yesterday
+Tomorrow 
+she will…
+It was about 
+the same 
+thing again
+Write raw fragments
+Store unstructured memory
+Retrieve by surface similarity
+Write memory units
+Retrieve relevant memories
+Atomic Facts
+Path B（codebook）
+Path A（vector）
+VQ-VAE Model
+Vector Embedding Model Vector DB
+Codebook DB
+Coreference 
+resolved,
+time anchored
+Raw Dialogue Input
+Raw Dialogue Input
+Write Store Retrieve
+Write Store Retrieve
+Dual-Path Structured & Connected Memory
+Low Noise，Efficient Retrieval
+Unstructured Memory
+Accurate,
+Aggregated 
+Result
+Traditional Approaches:
+Our Proposed Framework:
+implicit write-store-retrieve
+Figure 1: Traditional memory pipelines store raw dialogue fragments and retrieve them primarily
+by surface similarity. Ours rewrites dialogue into atomic memory units and retrieves them through
+complementary vector and codebook paths.
+a compressed summary might answer broad questions but can erase the factual hooks needed for
+multi-hop recall. Our goal is to create independently retrievable memory units that maintain pointers
+to raw dialogue, avoiding irreversible abstraction bottlenecks.
+Specifically, the writing pipeline is retrieval-oriented memory modeling, focusing on creating
+retrieval-accessible targets that remain understandable and indexable after separation from the orig-
+inal dialogue. Context-dependent fragments are weak storage units; instead, atomic facts are de-
+sirable. Long-term recall is usually cued by events and relations, not exact wording. In addition,
+the retrieval issue revolves around access representation. Most systems use continuous vectors for
+memory, retrieving content via top-K nearest-neighbor searches [12], as illustrated by the upper
+pipeline in Figure 1. This works for close memories in surface semantics but inherits the geometric
+bias of continuous representations: logically related but lexically distant content may be missed,
+consistent with evidence that dense retrievers can be brittle when retrieval conditions shift across
+tasks [13]. In contrast, human memory distinguishes itself through pattern separation, allowing the
+hippocampus to encode similar continuous inputs into discrete traces for associative recall of partial
+cues [14, 15]. Systems that just mimic human multi-level memory without discrete anchors may
+still misalign architecture and retrieval.
+Our proposed MemCode retains the RAG-style pipeline while adding a discrete representation layer
+alongside continuous vectors, utilized throughout writing, retrieval, and long-term maintenance.
+During writing, we employ LLM-based ingestion and abstraction to transform dialogue into self-
+contained AMUs with source pointers. Each AMU serves as a minimal semantic unit that can be
+independently retrieved. Independent semantic quantization (ISQ) anchors each AMU to a discrete
+symbolic state within a learnable codebook. During retrieval, global codebook co-occurrence of-
+fers an alternative access path for logically related yet geometrically distant memories, while source
+pointers enhance context reconstruction. MemCode also separates online writing from offline con-
+solidation, allowing clustering and synthesizing AMUs without disrupting real-time retrieval.
+Contributions. Our contributions are fourfold. (1) We propose MemCode, a unified write–index–
+retrieve–consolidate framework that addresses the write–retrieve mismatch in long-term agent mem-
+ory by organizing memory around atomic facts and discrete representations. (2) We introduce AMUs
+as the retrieval unit of this framework, turning raw dialogue into self-contained and source-grounded
+facts. (3) We pair AMUs with ISQ and codebook topology, giving each fact both a continuous vector
+interface and a discrete associative path for evidence beyond local embedding neighborhoods. (4)
+On LongMemEval-S, MemCode reaches 78.40%/74.60% Overall with GPT-4o-mini/Qwen3 after
+asynchronous consolidation; on LoCoMo it reaches 79.55%/76.88%, while keeping construction
+runtime roughly 3∼21× faster than LightMem and over an order of magnitude faster than A-MEM
+and MemoryOS.
+2
+
+
+2
+Related Work
+2.1
+RAG-Based Long-Term Memory for Agents
+Most long-term memory schemes for agents are built on RAG, which combines external stores
+with generative models to reduce knowledge cutoffs and hallucination; in cross-session memory,
+the same pattern writes, indexes, and invokes historical interactions [16]. Gao et al. [17] identify
+retrieval precision and context utilization as central limits that long-term memory inherits.
+Prior work has explored diverse ways to write and organize memories. Mem0 [7] maintains a dy-
+namic fact store through LLM-driven CRUD operations. A-MEM [9] organizes memories as an
+evolvable note network with explicit association edges, while LangMem [8] separates semantic,
+episodic, and procedural memory. These methods move beyond simple caches, but most machin-
+ery still sits above a continuous vector index. This leaves two gaps: 1) pronouns and relative-time
+expressions can make memory units hard to retrieve once detached from the original dialogue; 2)
+nearest-neighbor access is poorly matched to memories that are logically related but distant in sur-
+face semantics. Other systems focus on storage management and lifecycle maintenance. Memo-
+ryOS [10] divides memory into short-, medium-, and long-term levels with heat-driven eviction,
+LightMem [11] lowers token cost through offline compression, and MEMORY-VQ [18] uses VQ-
+VAE to compress precomputed token representations for memory-augmented models. These meth-
+ods improve storage use and throughput, but operate mainly at scheduling, compression, and eviction
+layers rather than retrieval-oriented memory organization. A long-term memory store can still grow
+redundant fragments with overlapping semantics, weakening later retrieval [19].
+2.2
+VQ Codebooks as Discrete Memory Anchors
+In machine learning, vector-quantized variational autoencoders (VQ-VAE) [20] provide a standard
+discretization tool. VQ-VAE maps continuous encodings to discrete embeddings in a finite code-
+book through a nearest-neighbor quantizer and uses the straight-through estimator (STE) for the
+non-differentiable quantization step. A finite codebook encourages distinguishable semantic primi-
+tives and has been widely used in image generation and speech coding [21]. Discrete codebooks can
+therefore serve as compact anchors for high-dimensional continuous representations. This codebook
+view is also compatible with neurocognitive memory intuition. Yassa and Stark [14] describe how
+the hippocampal dentate gyrus separates similar inputs into sparse traces, while the hippocampal
+CA3 subfield supports pattern completion from partial cues [15]. For agent memory, the relevant
+lesson is narrower: discrete anchors can separate similar facts and support associative retrieval be-
+yond geometric nearest neighbors. Dialogue memory, however, requires a retrieval-oriented use
+of VQ rather than direct lossy compression: because AMUs contain timestamps, entity identifiers,
+and state descriptions as factual anchors, MemCode applies stride-1 ISQ to preserve token-level
+alignment and uses the resulting discrete codes as associative retrieval keys.
+3
+Methodology
+3.1
+System Overview
+Figure 2 summarizes MemCode. Ingestion canonicalizes dialogue into self-contained facts (Sec-
+tion 3.2). Dual-path indexing maps each fact to a dense vector and an ISQ codebook fingerprint
+(Section 3.3). Retrieval uses the dense vector for local matching, then uses codebook co-occurrence
+to add associated evidence and reconstruct source context (Section 3.4). Consolidation clusters,
+merges, and deduplicates memories offline (Section 3.5).
+3.2
+Stream-Based Atomic Abstraction Framework
+Interaction chunking & context injection. The writing stage preserves streaming order. We rep-
+resent the raw stream as S = ⟨m1, . . . , mN⟩, where mi = (ri, ti, ci) contains role, timestamp, and
+text. Each compound message ci is split into atomic sentences si [22], and messages are grouped
+into true interaction turns B = {B1, . . . , BKturn}. If Ik is the message-index set of turn k, then
+Bk = ⟨mi : i ∈Ik⟩in chronological order. Because strict turn segmentation can break coreference,
+3
+
+
+Dialogue Stream
+(a) Ingestion & Abstraction
+Base Memory
+(Original Sentences)
+LLM 
+Abstraction Engine
+Atomic
+Facts
+(b) Dual-Path Indexing
+Vector DB
+Fuzzy Matching
+CodeBook DB
+Semantic Anchors
+(c) Retrieval Loop
+User Query
+Evidence
+Reconstruction
+VQ-VAE
+Hashing
+Codebook
+Vector 
+Retrieval
+Codebook 
+Retrieval
+Noise Filter
+Turn-aware
+Chunking
+BGE 
+Embedding
+（Continuous）
+Prompt
+Sort by Time
+Active Memory
+HAC Clustering
+Evolution Gating
+Memory Consolidation
+Temporal
+Refinement
+Knowledge 
+Output Archive
+(d) Memory Evolution
+（Discrete）
+Figure 2: MemCode architecture. Starting from raw dialogue streams, Ingestion & Abstraction
+preserves source-grounded base memory and rewrites interactions into self-contained atomic mem-
+ory units (AMUs). Dual-Path Indexing assigns each AMU both a continuous embedding and a
+discrete codebook fingerprint. During the Retrieval Loop, vector search provides high-precision
+matches, codebook topology adds associative evidence, and source pointers reconstruct richer con-
+text for answer generation. Memory Evolution then asynchronously consolidates long-term facts
+through clustering, deduplication, temporal refinement, and logic-oriented merging.
+MemCode processes the k-th turn with a suffix of Bk−1 as read-only background:
+Hk = Suffix(Bk−1, ω),
+Xk =
+Hk
+|{z}
+Background Context
+⊕
+Bk
+|{z}
+Active Target
+.
+(1)
+Here, Hk contains the last ω sentences from the previous turn, with H1 = ∅for the first turn; ω
+is the extraction-background budget, and ⊕denotes concatenation. The background resolves local
+coreference but is excluded from fact extraction.
+Semantic canonicalization & atomic extraction. Given Xk, the abstraction module rewrites the
+active turn Bk into self-contained facts Fk that remain retrievable after being detached from the
+dialogue. We model this as a generative mapping conditioned on the read-only background and
+metadata extracted from Xk:
+Fk = Φ(Bk | Hk, Tanchor, Rroles)
+(2)
+Here, Φ is the LLM abstraction engine. Tanchor is derived from message timestamps in Xk and
+anchors relative time, while Rroles is the role–speaker map extracted from message roles and used
+with background to resolve pronouns [23]. Each output AMU u ∈Fk is denoted as:
+u = (cfact, tabs, Λsrc)
+(3)
+where cfact is the canonicalized fact generated from Bk, tabs is the absolute timestamp obtained by
+resolving relative time against Tanchor, and Λsrc points to original spans in Bk and, when needed
+for grounding, Hk. During retrieval, these pointers recover nearby utterances when an atomic fact
+matches the query but is too terse for answer generation.
+3.3
+Fine-Grained Discrete Semantic Indexing
+Isomorphic semantic quantization. To build an associative discrete index, MemCode follows VQ-
+VAE and treats the codebook as a latent state basis [24]. For AMU text x = cfact, ISQ obtains
+4
+
+
+encoder states H = (h1, . . . , hL) from a T5-base encoder fine-tuned on DailyDialog [25]. Here,
+stride denotes the projection step over token positions. A learned stride-1 projection maps each state
+to zt = Wpht + bp, giving Z = (z1, . . . , zL) and preserving Lout = L so timestamps, numbers,
+and entity tokens are not dropped. We then introduce a learnable Euclidean codebook E = {ej}Nc
+j=1,
+where ej is the j-th code vector and Nc is the codebook size. Each projected vector zt is assigned
+to its nearest code:
+κt =
+argmin
+j∈{1,...,Nc}
+∥zt −ej∥2,
+¯zt = eκt.
+(4)
+Here, κt is the discrete code id and ¯zt is the quantized vector used in place of zt by the decoder.
+Backpropagation uses the straight-through estimator (STE) [26].
+Conversational codebook learning & semantic fingerprinting. The codebook is trained with
+predictive coding rather than input reconstruction: for each context–response pair, the model pre-
+dicts the response from the quantized context representation [27], preserving reasoning cues while
+filtering shallow lexical noise. The loss is:
+Ltotal = −
+|y|
+X
+r=1
+log pθ(yr | y<r, ¯Z) + λvq
+L
+X
+t=1
+ℓvq(zt, ¯zt).
+(5)
+Here, y is the target response, θ denotes the decoder parameters, ¯Z = (¯z1, . . . , ¯zL) is the quantized
+context sequence, ℓvq = ∥sg[zt]−¯zt∥2
+2+β∥zt−sg[¯zt]∥2
+2, sg[·] stops gradients, β is the commitment
+weight, and λvq balances generation and quantization. The codebook E is updated by EMA [28];
+low-frequency codewords are reinitialized from current-batch encoder outputs. At inference time,
+adjacent repeats in κ1:L are removed to form a compact fingerprint:
+Sfp(u) = ⟨κt : 1 ≤t ≤L, t = 1 or κt̸ = κt−1⟩.
+(6)
+The sequence Sfp(u) is the discrete fingerprint of AMU u. Its unique-code set Ufp(u) = {a :
+a ∈Sfp(u)} is used for topology construction, so repeated code ids are counted once per AMU
+when building co-occurrence statistics. Quantization does not replace the stored AMU text: the
+original cfact remains the evidence presented to the answer generator, while Sfp(u) serves only as
+an auxiliary retrieval key.
+3.4
+Topology-Aware Dual-Path Retrieval
+Implicit topology & associative inference. The discrete fingerprints define an implicit topology
+through codebook co-occurrence, complementing the geometric locality of dense vectors. Let F =
+SKturn
+k=1 Fk be the global AMU store and Nu = |F|. We keep a global matrix M over code ids:
+Mab =
+X
+u∈F
+1[a ∈Ufp(u)] 1[b ∈Ufp(u)] 1[a̸ = b],
+n(a) =
+X
+u∈F
+1[a ∈Ufp(u)].
+(7)
+Thus Mab counts how often distinct ids a and b co-occur in the same AMU fingerprint, while n(a)
+counts how many AMUs contain source id a; diagonal self-transitions are masked [29]. The one-hop
+transition probability is:
+P(b | a) =
+Mab
+P
+b′̸=a Mab′ + ϵ.
+(8)
+Here, ϵ is a small smoothing constant for codes with no outgoing co-occurrence. During inference,
+the query is projected and deduplicated by the same ISQ module, giving query code set Qfp. Treat-
+ing P(b | a) as the entry Pab of the code-to-code transition matrix, MemCode scores activation from
+a source id a ∈Qfp to an associated target id b across up to Hr topology hops:
+Scode(b | a) = log
+ Nu + 1
+n(a) + 1
+
+|
+{z
+}
+source IDF
+·
+max
+1≤h≤Hr
+[P h]ab
+| {z }
+h-hop transition
+· αh
+(9)
+where α ∈(0, 1) controls decay during neighbor expansion and Hr is the fixed retrieval expansion
+depth. We use Hr = 1 in all experiments, preventing recursive topology propagation from ampli-
+fying noisy associations. The source-side IDF downweights frequent query anchors [30], while the
+transition term activates codes reached by repeated co-occurrence.
+5
+
+
+Hybrid evidence retrieval & context reconstruction. The final retrieval stage merges the two
+evidence paths through structured supplementation. The dense path (Path A) retrieves Kv atomic
+facts by nearest-neighbor search over their dense vectors, forming Rvec. The codebook path (Path
+B) scores each AMU by the best code in its fingerprint:
+Samu(u) =
+max
+a∈Qfp
+b∈Ufp(u)
+Scode(b | a).
+(10)
+It then selects Kc supplementary facts from F, excluding Path A memories:
+Rtopo = Top-Kc(F \ Rvec ; ranked by Samu(u) ↓) ,
+Rhybrid = Rvec ∪Rtopo.
+(11)
+Here, Kv and Kc are the fixed dense-path and codebook-path evidence budgets, and ↓denotes de-
+scending order by score. Greedy topology selection adds evidence associated in codebook space but
+absent from dense candidates. MemCode then follows Λsrc back to original spans and orders them
+chronologically. The merge is intentionally asymmetric: Path A provides high-precision neighbors,
+while Path B only supplements it. This keeps popular associations from overwhelming the answer
+context and makes the ablation interpretable under a fixed Kv+Kc evidence budget. In Appendix,
+Figures 5–7 further show learned codes form a concentrated but non-collapsed topology, supporting
+asymmetric use of Path B.
+3.5
+Asynchronous Memory Consolidation
+Online atomic writes can accumulate duplicate facts, outdated states, and retrieval interference.
+MemCode handles this with an asynchronous consolidation engine outside the online path. It back-
+fills dense vectors, filters invalid entries, and applies hierarchical agglomerative clustering (HAC)
+based on cosine distance [31]:
+G = HAC
+
+F; d(ui, uj) = 1 −
+vi · vj
+∥vi∥∥vj∥, dmax = 1 −τ
+
+.
+(12)
+Here, vi is the dense vector of AMU ui produced by the same encoder used by Path A, τ is the con-
+figured minimum cosine similarity for grouping, and G is the candidate cluster set. Large clusters
+are split by time. Before entering the LLM, a gate skips count-sensitive clusters, restricts update-
+sensitive clusters, and avoids cross-speaker mixing. Passing clusters are assigned to AGGREGATE,
+MERGE, or UPDATE, with fewer new facts than archived facts. After write-back, Pointer Forward-
+ing marks old facts as archived and records their new fact indices, forming a two-level evidence
+chain with the original Λsrc. At retrieval, old facts are replaced by new ones. If the temporal span
+of a cluster g ∈G exceeds the minute level, the new fact is prefixed with [Time Span:
+Tstart to
+Tend], where Tstart = minu∈g tabs(u) and Tend = maxu∈g tabs(u). The archive policy combines
+consolidation mode, number of parent facts, time span, and speaker source to decide whether to
+replace or retain a fact, reducing the risk of irreversible information loss.
+4
+Experiments
+4.1
+Experimental Setting
+Datasets and protocol. We evaluate long-term agent memory on LoCoMo [32] and LongMemEval-
+S [33]. LongMemEval-S stresses dynamic multi-session retrieval and updating, while LoCoMo
+covers multi-hop, temporal, open-domain, and single-hop questions. We use an incremental proto-
+col that mimics deployment: the system ingests conversations turn by turn in chronological order
+and cannot access the full history in advance. Baselines and implementation. Baselines include
+Full Text, Naive RAG, LangMem, A-MEM, MemoryOS, Mem0, and LightMem; LangMem is re-
+ported on LongMemEval-S and omitted from the LoCoMo table. Full Text provides the controlled
+full-history self-attention alternative under the same answer backbone. All methods use GPT-4o-
+mini [34] and Qwen3-30B-A3B-Instruct-2507 [35]. MemCode’s discrete representation uses a VQ-
+VAE initialized from T5-base [36] and trained on DailyDialog with a single 32GB GPU; its contin-
+uous representation uses 768-dimensional bge-base-en-v1.5 embeddings [37]. We use only the of-
+ficial DailyDialog training split (11,118 dialogues; 64,935 context–response pairs) to learn reusable
+6
+
+
+Table 1: Accuracy and memory-construction cost on LongMemEval-S. We report Overall/category
+ACC (↑), runtime per dialogue (↓), Total Tokens, and Calls. Asyn. denotes asynchronous consolida-
+tion. Bold and underline denote the best and 2nd-best results within each backbone.
+Method
+Runtime ↓
+Total Tokens ↓
+Calls ↓
+Overall ↑
+Temporal
+Multi-Session
+Know.-Upd.
+Single-User
+Single-Asst.
+Single-Pref.
+(s)
+(k)
+ACC (%)
+(n = 133)
+(n = 133)
+(n = 78)
+(n = 70)
+(n = 56)
+(n = 30)
+GPT-4o-mini
+Full Text
+-
+-
+-
+56.80
+31.58
+45.45
+76.92
+87.14
+89.29
+36.67
+Naive RAG
+-
+-
+-
+61.00
+39.85
+48.48
+67.95
+90.00
+98.21
+53.33
+LangMem
+2293.70
+1102.16
+520.62
+37.20
+15.79
+20.30
+66.67
+60.00
+46.43
+60.00
+A-MEM
+5132.06
+1605.81
+986.55
+62.60
+47.36
+48.87
+64.11
+92.86
+96.43
+46.67
+MemoryOS
+8030.04
+2991.75
+2938.41
+44.80
+32.33
+31.06
+48.72
+80.00
+64.29
+30.00
+Mem0
+4248.49
+1152.62
+811.57
+53.61
+40.15
+46.21
+70.12
+81.43
+41.07
+60.00
+LightMem
+283.76
+28.25
+18.43
+68.64
+67.18
+71.74
+83.12
+87.14
+32.14
+68.18
+MemCode
+74.05
+318.41
+248.84
+77.20
+69.92
+65.41
+82.05
+92.86
+92.86
+83.33
+MemCode + Asyn.
+82.98
+328.05
+274.37
+78.40
+67.67
+69.17
+83.33
+95.71
+91.07
+90.00
+Qwen3-30B-A3B-Instruct-2507
+Full Text
+-
+-
+-
+54.80
+33.08
+35.61
+76.92
+82.86
+87.50
+50.00
+Naive RAG
+-
+-
+-
+60.80
+36.84
+47.73
+65.38
+91.43
+98.21
+70.00
+LangMem
+3237.16
+1430.02
+495.12
+50.80
+37.60
+38.35
+67.95
+78.57
+42.86
+70.00
+A-MEM
+5367.51
+1864.93
+989.30
+65.20
+51.88
+51.12
+76.93
+90.00
+96.43
+40.00
+MemoryOS
+8721.78
+2944.97
+2922.28
+49.60
+28.57
+36.84
+61.54
+72.86
+92.86
+33.33
+Mem0
+2239.94
+1001.90
+722.76
+39.51
+41.94
+28.13
+28.57
+55.32
+26.09
+81.82
+LightMem
+357.13
+25.15
+16.54
+61.95
+54.20
+51.91
+66.67
+80.00
+31.25
+80.00
+MemCode
+78.05
+356.41
+248.84
+73.80
+57.89
+64.66
+78.21
+94.29
+92.86
+90.00
+MemCode + Asyn.
+95.02
+363.59
+265.94
+74.60
+60.90
+66.17
+78.21
+91.43
+92.86
+90.00
+local conversational patterns. The codebook is frozen before memory evaluation; no benchmark
+histories, questions, answers, labels, or retrieval traces enter its optimization. Online ingestion and
+consolidation are constrained to a consumer RTX 3050 Ti GPU. Metrics. For task performance,
+we follow the common LLM-as-a-Judge protocol [38]: GPT-4o-mini compares each output with the
+reference answer or key topic points, and we report overall and category accuracy. For efficiency,
+we report average runtime, Calls, and Total Tokens for memory construction only; after retrieval, all
+methods use a single LLM generation call, while vector retrieval and codebook inverted lookup are
+computationally negligible and depend little on external API conditions. In long-term agent settings,
+the bottleneck is therefore the construction of structured historical memory rather than millisecond-
+level differences in a single query. Appendix Tables 5–7 report the compute environments, offline
+VQ-VAE training settings, and dataset-specific retrieval budgets; Appendix F reports the prompts.
+4.2
+Main Results
+Tables 1 and 2 show that MemCode improves the accuracy–efficiency trade-off across both back-
+bones and benchmarks. It achieves the highest overall accuracy while reducing construction run-
+time to roughly 1/21–1/3 of LightMem’s runtime and 1–2 orders of magnitude below A-MEM and
+MemoryOS. The category breakdown shows where the gains arise: atomic writing improves precise
+localization and speaker-aware facts, the codebook path supports structured temporal and composi-
+tional retrieval, and consolidation partially restores long-range continuity lost by atomic segmenta-
+tion. Appendix Tables 10–12 further show that backbone choice changes the memory store itself:
+Table 11 shows that Qwen3 writes denser AMU/codebook traces, while Tables 10 and 12 connect
+this density to better open-ended coverage but more distractors for exact temporal and multi-hop
+evidence. LongMemEval-S. This benchmark contains roughly 30–40 sessions and about 115K
+tokens, with an emphasis on retrieval and updating in dynamic memory. Under GPT-4o-mini, Mem-
+Code reaches 77.20% Overall, 8.56 points above LightMem; asynchronous consolidation raises it
+to 78.40%. The same trend appears under Qwen3 (73.80% →74.60%). Category results clarify
+the source of the gains. Absolute timestamps turn some temporal questions into constrained single-
+hop retrieval, which helps Temporal and Single-User. LightMem remains stronger on Multi-Session
+(71.74% vs. 65.41%), where paragraph compression preserves cross-session continuity; AGGRE-
+GATE partially recovers it to 69.17%. MemCode is much stronger on Single-Assistant (92.86% vs.
+32.14%), indicating the value of speaker binding.
+In efficiency, MemCode takes about 74 seconds per dialogue and about 83 seconds with consolida-
+tion. Its Calls and Tokens exceed LightMem’s, but the runtime is lower because atomic extraction
+is parallel, whereas batch compression is sequential. Tokens are closer to API cost; Runtime is
+closer to deployment latency. LoCoMo. LoCoMo averages 304.9 dialogue turns and 9209.2 to-
+kens. MemCode reaches 78.12%/76.36% Overall under GPT-4o-mini/Qwen3, and asynchronous
+consolidation improves this to 79.55%/76.88%. Single tasks improve over LightMem (87.04%
+vs. 77.41%), supporting atomic facts and spatiotemporal resolution in single-hop localization. On
+7
+
+
+Table 2: Category-level accuracy and memory-construction cost on LoCoMo. Asyn. denotes asyn-
+chronous consolidation. Bold and underline denote the best and 2nd-best results on each backbone.
+Method
+Runtime ↓
+Total Tokens ↓
+Calls ↓
+Overall ↑
+Multi
+Open
+Single
+Temp
+(s)
+(k)
+(ACC %)
+(n = 282)
+(n = 96)
+(n = 841)
+(n = 321)
+GPT-4o-mini
+Full Text
+-
+-
+-
+73.83
+68.79
+56.25
+86.56
+50.16
+Naive RAG
+-
+-
+-
+63.64
+55.32
+47.92
+70.99
+56.39
+A-MEM
+6060.73
+1149.43
+1175.47
+64.16
+56.03
+31.25
+72.06
+60.44
+MemoryOS (eval)
+2422.05
+287.00
+553.45
+58.25
+56.74
+45.83
+67.06
+40.19
+MemoryOS (pypi)
+3332.59
+526.48
+1016.06
+54.87
+52.13
+43.75
+63.97
+36.76
+Mem0
+4432.87
+1693.39
+1602.20
+61.69
+56.38
+43.75
+66.47
+59.19
+LightMem
+848.49
+99.76
+41.65
+71.95
+62.41
+44.79
+77.41
+74.14
+MemCode
+40.70
+189.32
+287.10
+78.12
+64.89
+43.75
+87.04
+76.64
+MemCode + Asyn.
+109.40
+266.59
+439.60
+79.55
+69.15
+51.04
+87.87
+75.39
+Qwen3-30B-A3B-Instruct-2507
+Full Text
+-
+-
+-
+74.87
+69.86
+57.29
+87.40
+51.71
+Naive RAG
+-
+-
+-
+66.95
+62.41
+57.29
+76.81
+47.98
+A-MEM
+5543.90
+1626.80
+1175.40
+56.10
+57.45
+43.75
+67.90
+27.73
+MemoryOS (eval)
+1269.70
+361.51
+414.70
+61.04
+62.77
+51.04
+72.29
+33.02
+MemoryOS (pypi)
+1982.20
+666.35
+1004.60
+51.30
+52.48
+40.62
+61.59
+26.48
+Mem0
+4540.70
+1799.40
+1614.50
+43.31
+42.91
+46.88
+46.37
+34.58
+LightMem
+815.70
+99.87
+29.10
+71.36
+70.57
+60.42
+79.19
+54.83
+MemCode
+41.14
+206.10
+287.10
+76.36
+59.22
+52.08
+88.11
+67.91
+MemCode + Asyn.
+129.69
+339.81
+517.50
+76.88
+66.31
+48.96
+88.59
+63.86
+Multi tasks, codebook topology under GPT-4o-mini exceeds LightMem and Naive RAG (64.89%
+vs. 62.41%/55.32%), consistent with discrete retrieval recovering implicit cross-segment dependen-
+cies [39]. Full Text and LightMem remain competitive on Multi as a complete or compressed narra-
+tive context preserves logical connections; retrieval methods remain limited by recall completeness.
+Open tasks expose a boundary of abstraction: mental states, implicit emotions, and motivations are
+difficult to fully propositionalize, so Full Text retains an advantage. Consolidation raises Open to
+51.04%, but the synthesized material still comes from extracted facts, leaving limited headroom. In
+efficiency, MemCode needs only 40.70 seconds on LoCoMo, about one twentieth of LightMem’s
+runtime; with consolidation, 109.40 seconds remains below all baselines, so the offline stage retains
+the same parallelism advantage. Boundary of consolidation. Consolidation synthesizes fragmented
+facts into denser memories, improving LoCoMo Multi by 4.26 and 7.09 points. UPDATE also
+reduces interference by archiving outdated states. The trade-off is temporal granularity: multiple
+time points may be compressed into one entry, causing a slight Temporal drop. Since extraction
+already normalizes absolute time, temporal results after consolidation still outperform or match most
+baselines. Qwen3 shows larger Multi gains but also a clearer Temporal drop, indicating that different
+backbones use compressed memories differently. This frames consolidation as an exchange between
+denser global memory and finer temporal resolution, not a uniformly monotonic gain. Appendix
+Table 9 shows that the LoCoMo GPT-4o-mini result is stable across repeated runs.
+Taken together, the two benchmarks separate two regimes. When answers are grounded in explicit
+entities, dates, speaker bindings, or linked facts, MemCode’s AMUs and discrete topology outper-
+form raw retrieval and compressed-memory baselines. When answers depend on implicit affect
+or broad narrative continuity, Full Text and LightMem remain competitive; consolidation narrows
+this gap by restoring continuity at a small temporal-granularity cost. The ablation below tests the
+retrieval path directly, while the appendix adds repeated-run stability (Table 9), dense-embedding
+sensitivity (Table 15), retrieval novelty (Figure 4), and codebook-space structure (Figures 5–7).
+4.3
+Ablation Study
+We run ablations on LoCoMo with GPT-4o-mini. Figure 3(a) shows that doubling vector Top-K
+adds only 1.4%, whereas dual-path retrieval improves Multi-Hop by 5.3 points. The limiting factor
+is therefore not candidate count, but continuous neighborhoods missing logical associations in the
+discrete topology. Figure 3(b) shows that coarser stride hurts Temporal and Multi-Hop while barely
+affecting Single-Hop, confirming that timestamps and entity IDs are core memory tokens rather than
+implementation details.
+Figure 3(c) shows that removing atomic-fact abstraction drops Overall to 53.8% and Multi-Hop
+by 31.2%, indicating that context-dependent writes are weak retrieved evidence. Removing raw
+context costs only 3.2%, meaning that AMUs carry the main retrievable semantics while source
+8
+
+
+Figure 3: Ablation on LoCoMo (GPT-4o-mini): retrieval path, stride, ingestion/context reconstruc-
+tion, and topology/IDF weighting.
+reconstruction mainly improves evidence completeness. This confirms that the quality of the write
+unit is the primary driver of retrieval success, and highlights the importance of precise temporal
+and speaker grounding. Figure 3(d) shows that topology expansion provides long-range activation,
+while IDF suppresses high-frequency anchors; removing either component reduces Multi-Hop, and
+the full model benefits from combining recall expansion with noise control. Together, these results
+illustrate how structured retrieval paths complement dense embeddings to handle compositional and
+temporally distributed evidence.
+Table 3 separates the codebook path from consolidation under a fixed representation and retrieval
+budget. The codebook path adds 5.32 points without consolidation and 3.90 points with it; con-
+solidation adds 5.67 points for dense-only retrieval and 4.26 points for dual-path retrieval. The
+−1.42-point interaction indicates partial overlap, while each component retains a positive marginal
+contribution.
+These ablations rule out a simple retrieval-budget explanation. More vector candidates mostly add
+near-duplicates from the same local embedding neighborhood, while the codebook path changes the
+access relation by following repeated co-occurrence among discrete anchors. The stride result gives
+the same message from the representation side: textual memory is dense in names, dates, quantities,
+and speaker states, so coarse compression removes exactly the tokens that later make temporal and
+compositional questions answerable. MemCode therefore gains by aligning the write unit, discrete
+index, and evidence reconstruction path rather than by tuning one isolated retriever. This indicates
+that future improvements in long-term memory should focus on enhancing the semantic structure
+of the stored units and the associative topology rather than merely increasing candidate counts or
+vector dimensions.
+Table 4(a) separates retrieval structure from evidence volume. Increasing dense retrieval from 20 to
+40 adds 1.43 points, while BM25, dense–sparse fusion, and HyDE remain below MemCode under
+the shared maximum budget.
+Table 3: Component attribution on LoCoMo Multi-Hop (GPT-4o-mini, n = 282). All settings use
+the same base AMU store and a total evidence budget of 40. Counts of correct answers are shown
+in parentheses.
+Retrieval path
+Without consolidation
+With consolidation
+Dense only
+59.57 (168)
+65.25 (184)
+Dense + codebook
+64.89 (183)
+69.15 (195)
+9
+
+
+Table 4: Fixed-budget retrieval controls on LoCoMo (GPT-4o-mini). Panel (a) uses the same frozen
+5,911-AMU store and at most 40 evidence items. Panel (b) isolates the second path under a 20+20
+budget; ∆is codebook minus BM25, C/B-only counts paired wins, and BM25 inj. reports additional
+base facts/time buckets beyond the vector stage.
+(a) Overall same-store controls
+Method
+Evidence budget
+Overall accuracy (%)
+Dense-20
+20
+73.18
+Dense-40
+40
+74.61
+Dense-20 + BM25-20
+20+20
+76.75
+Dense–sparse hybrid + reranker
+40
+76.36
+HyDE + reranker [40]
+40
+76.69
+Dense-20 + codebook-20 (MemCode)
+20+20
+78.12
+(b) Codebook versus BM25 by question category
+Category
+n
+Codebook
+BM25
+∆
+C-only
+B-only
+BM25 inj.
+Overall
+1540
+78.12
+76.75
++1.36
+105
+84
+18.58/10.96
+Multi-Hop
+282
+64.89
+60.64
++4.26
+33
+21
+18.50/10.65
+Temporal
+321
+76.64
+70.41
++6.23
+35
+15
+18.66/11.34
+Open
+96
+43.75
+50.00
+-6.25
+5
+11
+18.59/10.78
+Single-Hop
+841
+87.04
+87.63
+-0.59
+32
+37
+18.58/10.93
+Panel (b) then changes only the second path. BM25 injects many additional facts and time buckets,
+but it does not reproduce the codebook gain on Temporal and Multi-Hop questions. Sparse lexical
+expansion helps when surface terms already point to relevant context, whereas the codebook path
+helps when evidence must be joined across time, entities, and repeated discrete anchors. Appendix
+Tables 13 and 14 provide the trace-level category and explicit-graph cost details.
+5
+Conclusion
+Continuous nearest-neighbor retrieval leaves systematic gaps in structured long-term memory
+queries. Our proposed MemCode keeps the RAG-style paradigm but couples atomic abstraction
+with semantic quantization, topology-aware dual-path retrieval, and asynchronous consolidation.
+This gives facts stable, discrete anchors and exposes associations beyond vector nearest neighbors.
+Across LongMemEval-S and LoCoMo, MemCode achieves the best overall accuracy under two
+backbones while preserving construction efficiency. The component and BM25 replacement abla-
+tions further clarify the mechanism: extra lexical candidates or larger vector budgets do not recover
+the same temporal and multi-hop gains unless retrieval follows the discrete co-occurrence struc-
+ture written during memory construction. This keeps the claim narrow: the advantage comes from
+matching memory writing, indexing, and reconstruction, not from increasing context volume at
+query time. The remaining gaps in open questions reflect a clear limitation of AMU-based abstrac-
+tion: MemCode preserves explicit entities, times, speakers, and factual links well, but it may miss
+implicit motivations, emotions, and pragmatic cues that are better preserved in the raw dialogue.
+Acknowledgments
+This research is supported by the National Key Research and Development Program of China (Grant
+No.2025CSJGG01800/YDZX20263100004012), the National Natural Science Foundation of China
+(No.
+62406225), the Shanghai Municipal Commission of Economy and Informatization under
+the AI for Science ”Hundred Teams, Hundred Projects” Program (No. 2025-GZL-RGZN-BTBX-
+02020), and the Fundamental Research Funds for the Central Universities.
+10
+
+
+References
+[1] Zhiheng Xi, Wenxiang Chen, Xin Guo, Wei He, Yiwen Ding, Boyang Hong, Ming Zhang,
+Junzhe Wang, Senjie Jin, Enyu Zhou, Rui Zheng, Xiaoran Fan, Xiao Wang, Limao Xiong,
+Yuhao Zhou, Weiran Wang, Changhao Jiang, Yicheng Zou, Xiangyang Liu, Zhangyue Yin,
+Shihan Dou, Rongxiang Weng, Wensen Cheng, Qi Zhang, Wenjuan Qin, Yongyan Zheng,
+Xipeng Qiu, Xuanjing Huang, and Tao Gui. The rise and potential of large language model
+based agents: A survey. Science China Information Sciences, 68(2):121101, 2025. doi: 10.
+1007/s11432-024-4222-0. URL https://doi.org/10.1007/s11432-024-4222-0.
+[2] Lei Wang, Chen Ma, Xueyang Feng, Zeyu Zhang, Hao Yang, Jingsen Zhang, Zhiyuan Chen,
+Jiakai Tang, Xu Chen, Yankai Lin, Wayne Xin Zhao, Zhewei Wei, and Ji-Rong Wen. A sur-
+vey on large language model based autonomous agents. Frontiers of Computer Science, 18
+(6):186345, 2024. doi: 10.1007/s11704-024-40231-1. URL https://doi.org/10.1007/
+s11704-024-40231-1.
+[3] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Infor-
+mation Processing Systems (NeurIPS), 2017. URL https://arxiv.org/abs/1706.03762.
+[4] Nelson F. Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio Petroni,
+and Percy Liang. Lost in the middle: How language models use long contexts. Transactions
+of the Association for Computational Linguistics, 12:157–173, 2024. doi: 10.1162/tacl a
+00638. URL https://direct.mit.edu/tacl/article/doi/10.1162/tacl_a_00638/
+119630/Lost-in-the-Middle-How-Language-Models-Use-Long.
+[5] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman
+Goyal, Heinrich K¨uttler, Mike Lewis, Wen-tau Yih, Tim Rockt¨aschel, Sebastian Riedel, and
+Douwe Kiela. Retrieval-augmented generation for knowledge-intensive NLP tasks. In Ad-
+vances in Neural Information Processing Systems (NeurIPS), 2020. URL https://arxiv.
+org/abs/2005.11401.
+[6] Gautier Izacard and Edouard Grave. Leveraging passage retrieval with generative models for
+open domain question answering. In Proceedings of the 16th Conference of the European
+Chapter of the Association for Computational Linguistics (EACL), pages 874–880, 2021. doi:
+10.18653/v1/2021.eacl-main.74.
+URL https://aclanthology.org/2021.eacl-main.
+74/.
+[7] Prateek Chhikara, Dev Khant, Saket Aryan, Taranjeet Singh, and Deshraj Yadav.
+Mem0:
+Building production-ready AI agents with scalable long-term memory.
+arXiv preprint
+arXiv:2504.19413, 2025. URL https://arxiv.org/abs/2504.19413.
+[8] LangChain. LangMem. https://langchain-ai.github.io/langmem/, 2025. Software
+documentation and GitHub repository; accessed 2026-04-25.
+[9] Wujiang Xu, Zujie Liang, Kai Mei, Hang Gao, Juntao Tan, and Yongfeng Zhang. A-MEM:
+Agentic memory for LLM agents. In Advances in Neural Information Processing Systems
+(NeurIPS), 2025. URL https://openreview.net/forum?id=FiM0M8gcct.
+[10] Jiazheng Kang, Mingming Ji, Zhe Zhao, and Ting Bai.
+Memory OS of AI agent.
+In
+Proceedings of the 2025 Conference on Empirical Methods in Natural Language Process-
+ing, pages 25961–25970, 2025.
+doi: 10.18653/v1/2025.emnlp-main.1318.
+URL https:
+//aclanthology.org/2025.emnlp-main.1318/.
+[11] Jizhan Fang, Xinle Deng, Haoming Xu, Ziyan Jiang, Yuqi Tang, Ziwen Xu, Shumin Deng,
+Yunzhi Yao, Mengru Wang, Shuofei Qiao, Huajun Chen, and Ningyu Zhang.
+Light-
+Mem: Lightweight and efficient memory-augmented generation. In International Conference
+on Learning Representations (ICLR), 2026. URL https://openreview.net/forum?id=
+dyJ0GWpjJB.
+[12] Nils Reimers and Iryna Gurevych.
+Sentence-BERT: Sentence embeddings using Siamese
+BERT-networks.
+In Proceedings of the 2019 Conference on Empirical Methods in Natu-
+ral Language Processing and the 9th International Joint Conference on Natural Language
+11
+
+
+Processing (EMNLP-IJCNLP), pages 3982–3992, 2019. doi: 10.18653/v1/D19-1410. URL
+https://aclanthology.org/D19-1410/.
+[13] Nandan Thakur, Nils Reimers, Andreas R¨uckl´e, Abhishek Srivastava, and Iryna Gurevych.
+BEIR: A heterogeneous benchmark for zero-shot evaluation of information retrieval models. In
+Proceedings of the Neural Information Processing Systems Track on Datasets and Benchmarks,
+2021. URL https://openreview.net/forum?id=wCu6T5xFjeJ.
+[14] Michael A. Yassa and Craig E. L. Stark. Pattern separation in the hippocampus. Trends in
+Neurosciences, 34(10):515–525, 2011. doi: 10.1016/j.tins.2011.06.006.
+[15] Susumu Tonegawa, Xu Liu, Steve Ramirez, and Roger Redondo. Memory engram cells have
+come of age. Neuron, 87(5):918–931, 2015. doi: 10.1016/j.neuron.2015.08.002.
+[16] Vladimir Karpukhin, Barlas O˘guz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey Edunov,
+Danqi Chen, and Wen-tau Yih. Dense passage retrieval for open-domain question answering.
+In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing
+(EMNLP), pages 6769–6781, 2020. doi: 10.18653/v1/2020.emnlp-main.550. URL https:
+//aclanthology.org/2020.emnlp-main.550/.
+[17] Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia, Jinliu Pan, Yuxi Bi, Yi Dai, Jiawei Sun,
+Meng Wang, and Haofen Wang. Retrieval-augmented generation for large language models:
+A survey. arXiv preprint arXiv:2312.10997, 2023. URL https://arxiv.org/abs/2312.
+10997.
+[18] Yury Zemlyanskiy, Michiel de Jong, Luke Vilnis, Santiago Onta˜n´on, William Cohen, Sumit
+Sanghai, and Joshua Ainslie. MEMORY-VQ: Compression for tractable Internet-scale mem-
+ory.
+In Proceedings of the 2024 Conference of the North American Chapter of the Asso-
+ciation for Computational Linguistics: Human Language Technologies (Volume 2: Short
+Papers), pages 737–744, Mexico City, Mexico, 2024. Association for Computational Lin-
+guistics. doi: 10.18653/v1/2024.naacl-short.64. URL https://aclanthology.org/2024.
+naacl-short.64/.
+[19] Charles Packer, Sarah Wooders, Kevin Lin, Vivian Fang, Shishir G. Patil, Ion Stoica, and
+Joseph E. Gonzalez.
+MemGPT: Towards LLMs as operating systems.
+arXiv preprint
+arXiv:2310.08560, 2023. doi: 10.48550/arXiv.2310.08560. URL https://arxiv.org/abs/
+2310.08560.
+[20] A¨aron van den Oord, Oriol Vinyals, and Koray Kavukcuoglu. Neural discrete representa-
+tion learning. In Advances in Neural Information Processing Systems (NeurIPS), 2017. URL
+https://arxiv.org/abs/1711.00937.
+[21] Neil Zeghidour, Alejandro Luebs, Ahmed Omran, Jan Skoglund, and Marco Tagliasacchi.
+SoundStream: An end-to-end neural audio codec. IEEE/ACM Transactions on Audio, Speech,
+and Language Processing, 30:495–507, 2022.
+doi: 10.1109/TASLP.2021.3129994.
+URL
+https://doi.org/10.1109/TASLP.2021.3129994.
+[22] Tibor Kiss and Jan Strunk. Unsupervised multilingual sentence boundary detection. Compu-
+tational Linguistics, 32(4):485–525, 2006. doi: 10.1162/coli.2006.32.4.485.
+[23] Kenton Lee, Luheng He, Mike Lewis, and Luke Zettlemoyer. End-to-end neural coreference
+resolution. In Proceedings of the 2017 Conference on Empirical Methods in Natural Language
+Processing (EMNLP), pages 188–197, 2017. doi: 10.18653/v1/D17-1018. URL https://
+aclanthology.org/D17-1018/.
+[24] Alexandre D´efossez, Jade Copet, Gabriel Synnaeve, and Yossi Adi. High fidelity neural au-
+dio compression. arXiv preprint arXiv:2210.13438, 2022. URL https://arxiv.org/abs/
+2210.13438.
+[25] Yanran Li, Hui Su, Xiaoyu Shen, Wenjie Li, Ziqiang Cao, and Shuzi Niu. DailyDialog: A
+manually labelled multi-turn dialogue dataset. In Proceedings of the 8th International Joint
+Conference on Natural Language Processing (IJCNLP), pages 986–995, 2017. URL https:
+//aclanthology.org/I17-1099/.
+12
+
+
+[26] Yoshua Bengio, Nicholas L´eonard, and Aaron Courville. Estimating or propagating gradi-
+ents through stochastic neurons for conditional computation. arXiv preprint arXiv:1308.3432,
+2013. URL https://arxiv.org/abs/1308.3432.
+[27] Aaron van den Oord, Yazhe Li, and Oriol Vinyals. Representation learning with contrastive
+predictive coding. arXiv preprint arXiv:1807.03748, 2018. URL https://arxiv.org/abs/
+1807.03748.
+[28] Ali Razavi, A¨aron van den Oord, and Oriol Vinyals. Generating diverse high-fidelity images
+with VQ-VAE-2. In Advances in Neural Information Processing Systems (NeurIPS), 2019.
+URL https://arxiv.org/abs/1906.00446.
+[29] Omer
+Levy
+and
+Yoav
+Goldberg.
+Neural
+word
+embedding
+as
+implicit
+ma-
+trix
+factorization.
+In
+Advances
+in
+Neural
+Information
+Processing
+Sys-
+tems
+(NeurIPS),
+2014.
+URL
+https://proceedings.neurips.cc/paper/
+5477-neural-word-embedding-as-implicit-matrix-factorization.pdf.
+[30] Stephen Robertson and Hugo Zaragoza. The probabilistic relevance framework: BM25 and
+beyond. Foundations and Trends in Information Retrieval, 3(4):333–389, 2009. doi: 10.1561/
+1500000019. URL https://www.nowpublishers.com/article/Details/INR-019.
+[31] Joe H. Ward, Jr. Hierarchical grouping to optimize an objective function. Journal of the Amer-
+ican Statistical Association, 58(301):236–244, 1963. doi: 10.1080/01621459.1963.10500845.
+[32] Adyasha Maharana, Dong-Ho Lee, Sergey Tulyakov, Mohit Bansal, Francesco Barbieri, and
+Yuwei Fang. Evaluating very long-term conversational memory of LLM agents. In Proceed-
+ings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume
+1: Long Papers), pages 13851–13870, 2024.
+doi: 10.18653/v1/2024.acl-long.747.
+URL
+https://aclanthology.org/2024.acl-long.747/.
+[33] Di Wu, Hongwei Wang, Wenhao Yu, Yuwei Zhang, Kai-Wei Chang, and Dong Yu. Long-
+MemEval: Benchmarking chat assistants on long-term interactive memory. In International
+Conference on Learning Representations (ICLR), 2025. URL https://openreview.net/
+forum?id=pZiyCaVuti.
+[34] OpenAI.
+GPT-4o mini: Advancing cost-efficient intelligence.
+https://openai.com/
+index/gpt-4o-mini-advancing-cost-efficient-intelligence/, 2024. Official re-
+lease; accessed 2026-04-25.
+[35] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen
+Yu, Chang Gao, Chengen Huang, Chenxu Lv, Chujie Zheng, Dayiheng Liu, Fan Zhou,
+Fei Huang, Feng Hu, Hao Ge, Haoran Wei, Huan Lin, Jialong Tang, Jian Yang, Jianhong
+Tu, Jianwei Zhang, Jianxin Yang, Jiaxi Yang, Jing Zhou, Jingren Zhou, Junyang Lin, Kai
+Dang, Keqin Bao, Kexin Yang, Le Yu, Lianghao Deng, Mei Li, Mingfeng Xue, Mingze
+Li, Pei Zhang, Peng Wang, Qin Zhu, Rui Men, Ruize Gao, Shixuan Liu, Shuang Luo,
+Tianhao Li, Tianyi Tang, Wenbiao Yin, Xingzhang Ren, Xinyu Wang, Xinyu Zhang, Xu-
+ancheng Ren, Yang Fan, Yang Su, Yichang Zhang, Yinger Zhang, Yu Wan, Yuqiong Liu,
+Zekun Wang, Zeyu Cui, Zhenru Zhang, Zhipeng Zhou, and Zihan Qiu.
+Qwen3 technical
+report.
+arXiv preprint arXiv:2505.09388, 2025.
+doi: 10.48550/arXiv.2505.09388.
+URL
+https://arxiv.org/abs/2505.09388.
+[36] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena,
+Yanqi Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a unified
+text-to-text transformer. Journal of Machine Learning Research, 21(140):1–67, 2020. URL
+https://jmlr.org/papers/v21/20-074.html.
+[37] Shitao Xiao, Zheng Liu, Peitian Zhang, Niklas Muennighoff, Defu Lian, and Jian-Yun Nie.
+C-pack: Packed resources for general chinese embeddings. In Proceedings of the 47th In-
+ternational ACM SIGIR Conference on Research and Development in Information Retrieval
+(SIGIR), pages 641–649, 2024. doi: 10.1145/3626772.3657878. URL https://arxiv.org/
+abs/2309.07597.
+13
+
+
+[38] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yong-
+hao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang, Joseph E.
+Gonzalez,
+and
+Ion
+Stoica.
+Judging
+LLM-as-a-judge
+with
+MT-bench
+and
+chat-
+bot
+arena.
+In
+Advances
+in
+Neural
+Information
+Processing
+Systems
+(NeurIPS),
+2023.
+URL https://proceedings.neurips.cc/paper_files/paper/2023/hash/
+91f18a1287b398d378ef22505bf41832-Abstract-Datasets_and_Benchmarks.html.
+[39] Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot, and Ashish Sabharwal. MuSiQue:
+Multihop questions via single-hop question composition.
+Transactions of the As-
+sociation for Computational Linguistics,
+10:539–554,
+2022.
+doi:
+10.1162/tacl a
+00475. URL https://direct.mit.edu/tacl/article/doi/10.1162/tacl_a_00475/
+110996/MuSiQue-Multihop-Questions-via-Single-hop-Question.
+[40] Luyu Gao, Xueguang Ma, Jimmy Lin, and Jamie Callan.
+Precise zero-shot dense re-
+trieval without relevance labels.
+In Proceedings of the 61st Annual Meeting of the As-
+sociation for Computational Linguistics (Volume 1: Long Papers), pages 1762–1777. As-
+sociation for Computational Linguistics, 2023.
+doi: 10.18653/v1/2023.acl-long.99.
+URL
+https://aclanthology.org/2023.acl-long.99/.
+[41] Bernal Jim´enez Guti´errez, Yiheng Shu, Weijian Qi, Sizhe Zhou, and Yu Su. From RAG to
+memory: Non-parametric continual learning for large language models. In Proceedings of the
+42nd International Conference on Machine Learning, volume 267 of Proceedings of Machine
+Learning Research, pages 21497–21515. PMLR, 2025. URL https://proceedings.mlr.
+press/v267/gutierrez25a.html.
+[42] Irina Higgins, Loic Matthey, Arka Pal, Christopher Burgess, Xavier Glorot, Matthew
+Botvinick, Shakir Mohamed, and Alexander Lerchner. β-VAE: Learning basic visual concepts
+with a constrained variational framework. In International Conference on Learning Represen-
+tations (ICLR), 2017. URL https://openreview.net/forum?id=Sy2fzU9gl.
+14
+
+
+A
+Limitations
+MemCode targets retrieval-intensive long-term conversational memory, not fully deployed agents
+with planning, tool use, and interactive adaptation. Its LLM-based AMU writing can miss or distort
+implicit motivations, emotions, and pragmatic cues; these cases explain why full-context methods
+remain competitive on LoCoMo Open and bound our claims to structured memory retrieval. Our
+HippoRAG2 comparison also measures one-shot graph construction over complete LoCoMo histo-
+ries; repeated graph maintenance in a growing online memory is outside the present evaluation.
+B
+Implementation Settings
+MemCode uses a lightweight local memory stack. Dialogue and atomic-memory metadata are stored
+in SQLite, including raw utterances, extracted AMUs, codebook IDs, and code-to-AMU links.
+Dense retrieval uses a FAISS L2 index over 768-dimensional bge-base-en-v1.5 embeddings [37],
+while the discrete path uses a 1024-entry VQ codebook and maintains code frequency and code co-
+occurrence statistics in the metadata store. The online stage writes AMUs asynchronously, assigns
+both dense vectors and discrete code indices, and reconstructs evidence at query time by combining
+vector retrieval with topology-aware codebook expansion. The compute environments for memory
+runtime and offline ISQ training are summarized in Table 5.
+Table 5: Compute environments used by MemCode. Offline ISQ codebook training is performed
+once and is not included in the per-dialogue memory-runtime measurements in Tables 1 and 2.
+Stage
+Use
+Hardware
+Memory runtime
+Ingestion, retrieval, consoli-
+dation, and benchmark eval-
+uation
+12th Gen Intel Core i5-12500H @ 3.10GHz;
+NVIDIA GeForce RTX 3050 Ti Laptop GPU,
+4 GB; 16 GB RAM
+Offline ISQ training
+VQ-VAE codebook learning
+before memory evaluation
+12 vCPU Intel Xeon Platinum 8352V @
+2.10GHz; one 32 GB vGPU; 90 GB RAM
+Beyond the compute environments, reproducibility also depends on the fixed codebook-training
+configuration and the dataset-specific retrieval budgets. Table 6 summarizes the ISQ training setup,
+and Table 7 summarizes the dataset-specific ingestion and retrieval settings.
+15
+
+
+Table 6: Offline VQ-VAE training and ISQ codebook settings. These settings are fixed for all
+memory-runtime experiments.
+Block
+Item
+Setting
+Data
+Training pairs
+DailyDialog context–response pairs; the context
+contains the two previous utterances
+Data
+Sequence length
+Source and target sequences are truncated or
+padded to 128 tokens
+Model
+Base encoder
+T5-base encoder; code dimension equals the T5
+hidden size
+Model
+Projection and codebook
+Stride-1 Conv1d projection, kernel size 3, padding
+1; 1024 Euclidean code vectors
+Optimization
+Optimizer and schedule
+AdamW, weight decay 0.01; batch size 16; gradient
+accumulation 2; 10 epochs; cosine schedule with
+10% warmup; gradient clipping at 1.0
+Optimization
+Learning rates
+10−4 for T5 parameters; 10−3 for VQ, projection,
+and decoder-side parameters
+Objective
+Quantization loss
+Generation cross-entropy plus VQ loss; commit-
+ment cost 0.10; VQ loss weight 1.0; entropy usage
+regularizer weight 0.01
+Codebook
+EMA and anti-collapse
+EMA decay 0.99; codebook initialized from 4096
+valid encoder states; codes with EMA cluster size
+below 1.0 are revived every 20 optimizer steps
+Inference
+Fingerprint construction
+Adjacent duplicate code ids are removed be-
+fore building AMU fingerprints and co-occurrence
+topology
+Table 7: Dataset-specific ingestion and evidence-reconstruction budgets.
+Dataset
+Ingestion unit
+Extraction background
+Dense path
+Codebook path
+Final evidence budget
+LoCoMo
+A–B dialogue turn
+10 prior sentences
+20 AMUs
+20 AMUs
+40 AMUs + 25 raw dialogue turns
+LongMemEval-S
+User–Assistant turn
+5 prior sentences
+20 AMUs
+20 AMUs
+40 AMUs + 10 raw dialogue turns
+The extraction background controls how much local context is available when the system rewrites
+dialogue into self-contained AMUs, while the final evidence budget controls how much retrieved
+material is shown to the answer generator. LoCoMo uses a larger raw-context budget because
+image captions, speaker roles, and local conversational references often disambiguate short facts.
+LongMemEval-S has longer sessions and more topic drift, so its smaller raw-context budget keeps
+the final prompt closer to the retrieved AMUs and reduces unrelated historical evidence.
+C
+Hyperparameter Sensitivity and Run Variability
+C.1
+Codebook Retrieval Hyperparameters
+We also test the sensitivity of the codebook path to three retrieval hyperparameters on LoCoMo: the
+number of expanded neighbors K, the neighbor-weight decay coefficient α, and the IDF threshold
+τIDF. The default configuration in the main paper is K=3, α=0.3, and τIDF=0.5, with an overall
+accuracy of 78.12%.
+16
+
+
+Table 8: Additional hyperparameter ablations for the codebook retrieval path on LoCoMo (GPT-4o-
+mini). ∆denotes the signed percentage-point difference relative to the deployed default configura-
+tion (K=3, α=0.3, τIDF=0.5) with 78.12% overall accuracy.
+Hyperparameter
+Value
+Accuracy (%)
+∆vs. default
+K
+1
+77.40
+-0.72
+3 (default)
+78.12
++0.00
+5
+77.47
+-0.65
+7
+77.47
+-0.65
+9
+76.49
+-1.63
+α
+0.1
+77.79
+-0.33
+0.3 (default)
+78.12
++0.00
+0.5
+77.34
+-0.78
+0.7
+77.53
+-0.59
+τIDF
+0.1
+77.27
+-0.85
+0.3
+77.34
+-0.78
+0.5 (default)
+78.12
++0.00
+0.7
+77.53
+-0.59
+0.9
+77.40
+-0.72
+Table 8 shows modest variation across the tested range, with the default configuration consistently
+ahead of the alternatives. The result suggests a balance among neighbor expansion, propagation
+strength, and noise suppression. K is the most sensitive parameter: increasing the number of ex-
+panded neighbors to 9 drops accuracy to 76.49%, indicating that excessive expansion adds noise.
+Changes in α and τIDF are smoother. The codebook path is robust to these two parameters, although
+moderate propagation strength and filtering give the most stable retrieval.
+C.2
+Repeated-run Variability
+Although all LLM calls use temperature-0 decoding, the full hosted-LLM pipeline is not perfectly
+deterministic in practice. Small residual differences can arise from service-side execution, long-
+prompt boundary cases in memory writing and answer generation, and automatic judge decisions
+near the correctness boundary. We repeated the main results of LoCoMo using the GPT-4o-mini
+model six times, using the same retrieval configuration as Tables 1 and 2. The run IDs in Table 9 are
+renumbered chronologically from 1 to 6; they are not tied to internal experiment-folder suffixes.
+Table 9: Repeated runs for the main results of LoCoMo on GPT-4o-mini setting under temperature-0
+decoding. Category columns report accuracy. The main-table result corresponds to Run 6, which is
+close to the center of the repeated-run distribution and is not the best run.
+Run
+Correct / Total
+Overall
+Multi-Hop
+Temporal
+Open
+Single-Hop
+1
+1200 / 1540
+77.92
+64.54
+77.88
+48.96
+85.73
+2
+1199 / 1540
+77.86
+64.89
+76.95
+50.00
+85.73
+3
+1210 / 1540
+78.57
+62.77
+78.19
+48.96
+87.40
+4
+1207 / 1540
+78.38
+65.25
+76.32
+47.92
+87.04
+5
+1212 / 1540
+78.70
+65.60
+77.26
+47.92
+87.16
+6 (main table)
+1203 / 1540
+78.12
+64.89
+76.64
+43.75
+87.04
+Mean ± Std.
+–
+78.26 ± 0.35
+64.66 ± 0.99
+77.21 ± 0.72
+47.92 ± 2.19
+86.68 ± 0.75
+Range
+–
+77.86–78.70
+62.77–65.60
+76.32–78.19
+43.75–50.00
+85.73–87.40
+Table 9 shows that the main results of GPT-4o-mini on LoCoMo are stable across repeated runs: the
+full overall range is 0.84 percentage points, corresponding to 13 questions out of 1540. The reported
+78.12% is slightly below the six-run mean of 78.26% and is therefore a representative run rather
+than a best-case selection. Category-level variation is largest on Open because it contains only
+96 questions; by contrast, the larger Multi-Hop, Temporal, and Single-Hop groups remain within
+narrow ranges.
+17
+
+
+D
+Backbone Sensitivity
+The main results show a consistent but counter-intuitive pattern: GPT-4o-mini is stronger than
+Qwen3-30B-A3B-Instruct-2507 in several MemCode settings, even though Qwen3 is a newer and
+generally stronger backbone. This gap is not simply a raw model-capability result. In MemCode,
+the backbone participates in both memory writing and answer generation, so a more verbose or more
+expansive model can change the density and noise profile of the memory store itself. To isolate this
+effect, the automatic judge is held fixed across the two backbones.
+Table 10: Backbone-level performance and generation behavior for MemCode without consolida-
+tion. Category columns report accuracy. Avg. Ans. reports average answer length in words.
+Benchmark
+Backbone
+Overall
+Temporal
+Multi
+Open
+Single
+Know.-Upd.
+Single-Asst.
+Avg. Ans.
+LoCoMo
+GPT-4o-mini
+78.12
+76.64
+64.89
+43.75
+87.04
+–
+–
+73.12
+LoCoMo
+Qwen3
+76.36
+67.91
+59.22
+52.08
+88.11
+–
+–
+128.88
+LongMemEval-S
+GPT-4o-mini
+77.20
+69.92
+65.41
+–
+92.86
+82.05
+92.86
+75.52
+LongMemEval-S
+Qwen3
+73.80
+57.89
+64.66
+–
+94.29
+78.21
+92.86
+146.37
+Table 10 shows that the gap is concentrated in precision-sensitive categories. On LoCoMo, GPT-4o-
+mini is 8.73 points higher on Temporal and 5.67 points higher on Multi, while Qwen3 is higher on
+Open and slightly higher on Single. On LongMemEval-S, the largest gap is again Temporal: 69.92%
+for GPT-4o-mini versus 57.89% for Qwen3. This pattern suggests that Qwen3 is not uniformly
+weaker. Rather, it is less stable under a fixed evidence budget when the question requires exact
+dates, counts, or entity binding.
+Table 11: Backbone-induced memory-store characteristics. Values are averaged over dialogue-level
+memory stores. Qwen3 writes more AMUs and activates more codebook assignments, which in-
+creases coverage but also raises the density of potential distractors.
+Benchmark
+Backbone
+AMUs / dialog
+Active codes
+Code assignments
+Max code freq.
+Avg. AMU words
+LoCoMo
+GPT-4o-mini
+591.1
+216.9
+3678.6
+294.0
+16.48
+LoCoMo
+Qwen3
+940.4
+266.1
+6150.2
+461.4
+15.92
+LongMemEval-S
+GPT-4o-mini
+1553.4
+420.4
+9941.1
+798.0
+21.41
+LongMemEval-S
+Qwen3
+2130.3
+450.2
+14532.2
+1356.1
+21.80
+The memory statistics in Table 11 explain why the stronger backbone does not automatically yield
+higher end-to-end memory accuracy. Qwen3 produces substantially more AMUs: 59.1% more on
+LoCoMo and 37.1% more on LongMemEval-S. It also produces many more code assignments,
+increasing by 67.2% and 46.2% respectively. This denser write behavior can improve coverage for
+open-ended questions, but it also creates more near-duplicate facts and more competing codebook
+activations. Since the answer prompt still keeps a fixed number of AMUs, higher memory density
+can make the selected evidence less clean.
+Table 12: Paired question-level disagreements between GPT-4o-mini and Qwen3 under MemCode.
+GPT-only means GPT-4o-mini answers correctly while Qwen3 does not; Qwen-only is the reverse.
+Benchmark
+Shared n
+Both correct
+Both wrong
+GPT-only
+Qwen-only
+Largest GPT-only source
+LoCoMo
+1540
+1055
+216
+148
+121
+Temporal: 55 vs. 27
+LongMemEval-S
+500
+322
+67
+64
+47
+Temporal: 28 vs. 12
+The paired comparison in Table 12 supports the same interpretation. GPT-4o-mini has more unique
+wins on both benchmarks, and the largest asymmetry comes from temporal reasoning. Manual
+inspection of the disagreement patterns shows recurring Qwen3 failure modes: answering with
+the total amount rather than the per-item amount, selecting a nearby but wrong event date, over-
+explaining abstention questions, or following a plausible distractor when multiple related facts are
+retrieved. These errors are consistent with a memory-system interaction: a more expansive writer
+and generator improves recall coverage, but it also increases distractor density and makes exact
+18
+
+
+evidence selection harder. The backbone gap therefore reflects how the model interacts with the
+external memory pipeline, not a simple ranking of model capability in isolation.
+E
+Further Retrieval and Codebook Analysis
+This appendix examines retrieval-path behavior through same-budget controls, dense-embedding
+sensitivity, question-level novelty analysis, case studies, global codebook usage, and a local visual-
+ization of semantic purity.
+E.1
+Codebook Path vs. a BM25 Keyword Second Path
+The main paper summarizes a second-path replacement ablation in Table 4. Here we provide the full
+trace-level version. We replace MemCode’s codebook path with vanilla BM25 keyword retrieval un-
+der the same “20+20” retrieval budget: Path A remains dense vector retrieval, while Path B changes
+from discrete codebook retrieval to BM25.
+Table 13: Full details for the second-path replacement ablation on LoCoMo (GPT-4o-mini). ∆
+denotes codebook minus BM25. “C-only” counts cases where the codebook path answers correctly
+while BM25 does not, and “B-only” denotes the reverse. “New Base” and “New Time” report the
+average number of additional base facts and time buckets injected by the BM25 stage beyond the
+vector stage.
+Category
+n
+Accuracy
+Paired Wins
+BM25 Injection
+Codebook
+BM25
+∆
+C-only
+B-only
+New Base
+New Time
+Overall
+1540
+78.12
+76.75
++1.36
+105
+84
+18.58
+10.96
+Multi-Hop
+282
+64.89
+60.64
++4.26
+33
+21
+18.50
+10.65
+Temporal Reasoning
+321
+76.64
+70.41
++6.23
+35
+15
+18.66
+11.34
+Open Domain
+96
+43.75
+50.00
+-6.25
+5
+11
+18.59
+10.78
+Single-Hop / Basic
+841
+87.04
+87.63
+-0.59
+32
+37
+18.58
+10.93
+The codebook path is not directly replaceable by a lexical second path. Overall accuracy rises from
+76.75% with BM25 to 78.12% with the codebook path, or 21 more correct answers. The advantage is
+concentrated in the categories closest to structured memory retrieval: Temporal Reasoning improves
+by 6.23 percentage points and Multi-Hop by 4.26 points. BM25 is 6.25 points higher on Open
+Domain, but that category contains only 96 questions; on Single-Hop / Basic, BM25 has only a 0.59-
+point edge. The distribution matches the inductive biases of the two paths. BM25 favors surface term
+overlap, whereas the codebook path helps when evidence has stronger temporal structure or higher
+compositionality.
+The paired comparison over 1540 shared question-level traces supports the category-level result.
+There are 105 samples where the codebook path is correct and BM25 is wrong, compared with 84 in
+the reverse direction. The asymmetry again comes from the more complex categories. On Temporal
+Reasoning, the codebook path has 35 “codebook-only wins” versus 15 “BM25-only wins”; on Multi-
+Hop, the counts are 33 versus 21. BM25 shows only local advantages on Single-Hop / Basic (37
+versus 32) and Open Domain (11 versus 5).
+Retrieval traces also show that BM25 is not empty expansion: relative to the vector stage, it injects
+about 18.6 additional new base facts and about 11 new time buckets per question on average. Still,
+this lexical expansion does not close the gap on temporal and compositional questions. The code-
+book path helps by adding candidates that better match structured memory retrieval, rather than by
+merely expanding the candidate set.
+These results should not be read as showing that the codebook path is uniformly better than BM25
+across all question types. Under the same dual-path budget, BM25 is a reasonable sparse-retrieval
+control, but it does not reproduce the gain pattern of the codebook path, especially its relative ad-
+vantage on temporal and multi-hop questions.
+19
+
+
+E.2
+Same-Budget Retrieval Controls and an Explicit-Graph Baseline
+As a supplementary explicit-graph control, we evaluate Full HippoRAG2 [41] on the same frozen
+5,911-AMU store with at most 40 evidence items per query. It answers 1,200 of 1,540 questions
+correctly, compared with 1,203 for MemCode; the 0.20-point difference is not statistically significant
+in the paired analysis. Thus, an explicit graph can recover comparable associations, while Table 14
+isolates the additional construction and query profile.
+Table 14: Additional retrieval-system cost beyond the shared AMU construction stage. Query la-
+tency is averaged over LoCoMo questions.
+Metric
+MemCode
+Full HippoRAG2@40
+Additional model calls
+0
+12,779
+Additional tokens
+0
+8.47M
+Explicit graph construction
+None
+34.49 min
+Graph size
+None
+17,275 nodes / 109,779 edges
+Query latency
+0.060 s
+2.864 s
+The explicit graph baseline is evaluated favorably with a one-shot build over each complete dia-
+logue history. Even in this static setting, its additional construction calls and 47.8× query latency
+contrast with MemCode’s use of code assignments already produced during AMU indexing. This
+comparison supports an efficiency claim, rather than a claim that graph retrieval is intrinsically less
+accurate.
+E.3
+Sensitivity to the Dense Embedding Model
+We further test whether MemCode’s LoCoMo result depends on the particular dense embedding
+backbone used by the vector path. The main experiments use bge-base-en-v1.5. As a smaller and
+widely used alternative, we replace the dense encoder with all-MiniLM-L6-v2 while keeping the
+GPT-4o-mini writer/reader, the 1024-entry codebook, and the same “20+20” retrieval budget fixed.
+Table 15 reports paired question-level results over the same 1540 LoCoMo questions.
+Table 15: Embedding-model sensitivity on LoCoMo (GPT-4o-mini). The bge-base-en-v1.5 row
+corresponds to the main MemCode setting. ∆is the signed percentage-point difference of all-
+MiniLM-L6-v2 minus bge-base-en-v1.5. “bge-only” and “MiniLM-only” count paired question-
+level wins.
+Category
+n
+bge Acc.
+MiniLM Acc.
+∆
+bge-only
+MiniLM-only
+Shared correct
+Overall
+1540
+78.12
+76.23
+-1.88
+90
+61
+1113
+Multi-Hop
+282
+64.89
+62.77
+-2.13
+23
+17
+160
+Temporal Reasoning
+321
+76.64
+73.83
+-2.80
+20
+11
+226
+Open Domain
+96
+43.75
+43.75
++0.00
+4
+4
+38
+Single-Hop / Basic
+841
+87.04
+85.37
+-1.66
+43
+29
+689
+The smaller encoder preserves the qualitative result but slightly weakens retrieval accuracy. Overall
+accuracy decreases from 78.12% to 76.23%, and the paired comparison gives 90 bge-only wins ver-
+sus 61 MiniLM-only wins. The drop is concentrated in the categories that require tighter evidence
+binding: Temporal Reasoning falls by 2.80 points and Multi-Hop by 2.13 points. Open Domain is
+unchanged, which is consistent with the earlier BM25 control: open-ended questions are less dom-
+inated by exact nearest-neighbor geometry and more affected by whether the final prompt contains
+broadly relevant context.
+The memory-store statistics are nearly unchanged by embedding replacement. Averaged over the 10
+LoCoMo dialogue stores, bge-base-en-v1.5 writes 591.1 AMUs, activates 216.9 codes, and pro-
+duces 3678.6 code assignments per dialogue; all-MiniLM-L6-v2 writes 588.3 AMUs, activates
+215.5 codes, and produces 3651.9 assignments. The performance gap therefore does not come
+20
+
+
+from a different memory volume. It more likely reflects the precision of dense evidence selection
+before codebook expansion. This supports a conservative interpretation: MemCode does not rely on
+bge-base-en-v1.5 to function, but stronger dense embeddings improve the exact-evidence categories
+most sensitive to retrieval precision.
+E.4
+Dual-Path Retrieval: Novelty Analysis and Case Studies
+We measure what the codebook second path adds by computing the proportion of facts indepen-
+dently hit by the codebook path but not covered by the vector path. Figure 4 shows that the added
+content is closer to facts that the vector path structurally misses than to candidates the vector path
+could already find at lower ranks. In particular, 69.3% of facts added by the codebook path are still
+absent from vector top-100, while simply doubling vector Top-K brings only a 1.4% marginal gain.
+The difference between the two paths is therefore not retrieval depth but representation: the vector
+path favors fragments with similar surface semantics, while the codebook path uses co-occurrence
+topology to activate memories that are logically related but more distant on the surface.
+Figure 4: Dual-path retrieval: novelty analysis and case studies.
+The three cases in Figure 4(C) show the same complementarity in concrete tasks. The failures fol-
+low different patterns: in the counting question, the vector path misses another independent entity
+(Coco); in the location question, it misses a low-frequency proper noun (Whispering Falls); in the
+shared-attribute question, it misses parallel facts scattered across dialogue fragments. Entity omis-
+sion, suppression of low-frequency proper nouns, and cross-fragment attribute dispersion all follow
+from geometric nearest-neighbor bias. Codebook topology compensates for them by modeling co-
+occurrence relations. Together with the BM25 control, this novelty evidence supports a more specific
+claim: the codebook path recovers structured evidence that both vector and lexical paths often miss.
+E.5
+Additional Codebook Space Analysis
+We also analyze the codebook space learned in the main experiments. The analysis uses metadata
+statistics from 10 dialogue buckets in the LoCoMo main run and focuses on sparsity, cross-session
+stability, global concentration, and co-occurrence topology. The 1024-dimensional codebook acti-
+vates 216.9 codes on average within a single dialogue (21.18%). The union of 10 dialogues covers
+525 codes (51.27%), while only 61 codes (5.96%) appear in every dialogue. The learned discrete
+space therefore does not collapse into a flat structure where all codes are used uniformly. It forms a
+backbone-plus-tail pattern with a stable core and conversation-specific tail.
+21
+
+
+Figure 5: Global codebook usage concentration. The cumulative coverage curve over ranked codes
+shows the top-10 codes already explain 39.23% of all assignments and the top-100 explain 91.53%.
+Figure 5 shows concentrated rather than uniform code usage: the top-10 codes explain 39.23% of all
+AMU assignments, the top-20 explain 54.41%, and the top-100 explain 91.53%. This concentration
+is not trivial collapse, as the activated vocabulary extends well beyond a tiny fixed set of symbols.
+Figure 6: Conversation-level sparsity and shared hub codes. Left: active-code counts per conversa-
+tion, showing strong per-dialogue sparsity and a small shared core. Right: frequency distribution of
+the top-15 hub codes across all 10 conversations; all 15 appear in every conversation, with Code 806
+being the dominant hub.
+Figure 6 complements the aggregate coverage view by showing both sides of the activation pattern.
+Each dialogue occupies only a small local subset of the 1024-code vocabulary, while the top hub
+codes recur across all 10 conversations, with Code 806 standing out as the most frequent anchor.
+Together, Figures 5 and 6 support a shared backbone + conversation-specific tail regime, which
+is the setting in which a global co-occurrence topology can support associative retrieval beyond
+nearest-neighbor matching.
+Figure 7 checks two properties of the learned discrete space. First, all conversations lie in a high-
+entropy (≈5.8–6.4 bits), low-HHI (≈0.022–0.034) region, with average entropy 6.00 and average
+HHI 0.029. This pattern is inconsistent with codebook collapse and supports the entropy regular-
+ization and dead-code revival mechanism used in ISQ training. Second, the co-occurrence heatmap
+is structured: Code 806 acts as a clear hub, the strongest pair (242, 806) reaches weight 1067, and
+22
+
+
+several sub-clusters are visibly denser than the background. Together, these observations support the
+claim that the codebook path provides a structured semantic topology rather than a bag of arbitrary
+discrete tokens.
+Figure 7: Codebook stability and co-occurrence topology. Left: entropy–HHI scatter across con-
+versations; all points lie in a high-entropy, low-HHI regime, indicating that the codebook does
+not collapse to a few trivial symbols.
+Right: co-occurrence heatmap of representative high-
+frequency codes; the strongest pair is (242, 806) with weight 1067, and visible sub-clusters such
+as (242, 525, 526) indicate structured semantic topology.
+Figure 8: Visualization of discrete semantic disentanglement. (a) shows the continuous latent man-
+ifold from the T5-base encoder; (b) shows topological tightening after commitment loss; (c) shows
+the disentanglement matrix with exclusive activation of top-K codebook IDs by semantic clusters.
+23
+
+
+E.6
+Visualization of Discrete Semantic Disentanglement
+To complement the aggregate codebook statistics, we inspect the geometry of the learned latent
+space. Figure 8(a) shows that the continuous latent manifold produced by the T5-base encoder
+remains diffuse, with soft semantic boundaries before quantization. After the commitment constraint
+is imposed, Figure 8(b) shows the latent space contracting into tighter and more separated discrete
+semantic clusters.
+We probe semantic purity by analyzing the most frequently activated Top-K codebook indices on
+the validation set. Using Statistical Significance Lift to map input tokens to these high-frequency
+indices, the disentanglement matrix in Figure 8(c) has a near-diagonal sparse structure, indicating
+separated discrete representations [42]. For example, Code 442 is selectively activated by med-
+ical terms such as “prescription” and “medicine,” while Codes 712 and 715 consistently anchor
+accommodation- and transportation-related contexts, respectively, with little overlap. This visual-
+ization is consistent with the broader appendix evidence: the codebook is not collapsed, and its
+discrete anchors are semantically meaningful.
+F
+Prompt Templates
+We include the core prompt templates used for memory writing and automatic evaluation. The
+templates are shown in normalized form with variable placeholders; dataset-specific values such as
+timestamps, speakers, retrieved evidence, rubrics, and reference answers are substituted at runtime.
+F.1
+Atomic Memory Writing
+Atomic Fact Extraction with Background Context
+You are an expert Memoryist. Extract dense, stand-alone facts from the conversation.
+Rules
+1. Filter Noise: Ignore greetings, short reactions, and vague chitchat.
+2. Resolve Identity: Replace pronouns (I/you/he) with actual speaker names.
+3. Time Rewriting: Rewrite relative time terms (e.g., “yesterday”, “last week”) into exact dates/-
+times. Use the timestamp header above the text as the anchor.
+4. Merge: Combine fragmented sentences into one complete fact.
+5. Context: If a line is marked as [Background], use it for understanding but do not extract
+facts from it.
+Example
+--- Timestamp:
+2023-05-10 14:30 ---
+[User]:
+I just arrived.
+Output Fact:
+‘‘User arrived at 14:30 on 2023-05-10.’’
+Input
+{context}
+Output strictly JSON
+[
+{"fact":
+"SpeakerName action...",
+"source indices":
+[1, 2]}
+]
+Atomic Fact Extraction without Background Context
+You are an expert Memoryist. Extract dense, stand-alone facts from the conversation.
+Rules
+24
+
+
+1. Filter Noise: Ignore greetings, short reactions, and vague chitchat.
+2. Resolve Identity: Replace pronouns (I/you/he) with actual speaker names.
+3. Time Rewriting: Rewrite relative time terms into exact dates/times using the timestamp
+header above the text as the anchor.
+4. Merge: Combine fragmented sentences into one complete fact.
+Input
+{context}
+Output strictly JSON
+[
+{"fact":
+"SpeakerName action...",
+"source indices":
+[1, 2]}
+]
+The background-aware version is used when the ingestion chunk contains carry-over context from
+previous turns. This keeps pronoun and temporal resolution stable without allowing old context to
+create duplicate AMUs. The background-free version is used when the chunk itself already contains
+the target evidence.
+F.2
+LLM-as-Judge
+Standard Tasks
+I will give you a question, a correct answer, and a response from a model. Please answer yes if the
+response contains the correct answer. Otherwise, answer no. If the response is equivalent to the correct
+answer or contains all the intermediate steps to get the correct answer, you should also answer yes. If the
+response only contains a subset of the information required by the answer, answer no.
+Fields
+Reference Time:
+{query date}
+(optional)
+Question:
+{question}
+Correct Answer:
+{correct answer}
+Model Response:
+{model response}
+Decision
+Is the model response correct? Answer yes or no only.
+Temporal Reasoning Tasks
+You are an intelligent judge evaluating the correctness of an AI’s answer regarding time and dates.
+Fields
+Reference Time:
+{query date}
+(optional)
+Question:
+{question}
+Ground Truth:
+{correct answer}
+Model Answer:
+{model response}
+Evaluation Rules
+1. Date formats are equivalent when they refer to the same date.
+2. If the ground truth is a simple time and the model answer contains that time in a full sentence,
+mark it correct.
+3. If the ground truth provides multiple valid options, the model answer is correct if it matches
+any one of them.
+4. For duration questions, allow inclusive/exclusive counting ambiguity and explicit ±1 unit dif-
+ferences.
+25
+
+
+5. If the answer is relative to the reference time and matches the ground-truth logic, mark it
+correct.
+Decision
+Does the model answer factually match the ground truth or one of its valid options? Respond
+with only “yes” or “no”.
+Knowledge Update Tasks
+I will give you a question, a correct answer, and a response from a model. Please answer yes if the re-
+sponse contains the correct answer. Otherwise, answer no. If the response contains previous information
+along with an updated answer, the response should be considered correct as long as the updated answer
+is the required answer.
+Fields
+Reference Time:
+{query date}
+(optional)
+Question:
+{question}
+Correct Answer:
+{correct answer}
+Model Response:
+{model response}
+Decision
+Is the model response correct? Answer yes or no only.
+Preference Tasks
+I will give you a question, a rubric for the desired personalized response, and a response from a model.
+Please answer yes if the response satisfies the desired response. The model does not need to reflect all
+points in the rubric; the response is correct as long as it recalls and uses the user’s personal information
+correctly.
+Fields
+Reference Time:
+{query date}
+(optional)
+Question:
+{question}
+Rubric:
+{rubric}
+Model Response:
+{model response}
+Decision
+Is the model response correct? Answer yes or no only.
+Abstention Tasks
+I will give you an unanswerable question, an explanation, and a response from a model. Please an-
+swer yes if the model correctly identifies the question as unanswerable. The model could say that the
+information is incomplete, or that some information is given but the asked information is not.
+Fields
+Reference Time:
+{query date}
+(optional)
+Question:
+{question}
+Explanation:
+{explanation}
+Model Response:
+{model response}
+Decision
+Does the model correctly identify the question as unanswerable? Answer yes or no only.
+26
+
+
+G
+Responsible Use and Existing Assets
+Broader impacts. MemCode is intended to make long-term agent memory more reliable, auditable,
+and efficient. Better memory systems can improve personalized assistance, reduce repeated user ef-
+fort across sessions, and make retrieved evidence easier to inspect through source pointers and struc-
+tured memory records. The same capability also raises risks when deployed on real user histories:
+a persistent memory store may retain sensitive personal information, propagate extraction mistakes
+into future personalization, or retrieve outdated facts after user preferences or circumstances change.
+These risks are especially relevant because MemCode targets cross-session memory rather than iso-
+lated question answering.
+Responsible deployment should therefore treat the memory store as user data rather than as ordi-
+nary model cache. Practical safeguards include explicit user consent for memory creation, user-
+visible inspection and deletion controls, retention limits, access control for stored memories and
+source dialogue, and deployment-time filters for sensitive categories. MemCode’s source point-
+ers, archived-fact records, and conservative consolidation gates provide auditability and reduce ir-
+reversible rewriting, but they do not replace product-level privacy controls or jurisdiction-specific
+compliance review.
+Existing assets and licenses. Table 16 summarizes the main third-party assets used in the exper-
+iments. We cite the original papers or release pages for these assets and use them according to
+their accompanying licenses or terms of use. We do not redistribute third-party datasets, model
+weights, or API outputs as a new dataset; any released code or supplemental material should instruct
+users to obtain third-party assets from their original sources and follow the corresponding license,
+non-commercial restriction, or service terms.
+Table 16: Existing datasets, models, APIs, and software assets used by MemCode. License and
+terms information follows the public release pages associated with the cited assets.
+Asset
+Role in this paper
+Citation/source
+License or terms
+LoCoMo
+Long-term
+conversational-
+memory benchmark for QA
+evaluation
+Maharana et al. [32]
+CC BY-NC 4.0 release
+license
+LongMemEval-S
+Dynamic multi-session mem-
+ory benchmark for QA evalu-
+ation
+Wu et al. [33]
+MIT-licensed public re-
+lease
+DailyDialog
+Conversation data used to train
+the discrete codebook compo-
+nent
+Li et al. [25]
+CC BY-NC-SA 4.0 re-
+lease license
+T5-base
+Encoder initialization for iso-
+morphic semantic quantization
+Raffel et al. [36]
+Apache-2.0 release li-
+cense
+bge-base-en-v1.5
+Dense embedding backbone
+for vector retrieval
+Xiao et al. [37]
+MIT
+public
+model-
+release terms
+GPT-4o-mini API
+Memory writing, answer gen-
+eration, and LLM-as-a-judge
+evaluation
+OpenAI [34]
+OpenAI service terms
+Qwen3-30B-A3B-
+Instruct-2507
+Open-weight LLM backbone
+in the main evaluation
+Yang et al. [35]
+Apache-2.0 model re-
+lease
+Mem0
+Baseline
+long-term
+memory
+system
+Chhikara et al. [7]
+Apache-2.0
+public
+repository license
+LangMem
+Baseline
+long-term
+memory
+system
+LangChain [8]
+MIT public repository
+license
+A-MEM
+Baseline agentic memory sys-
+tem
+Xu et al. [9]
+MIT public repository
+license
+MemoryOS
+Baseline hierarchical memory
+system
+Kang et al. [10]
+Apache-2.0
+public
+repository license
+LightMem
+Baseline lightweight memory
+system
+Fang et al. [11]
+MIT public repository
+license
+27

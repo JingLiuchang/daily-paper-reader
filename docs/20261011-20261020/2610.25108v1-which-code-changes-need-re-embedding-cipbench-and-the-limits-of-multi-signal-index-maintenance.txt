@@ -1,0 +1,2835 @@
+Which Code Changes Need Re-embedding? CIPBench and the Limits of
+Multi-Signal Index Maintenance
+NANNAN ZHAO, Northwestern Polytechnical University, China
+JIAMENG ZHANG, Northwestern Polytechnical University, China
+TAOYU ZHONG, Northwestern Polytechnical University, China
+HAO WANG, Northwestern Polytechnical University, China
+BO WANG, Northwestern Polytechnical University, China
+Repository-level retrieval-augmented generation systems must keep vector indexes synchronized with continuously evolving code,
+yet there is no principled basis for deciding which changed code units actually need new embeddings. We ask whether the retrieval
+impact of a code change can be anticipated before that embedding is computed.
+Across 10 open-source repositories in Python, Go, and JavaScript, we characterize how a change propagates from syntactic
+substantiality through embedding displacement to retrieval impact. The links are informative but not deterministic: syntactic class
+separates displacement sharply, yet impact depends on a unit’s retrieval exposure as much as on how far its representation moves,
+and recurring counterexamples bound what any single signal can decide. We formalize the decision as CIPBench, a benchmark that
+scores maintenance policies under a strict pre-embedding information boundary.
+Prediction works, and one signal exhausts it. A ranker using only a unit’s change history substantially reduces retrieval harm
+relative to random and recency-based scheduling. Combining it with three further signals — individually discriminative and largely
+unassociated with one another — leaves the decision statistically unchanged across every budget we evaluate, for reasons we trace to
+the structure of the score rather than to its tuning. What does pay off is not ranking but filtering: units whose text is unchanged from
+the indexed state can be skipped with no risk and, in the most reversion-heavy project, at nearly half the embedding cost. Signal-level
+informativeness is therefore not evidence of decision-level value, and separating the two requires evaluating the decision a signal
+produces rather than its association with the outcome.
+CCS Concepts: • Software and its engineering →Software evolution; • Information systems →Search engine indexing; Retrieval
+models and ranking.
+Additional Key Words and Phrases: Retrieval-augmented generation, Repository-level code retrieval, Vector index maintenance, Code
+embeddings, Index staleness, Empirical software engineering, Benchmark.
+ACM Reference Format:
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang. 2026. Which Code Changes Need Re-embedding? CIPBench
+and the Limits of Multi-Signal Index Maintenance. ACM Trans. Softw. Eng. Methodol. 1, 1 (October 2026), 39 pages. https://doi.org/10.
+1145/nnnnnnn.nnnnnnn
+Authors’ Contact Information: Nannan Zhao, Northwestern Polytechnical University, Xi’an, China, nannanzhao@nwpu.edu.cn; Jiameng Zhang, North-
+western Polytechnical University, Xi’an, China, zhangjiameng@mail.nwpu.edu.cn; Taoyu Zhong, Northwestern Polytechnical University, Xi’an, China,
+zhongtaoyu@mail.nwpu.edu.cn; Hao Wang, Northwestern Polytechnical University, Xi’an, China, kingshulk989@mail.nwpu.edu.cn; Bo Wang, North-
+western Polytechnical University, Xi’an, China, wb2022302586@mail.nwpu.edu.cn.
+Permission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee provided that copies are not
+made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. Copyrights for components
+of this work owned by others than the author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or republish, to post on
+servers or to redistribute to lists, requires prior specific permission and/or a fee. Request permissions from permissions@acm.org.
+© 2026 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+Manuscript submitted to ACM
+Manuscript submitted to ACM
+1
+arXiv:2610.25108v1  [cs.DB]  18 Oct 2026
+
+
+2
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+1
+Introduction
+Modern software repositories evolve continuously, while repository-level retrieval-augmented generation (RAG) systems
+rely on vector indexes built from particular repository snapshots [47, 53]. As code changes, these indexes become stale:
+a modified function may no longer be represented by the vector stored in the index, causing the retriever to return
+outdated context to the downstream large language model. Keeping the index synchronized with the repository is
+therefore a recurring maintenance task in repository-level code intelligence systems.
+The straightforward solution is to re-embed every changed code unit, but at repository scale this wastes computation.
+Full re-embedding scales with corpus size, while per-change incremental re-embedding still recomputes a representation
+for every observed update—including changes with little or no effect on retrieval. The shape of the problem is familiar
+from predictive test selection, where a change arrives, a budget constrains the downstream work it triggers, and a signal
+derived from the change must decide what to spend that budget on [26, 34]. Here the downstream work is embedding,
+and the decision is: when a code unit changes, does its representation actually need to be recomputed?
+Answering this is less straightforward than it appears. A natural intuition is that the syntactic nature of a change
+should serve as a signal: a formatting or documentation edit may be less consequential than a modification to a function
+body or signature. Prior work already cautions against taking that correspondence for granted—Fluri and Gall showed
+that textual edits need not correspond to substantive program changes [11], and Kawrykow and Robillard documented
+how much of a version history consists of non-essential modifications [22]—but the gap that matters here opens one
+layer further downstream. The maintenance objective is not syntactic substantiality but whether a change alters the
+unit’s representation enough to affect retrieval, and these need not coincide. A syntactically substantial edit may leave
+the embedding almost unchanged; an embedding may move substantially without altering any relevant top-𝐾result;
+and a small movement may change retrieval when the unit lies near a ranking boundary. The question is therefore not
+whether code has changed, but how a change propagates from syntax, through embedding space, to retrieval outcomes.
+Existing research supplies pieces of this problem without characterizing the propagation end to end. Fine-grained
+code-change analysis—ChangeDistiller [12], GumTree [8], non-essential-change detection [22]—describes what changed
+and relates it to defects, tests, refactorings, or affected program entities, but never to embedding displacement or retrieval
+impact. Approaching from the other side, code-search benchmarks such as CodeSearchNet [20] and CoSQA [19] and
+RAG evaluators such as RAGAS [7] and ARES [35] assume a fixed indexed corpus, while dynamic vector-index systems
+such as SPFresh [51], Ada-IVF [30] and Quake [29] begin after the new vector exists, optimizing how it is incorporated
+rather than whether computing it was necessary. Drift-aware retrieval such as DeDrift [1] likewise responds to drift
+once it has occurred. This leaves an upstream decision unevaluated: which changed units should be re-embedded at all?
+We study that decision as an empirical and evaluative problem, characterizing a three-layer funnel from syntactic
+substantiality through embedding displacement to retrieval impact across 10 open-source repositories in Python, Go and
+JavaScript—2,366 function-level units and 8,936 real updates—with key measurements replicated over three embedding
+models. The layers turn out to be related but not interchangeable. Change type separates displacement sharply, yet
+displacement alone does not determine retrieval: the effect is jointly moderated by a unit’s position in the retrieval
+space. Recurring counterexamples—documentation edits that move an embedding without moving retrieval, comment
+edits that remain retrieval-relevant despite leaving executable syntax untouched, reversions that move nothing at
+all—mark the boundaries of any single-signal rule. Change history supplies a further inexpensive prior, following the
+persistence that Gîrba et al. observed for change-prone entities [15].
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+3
+These findings expose a second problem: no standard way exists to evaluate the re-embedding decision itself. A code-
+search benchmark asks whether a system retrieves the right code from a snapshot. An index-maintenance benchmark
+must ask whether a system can decide, before observing the updated embedding or its retrieval effect, which changes
+deserve recomputation. We therefore introduce CIPBench(open-source code available at https://github.com/nnzhaocs/
+CIPBench), which turns evolving-index maintenance into a reproducible decision problem under a strict pre-embedding
+information boundary, with two tracks: filtering, which exposes the safety–savings trade-off when changed units are
+skipped, and budget-constrained scheduling, which evaluates which units to prioritize when only a fraction can be
+re-embedded.
+Finally, we ask whether these regularities are operationally useful, and the answer separates cleanly. Prediction
+works: a single historical signal, computable before re-embedding, cuts retrieval harm substantially relative to both
+random and freshness-based scheduling. Combining signals does not. Adding three further signals to that one leaves
+the decision statistically unchanged across every budget we evaluate. Filtering, by contrast, does work: skipping units
+whose text is unchanged from the indexed state is safe by construction and avoids up to half of all re-embedding
+computations in the most reversion-heavy project.
+That contrast is the paper’s main empirical lesson. The signals are discriminative and, with one exception related
+by construction, unassociated with one another—exactly the condition under which combining features is standard
+practice—and combining them still changes no decision. Signal-level informativeness and decision-level relevance are
+different properties, and telling them apart requires an evaluation that scores decisions rather than signals.
+In summary, this work makes four contributions:
+• An empirical characterization of how code changes propagate into retrieval impact. We study the relationship
+among syntactic change type, embedding displacement, and retrieval outcomes across 10 repositories, 8,936 real
+updates, three programming languages, and three embedding models, establishing both the predictive structure of
+this propagation and the recurring counterexamples that bound it.
+• CIPBench, an evaluation that separates informative signals from useful ones. Existing practice validates a
+maintenance signal by showing it correlates with the outcome. CIPBench instead scores the decision a signal produces,
+under a strict pre-embedding information boundary, across two tracks and five reference baselines. That distinction is
+what makes the saturation in Section 6 visible: the signals that pass a correlational test there still change no outcome.
+The benchmark ships with an open toolchain and human-validated change labels (Cohen’s 𝜅= 0.786; classifier
+accuracy = 88.7%).
+• A negative result on multi-signal scheduling, with its mechanism. On the full 20-point Track B grid a weighted
+combination of four pre-embedding signals is statistically equivalent to history alone, and a 130-point sweep spanning
+budgets from 5% to 100% finds no budget at which that changes. The combination is invariant to the substantive
+weight and unimproved by the orthogonal exposure signal. Cross-validation discards retrieval exposure entirely in
+eight of the ten repositories, so the combination reduces in practice to the single signal it was built to improve on.
+• A measured, deployable filter. Track A shows that hash-identity skipping is safe by construction in all 10 repositories
+with savings up to 49.2%. A Python docstring rule applies to only eight units across the benchmark and misses one,
+too few to validate; we give a label-free probing guard for deploying it but cannot exercise that guard on this data.
+Both rules are detectable from the changed text alone, so the filter stage costs a hash comparison and a tree-sitter
+parse and consumes no GPU.
+Manuscript submitted to ACM
+
+
+4
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+2
+Related Work
+Three bodies of work bear on the re-embedding decision: code-change analysis, which characterizes what changed and
+what it predicts; code retrieval and repository-level RAG, which evaluate retrieval quality over a repository snapshot;
+and dynamic index maintenance, which incorporates updated vectors into an index efficiently. Each stops one step
+short of the decision this paper studies, and for a different reason.
+2.1
+Code Change Analysis and Impact Prediction
+Fine-grained code-change analysis has long sought to characterize source-code modifications beyond line-level textual
+differences. ChangeDistiller extracts fine-grained source-code changes and organizes them into a detailed taxonomy [12];
+Fluri and Gall showed that textual edits do not necessarily correspond to substantive program changes [11]; and
+Kawrykow and Robillard systematically studied non-essential changes in version histories [22]. GumTree later provided
+a widely used language-independent AST differencing technique [8], while RefactoringMiner and its extensions identify
+structured refactorings across successive program versions [43, 44]. These approaches provide increasingly precise
+descriptions of what changes between software revisions.
+Code changes have also been used to predict downstream maintenance outcomes. Change-impact analysis relies on
+program dependencies, slicing, and semantic relationships to identify entities that may be affected by a modification [3,
+18, 33]. Fine-grained change features have been studied for defect prediction [14] and just-in-time quality assurance [21].
+Historical evolution provides another useful signal: Gîrba et al.’s Yesterday’s Weather observation shows that entities
+that changed recently are more likely to continue changing [15].
+Predictive test selection is the closest structural analogue to our setting. It estimates which tests are likely to be
+relevant to a given code change in order to reduce execution cost [26, 40], and regression-test selection similarly
+balances safety against the cost of rerunning a suite [34]. Both share the shape of the problem studied here: a change
+arrives, a budget constrains how much downstream work can be done, and a signal derived from the change must
+decide what to spend it on. Section 8 returns to this analogy, because the failure mode we identify is one that any
+budget-constrained selection mechanism can exhibit.
+Recent work has extended code-change analysis to large language models. Fan et al. [9] evaluate LLMs on several
+code-change-related tasks, including code review generation, commit-message generation, and just-in-time comment
+updating. Their study examines how effectively LLMs reason about differences between program versions. Our study
+considers a different downstream consequence of change: whether a modification alters the code representation and,
+ultimately, the retrieval results produced from that representation.
+Prior change-impact studies therefore provide both the change representations and the predictive perspective
+used in our work, but their outcomes are typically defects, tests, refactorings, or affected program entities. Neural
+retrieval introduces a different form of impact. Its behavior depends on continuous similarity scores and competition
+among ranked candidates, so a code unit may move in embedding space without changing any top-𝐾result, while a
+comparatively small movement may affect retrieval near a ranking boundary. We study this propagation from syntactic
+change to embedding displacement and retrieval impact.
+2.2
+Code Retrieval and Repository-Level RAG
+A large body of work has studied learned representations of source code. CodeBERT [10], GraphCodeBERT [17],
+CodeT5 [49], UniXcoder [16], and CodeSage [52] incorporate programming-language structure, data flow, identifiers,
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+5
+or large-scale code pretraining into code representations. General-purpose encoders such as Sentence-BERT [32] and
+MiniLM [48] are also widely used as transferable embedding backbones. In this work the embedding model is not itself
+the optimization target; we study how the representation produced by such a model behaves as the underlying source
+code evolves.
+Code-search benchmarks evaluate whether learned representations support effective retrieval. CodeSearchNet [20]
+and CoSQA [19] provide code–query pairs for semantic code search and question answering. More recent benchmarks
+and systems move toward repository-level context. RepoBench [25] and CrossCodeEval [6] evaluate repository-level
+or cross-file code completion, while RepoCoder [53] combines iterative retrieval with code generation. CodeRAG-
+Bench [47] evaluates the contribution of retrieval to code generation, and general RAG evaluation frameworks such
+as RAGAS [7] and ARES [35] assess retrieval and generation quality more broadly. Repository-level RAG research
+has also investigated how retrieval itself can be improved; Tan et al. [42], for example, combine multiple retrieval
+perspectives and adaptively select useful context for code completion. These studies primarily evaluate retrieval over a
+given repository snapshot.
+Recent work has begun to study retrieval under evolving corpora explicitly. Zhang et al. [55] evaluate generative
+retrieval as new documents are added to a dynamic corpus, while GradNormIR [23] detects corpus-level distribution
+shift to determine when a dense retriever should be updated. FlowRAG [54] instead continually adapts the retriever
+under non-stationary corpora. These works address retrieval adaptation at the corpus or retriever level, rather than
+deciding whether the representation of an individual changed code unit should be refreshed.
+Our setting differs in both granularity and timing. Once an indexed code unit changes, the stored representation
+may no longer correspond to its current content. Existing code-search and code-RAG benchmarks generally measure
+whether relevant code can be retrieved from a snapshot; they do not evaluate whether an individual representation
+should be refreshed after the underlying code changes. Drift-oriented retrieval work such as DeDrift [1] studies how
+search can remain robust after content drift has occurred; we instead examine whether the retrieval consequence of an
+observed change can be anticipated before the updated embedding is computed.
+2.3
+Dynamic Index Maintenance and Refresh Scheduling
+Dynamic vector indexes support efficient search while the indexed collection changes over time. DiskANN [41] and
+FreshDiskANN [37] study graph-based approximate nearest-neighbor search under large-scale and streaming workloads.
+SPFresh [51] supports incremental in-place updates for billion-scale vector search, while Ada-IVF [30] and Quake [29]
+adapt index organization as vectors are inserted, deleted, or updated. These systems address the structural cost of
+maintaining a dynamic ANN index.
+A key assumption in these systems is that the updated vector is already available. Their concern is how that vector should
+be incorporated into the index efficiently. In code-RAG maintenance, however, obtaining the updated vector may itself
+be expensive. After observing a source-code change, a system must first decide whether recomputing the corresponding
+representation is worthwhile. A re-embedding policy can therefore precede dynamic-index maintenance: selected
+code changes produce new vectors, which are then processed by SPFresh-, Quake-, or graph-based index-maintenance
+mechanisms.
+A complementary line of work reduces representation-maintenance costs under model or distribution drift. AU-
+RORA [36] adapts retrieval indices under distribution shift through lightweight continual adaptation and uncertainty-
+aware routing. Drift-Adapter [45] addresses embedding-model upgrades by mapping queries from a new embedding
+Manuscript submitted to ACM
+
+
+6
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+Table 1. Comparison with adjacent research settings.
+Research setting
+Corpus state
+Information available
+Primary question
+Code-change analysis
+Evolving source code
+Observed code changes and program
+structure
+What changed, and which program artifacts or
+maintenance outcomes may be affected?
+Code retrieval and repository-
+level RAG
+Typically a fixed repository
+snapshot
+Current code representations and re-
+trieval index
+Which code is relevant to a query, and how can retrieval
+or generation quality be improved?
+Dynamic vector-index mainte-
+nance
+Evolving vector collection
+Updated vectors are available
+How should inserted, deleted, or updated vectors be
+incorporated into the index efficiently?
+Refresh and cache scheduling
+Evolving data or cached state
+Freshness or change information varies
+by setting
+Which state should be refreshed or retained under
+resource constraints?
+CIPBench setting
+Evolving source code
+Observed code change and existing
+index, but no updated embedding
+Should a changed unit be re-embedded, and which
+units should be prioritized under a limited budget?
+space into a legacy space, allowing an existing ANN index to remain in service without immediate corpus-wide re-
+embedding. Monath et al. [31] address stale cached embeddings during dense-retriever training with a learned corrector
+network that reduces repeated re-encoding. These approaches address staleness caused by distribution shift, model
+upgrades, or training-time encoder updates, whereas our setting concerns staleness caused by source-code content
+changes.
+Similar cost–freshness trade-offs appear in other systems domains. Web-crawling policies determine when pages
+should be revisited in order to maintain freshness under limited bandwidth [5]. Database systems maintain materialized
+views and cached state after base-data changes [2, 13], while web caching systems study invalidation and consistency for
+dynamic content [4]. Adaptive cache-replacement methods such as ARC, LeCaR, and LRB further show that inexpensive
+historical information can support resource-allocation decisions [28, 39, 46].
+The information available in code-RAG maintenance differs from these settings. A web crawler may not know
+whether a page has changed until it revisits the page, whereas a version-controlled repository exposes the change
+itself directly. The uncertainty is instead whether that observed change has a meaningful retrieval consequence. Cache
+invalidation and materialized-view maintenance also commonly rely on discrete dependency relationships, while neural
+retrieval depends on continuous similarity and ranking geometry. The resulting maintenance decision is therefore not
+simply whether content changed, but whether the observed change warrants recomputing its representation.
+Table 1 places CIPBench against these settings. The decision it formalizes arises only under the conjunction of three
+conditions that no prior setting combines: code changes continuously, retrieval quality is the quantity at stake, and the
+new vector does not yet exist.
+3
+Empirical Analysis
+We investigate how code changes propagate through the three layers introduced in Section 1: syntactic substantiality
+→embedding displacement →retrieval impact. The central question is whether information available when a code
+change occurs can anticipate its downstream retrieval consequence before the updated embedding is computed. We
+organize the analysis around four research questions:
+• RQ1—Change and representation: How does the syntactic nature of a code change relate to embedding displace-
+ment?
+• RQ2—Representation and retrieval: When does embedding displacement translate into retrieval impact?
+• RQ3—Context and predictability: Which temporal, retrieval-exposure, and repository-level signals provide infor-
+mation about retrieval impact before re-embedding?
+• RQ4—Failure boundaries: Under what conditions do the three layers fail to align?
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+7
+The remainder of this section maps each research question to a subsection and a numbered finding—RQ1 to Finding 1,
+RQ2 to Finding 2, RQ3 to Findings 3–5, RQ4 to Finding 6—each supported by a table or figure.
+3.1
+Study Setup
+The study covers 10 open-source repositories in Python, Go, and JavaScript, comprising 2,366 function-level units
+and 8,936 real updates organized as issue-driven evolution streams, with 74–983 ground-truth queries per repository.
+Section 4 documents how these streams are constructed and released. This subsection defines the three quantities
+measured for every update, which are used throughout the paper.
+We record three quantities, which are not all defined at the same granularity. Change type is a property of an update:
+each update in a unit’s history carries a syntactic category. Displacement and retrieval impact are properties of a unit:
+one 𝛿and one 𝐼per unit, measuring net movement and net retrieval consequence across that unit’s whole observed
+history. The decision a maintenance policy makes is likewise per unit (Section 4), so where an analysis relates change
+type to the other two it attributes to each unit the most severe class in its history.
+Change type. A tree-sitter-based classifier assigns six fine-grained change levels. For readability these are grouped
+into three analysis tiers: non-substantive, implementation-body, and function-signature changes, where signature changes
+include modifications to parameters, return types, and type annotations. A lexical fallback is used only when syntactic
+parsing is unavailable, and accounts for at most 2.8% of updates in any repository.
+Embedding displacement. Let 𝐸(·) be the encoder mapping source text to a vector. Displacement is measured per unit
+rather than per update: writing 𝑥first for a unit’s source text before its earliest observed update and 𝑥last for its text after
+the latest, we define
+𝛿= 1 −cos(𝐸(𝑥first), 𝐸(𝑥last)) ,
+the cosine distance between where the unit’s representation started and where it ended. This is 0 when the two coincide
+and grows toward 2 as they become dissimilar. Measuring net movement rather than the size of individual steps is what
+makes the reversion cases of Section 3.2 visible: a unit edited and then restored has 𝛿= 0 exactly, however large the
+intermediate steps were. The per-update step displacements are retained separately and are used only where movement
+must be decomposed across a sequence, as in the cumulative-drift case of Section 3.5.1 The primary experiments use
+MiniLM-L6-v2 [48];MPNet-base-v2 [38] and BGE-base-en-v1.5 [50] are used for cross-model robustness checks.
+Retrieval impact. Impact compares top-𝐾retrieval before and after replacing the changed unit’s vector, with 𝐾= 10.
+Let 𝐺(𝑞) denote the ground-truth units of query 𝑞and
+Hit𝐾(𝑞; I) = 𝐺(𝑞) ∩Top𝐾(𝑞; I)
+the ground-truth units that I actually retrieves for 𝑞. A unit is impacted, 𝐼> 0, if some ground-truth query satisfies
+Hit𝐾(𝑞; Iold) ≠Hit𝐾(𝑞; Inew),
+and 𝐼= 0 otherwise. The predicate therefore records changes in which ground-truth units are retrieved, not reorderings
+among them: a unit that moves from rank 3 to rank 7 while remaining in the top-𝐾does not count as impacted, because
+no user-visible result set has changed. Section 7 discusses the sensitivity of this choice.
+1The encoders used here L2-normalize their output vectors, and retrieval scores in the index are themselves cosine similarities; measuring displacement
+as a cosine distance therefore keeps the representation-level quantity consistent with the retrieval-level quantity it is intended to explain. The form
+1 −cos also anchors “no change” at exactly 0, which matters for the net-zero reversion cases in Section 3.5.
+Manuscript submitted to ACM
+
+
+8
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+Table 2. Median embedding displacement across three change classes in 10 repositories.
+Repository
+Lang.
+Non-substantive med(𝛿)
+Implementation med(𝛿)
+Signature med(𝛿)
+Ratio
+flask
+Py
+0.019 (𝑛= 4)*
+0.005
+0.061
+–‡
+aiohttp
+Py
+0.026 (𝑛= 2)
+0.027
+0.000†
+–
+pylint
+Py
+0.000 (𝑛= 9)
+0.020
+0.014
+–
+requests
+Py
+0.002 (𝑛= 1)
+0.006
+0.049
+–‡
+click
+Py
+0.026 (𝑛= 3)*
+0.040
+0.031
+–
+cobra
+Go
+0.002
+0.044
+0.144
+85×
+echo
+Go
+≈0 (𝑛= 1)
+0.028
+0.137
+–
+gin
+Go
+–
+0.051
+0.167
+–
+lodash
+JS
+0.015
+0.033
+0.078
+5×
+express
+JS
+0.006 (𝑛= 1)
+0.035
+0.156
+–
+* Two of four flask units and two of three click units have 𝐼> 0; these cases are revisited in Section 3.5.
+† Of 43 aiohttp signature-change units, 28 have 𝛿= 0 exactly.
+‡ Ratio withheld: the non-substantive category has 𝑛< 5, too few for a stable denominator.
+Computing retrieval impact requires traversing each repository’s query set for every evaluated update, roughly 15
+million top-𝐾retrieval calculations across the three encoders.
+The change labels were independently validated on 300 updates, stratified across the 10 repositories. Inter-rater
+agreement is Cohen’s 𝜅= 0.786 (95% CI [0.729, 0.840]), and the classifier agrees with the adjudicated final labels on
+266/300 cases (88.7%). Section 7 discusses the disagreement structure in detail.
+Statistical comparisons are performed within repositories wherever possible: Kruskal–Wallis with pairwise Mann–
+Whitney tests at Bonferroni-adjusted 𝛼′ = 0.017 for the displacement classes, and Fisher’s exact test for sparse
+contingency tables. Continuous signals are split at their within-repository medians, except 𝑘-occ, for which zero
+exposure and 𝑘-occ≥3 form operational low- and high-exposure groups; these cutoffs support descriptive comparison
+and are not deployment thresholds.
+3.2
+RQ1: How Does Change Type Relate to Embedding Displacement?
+We first examine the link between syntactic change and movement in representation space. If different change types
+induce systematically different displacement, syntax provides information about representation change without requiring
+the updated embedding itself.
+Each unit contributes one displacement, attributed to the most severe change class observed anywhere in its history;
+Table 2 reports the median over the units in each class. The ratio compares the larger of the median signature- or
+implementation-change displacement with the median non-substantive displacement. Categories with 𝑛< 5 are
+excluded from this ratio to avoid unstable denominators.
+Across repositories, signature changes generally induce larger displacement than implementation-body changes,
+while implementation changes tend to exceed non-substantive edits. The separation can be large: in cobra, the median
+displacement for signature changes is 85× the non-substantive median. A Kruskal–Wallis test confirms a strong
+difference across the three classes, and all three pairwise comparisons survive multiplicity correction with rank-biserial
+effect sizes between 0.39 and 0.68; Appendix D gives the test statistics. Each unit enters the comparison once, since
+displacement is a unit-level quantity; the dependence that remains is in the class label rather than the observation
+count, because a unit whose history spans several classes is assigned only its most severe.
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+9
+One possible explanation is that signature edits disproportionately modify identifier-bearing tokens—function names,
+parameter names, and return/type annotations—whereas implementation changes are distributed over a larger token
+sequence. We treat this as a hypothesis rather than a demonstrated mechanism; direct probing of encoder sensitivity is
+outside the scope of this study.
+The aiohttp results illustrate an important boundary. Of 43 signature-change units, 28 (65%) have exactly zero net
+displacement. Inspection reveals repeated 𝐴→𝐵→𝐴patterns in which type annotations are changed and later
+restored. These reverts are retained in the stream as real repository events; a sensitivity analysis excluding exact
+text-level reverts is provided in the artifact. Syntactic substantiality therefore indicates that a meaningful edit occurred,
+but does not guarantee that the final representation differs from its earlier state.
+Finding 1. Change type is a usable proxy for displacement but not a substitute for it. The class separation is large enough
+to act on (up to 85× in median displacement), yet 65% of aiohttp’s signature changes move the representation not at all—so
+syntax identifies edits that could matter, not edits that did.
+3.3
+RQ2: When Does Embedding Displacement Affect Retrieval?
+The first link in the funnel is strong, but representation movement is useful for maintenance only if it translates into
+retrieval change. We therefore examine displacement together with the unit’s position in the existing retrieval space.
+For a unit 𝑢, we define 𝑘-occ as the number of ground-truth queries for which 𝑢appears among the current top-𝐾
+results, with 𝐾= 10. Unlike displacement, 𝑘-occ can be computed entirely from the old index. It captures the unit’s
+observed retrieval exposure: a unit with 𝑘-occ= 0 has not appeared in the top-𝐾results of any ground-truth query.
+Table 3 reports retrieval-impact rates after jointly stratifying units by displacement and 𝑘-occ.
+Table 3. Joint discrimination of retrieval impact by displacement and retrieval position.
+Repository
+𝑘-occ≥3
+𝑘-occ= 0
+High–high
+Low–low
+𝑃(𝐼> 0)
+𝑃(𝐼> 0)
+𝑃(𝐼> 0)
+𝑃(𝐼> 0)
+flask
+16.2%
+12.5%
+22.6%
+0%
+aiohttp
+13.1%
+0.0%
+25.0%
+0%
+pylint
+25.9%
+0.0%
+36.6%
+0%
+requests
+23.3%
+N/A†
+40.9%
+N/A†
+click
+34.8%
+N/A†
+50.0%
+N/A†
+cobra
+39.5%
+13.0%
+48.8%
+0%
+echo
+32.5%
+17.3%
+49.3%
+0%
+gin
+39.3%
+16.7%
+53.3%
+0%
+lodash
+21.0%
+6.8%
+26.7%
+11.8%
+express
+34.3%
+N/A†
+55.6%
+N/A†
+† No unit in requests, click, or express has𝑘-occ= 0; their minimum values are
+7, 5, and 1, respectively. Empty cells should not be interpreted as 𝑃(𝐼) = 0.
+“High–high” denotes displacement above the repository median together with 𝑘-occ≥3; “low–low” denotes dis-
+placement below the median together with 𝑘-occ= 0. The 𝑘-occ≥3 cutoff is used here as an operational high-exposure
+group rather than as a universal boundary.
+The two dimensions separate impacted units substantially better when considered together. Across repositories, the
+high–high region has 𝑃(𝐼> 0) between 22.6% and 55.6%. In six repositories with sufficient low-exposure support—
+aiohttp, pylint, flask, cobra, echo, and gin—the low–low region contains no impacted unit; lodash is the exception
+Manuscript submitted to ACM
+
+
+10
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+Table 4. Temporal persistence of substantive updates across 10 repositories.
+Repository
+Lang.
+Multi-update units
+First subst.→later subst.
+First non-subst.→later subst.
+Effect (pp)
+aiohttp
+Py
+52
+99.3%
+20.4%
++78.9
+click
+Py
+16
+93.9%
+0.0%
++93.9
+pylint
+Py
+82
+91.1%
+25.2%
++66.0
+requests
+Py
+11
+96.1%
+50.0%
++46.1
+flask
+Py
+87
+92.6%
+55.6%
++37.1
+cobra
+Go
+173
+92.1%
+57.7%
++34.4
+echo
+Go
+436
+96.9%
+69.8%
++27.1
+gin
+Go
+263
+94.9%
+93.5%
++1.4‡
+lodash
+JS
+194
+97.7%
+77.5%
++20.2
+express
+JS
+23
+97.7%
+100.0%
+-2.3‡
+‡ The comparison group contains fewer than five units in gin and express, both of which have very high substantive-update rates; 6/10 per-
+repository Fisher tests are significant at 𝛼= 0.05.
+at 11.8%. Per-repository Fisher tests are significant at 𝛼= 0.05 in 9/10 repositories and remain strong under the
+conservative Bonferroni threshold of 𝛼′ = 0.005. The corresponding odds ratios range from 3.5 to 23.2.
+The evidence therefore does not support a monotonic “larger displacement implies retrieval impact” interpretation. A
+unit can move substantially without altering a relevant ranking if it has little retrieval exposure, whereas comparatively
+small movements may matter when a unit already competes near a top-𝐾boundary.
+Two mechanisms are consistent with this pattern. First, rankings near the top-𝐾boundary can be sensitive to small
+geometric changes. Second, highly exposed units may lie in competitive neighborhoods where several candidates have
+similar scores. The present experiment establishes the positional association; direct measurement of boundary geometry
+is left for future work.
+Finding 2. Retrieval position is a distinct signal, not a refinement of displacement. Even an oracle with perfect knowledge of
+how far an embedding will move cannot say where that movement matters: the two dimensions jointly reach 𝑃(𝐼> 0) = 22.6–
+55.6% where either alone is uninformative.
+3.4
+RQ3: Which Pre-Embedding Signals Are Informative?
+RQ1 and RQ2 identify two sources of pre-embedding information: the current syntactic change and the unit’s existing
+retrieval exposure. We now examine two additional sources—change history and repository context—and then compare
+the four inexpensive signals directly.
+3.4.1
+Temporal Persistence. Prior software-evolution work has reported persistence in change behavior. In particular,
+Gîrba et al.’s Yesterday’s Weather observation suggests that entities undergoing substantial change in the recent past
+are likely to remain change-prone in subsequent versions [15]. Motivated by this observation, we test a related form of
+persistence for substantive updates.
+For every unit with multiple updates, we compute the probability that later updates are substantive conditional on
+whether the first observed update is substantive. Table 4 reports the results.
+Across repositories, a unit whose first observed update is substantive has a 91.1–99.3% probability that later updates
+are also substantive. The contrast with initially non-substantive units varies considerably. aiohttp, click, and pylint
+show differences of +66 to +94 percentage points, whereas gin and express provide little contrast because nearly all
+updates in those repositories are substantive.
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+11
+At first glance the larger effects in several Python repositories might suggest a language effect. Persistence of the
+exact coarse change class between consecutive updates rules that out (Appendix C): the language-level averages of
+84.5%, 71.5%, and 77.7% for Python, Go, and JavaScript hide larger within-language variation, with aiohttp, click, and
+pylint at 93–96% but flask and requests at 65–73%, overlapping the Go and JavaScript repositories.
+One plausible repository-level explanation is gradual type-hint adoption: annotation-heavy libraries may repeatedly
+refine function signatures, creating long runs of signature-to-signature changes, while repositories with more heteroge-
+neous feature and bug-fix evolution show weaker persistence. The mechanism remains a hypothesis, but the empirical
+result is clear: recent change history contains useful information, and its strength is repository-dependent rather than
+language-dependent.
+Finding 3. Substantive changes exhibit substantial temporal persistence. In repositories with informative comparison
+groups, the lift associated with an initially substantive update ranges from roughly +20 to +94 percentage points, but the
+strength of this effect varies more by repository than by language. This persistence motivates using history as a prior, but
+not as a repository-independent rule.
+3.4.2
+Repository Temperature. The repositories also differ in the overall fraction of updates that are substantive
+(Table 5); we refer to this update-level fraction as the repository’s temperature.
+Table 5. Update-level temperature (substantive fraction of updates) across the 10 repositories. Headroom is the non-substantive
+fraction available for change-based filtering.
+Repository
+Lang.
+Updates
+Temperature
+Headroom
+pylint
+Py
+720
+70.6%
+29.4%
+cobra
+Go
+1,079
+80.5%
+19.5%
+requests
+Py
+69
+87.0%
+13.0%
+click
+Py
+86
+87.2%
+12.8%
+flask
+Py
+334
+87.4%
+12.6%
+aiohttp
+Py
+409
+89.5%
+10.5%
+gin
+Go
+1,802
+95.7%
+4.3%
+lodash
+JS
+950
+95.9%
+4.1%
+echo
+Go
+3,351
+96.0%
+4.0%
+express
+JS
+136
+97.8%
+2.2%
+Temperature changes the opportunity available to any selective maintenance method. In a repository with roughly
+70% substantive updates, close to 30% of updates remain potential candidates for avoiding recomputation based on
+change substantiality. When more than 95% of updates are substantive, the corresponding headroom is below 5%.
+The available non-substantive headroom therefore differs by more than an order of magnitude across the observed
+workloads, from 29.4% (pylint) to 2.2% (express).
+Two distinct quantities are easy to conflate here. Temperature is computed over updates and bounds the headroom
+for change-based filtering. A separate quantity, the substantive fraction of retained units, ranges from 87.0% (click) to
+99.1% (gin) and instead determines whether the substantive tier exceeds a scheduling budget; Section 6 uses it for that
+purpose. The two should not be substituted for one another: pylint is 70.6% by updates but 92.6% by units.
+This distinction is independent of whether a particular maintenance policy is effective: a hot repository simply
+contains fewer obviously low-substantiality updates to exploit. Temperature is consequently useful for interpreting
+cross-repository differences in attainable savings.
+Manuscript submitted to ACM
+
+
+12
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+Finding 4. Repositories differ substantially in their evolution “temperature.” This workload property directly constrains the
+headroom available to change-based filtering and helps explain why identical decision rules can have different opportunities
+across repositories.
+3.4.3
+Discrimination of the Four Pre-Embedding Signals. We next compare the four signals available at the refresh point,
+before any updated embedding is computed. They are not all of the same granularity: change type is a property of an
+individual update, which we aggregate to the unit as described above, while the other three are unit-level quantities.
+• change_type: the syntactic category of the current update, taking one of the three analysis tiers. This is distinct from
+the binary substantive flag used by the policy of Section 6, which is a unit-level property rather than a property of
+the current update, and the two behave differently: in requests they are associated with 𝑛𝑠𝑢𝑏at −0.170 and +0.475
+respectively;
+• 𝑘-occ: the unit’s exposure in the existing top-𝐾retrieval results;
+• 𝑛𝑠𝑢𝑏: the number of substantive updates in the unit’s observed history. Because the decision object is the unit
+(Section 4), this is a count over the unit’s whole stream rather than a prefix of it; there is no “current” update to
+exclude. It is computable before any embedding, since change type is derived from source text alone; and
+• nn_sim: the cosine similarity between the unit’s old embedding and its nearest neighbor in the old index.
+For descriptive comparison, we measure signal discrimination as Δ𝑃= 𝑃(𝐼> 0 | high) −𝑃(𝐼> 0 | low). Positive
+values indicate that the high-signal group contains a larger fraction of impacted units. We use Δ𝑃> 0.10 to highlight
+practically noticeable separation in this analysis; it is an operational descriptive cutoff rather than a universal statistical
+threshold.
+Table 6. Discriminative power Δ𝑃= 𝑃(𝐼> 0 | ℎ𝑖𝑔ℎ) −𝑃(𝐼> 0 | 𝑙𝑜𝑤) of four pre-embedding signals.
+Repository
+Lang.
+change_type
+𝑘-occ
+𝑛𝑠𝑢𝑏
+nn_sim
+flask𝑠
+Py
+-0.083
++0.114
++0.086
++0.033
+aiohttp
+Py
++0.133
++0.098
++0.088
+-0.030
+pylint
+Py
++0.227
++0.164
++0.191
++0.007
+requests𝑠
+Py
+-0.280
++0.197
++0.093
+-0.023
+click𝑠
+Py
+-0.367
++0.049
++0.078
++0.092
+cobra
+Go
++0.265
++0.100
++0.183
+-0.007
+echo
+Go
++0.280
++0.052
++0.196
+-0.049
+gin
+Go
++0.131
++0.081
++0.037
+-0.005
+lodash
+JS
++0.165
++0.026
++0.078
++0.002
+express
+JS
++0.343
++0.098
++0.147
+-0.024
+𝑠Small-𝑁: 𝑛𝑛𝑜𝑛𝑠𝑢𝑏≤16. Per-signal sample counts are retained in the benchmark data.
+The signals separate on stability rather than on strength. change_type clears the cutoff most often (7/10) and has
+the largest individual values, but it reverses sign in flask, requests, and click—precisely the three repositories with at
+most 16 non-substantive examples, where a handful of impacted units can flip the estimated polarity—and its mean is
+dragged to +0.081 as a result. 𝑘-occ and 𝑛𝑠𝑢𝑏clear the cutoff less often (3/10 and 4/10) but never reverse sign in any
+repository, and their means are comparable or higher (+0.098 and +0.118). nn_sim clears the cutoff in no repository,
+reaching at most +0.092, and averages to zero.
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+13
+Table 7. Recurring counterexamples to the syntax–displacement–impact chain.
+Type
+Evidence
+Maintenance implication
+Embedding moves, retrieval does not
+docstring-only: flask 5 units (med𝛿= 0.024, 𝑃(𝐼)=0);
+aiohttp 5 units (𝑃(𝐼)=0)
+docstring filter candidate under a per-repository guard
+Executable syntax unchanged, retrieval changes
+comment-only: flask 2/4, click 2/3 units impacted
+comments remain rankable; no comment filter
+Cross-language variation
+Go string-only: cobra 1/5, gin 1/4 units impacted
+no universal non-substantive rule
+Net-zero reversion
+aiohttp 28/43 signature units have 𝛿=0 (𝐴→𝐵→𝐴)
+inexpensive hash-equality skip
+Cumulative drift
+flask query “limits”: 𝛿=0.177 over 4 updates; recall
+1.00→0.00
+per-update gating insufficient; periodic probing
+Top-𝐾boundary
+flask issue #2935: 𝛿=0.055/0.019; recall 1.00→0.50
+displacement alone insufficient (Finding 2)
+The ordering by mean is therefore 𝑛𝑠𝑢𝑏, 𝑘-occ, change_type, nn_sim, while the ordering by cutoff count puts
+change_type first. The disagreement is the point: a signal can be the strongest where it works and still be the least
+dependable, and a maintenance policy has to live with the latter.
+The signals also differ in redundancy. The mean absolute Kendall association between 𝑘-occ and the other signals is
+below 0.15, and a per-repository Kendall-𝜏analysis (Appendix A) confirms this at the unit level: the language-level
+association between 𝑘-occ and 𝑛𝑠𝑢𝑏is weak (𝜏= 0.13, 0.11, and 0.24 for Python, Go, and JavaScript, respectively),
+whereas the association between change type and 𝑛𝑠𝑢𝑏is moderate on average (𝜏= 0.32, 0.24, 0.22). The language means
+conceal wide within-language variation: the association reaches +0.52 in click and +0.48 in flask but is essentially
+absent in gin (+0.05) and negative in requests (−0.17). History therefore overlaps substantially with change type in
+most repositories without subsuming it everywhere, and the exceptions are the repositories in which the two signals
+would be expected to contribute independently. Nearest-neighbor similarity, in contrast, provides little consistent
+discrimination.
+Finding 5. No single inexpensive signal dominates across repositories. Change type is often the strongest individual
+discriminator but becomes unstable when non-substantive evidence is sparse; 𝑘-occ is more consistently positive and
+comparatively independent, while nearest-neighbor similarity contributes little on average.
+The observed sign reversals motivate treating small non-substantive samples conservatively; we do not infer a
+deployment threshold directly from the largest observed sample of 16.
+Repository-level meta-features—size, temperature, annotation density, history length, and impacted-unit fraction—
+show associations with per-signal strength that we report in Appendix B. Because those correlations rest on only 10
+repositories and we do not act on them in any policy, we treat them as exploratory context rather than as a finding.
+3.5
+RQ4: Where Does the Three-Layer Relationship Break Down?
+Aggregate relationships can hide precisely the cases that matter most to a maintenance decision. We therefore examine
+recurring mismatches among syntax, embedding displacement, and retrieval impact. They are not isolated noise:
+each exposes a distinct limitation of single-signal reasoning. Table 7 summarizes the recurring failure types and their
+maintenance implications. The case studies below come from a targeted inspection of extreme recall-loss events and of
+units whose syntactic class and retrieval outcome disagree; they are intended as design constraints, not as an exhaustive
+census of failures.
+3.5.1
+Four Mismatches, Four Different Causes. Table 7 gives the evidence for the first four failure types. What it cannot
+give is why each occurs, and the reasons do not generalize to one another.
+Docstring-only edits move the embedding without moving retrieval because the affected units have low exposure:
+a representation can shift noticeably while leaving the top-𝐾results unchanged if the unit rarely enters a relevant
+Manuscript submitted to ACM
+
+
+14
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+query neighborhood. This reinforces Finding 2 and marks the class as low-risk in the studied Python repositories—on
+five units per repository, evidence enough for a guarded candidate rule but not a universal one. Comment-only edits
+produce the opposite mismatch for a model-related reason: the primary encoder represents the full text of a unit,
+so natural-language terms in a comment move the embedding even when the executable AST is untouched. Under
+text-oriented encoders, syntactic non-substantiality does not imply retrieval non-substantiality. Go string-literal edits
+then show that one non-substantive category can behave differently across languages, because error messages such as
+“failed to parse config” overlap directly with query terms and template strings can carry identifiers.
+Net-zero reversions are qualitatively unlike the other three. They separate change occurrence from net representational
+change, and because the final equality of the code state is detectable without computing an embedding, this is the one
+failure mode admitting an exact and inexpensive test.
+3.5.2
+Large Recall Losses from Cumulative and Positional Effects. Three flask queries exhibit particularly large recall
+drops, but through two different mechanisms.
+The first is cumulative drift. For the query “add config and docs for limits,” associated with flask/wrappers.py::max_content_length,
+four consecutive updates accumulate a displacement of 𝛿= 0.1773, while the largest individual step is 0.1118. Recall
+first collapses at 𝑡= 4, falling from 1.00 to 0.00.
+This exposes a limitation of per-update gating: individually moderate changes can accumulate until their combined
+displacement becomes consequential, and a rule evaluating each update independently may not detect the pattern
+before the accumulated drift crosses a retrieval boundary.
+The remaining two cases arise through position rather than accumulation. Two units associated with issue #2935 fail
+at their first observed update, with displacements of only 0.0546 and 0.0192, yet recall falls from 1.00 to 0.50—the top-𝐾
+boundary effect suggested in RQ2, where a small movement matters because the unit occupies a sensitive ranking
+position.
+Together, the three cases account for 2.3% of flask’s 128 ground-truth queries. They are rare, but they expose two
+different limitations of displacement-based reasoning: cumulative movement over time and sensitivity to retrieval
+position.
+Finding 6. The mismatches among syntax, displacement, and retrieval impact have recurring structure (Table 7). We
+observe retrieval-irrelevant embedding movement, text-sensitive non-substantive changes, cross-language variation, net-zero
+reversions, cumulative drift, and top-𝐾boundary effects. No single layer is therefore sufficient for reliable maintenance
+decisions.
+These counterexamples provide design constraints rather than ready-made policy rules. They motivate conservative
+treatment of apparently low-impact changes, an explicit net-zero check, and a separate mechanism for cumulative drift.
+3.6
+Summary of Findings
+The empirical results support the three-layer funnel as an organizing model, but not as a deterministic chain. Change
+type predicts how far a representation moves (Finding 1); retrieval exposure determines whether that movement
+becomes consequential (Finding 2); change history supplies an additional temporal prior (Finding 3); repository
+temperature bounds the headroom available to any change-based rule (Finding 4); and of the four inexpensive signals
+three discriminate impacted units while neighbourhood similarity does not, with only one associated pair among the
+six (Finding 5). The counterexamples then show why no single layer suffices (Finding 6).
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+15
+Findings 3 and 5 together constitute a prior worth testing: if three of the four signals discriminate impacted units
+and five of the six pairings are unassociated, combining them should improve a maintenance decision. Section 4 builds
+the benchmark needed to test that prior under an explicit pre-embedding information boundary; Section 6 tests it and
+finds it does not hold, and Section 5 shows which part of the evidence does convert into a deployable rule.
+4
+CIPBench: A Benchmark for Re-embedding Decisions
+Section 3 shows that code changes differ systematically in their embedding and retrieval consequences, but also
+that no single observable signal perfectly identifies consequential updates. CIPBench formalizes this problem as a
+benchmark for deciding whether and when a changed code unit should be re-embedded. The benchmark records the
+eventual representation and retrieval consequences of each update for evaluation, while restricting candidate methods
+to information available before the updated embedding is computed.
+The measurements are defined in Section 3.1 and are not restated here; recall that change type is recorded per update
+while displacement and impact are recorded per unit. This section contributes what is specific to the benchmark: the
+information boundary that separates deployable methods from oracles, the construction of the evolution streams, the
+two evaluation tracks and their metrics, and the reference baselines.
+4.1
+Task Definition and Information Boundary
+Consider an evolving repository with a sequence of code updates 𝑢1,𝑢2, . . . ,𝑢𝑇distributed over a set of code units. The
+decision object is the unit: a maintenance policy decides whether to recompute a unit’s representation, and CIPBench
+scores that decision. Updates are the evidence stream from which the decision is made—they supply each unit’s
+change history—but they are not themselves scored. Accordingly the benchmark records, for each unit, its cumulative
+displacement 𝛿and its retrieval impact 𝐼, together with the sequence of change types observed across its updates.
+The central constraint is temporal and operational. At the time a maintenance decision is made, a method may use
+• the old and updated source text;
+• repository metadata and the unit’s accumulated change history up to the refresh point; and
+• the state of the existing retrieval index.
+It may not use the updated embedding, the true displacement 𝛿(𝑢), or the true retrieval impact 𝐼(𝑢). These quantities
+become available only after performing the computation that the maintenance decision is intended to avoid, and are
+therefore reserved for evaluation or oracle baselines. Figure 1 places each quantity at the point in time at which it
+comes into existence.
+This information boundary distinguishes the prediction problem from ordinary post-update analysis, and it is
+representational rather than temporal. CIPBench models periodic index maintenance: at a refresh point, a set of units
+has accumulated changes since the last refresh, and the policy decides for each whether to recompute its vector. The
+decision point is therefore after that unit’s accumulated evolution is known and before any embedding is computed
+from it. What the boundary excludes is everything derived from the new representation—𝐸(𝑥new), 𝛿, and 𝐼—not the
+earlier part of the unit’s own change history. Repository evolution beyond the refresh point remains unavailable, as it
+must: no feature may be computed from updates the policy has not yet seen.
+Manuscript submitted to ACM
+
+
+16
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+time
+information boundary
+unit u changes
+old and new text
+now available
+DECISION
+re-embed  or  skip
+embedding computed
+only if re-embedded
+impact realised
+only if measured
+usable by any policy
+evaluation and oracles only
+a deployable policy decides using only what exists to the left of the boundary
+xold,  xnew
+change history
+k-occ,  nn_sim
+E(xnew),  δ(u)
+I(u)
+Fig. 1. The CIPBench information boundary. At a refresh point a unit’s accumulated changes and its retrieval context are known, but
+the decision precedes embedding computation, so 𝛿and 𝐼do not yet exist when a deployable method must choose; they are available
+only to evaluation and to oracle baselines.
+4.2
+Dataset Construction
+4.2.1
+Issue-Driven Evolution Streams. CIPBench is constructed from issue-driven repository evolution. Each issue
+provides an externally meaningful evolution event: its title and body form a natural-language retrieval query, while the
+code units associated with the issue form the corresponding ground-truth target set.
+This construction serves two purposes. First, it preserves a connection between repository evolution and an explicit
+retrieval intent. Second, it reduces the number of updates for which no issue-level semantic context is available. The
+resulting stream is not intended to reproduce an unconstrained production commit stream, and this distinction is
+treated as an external-validity boundary in Section 7.
+The benchmark contains 10 repositories in Python, Go, and JavaScript. Table 8 summarizes the retained function-level
+units and updates. Repositories carry between 74 and 983 ground-truth queries. That range matters for reading the
+results: Hurt@B is a fraction of a repository’s own query set, so a given harm value rests on a denominator that differs
+by more than an order of magnitude across the benchmark, and a small value in a query-poor repository can correspond
+to a single affected query.
+Repositories were selected to cover active projects over multi-year histories, at least 100 issue-level events before
+benchmark filtering, a broad range of retained repository sizes, and multiple projects within each language. The resulting
+benchmark contains between 23 and 678 retained units per repository.
+4.2.2
+Construction Pipeline. Benchmark construction proceeds in three stages. First, tree-sitter extracts function- and
+method-level code units and aligns them across repository evolution. Second, real updates to the retained units are
+ordered along the issue-driven evolution stream. Third, issue titles and bodies are converted into retrieval queries, with
+the associated code units serving as retrieval ground truth.
+Each retained unit is then annotated with the measurements of Section 3.1, and each update with its change type.
+Two properties of that annotation are specific to the benchmark release. Displacement is recorded per unit, between its
+first and last observed states, and the release additionally stores the per-update step displacements so that movement
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+17
+Table 8. CIPBench repositories and evolution-stream size.
+Repository
+Lang.
+Units
+Updates
+flask
+Py
+131
+334
+aiohttp
+Py
+65
+409
+pylint
+Py
+162
+720
+requests
+Py
+43
+69
+click
+Py
+23
+86
+cobra
+Go
+259
+1,079
+echo
+Go
+678
+3,351
+gin
+Go
+434
+1,802
+lodash
+JS
+535
+950
+express
+JS
+36
+136
+Total
+2,366
+8,936
+can be decomposed across a sequence where required; the cumulative-drift case of Section 3.5 uses both, and states
+which. And because impact labels are sensitive to 𝐾, the released pipeline supports regeneration at other values of 𝐾
+and with graded relevance measures; 𝐾= 10 is the default used throughout this paper. We denote the set of impacted
+units by
+𝐻= { units with 𝐼> 0 }.
+Computing these labels requires traversing the repository query set for each evaluated unit, approximately 15 million
+top-𝐾retrieval calculations over the complete benchmark.
+4.2.3
+Label Quality and Reproducibility. The change classifier was evaluated with 24 cross-language smoke tests and
+a manually validated sample of 300 updates, stratified as 30 updates per repository, which two annotators labeled
+independently before disagreement adjudication. Section 3.1 reports the resulting agreement figures, and Section 7
+reports the disagreement structure and repository-level variation.
+The standard impact labels are computed with the primary encoder MiniLM-L6-v2. Because impacted sets transfer
+only partially across encoders (Section 7), CIPBench should be read as parameterized by encoder: labels for a target
+encoder must be regenerated with the released pipeline rather than transferred.
+The benchmark artifact includes the data representation, loaders, evaluation scripts, and the measurement pipeline,
+so that future maintenance policies can be evaluated under the same data construction and information constraints.
+4.3
+Evaluation Protocol
+CIPBench evaluates two maintenance tasks. Track A asks whether a changed unit can be skipped altogether; Track B
+asks how the remainder should be prioritized when only a limited fraction can be re-embedded. We present them
+in that order, which is the order in which a deployed system encounters them and the order of the evaluations in
+Sections 5 and 6. Track A’s metrics speak directly to computational savings; Track B carries the reference baselines and
+the leaderboard below, and is where the benchmark’s discriminative power is established.
+Manuscript submitted to ACM
+
+
+18
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+4.3.1
+Track A: Impact-Prediction Filtering. Track A evaluates selective re-embedding as a binary decision. Let 𝑈denote
+the set of evaluated units and 𝑆⊆𝑈the units a policy selects for re-embedding. We report two complementary metrics,
+MissRate = |𝐻\ 𝑆|
+|𝐻|
+,
+Savings = 1 −|𝑆|
+|𝑈| .
+Miss rate measures the fraction of truly consequential units that the policy fails to re-embed; savings measures the
+fraction of embedding computations avoided. A useful filtering policy trades one against the other.
+We report this pair rather than conventional classification accuracy because retrieval-impact labels are imbalanced
+and the operational costs of the two error types are asymmetric. Skipping an unaffected unit saves computation;
+skipping an impacted unit can degrade retrieval quality.
+4.3.2
+Track B: Budget-Constrained Scheduling. Track B considers settings in which only a fraction of units can be
+re-embedded. For a budget 𝐵∈{10, 20, . . . , 100}%, a policy ranks the available units and selects the highest-ranked 𝐵%
+for re-embedding. As in Track A the budget is a fraction of units, not of updates: pylint’s 162 units at 𝐵=30% give 48
+re-embeddings.
+Let 𝑆𝐵⊆𝑈denote the set of units selected under budget 𝐵, and let Ifull and I𝑆𝐵denote the indexes in which,
+respectively, every evaluated unit and only the units in 𝑆𝐵have been re-embedded. Writing
+drop(𝑞) = Recall@K
+
+𝑞; Ifull
+−Recall@K
+
+𝑞; I𝑆𝐵
+
+,
+with Recall@K(𝑞; I) = |𝐺(𝑞) ∩Top𝐾(𝑞; I)| / |𝐺(𝑞)|, the primary metric is the fraction of queries that lose a material
+amount of recall,
+Hurt@B(𝑆𝐵) =
+1
+|𝑄|
+{𝑞∈𝑄: drop(𝑞) ≥0.1 }
+.
+Lower values indicate better preservation of retrieval quality. We count queries rather than averaging the drop because
+the two behave differently when a query has several ground-truth units: averaging lets many small partial losses
+offset a query that loses its only retrieved match, whereas the operational concern is how many queries are visibly
+degraded. The 0.1 threshold excludes losses smaller than one ground-truth unit in a ten-unit target set. CIPBench
+additionally records the number of affected queries and the maximum per-query recall loss, allowing aggregate harm to
+be considered together with worst-case behavior.
+The protocol is defined over the complete budget range. For compact presentation, the main tables report 𝐵= 30%
+and 𝐵= 50% as representative constrained operating points.
+4.4
+Reference Baselines
+CIPBench includes five reference policies spanning freshness-based, retrieval-aware, history-based, and oracle informa-
+tion.
+(1) Random. Updates are randomly ordered. Results are averaged over five random seeds.
+(2) Recency. Updates are prioritized by recency, representing a freshness-oriented policy that does not inspect the
+semantic nature of the change.
+(3) 𝑘-occ. Updates are prioritized according to their exposure in the existing top-𝐾retrieval results, following the
+positional effect of Finding 2. This baseline uses retrieval position but does not inspect the new embedding.
+(4) YW-hist. Updates with stronger prior substantive-change history are prioritized, following the temporal persistence
+of Finding 3.
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+19
+Table 9. CIPBench Track B reference results (lower Hurt@𝐵is better).
+Repo
+Lang.
+𝐵
+Random
+Recency
+𝑘-occ
+YW-hist
+True-𝛿
+flask
+Py
+30
+.039
+.070
+.078
+.016
+.016
+50
+.023
+.062
+.047
+.016
+.008
+aiohttp
+Py
+30
+.054
+.065
+.011
+.022
+.022
+50
+.054
+.022
+.011
+.011
+.000
+pylint
+Py
+30
+.027
+.027
+.022
+.013
+.018
+50
+.022
+.013
+.022
+.009
+.013
+requests
+Py
+30
+.040
+.040
+.020
+.033
+.020
+50
+.026
+.033
+.000
+.033
+.013
+click
+Py
+30
+.036
+.024
+.012
+.024
+.012
+50
+.036
+.024
+.012
+.012
+.012
+cobra
+Go
+30
+.096
+.143
+.125
+.054
+.042
+50
+.063
+.110
+.075
+.036
+.024
+echo
+Go
+30
+.171
+.129
+.150
+.086
+.046
+50
+.129
+.103
+.103
+.065
+.025
+gin
+Go
+30
+.114
+.127
+.118
+.078
+.062
+50
+.107
+.116
+.098
+.053
+.027
+lodash
+JS
+30
+.098
+.098
+.027
+.030
+.030
+50
+.049
+.102
+.023
+.011
+.027
+express
+JS
+30
+.054
+.041
+.041
+.041
+.041
+50
+.041
+.027
+.041
+.068
+.041
+(5) True-𝛿Oracle. Updates are ranked by their true embedding displacement after the new representation has been
+computed. This baseline violates the deployment information boundary and is therefore used only as an oracle
+reference.
+The first four policies are compatible with the benchmark’s pre-embedding information boundary. True-𝛿is deliber-
+ately non-deployable: its role is to estimate how much improvement would remain available if future representation
+movement were known perfectly.
+We additionally evaluate a character-feature LightGBM model as a diagnostic learned baseline. It is not counted
+among the five reference policies above; its purpose is to test whether a lightweight trained predictor automatically
+dominates simple pre-embedding signals.
+4.5
+Benchmark Characterization
+Table 9 reports per-repository Track B reference results at the two representative budgets.
+The results exhibit substantial variation across repositories. No deployable single-signal baseline dominates in every
+setting. In particular, Recency underperforms Random on average at both budgets (𝐵=30: .076 vs. .073; 𝐵=50: .061 vs.
+.055): the issue-driven stream concentrates recent updates at the tails of multi-update issues, so freshness alone selects
+the smallest, least representative steps. YW-hist performs particularly well in several repositories, whereas 𝑘-occ is
+stronger in others.
+Table 10 summarizes mean harm across the 10 repositories.
+Table 10. Mean Track B harm across all 10 repositories. Differences quoted in the text are computed from unrounded per-repository
+values and may therefore differ from the quotient of the displayed figures (e.g., YW-hist improves on Recency by 3.67pp, which the
+rounded means give as 3.6pp).
+𝐵
+Random
+Recency
+𝑘-occ
+YW-hist
+True-𝛿
+30%
+.073
+.076
+.060
+.040
+.031
+50%
+.055
+.061
+.043
+.031
+.019
+Manuscript submitted to ACM
+
+
+20
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+At 𝐵= 30%, YW-hist is the strongest deployable single-signal baseline on average, reducing mean harm by 3.3
+percentage points relative to Random and by 3.7 points relative to Recency. A substantial gap also remains between
+Recency and the True-𝛿oracle: 4.5 percentage points at 𝐵= 30% and 4.2 points at 𝐵= 50%.
+Workload heterogeneity is visible at the language level as well (Appendix D). Python is already comparatively close
+to the oracle under these baselines, while the Go repositories leave substantially more room for improvement, and in
+the two JavaScript repositories 𝑘-occ has lower mean harm than YW-hist. These differences reinforce the observation
+from Section 3 that the usefulness of individual signals depends strongly on repository workload.
+The diagnostic character-feature LightGBM baseline obtains mean harm of approximately .058 at 𝐵= 30%. It slightly
+improves on 𝑘-occ but remains worse than YW-hist. Thus, under the same pre-embedding information constraint,
+adding a trained character-level predictor does not by itself eliminate the advantage of simple historical signals.
+Overall, the reference results establish two properties of CIPBench. First, the benchmark separates maintenance
+policies that exploit different kinds of pre-embedding information into clearly distinct harm levels. Second, a substantial
+gap remains between the strongest deployable baseline and an oracle with access to future embedding displacement.
+Whether that gap can be closed by combining the complementary signals of Section 3 is the question Section 6 takes
+up; Section 5 then evaluates the filtering track.
+5
+Track A: Conservative Filtering
+Track A asks whether a changed unit can be skipped outright, before any ranking question arises. Section 3.5 supplies
+two candidate rules: the 𝐴→𝐵→𝐴reversions, in which a unit’s text returns to the state the index already represents,
+and the docstring-only edits, the strongest observed instance of “embedding moves, retrieval does not.” Both are cheap
+to detect before re-embedding. This section measures what they save and what they cost.
+5.1
+Rules and Measurement
+We evaluate two rules over the 2,366 units of all 10 repositories, using each unit’s change history to decide:
+(1) Hash-identity skip. Skip a unit whose text at the refresh point is hash-identical to the text represented by the
+currently indexed vector (Section 3.2).
+(2) Python docstring skip. Additionally skip a unit whose accumulated changes are confined to Python docstrings
+(Section 3.5).
+Both rules are stated over units because that is the decision object, but the evidence they consult is update-level:
+the first compares the unit’s current text against what the index holds, and the second inspects the change types of
+the updates that produced it. A unit qualifies for the second rule only if every update in its accumulated history is
+docstring-only; a single implementation change disqualifies it.
+We evaluate both rules with the Track A metrics of Section 4, Savings and MissRate, writing 𝑆reembed for the set there
+denoted 𝑆to keep it distinct from the set a rule skips.
+We report the two rules separately rather than pooled. Hash-identical skips are non-impacting by construction—
+identical text yields an identical embedding, which cannot change any ranking—so they contribute zero misses by
+definition. Pooling them with the docstring rule would divide the docstring rule’s misses by a denominator inflated
+with cases that cannot miss, overstating its safety.
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+21
+Table 11. Track A filter evaluation. “Miss” is the fraction of a repository’s impacted units that the rule skips, following the definition
+in Section 4. Hash-identity misses are zero by construction. The single docstring miss, in requests, is one unit out of that repository’s
+ten impacted units—and out of the one unit to which the rule applies there.
+Repo
+Lang.
+hash-skip savings
+hash-skip miss
++docstring savings
++docstring miss
+aiohttp
+Py
+49.2%
+0
+49.2%
+0
+click
+Py
+13.0%
+0
+13.0%
+0
+pylint
+Py
+11.1%
+0
+13.0%
+0
+flask
+Py
+5.3%
+0
+8.4%
+0
+echo
+Go
+2.8%
+0
+2.8%
+0
+express
+JS
+2.8%
+0
+2.8%
+0
+gin
+Go
+0.7%
+0
+0.7%
+0
+lodash
+JS
+0.6%
+0
+0.6%
+0
+requests
+Py
+0.0%
+0
+2.3%
+0.10 (1/10)
+cobra
+Go
+0.0%
+0
+0.0%
+0
+0
+10
+20
+30
+40
+50
+60
+re-embedding computations avoided (%)
+aiohttp
+click
+pylint
+flask
+echo
+express
+gin
+lodash
+requests
+cobra
+49.2
+13.0
+11.1 + 1.9
+5.3 + 3.1
+2.8
+2.8
+0.7
+0.6
+0.0 + 2.3
+docstring miss 1/10
+0.0
+Python
+Go
+JavaScript
++ docstring skip
+Fig. 2. Per-repository savings from conservative filtering. Hash-identical skipping is safe everywhere but heavily skewed, reaching
+49.2% in aiohttp where the reversion phenomenon is concentrated. The docstring rule adds savings in three Python repositories—pylint,
+flask and requests—and is the only rule to record a miss, in requests.
+5.2
+Results
+Table 11 reports savings and miss rate per repository at each level; Figure 2 shows the savings distribution.
+The hash-identity rule has a zero miss rate in every repository, as its construction requires, and its savings are heavily
+skewed: 49.2% in aiohttp, where the reversion phenomenon is concentrated, but under 3% in six of the ten repositories
+and exactly zero in cobra and requests. The rule is worth deploying because it never costs anything, not because it
+reliably saves much.
+The docstring rule is safe in four of five Python repositories but misses one impacted unit in requests, the only
+miss across all 10 repositories. The reported rate of 0.10 follows the definition above: one miss over requests’ ten
+impacted units. Read against the rule’s own candidates it is far worse, and worth stating plainly—the rule applies to
+exactly one unit in requests, and that unit is impacted. Its 2.3% saving and its miss are the same unit.
+That is the reason we do not present the rule as universal. It is also why the repository-level miss rate understates
+the risk: a rule with one candidate and one miss looks like a 10% failure against the repository and a total failure against
+itself, and only the second number describes what the rule does.
+Manuscript submitted to ACM
+
+
+22
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+Extending the filter further is unsafe on the current evidence. Comment-only changes miss 2/19 impacted units in
+flask and 2/8 in click, confirming the comment-sensitivity counterexample of Section 3.5. Go string-literal changes miss
+1/87 in cobra and 1/165 in gin. Neither class should be hard-filtered.
+5.3
+A Label-Free Deployment Guard
+The requests miss creates a design problem. Hard-coding a repository exclusion would overfit the benchmark, and a
+deployed system cannot consult retrieval-impact labels— computing them requires exactly the embeddings the filter
+exists to avoid. We therefore express the rule as a guard that a deployment can evaluate from its own observations:
+Enable the docstring filter for a repository only after periodic probing has accumulated at least 𝑁= 20
+observed docstring-only updates with zero measured impact; disable it permanently at the first observed
+miss.
+Probing re-embeds a small random sample of filtered units and measures their true impact, so the guard is self-
+supervising: it pays a bounded sampling cost to maintain the evidence its own safety depends on. 𝑁= 20 is a deployment
+parameter and we state it explicitly, because leaving it unspecified would reintroduce the overfitting objection in a
+vaguer form.
+We must be clear about what the benchmark can say regarding this threshold, which is less than we would like. The
+docstring rule applies to eight units in total across the ten repositories—four in flask, three in pylint, one in requests—so
+no repository here accumulates anything close to twenty clean observations within the observed window. On this
+benchmark the guard would therefore enable the rule nowhere; it excludes requests not by tripping on the miss but by
+never reaching the evidence threshold at all. The guard is a deployment mechanism whose counts accumulate over a
+production stream far longer than an issue-linked evolution window, and the benchmark can demonstrate its logic but
+cannot exercise it.
+This bounds the Track A result. The hash-identity rule carries essentially all of the measured savings and is safe by
+construction; the docstring rule rests on eight candidate units, one of which is impacted, and should be read as a design
+sketch supported by the counterexample analysis of Section 3.5 rather than as a validated rule.
+5.4
+Deployment Cost and Interface
+The filter is the first stage of a per-unit decision path whose second stage, scoring, is the subject of Section 6. We
+give the whole path here because the two stages share one traversal of the update. Algorithm 1 states it. The decision
+respects the CIPBench information boundary throughout: it consults the indexed text, the updated source text, prior
+change history, and the old index, and never the updated embedding, true displacement, or retrieval-impact label.
+The two filter stages are inexpensive by construction. A hash comparison is 𝑂(1) in the length of the unit, and
+tree-sitter classification is millisecond-scale on CPU, so an update that the filter skips leaves the path having consumed
+neither a GPU nor an index traversal—which is the entire point of placing the filter first.
+The scoring stage is where the cost sits. Historical counts are 𝑂(1) once maintained in memory, but computing 𝑘-occ
+requires a query–unit ranking pass over the old index at 𝑂(𝑛𝑞𝑛𝑢log𝑛𝑢), by a wide margin the most expensive step.
+Whether a deployment must pay it depends on the weight its repository’s cross-validation assigns to 𝑘-occ: Section 6
+reports that weight as zero in eight of the ten repositories, where the pass can be omitted without changing any decision,
+and small but non-zero in the remaining two.
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+23
+Algorithm 1 Priority computation for one changed unit.
+Require: Changed unit 𝑢; new text 𝑥new; indexed state; weights 𝑤0,𝑤1,𝑤2,𝑤3
+Ensure: Skip or a priority score
+1: if Hash(𝑥new) = IndexedTextHash(𝑢) then
+2:
+return Skip
+3: end if
+4: 𝑥old ←IndexedText(𝑢)
+⊲text the index currently represents
+5: 𝑐𝑡←ClassifyTreeSitter(𝑥old,𝑥new)
+6: if 𝑐𝑡= PythonDocstring and DocstringFilterEnabled(𝑟𝑒𝑝𝑜) then
+7:
+return Skip
+8: end if
+9: 𝑘occ ←ComputeKOcc(𝑢, 𝐾= 10)
+10: 𝑠nn ←NNSim(𝑢)
+11: 𝑛sub ←NSubCount(𝑢)
+⊲substantive updates in 𝑢’s history
+12: 𝑠𝑐𝑜𝑟𝑒←𝑤0 · 1[𝑛sub ≥1] + 𝑤1 · log(1 + 𝑘occ)
++ 𝑤2 · log(1 + 𝑛sub) + 𝑤3 · 𝑠nn
+13: return 𝑠𝑐𝑜𝑟𝑒
+Result 1. Conservative filtering avoids measurable computation at measurable risk. Skipping hash-identical units is safe
+in every repository by construction and saves up to 49.2%, which is the whole of the measured benefit. The Python docstring
+rule applies to eight units across the benchmark and misses one of them, too few to validate; we give a label-free probing
+guard for deploying it safely but cannot exercise that guard here. Comment-only and string-literal extensions are unsafe on
+the current evidence.
+6
+Track B: History Alone Captures the Available Predictability
+Filtering removes updates that provably cannot matter. Track B asks the harder question that remains: among the units
+that survive the filter, which should be re-embedded first when only a fraction of them can be?
+Section 3 leaves a prior worth testing here. Four signals—syntactic substantiality, retrieval exposure (𝑘-occ),
+substantive-change history (𝑛𝑠𝑢𝑏), and old-index neighborhood similarity (nn_sim)—are the inexpensive signals available
+at the boundary. Three of them discriminate impacted units and nn_sim does not (Finding 5); we retain it so that the
+combination is tested with everything the boundary permits rather than with a set pre-filtered on the outcome. Five of
+the six pairings are weakly associated (Appendix A); the exception, change type versus history, is the pair Section 6.1
+shows to be related by construction. Standard practice would take that as sufficient reason to combine them. This
+section asks whether the combination actually improves the re-embedding decision, measured against the strongest
+deployable single signal rather than against an arbitrary baseline.
+Prediction works here, and one signal does all of it. Section 4 already establishes that the history baseline YW-hist
+reduces mean harm by 3.3 percentage points relative to Random and 3.7 relative to Recency—a substantial and deployable
+margin under the pre-embedding boundary. What the combination adds to that margin is nothing. On the complete
+20-point operating grid a weighted combination of all four signals is statistically indistinguishable from YW-hist alone,
+and the conclusion survives every perturbation of the score we could apply. The available predictability is real; it is
+simply exhausted by a single cheap signal.
+Manuscript submitted to ACM
+
+
+24
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+6.1
+Policy, Baselines, and Reporting
+6.1.1
+The weighted policy. For every update that survives the conservative filter of Section 5, the weighted score for
+unit 𝑢is
+score(𝑢) = 𝑤0 1[substantive(𝑢)]
++ 𝑤1 log(1 + 𝑘-occ(𝑢))
++ 𝑤2 log(1 + 𝑛𝑠𝑢𝑏(𝑢)) + 𝑤3 nn_sim(𝑢),
+(1)
+with the weighted terms normalized so that 𝑤1 + 𝑤2 + 𝑤3 = 1.
+One relationship between the terms should be stated at the outset, because it governs what follows. At the unit level
+a unit is flagged substantive exactly when it has at least one substantive update in its history, so 1[substantive(𝑢)] and
+𝑛𝑠𝑢𝑏(𝑢) are not independent quantities: the flag is 𝑛𝑠𝑢𝑏≥1. We verified this holds without exception across all 2,366
+units. Equation 1 therefore combines a count with a thresholded copy of that same count, and the question this section
+asks is in part whether the threshold adds anything to the count. We select the weights by leave-one-repository-out
+cross-validation over a fixed 64-point grid; when repository 𝑟is evaluated, no outcome from 𝑟contributes to its weights,
+so the procedure yields one weight vector per repository.
+The selected vectors are strikingly uniform. Eight of the ten repositories select (𝑤1,𝑤2,𝑤3) = (0, 0.667, 0.333),
+assigning zero weight to retrieval exposure; the exceptions are flask, which selects (0.167, 0.667, 0.167), and pylint,
+which selects (0.2, 0.8, 0). Cross-validation therefore discards 𝑘-occ in most repositories and retains a small amount of
+it in two, which is consistent with the weak and repository-dependent discrimination reported in Finding 5. We treat
+𝑤0 as a tunable coefficient and sweep it in Section 6.3 so that the result cannot be attributed to the choice of its value.
+Where the selection is 𝑤1 = 0 it lies on the boundary of the coarse grid, which has no sample between zero and its
+smallest positive value. A fine grid near 𝑤1=0 (step 0.005) confirms that harm is flat from 𝑤1=0 through approximately
+0.03 in cobra and 0.05 in echo before worsening, so those selections sit at the boundary of a flat optimum rather than at
+a unique minimum. The grid is therefore too coarse to distinguish a zero weight on 𝑘-occ from a small positive one,
+which is also why flask and pylint can select 𝑤1 = 0.167 and 0.2 without contradicting the eight repositories that select
+zero.
+6.1.2
+Reference baselines. Beyond the five baselines of Section 4 (Random, Recency, 𝑘-occ, YW-hist, True-𝛿), we add
+two rankers that isolate individual contributions:
+(1) Substantive-only, ranking by the substantive flag alone with stream order as tie-breaker, which tests whether
+Eq. 1 reduces to the substantive partition at the selection level.
+(2) YW-hist + 𝑘-occ, the two-signal combination 𝑤1 log(1 + 𝑘-occ) + 𝑤2 log(1 + 𝑛𝑠𝑢𝑏) with weights selected by the
+same procedure, which tests whether adding the orthogonal exposure signal to the strongest history signal helps.
+6.1.3
+Reporting rule. CIPBench defines budgets 𝐵∈{10, . . . , 100}%. We evaluate the full repository–budget grid at
+𝐵∈{30, 50}—all 20 operating points, none omitted. Table 12 reports the complete grid.
+6.2
+The Combination Is Equivalent to History Alone
+Table 13 collects the comparison and Figure 3 shows its per-point distribution. Two features of that distribution carry
+the claim. Twelve of the 20 points are bit-identical, so on most of the grid the two policies are not merely close but
+indistinguishable on the metric. Identical harm does not by itself establish identical selection—Hurt@B counts degraded
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+25
+Table 12. Full Track B operating-point grid (lower harm is better). Δ is Weighted −YW-hist harm; positive means the weighted policy
+is worse.
+Repo
+Lang.
+𝐵
+Recency
+YW-hist
+Sub-only
+Weighted
+Δ
+flask
+Py
+30
+.070
+.016
+.055
+.039
++2.34pp
+flask
+Py
+50
+.062
+.016
+.016
+.039
++2.34pp
+aiohttp
+Py
+30
+.065
+.022
+.054
+.022
+0
+aiohttp
+Py
+50
+.022
+.011
+.054
+.011
+0
+pylint
+Py
+30
+.027
+.013
+.045
+.018
++0.45pp
+pylint
+Py
+50
+.013
+.009
+.031
+.018
++0.90pp
+requests
+Py
+30
+.040
+.033
+.033
+.033
+0
+requests
+Py
+50
+.033
+.033
+.033
+.033
+0
+click
+Py
+30
+.024
+.024
+.024
+.024
+0
+click
+Py
+50
+.024
+.012
+.012
+.012
+0
+cobra
+Go
+30
+.143
+.054
+.096
+.051
+−0.30pp
+cobra
+Go
+50
+.110
+.036
+.051
+.036
+0
+echo
+Go
+30
+.129
+.086
+.143
+.086
+0
+echo
+Go
+50
+.103
+.065
+.133
+.065
+0
+gin
+Go
+30
+.127
+.078
+.118
+.078
+0
+gin
+Go
+50
+.116
+.053
+.083
+.054
++0.18pp
+lodash
+JS
+30
+.098
+.030
+.049
+.027
+−0.38pp
+lodash
+JS
+50
+.102
+.011
+.019
+.015
++0.38pp
+express
+JS
+30
+.041
+.041
+.054
+.041
+0
+express
+JS
+50
+.027
+.068
+.054
+.068
+0
+Mean Δ = +0.30pp, median Δ = 0, 12 ties, 2 wins, 6 losses.
+queries, and two different selections can produce the same count—so Section 6.3 compares selected sets directly where
+that stronger claim is needed. And the positive mean is almost entirely one repository: flask contributes +2.34pp at
+both budgets, four fifths of the total, leaving the other 18 points averaging +0.07pp. The median difference is zero.
+Table 13. Equivalence statistics between the weighted policy and YW-hist over the 20-point grid.
+Statistic
+Value
+Mean Δ (Weighted −YW-hist)
++0.30pp
+Median Δ
+0
+Bit-identical ties / 20
+12
+Wins / Losses
+2 / 6
+Repository-clustered bootstrap 95% CI
+[−0.02, +0.79]pp
+TOST (±1pp margin)
+𝑝= 2.4 × 10−4
+Simulated coverage (𝜎=0.01/0.02)
+0.91 / 0.86
+CI width ratio (2 × 𝜎)
+1.90
+Two qualifications bound this claim. The ±1pp margin is absolute, so on repositories with very low harm—aiohttp
+ranges from .011 to .022—it is roughly half the quantity being compared; equivalence would be looser under a relative
+margin. And the clustered bootstrap undercovers at 10 clusters: a synthetic validation with known between-repository
+variance measures coverage at 0.91 (𝜎=0.01) and 0.86 (𝜎=0.02) against a nominal 0.95, with CI width scaling near-linearly
+(ratio 1.90 for a doubled 𝜎).
+The weighted policy does improve on Recency by 3.04pp, but Recency is itself beaten by Random (Section 4), so that
+comparison measures nothing. We treat YW-hist as the reference throughout.
+Result 2. Combining four pre-embedding signals is statistically equivalent to using the single strongest one, within
+±1pp over the full 20-point grid (Table 13). Twelve of 20 operating points produce bit-identical harm.
+Manuscript submitted to ACM
+
+
+26
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+−1
+0
+1
+2
+Δ = Weighted − YW-hist harm (pp);  right of 0 is worse
+flask  B=30%
+flask  B=50%
+aiohttp  B=30%
+aiohttp  B=50%
+pylint  B=30%
+pylint  B=50%
+requests  B=30%
+requests  B=50%
+click  B=30%
+click  B=50%
+cobra  B=30%
+cobra  B=50%
+echo  B=30%
+echo  B=50%
+gin  B=30%
+gin  B=50%
+lodash  B=30%
+lodash  B=50%
+express  B=30%
+express  B=50%
+operating point (repository, budget)
+shaded: pre-specified ±1pp equivalence margin
+mean +0.30pp
+median 0   ·   12 of 20 bit-identical
+Python
+Go
+JavaScript
+Fig. 3. Per-point difference between the weighted policy and YW-hist at each of the 20 operating points. Twelve points are exactly
+zero. The mean is driven almost entirely by flask, whose two points are the only ones outside the pre-specified ±1pp margin.
+6.3
+The Result Does Not Depend on the Substantive Weight
+A fixed large coefficient on the substantive term would guarantee that substantive updates outrank non-substantive ones,
+inviting the objection that Result 2 is an artifact of parameterization. We therefore sweep 𝑤0 ∈{0, 0.94, 3.38, 5.06, 10},
+re-selecting 𝑤1,𝑤2,𝑤3 at each value. Every summary statistic is unchanged at every value: mean Δ = +0.30pp, median
+0, 12 ties, and the same per-repository weight selections (Appendix D).
+Exact invariance across structurally different score functions calls for a check on what is actually happening, and the
+answer is set identity: the selected sets 𝑆𝐵at 𝑤0=0 and 𝑤0=10 coincide at all 20 operating points (Jaccard 1.0), so the
+harm must be bit-identical. At these budgets the substantive tier of ranked units exceeds the budget in every repository
+(Section 6.4), which is consistent with the flag having no room to act. We report the invariance as observed rather than
+claiming the tier condition as its cause; separating the two would require budgets at which the tier no longer covers the
+selection, and those lie well above the operating range studied here.
+A positive control confirms that the score does respond to 𝑤0: inverting the sign of the substantive term at pylint
+𝐵=30 changes the selected set by as much as the repository’s composition permits.2
+The identity noted in Section 6.1 explains why, and does so exactly rather than empirically. Because a substantive unit
+has 𝑛𝑠𝑢𝑏≥1 and a non-substantive unit has 𝑛𝑠𝑢𝑏= 0, the history term is bounded below by 𝑤2 log 2 on the substantive
+side and contributes nothing on the other. In the eight repositories that select (𝑤1,𝑤2,𝑤3) = (0, 0.667, 0.333) this gives
+𝑇(𝑢𝑠) ≥0.462 while𝑇(𝑢𝑛𝑠) ≤𝑤3 max(nn_sim) ≤0.333, so𝑇orders every substantive unit above every non-substantive
+one and 𝑤01[substantive] cannot reorder anything for any 𝑤0 ≥0. The invariance in those repositories is an algebraic
+consequence of the score’s construction, not a property of the data.
+The two repositories that retain a non-zero weight on retrieval exposure are the exception, and the same algebra says
+where. For pylint, 𝑇(𝑢𝑠) ≥0.555 while a non-substantive unit reaches that level once 𝑘-occ > 15; for flask the threshold
+is 𝑘-occ > 5. Separation therefore holds in those repositories only while no sufficiently exposed non-substantive unit
+2At 𝑤0=−100 the selection is pylint’s 12 non-substantive units plus the top-36 substantive units; at 𝑤0=+100 it is the top-48 substantive units. Twelve of
+48 differ—the maximum available, since only 12 of pylint’s 162 ranked units are non-substantive, so the budget cannot be filled from that tier alone.
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+27
+exists near the budget cutoff, which is a contingent fact rather than a guarantee. Section 6.4 finds exactly this: the flag
+is inert everywhere at budgets up to 70%, and becomes active only at higher budgets and only in flask and pylint.
+Result 3. Result 2 is not a parameterization artifact. The selected sets at 𝑤0=0 and 𝑤0=10 coincide at all 20 operating
+points, so the reported harm is invariant to the substantive weight over [0, 10], and a positive control confirms the score
+does respond to 𝑤0. Section 6.4 shows the invariance extends to every budget at or below 70%.
+6.4
+Why the Flag Is Inert, and Over What Range
+Substantive-only and Weighted differ in harm at 16 of 20 points, sometimes by a factor of two or more (echo 𝐵=50: .133
+vs. .065; aiohttp 𝐵=50: .054 vs. .011). That looks at first like the substantive partition failing, but comparing selected sets
+rather than harm shows the opposite.
+Every repository’s substantive fraction of ranked units—a different quantity from the update-level temperature of
+Section 3.4—exceeds 87%, from 87.0% in click to 99.1% in gin. At both 𝐵=30% and 𝐵=50% the substantive tier is therefore
+larger than the budget in every repository, so every selected unit is substantive whatever the flag’s value and the flag
+cannot discriminate at all. What differs between the two policies is the within-tier ordering—stream index versus the
+weighted terms—and that ordering changes the selected set at 19 of 20 points, with Jaccard overlap between 0.12 and
+0.45. The large harm differences in Table 12 follow from those set differences, not from any failure of the partition.
+Reporting this at two budgets invites the objection that we evaluated where the signals happened not to matter.
+We therefore repeat the comparison over 𝐵∈{5, 10, 20, . . . , 95, 100}%, giving 130 repository–budget points with each
+repository’s own cross-validated weights.
+The picture does not change with the budget. Across all 130 points the mean difference is +0.059pp with a median of
+0, and 71 points are bit-identical. Table 14 gives the per-budget means, whose sign alternates without pattern across the
+thirteen levels—what one expects from noise around zero rather than from a budget-dependent effect.
+We describe this as consistency with Result 2 rather than as equivalence, because it is weaker evidence of a different
+kind. The pre-specified margin, the clustered bootstrap and the TOST apply to the 20-point grid, where the operating
+points were fixed in advance; the sweep is a check that no budget reverses the conclusion, and 17 of its 130 points do
+exceed one percentage point individually. What it rules out is a budget-dependent effect that the two reported budgets
+happened to miss, which is the objection it was run to answer.
+The sweep also bounds the invariance of Result 3. Comparing the sets selected under 𝑤0=0 and 𝑤0=10 at each point,
+they are identical at every budget at or below 70%. The flag does change the selection at six points, all at 𝐵≥80% and
+all in flask and pylint—the two repositories whose cross-validated weights give 𝑘-occ a non-zero coefficient. Where
+𝑤1 = 0 the ranking term is a function of history and neighbourhood similarity alone, both aligned with substantiality,
+and the flag has nothing left to reorder; where 𝑤1 > 0 the term carries retrieval exposure, which is not so aligned, and
+the flag can act. Even there it acts only when four fifths or more of all updates are re-embedded, and the largest such
+perturbation moves the selected set by under 4% (Jaccard ≥0.968).
+Result 4. The substantive flag is inert at every budget a deployment would impose. The substantive tier of ranked units
+(87.0%–99.1%) exceeds the budget at all reported operating points, and over the full range the flag changes the selected set
+at no point with 𝐵≤70% and at six points above it, confined to the two repositories in which cross-validation retains a
+non-zero weight on retrieval exposure. Within-tier ordering, not the flag, determines the selection: 𝑆𝐵(Substantive-only)
+differs from 𝑆𝐵(Weighted) at 19 of 20 points. Extending the comparison to 130 repository–budget points leaves the picture
+unchanged (mean +0.059pp, median 0, 71 bit-identical), so Result 2 is not an artifact of the two budgets reported.
+Manuscript submitted to ACM
+
+
+28
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+Table 14. Mean Δ (Weighted −YW-hist, pp) over the 10 repositories at each budget, with the number of bit-identical points and the
+number at which the substantive flag changes the selected set.
+𝐵
+Mean Δ (pp)
+Ties / 10
+Flag active / 10
+5%
+−0.086
+7
+0
+10%
+−0.213
+5
+0
+20%
++0.573
+2
+0
+30%
++0.211
+6
+0
+40%
++0.268
+4
+0
+50%
++0.380
+6
+0
+60%
++0.104
+6
+0
+70%
+−0.005
+4
+0
+80%
+−0.184
+5
+1
+85%
+−0.290
+5
+2
+90%
+−0.124
+5
+2
+95%
++0.128
+6
+1
+100%
++0.000
+10
+0
+6.5
+Adding the Orthogonal Signal Does Not Help Either
+Result 2 could be read narrowly, as a fact about one particular four-term score. The sharper test is the two-signal
+combination that the Section 3 evidence most directly recommends. 𝑘-occ is only weakly associated with 𝑛𝑠𝑢𝑏(language-
+level Kendall 𝜏= 0.13, 0.11, and 0.24 for Python, Go, and JavaScript), so if orthogonality translated into decision-level
+gain anywhere, it should be here.
+It does not. Over the 20 points the two-signal ranker ties YW-hist on 14, is worse on 5 (flask 𝐵=30/50, pylint 𝐵=30/50,
+gin 𝐵=30), and better on 1 (gin 𝐵=50, −0.36pp), for a mean difference of +0.21pp. Adding retrieval exposure to a history
+ranker does not reduce harm.
+Result 5. Signal-level independence does not imply decision-level gain. 𝑘-occ is near-orthogonal to 𝑛𝑠𝑢𝑏and individually
+discriminative, yet adding it to a history ranker changes no aggregate outcome (14/20 ties; mean +0.21pp worse).
+6.6
+Why the Displacement Oracle Is Not a Ceiling
+Two operating points look striking in isolation: at aiohttp 𝐵=30 the weighted policy matches the True-𝛿oracle (.022 vs.
+.022), and at lodash 𝐵=50 it beats it (.015 vs. .027). Neither is a success of the combination—YW-hist attains exactly the
+same harm at both points.
+The observation still matters, because it confirms Finding 2 at the policy level. Displacement alone does not
+characterize retrieval impact, so an oracle that ranks by displacement is not a retrieval-aware scheduler and its harm
+is not a lower bound on what a deployable policy can achieve. This is a property of the task, and it is one reason the
+Recency-to-oracle gap reported in Section 4 should not be read as headroom that a better ranker is guaranteed to
+capture.
+6.7
+Summary
+A single cheap historical signal captures essentially all of the predictability available before re-embedding. Three further
+signals—two of them discriminative, all largely unassociated with one another, and combined under cross-validated
+weights—add nothing to it. The result holds across the full budget range, from 5% to 100%, and is invariant to the
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+29
+substantive weight. At the budgets that matter the substantive tier exceeds the budget in every repository, leaving the
+syntactic flag no room to discriminate, and history carries the decision.
+Read together with Section 5, the two tracks fail and succeed for opposite reasons. Ordering saturates because the
+discriminative work is already done by a single signal. Filtering succeeds because it exploits a structural property—textual
+identity between the new state and the indexed one—that no ranking signal captures, and that certifies non-impact
+rather than predicting it. Section 8 takes up what this contrast implies for how maintenance signals should be validated.
+7
+Threats to Validity
+Several aspects of the study affect how broadly its findings can be interpreted, including the choice of embedding model,
+change labeling, dataset construction, and repository coverage. We discuss six threats below, focusing on the scope of
+the conclusions they affect and the evidence available to assess them.
+T1—Embedding-model dependence. The main analysis uses MiniLM-L6-v2, so some observed relationships may
+depend on the embedding model. We assess this by repeating the displacement and retrieval-impact measurements
+with MPNet-base-v2 and BGE-base-en-v1.5 across all 10 repositories.
+Displacement rankings are highly consistent across the three models: over 30 repository–model comparisons the
+mean Spearman correlation is 𝜌= 0.905 (range 0.82–0.97), with language-level means of 0.903, 0.901, and 0.915 for
+Python, Go, and JavaScript. Retrieval impact is not. The impacted sets produced by MPNet and BGE overlap only partially
+with those from MiniLM: mean Jaccard overlap 0.232 across 20 comparisons, ranging from 0.07 to 0.38. The relative
+displacement patterns therefore transfer well across the tested encoders, whereas the exact set of retrieval-impacting
+updates does not.
+Two caveats bound the second measurement. The cross-model retrieval analysis differs slightly from the main
+pipeline for five repositories—flask, cobra, echo, gin, and lodash—where a stricter impact implementation produces
+impacted fractions 2–16 percentage points lower; the remaining five use matching definitions. This does not affect the
+main MiniLM results, but it means we can characterize the relative stability of displacement and the model sensitivity
+of impact without claiming exact transfer rates. Together these imply that the standard CIPBench impact labels are
+MiniLM-specific: the encoder is a parameter of the benchmark, and labels for a target encoder must be regenerated
+with the released pipeline rather than transferred.
+T2—Change-label reliability. The empirical analysis relies on automatically assigned change categories. Section 3.1 re-
+ports the validation results—Cohen’s 𝜅= 0.786 between annotators [24] and 88.7% classifier agreement with adjudicated
+labels; what matters for validity is the structure of the disagreement rather than its magnitude.
+Disagreements concentrate on a small number of recurring classification boundaries rather than spreading uniformly.
+More than half (23/45) involve lex_substantive. Agreement is also lower in cobra and lodash (𝜅= .555 and .494),
+where two specific ambiguities recur: Go template strings containing embedded DSL syntax, and local parsing failures
+in the large runInContext wrapper.
+Adjudication assigns 31 disagreements to implementation changes, eight to signature changes, and six to string-literal-
+only changes; none remains in the lex_substantive category. We subsequently clarified the annotation protocol so that
+local parsing failures with identifiable semantics are assigned to their semantic change class, while lex_substantive is
+reserved for cases that cannot be classified reliably from the parsed structure. Following standard inter-rater-reliability
+practice [27], we retain the original independently obtained 𝜅rather than recomputing agreement after this clarification.
+Manuscript submitted to ACM
+
+
+30
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+Importantly, the main analyses use a broader substantive tier that combines lex_substantive with implementation
+changes, so the principal findings are less sensitive to the fine-grained boundary responsible for most annotation
+disagreement.
+T3—Issue-linked evolution streams. CIPBench follows issue-linked repository evolution rather than an unconstrained
+production commit stream. This choice provides a natural semantic anchor for retrieval queries, but it can also change the
+distribution of updates represented in the benchmark. Maintenance activities only weakly associated with issues—some
+dependency updates, routine refactorings, or automated changes—may be less visible in the resulting streams.
+The current benchmark representation does not retain reliable author metadata, so bot-generated activity cannot be
+quantified separately. We do not rely on an assumed bot-contamination rate in any of the main analyses. The relevant
+generalization question is instead whether the observed temporal persistence, repository-level heterogeneity, and policy
+behavior remain similar under natural production commit streams; replication on bot-filtered commit histories would
+provide complementary evidence.
+T4—Repository and language coverage. The benchmark contains five Python, three Go, and two JavaScript repositories,
+which vary substantially in size, change history, and retrieval behavior but remain 10 projects in three languages.
+Our conclusions should be read as cross-repository evidence within the studied ecosystems rather than as universal
+language-level laws. The qualification is sharpest for findings involving signatures, type annotations, comments, and
+string literals, whose roles differ across languages and coding conventions.
+T5—Statistical multiplicity and repository-level sample size. Several parts of the analysis involve repeated statistical
+comparisons. For the three pairwise change-type comparisons underlying Table 2, we use a Bonferroni-adjusted
+threshold of 𝛼′ = 0.017; all three Mann–Whitney tests have 𝑝< 10−9 and remain significant after correction. The
+temporal-persistence analysis is reported separately for each repository, with 6/10 Fisher tests significant at 𝛼= 0.05,
+so we interpret it primarily through the magnitude and cross-repository pattern of the probability differences rather
+than through a pooled count of significant tests.
+Repository-level meta-feature correlations (Appendix B) serve a different purpose. They are computed over the 10
+repositories to characterize possible sources of heterogeneity, not to establish population-level relationships, and no
+policy in this paper consults them.
+The temporal-persistence analyses of Section 3.4 take the update as the unit of observation—both the first-update
+conditional probabilities and the consecutive-class persistence rates of Appendix C—even though a unit contributes
+several updates and may revert (e.g., aiohttp’s 𝐴→𝐵→𝐴annotation restorations, retained as real events). Their
+figures should be read as descriptive of the pooled update population rather than as exact inference over independent
+samples.
+The remaining analyses are not affected in that way, because they are unit-level: displacement, retrieval impact, and
+three of the four signals are defined per unit, and change type is aggregated to the unit before use. Their dependence is
+of a different kind—a unit spanning several change classes is assigned only its most severe—which affects the class
+labels rather than the observation count.
+The Section 6 equivalence claim rests on a repository-clustered bootstrap(1,000 resamples over the 10 repositories)
+and the two one-sided tests (TOST) procedure, using a pre-specified equivalence margin of ±1 pp. With only 10 clusters,
+percentile bootstrap intervals are known to undercover: a synthetic-data validation with known between-repository
+variance measures coverage at 0.91 (𝜎=0.01) and 0.86 (𝜎=0.02), with CI width scaling near-linearly (ratio 1.90 for a
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+31
+2× standard deviation). We report the measured coverage rather than assuming the nominal 0.95. Two of the four
+signals entering Eq. 1 are not independent by construction: the unit-level substantive flag is exactly 𝑛𝑠𝑢𝑏≥1, verified
+without exception across all 2,366 units. The equivalence reported in Section 6 is therefore in part a statement about a
+score that combines a count with a thresholded copy of itself, and the reader should not read it as evidence that four
+unrelated signals fail to combine. The three genuinely distinct inputs are history, retrieval exposure, and neighbourhood
+similarity; Appendix A shows those to be weakly associated, and Section 6.5 tests the strongest pair of them directly.
+Separately, the weight grid limits what can be concluded about 𝑘-occ. Leave-one-repository-out selection returns
+𝑤1 = 0 in eight repositories and 0.167 and 0.2 in the remaining two, but the coarse 64-point grid has no sample between
+zero and its smallest positive value, and a fine sweep (step 0.005) finds harm flat from 𝑤1=0 through roughly 0.03–0.05.
+The eight zero selections should therefore be read as “no more than a small weight” rather than as an exact zero, and
+the contrast between the two groups of repositories as a difference in degree rather than in kind.
+Across the empirical analysis, we report effect sizes and cross-repository patterns alongside significance tests so that
+no conclusion depends on individual 𝑝values alone.
+T6—Filter boundary conditions and Track A measurement. The Track A evaluation of Section 5 measures the two filter
+rules over all 2,366 units, so their savings and miss rates are observed rather than assumed. Three limits bound what
+that measurement establishes.
+First, the docstring rule’s evidence base is small in absolute terms. It changes the outcome in only three repositories—
+adding four skipped units in flask, three in pylint and one in requests—and the single miss we observe is that one
+requests unit. Expressed as the paper’s MissRate it is one of requests’ ten impacted units, or 0.10; expressed against
+the rule’s own candidates in that repository it is one of one. A rule validated on tens of cases per repository should be
+deployed behind the probing guard we describe rather than enabled by default, and the guard’s threshold (𝑁= 20) is an
+engineering choice calibrated against a single observed failure, not a value derived from a risk model.
+Second, the hash-identity rule’s zero miss rate is a construction guarantee, not an empirical one, and it should not be
+read as evidence about the docstring rule. We report the two rules separately for this reason. The reader should also
+note that MissRate is defined against a repository’s impacted set, so a rule that fires on very few units is divided by a
+denominator much larger than its own exposure; the per-rule candidate counts above are the figures that describe each
+rule’s own reliability.
+Third, the savings figures are workload properties, not policy properties. Hash-identity savings range from 49.2%
+(aiohttp) to 0.0% (cobra, requests) and track the incidence of 𝐴→𝐵→𝐴reversions rather than anything about the
+rule. A deployment should expect savings characteristic of its own revision behavior, and the aiohttp figure should not
+be read as a typical outcome.
+8
+Discussion, Conclusion, and Future Work
+8.1
+Discussion
+8.1.1
+Informative Signals Are Not Necessarily Useful Ones. The result we did not expect is that signals can be informative
+about retrieval impact, be largely unassociated with one another, and still combine into a policy that changes no decision.
+This is worth dwelling on, because the reasoning that led us to attempt the combination is standard and, on its own terms,
+sound. We measured per-signal discrimination, found that three of the four separated impacted from unimpacted units
+while neighbourhood similarity did not, checked that the discriminating signals were not redundant with one another,
+Manuscript submitted to ACM
+
+
+32
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+and concluded that combining them should help. Every step of that argument is common practice in software-analytics
+work. The conclusion was still wrong.
+The gap is between two properties that correlational validation cannot distinguish. A signal is informative if knowing
+it reduces uncertainty about the outcome. A signal is decision-relevant if knowing it changes what a system does. Our
+results separate these in two ways, and the second is the more general.
+The first is redundancy. A signal that is individually informative can carry no information the system does not
+already have. The substantive flag discriminates impacted units in seven of ten repositories (Finding 5), yet it changes
+no re-embedding decision at any budget a deployment would impose, because the history term already reproduces its
+ordering (Results 3 and 5). Correlational validation cannot detect this, since it evaluates each signal against the outcome
+rather than against the other signals in the presence of which it will be used.
+The second is objective mismatch, and it survives even when a signal is not redundant. Retrieval-impact prediction
+and re-embedding scheduling are different problems: ranking by 𝑃(𝐼> 0) maximizes the number of impacted units
+re-embedded, whereas Hurt@B counts the queries left visibly degraded, and the updates most likely to be impacted are
+not the units whose staleness degrades the most queries. A signal validated against the first can therefore misallocate a
+budget spent on the second.
+We think the second pattern generalizes past our benchmark. Wherever a maintenance mechanism spends a budget,
+the quantity being predicted and the quantity being optimized tend to differ: predictive test selection estimates which
+tests are likely to fail, while the objective is fault detection per unit of execution time; crawl scheduling estimates
+which pages have changed, while the objective is the freshness a user observes. A signal validated against the predicted
+quantity can be entirely correct and still misallocate the budget. The methodological implication is that a maintenance
+signal should be evaluated by the decision it produces under the objective it will face, not by its association with a
+proxy for that objective. Such an evaluation needs an artifact like CIPBench, which fixes the information boundary, the
+budget, and the metric so that two policies can be compared on decisions rather than on scores.
+8.1.2
+Why Filtering Succeeds Where Ranking Saturates. The two tracks fail and succeed for opposite reasons, and the
+contrast is instructive. Ranking saturates because the discriminative work is already done: history reproduces the
+substantive ordering exactly, and exposure adds nothing on top. Filtering succeeds because it exploits a property no
+ranking signal captures—textual identity between the new state and the indexed one. That property is not a better
+predictor of impact; it is a proof of non-impact. An update whose text is unchanged cannot move its embedding, so it
+cannot change any ranking, and the miss rate is zero by construction rather than by measurement.
+This suggests a design principle for maintenance policies more broadly. Where a decision admits a structural
+certificate—an argument that an action is safe rather than an estimate that it is probably safe—that certificate is worth
+more than any amount of signal engineering, and it should be sought first. Our largest single saving, 49.2% in aiohttp,
+comes from a hash comparison. The four-signal weighted score that occupied most of our design effort produces none.
+8.2
+Conclusion
+This paper asks whether a changed code unit necessarily needs to be re-embedded. It does not, but the useful answer
+turned out to lie in a different place from where we looked for it.
+Across 10 repositories in Python, Go, and JavaScript we find a consistent progression from syntactic change to
+embedding displacement to retrieval impact, with links that are informative rather than deterministic. CIPBench turns
+that observation into an evaluation problem by requiring a policy to decide before observing the updated embedding
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+33
+or its retrieval effect. Under that constraint, combining the available pre-embedding signals into a ranking policy is
+statistically equivalent to using the single strongest signal, for a structural reason we identify; conservative filtering, by
+contrast, avoids real computation at zero measured risk.
+The broader implication is that repository freshness need not be reduced to a choice between refreshing everything
+and refreshing whatever changed most recently. A code change can be treated as evidence whose importance depends
+on its syntax, its history, and its position in the retrieval workload—but only where the maintenance mechanism is
+actually sensitive to that evidence. Establishing where it is sensitive is what an index-maintenance benchmark is for.
+8.3
+Future Work
+Speculative re-embedding with read-time validation. Our policies decide once, at write time, and a wrong decision is
+silent: a unit skipped in error stays stale until something happens to surface it. An alternative architecture would treat
+the skip as a speculation and detect the misprediction afterwards, in the manner of branch prediction. The obstacle is
+that naive detection is circular— establishing whether a skip was wrong requires 𝐼(𝑢), which requires the embedding
+the skip avoided—so the check costs exactly what it saves.
+Finding 2 of Section 3 suggests an escape. A stale unit that is never retrieved cannot manifest its staleness, and
+most skipped units are never retrieved. Validation could therefore move from write time to read time: retrieve 𝐾′ > 𝐾
+candidates from the stale index, re-embed only the deferred units that surface within 𝐾′, and re-rank before returning
+𝐾. The cost is then bounded by 𝐾′ embeddings per query rather than one per update, and is paid only for staleness that
+reaches a user. What this cannot catch is a unit whose fresh embedding would enter the top-𝐾while its stale embedding
+sits below 𝐾′; that residual miss rate is measurable from CIPBench’s existing labels as a function of 𝐾′, and bounding
+it—perhaps by per-change-class empirical bounds on 𝛿, generalizing the exact certificate that hash identity already
+provides—is the substantive open problem.
+We regard this as the most promising direction, and as a systems problem rather than a prediction problem: it needs a
+query workload with timing, a cost model in wall-clock rather than embedding counts, and end-to-end retrieval quality
+under deferral.
+Generality across languages and encoders. Extending CIPBench to Java, Rust, C++, and TypeScript would show how
+type systems and language-specific conventions affect the observed relationships, and evaluating code-specialized
+retrieval encoders would show whether the comment and string-literal sensitivities persist when the representation
+model is designed for source code. A harmonized cross-model impact pipeline would also permit a cleaner measurement
+of how impact labels transfer between encoders than Section 7 can report.
+Broader evolution and query workloads. Issue-linked streams give CIPBench a natural connection between repository
+evolution and retrieval intent, but they are not production commit histories. Replication on bot-filtered natural commit
+streams would show whether the temporal patterns and repository-level differences persist under a less curated
+process. The impact definition is likewise tied to ground-truth repository queries; question answering, semantic code
+search, and completion-oriented retrieval expose different parts of a repository and may therefore warrant different
+maintenance decisions. Developer intent is a further unexploited signal: issue text is available but the current per-update
+representation carries no validated intent label, and we preferred to exclude intent rather than introduce a heuristic we
+could not evaluate under the same protocol.
+Manuscript submitted to ACM
+
+
+34
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+Metric sensitivity and cumulative drift. The default 𝐾= 10 and the binary impact predicate warrant comparison
+against graded relevance measures such as NDCG change and against other values of 𝐾, and the leave-one-repository-
+out grid was refined only near 𝑤1 = 0. Separately, the present policies evaluate a unit once per refresh and carry nothing
+between refreshes. A unit passed over at several consecutive refreshes accumulates staleness that Hurt@B charges
+but that no term in Eq. 1 anticipates. A drift-aware variant would escalate a unit’s priority with its deferral count,
+restricted to units with retrieval exposure to lose; the Track A probing guard of Section 5 already provides the sampling
+machinery such a policy would need to calibrate itself.
+References
+[1] Dmitry Baranchuk et al. 2023. DeDrift: Robust Similarity Search under Content Drift. In Proceedings of the IEEE/CVF International Conference on
+Computer Vision (ICCV).
+[2] Jose A. Blakeley, Per-Åke Larson, and Frank Wm. Tompa. 1986. Efficiently Updating Materialized Views. In Proceedings of the ACM SIGMOD
+International Conference on Management of Data.
+[3] Shawn A. Bohner and Robert S. Arnold (Eds.). 1996. Software Change Impact Analysis. IEEE Computer Society Press.
+[4] Jim Challenger, Arun Iyengar, and Paul Dantzig. 1999. A Scalable System for Consistently Caching Dynamic Web Data. In Proceedings of IEEE
+INFOCOM, Vol. 1. 294–303. doi:10.1109/INFCOM.1999.749295
+[5] Junghoo Cho and Hector Garcia-Molina. 2000. Synchronizing a Database to Improve Freshness. In Proceedings of the ACM SIGMOD International
+Conference on Management of Data.
+[6] Yangruibo Ding, Zijian Wang, Wasi Uddin Ahmad, Hantian Ding, Ming Tan, Nihal Jain, Murali Krishna Ramanathan, Ramesh Nallapati, Parminder
+Bhatia, Dan Roth, and Bing Xiang. 2023. CrossCodeEval: A Diverse and Multilingual Benchmark for Cross-File Code Completion. In Advances in
+Neural Information Processing Systems (NeurIPS) Datasets and Benchmarks Track.
+[7] Shahul Es, Jithin James, Luis Espinosa-Anke, and Steven Schockaert. 2024. RAGAS: Automated Evaluation of Retrieval Augmented Generation.
+[8] Jean-Rémy Falleri, Floréal Morandat, Xavier Blanc, Matias Martinez, and Martin Monperrus. 2014. Fine-Grained and Accurate Source Code
+Differencing. In Proceedings of the 29th ACM/IEEE International Conference on Automated Software Engineering (ASE).
+[9] Lishui Fan, Jiakun Liu, Zhongxin Liu, David Lo, Xin Xia, and Shanping Li. 2025. Exploring the Capabilities of LLMs for Code-Change-Related Tasks.
+ACM Transactions on Software Engineering and Methodology 34, 6, Article 159 (2025), 36 pages. doi:10.1145/3709358
+[10] Zhangyin Feng, Daya Guo, Duyu Tang, et al. 2020. CodeBERT: A Pre-Trained Model for Programming and Natural Languages. In Findings of
+EMNLP.
+[11] Beat Fluri and Harald C. Gall. 2006. Classifying Change Types for Qualifying Change Couplings. In Proceedings of the 14th IEEE International
+Conference on Program Comprehension (ICPC).
+[12] Beat Fluri, Michael Wursch, Martin Pinzger, and Harald C. Gall. 2007. Change Distilling: Tree Differencing for Fine-Grained Source Code Change
+Extraction. IEEE Transactions on Software Engineering 33, 11 (2007), 725–743.
+[13] Michael J. Franklin and Michael J. Carey. 1992. Client-Server Caching Revisited. In International Workshop on Distributed Object Management
+(IWDOM). 57–78.
+[14] Emanuel Giger, Martin Pinzger, and Harald C. Gall. 2011. Comparing Fine-Grained Source Code Changes and Code Churn for Bug Prediction. In
+Proceedings of the 8th Working Conference on Mining Software Repositories (MSR).
+[15] Tudor Gîrba, Stéphane Ducasse, and Michele Lanza. 2004. Yesterday’s Weather: Guiding Early Reverse Engineering Efforts by Summarizing the
+Evolution of Changes. In Proceedings of the 20th IEEE International Conference on Software Maintenance (ICSM).
+[16] Daya Guo, Shuai Lu, Nan Duan, et al. 2022. UniXcoder: Unified Cross-Modal Pre-training for Code Representation. In Proceedings of the 60th Annual
+Meeting of the Association for Computational Linguistics (ACL).
+[17] Daya Guo, Shuo Ren, Shuai Lu, et al. 2021. GraphCodeBERT: Pre-Training Code Representations with Data Flow. In International Conference on
+Learning Representations (ICLR).
+[18] Susan Horwitz, Thomas Reps, and David Binkley. 1988. Interprocedural Slicing Using Dependence Graphs. In Proceedings of the ACM SIGPLAN
+Conference on Programming Language Design and Implementation (PLDI).
+[19] Junjie Huang, Duyu Tang, Linjun Shou, et al. 2021. CoSQA: 20,000+ Web Queries for Code Search and Question Answering. In Proceedings of
+ACL-IJCNLP.
+[20] Hamel Husain, Ho-Hsiang Wu, Tiferet Gazit, Miltiadis Allamanis, and Marc Brockschmidt. 2019. CodeSearchNet Challenge: Evaluating the State of
+Semantic Code Search. arXiv:1909.09436.
+[21] Yasutaka Kamei, Emad Shihab, Bram Adams, Ahmed E. Hassan, Audris Mockus, Anand Sinha, and Naoyasu Ubayashi. 2013. A Large-Scale Empirical
+Study of Just-in-Time Quality Assurance. IEEE Transactions on Software Engineering 39, 6 (2013), 757–773.
+[22] David Kawrykow and Martin P. Robillard. 2011. Non-Essential Changes in Version Histories. In Proceedings of the 33rd International Conference on
+Software Engineering (ICSE).
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+35
+[23] Dayoon Ko, Jinyoung Kim, Sohyeon Kim, Jinhyuk Kim, Jaehoon Lee, Seonghak Song, Minyoung Lee, and Gunhee Kim. 2025. When Should
+Dense Retrievers Be Updated in Evolving Corpora? Detecting Out-of-Distribution Corpora Using GradNormIR. In Findings of the Association for
+Computational Linguistics: ACL 2025. Association for Computational Linguistics, 25977–25996. doi:10.18653/v1/2025.findings-acl.1334
+[24] J. Richard Landis and Gary G. Koch. 1977. The Measurement of Observer Agreement for Categorical Data. Biometrics 33, 1 (1977), 159–174.
+[25] Tianyang Liu, Canwen Xu, and Julian McAuley. 2024. RepoBench: Benchmarking Repository-Level Code Auto-Completion Systems. In International
+Conference on Learning Representations (ICLR).
+[26] Mateusz Machalica, Alex Samylkin, Meredith Porth, and Satish Chandra. 2019. Predictive Test Selection. In Proceedings of the 41st International
+Conference on Software Engineering: Software Engineering in Practice (ICSE-SEIP).
+[27] Mary L. McHugh. 2012. Interrater Reliability: The Kappa Statistic. Biochemia Medica 22, 3 (2012), 276–282.
+[28] Nimrod Megiddo and Dharmendra S. Modha. 2003. ARC: A Self-Tuning, Low Overhead Replacement Cache. In 2nd USENIX Conference on File and
+Storage Technologies (FAST).
+[29] Jason Mohoney et al. 2025. Quake: Adaptive Indexing for Vector Search. In USENIX Symposium on Operating Systems Design and Implementation
+(OSDI).
+[30] Jason Mohoney, Anil Pacaci, Shihabur Rahman Chowdhury, Umar Farooq Minhas, Jeffrey Pound, Cédric Renggli, Nima Reyhani, Ihab F. Ilyas,
+Theodoros Rekatsinas, and Shivaram Venkataraman. 2024. Incremental IVF Index Maintenance for Streaming Vector Search. arXiv:2411.00970.
+[31] Nicholas Monath, Will Sussman Grathwohl, Michael Boratko, Rob Fergus, Andrew McCallum, and Manzil Zaheer. 2024. A Fresh Take on Stale
+Embeddings: Improving Dense Retriever Training with Corrector Networks. In Proceedings of the 41st International Conference on Machine Learning
+(Proceedings of Machine Learning Research, Vol. 235). PMLR, 36072–36087.
+[32] Nils Reimers and Iryna Gurevych. 2019. Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks. In Proceedings of EMNLP-IJCNLP.
+[33] Xiaoxia Ren, Ophelia C. Chesley, and Barbara G. Ryder. 2006. Identifying Failure Causes in Java Programs: An Application of Change Impact
+Analysis. IEEE Transactions on Software Engineering 32, 9 (2006), 718–732. doi:10.1109/TSE.2006.90
+[34] Gregg Rothermel and Mary Jean Harrold. 1997. A Safe, Efficient Regression Test Selection Technique. ACM Transactions on Software Engineering
+and Methodology 6, 2 (1997), 173–210.
+[35] Jon Saad-Falcon, Omar Khattab, Christopher Potts, and Matei Zaharia. 2024. ARES: An Automated Evaluation Framework for Retrieval-Augmented
+Generation Systems.
+[36] Manoj Saravanan, Rohit Kumar Salla, and Ramya Manasa Amancherla. 2026. AURORA: Neuro-Symbolic Continual Indexing for Evolving
+RAG Systems. In Findings of the Association for Computational Linguistics: ACL 2026. Association for Computational Linguistics, 10179–10195.
+doi:10.18653/v1/2026.findings-acl.495
+[37] Aditi Singh et al. 2021. FreshDiskANN: A Fast and Accurate Graph-Based ANN Index for Streaming Similarity Search.
+[38] Kaitao Song, Xu Tan, Tao Qin, Jianfeng Lu, and Tie-Yan Liu. 2020. MPNet: Masked and Permuted Pre-training for Language Understanding. In
+Advances in Neural Information Processing Systems, Vol. 33.
+[39] Zhenyu Song, Daniel S. Berger, Kai Li, and Wyatt Lloyd. 2020. Learning Relaxed Belady for Content Distribution Network Caching. In 17th USENIX
+Symposium on Networked Systems Design and Implementation (NSDI).
+[40] Helge Spieker, Arnaud Gotlieb, Dusica Marijan, and Morten Mossige. 2017. Reinforcement Learning for Automatic Test Case Prioritization and
+Selection in Continuous Integration. In Proceedings of the 26th ACM SIGSOFT International Symposium on Software Testing and Analysis (ISSTA).
+[41] Suhas Jayaram Subramanya, Fnu Devvrit, Rohan Kadekodi, Ravishankar Krishaswamy, and Harsha Vardhan Simhadri. 2019. DiskANN: Fast Accurate
+Billion-Point Nearest Neighbor Search on a Single Node. In Advances in Neural Information Processing Systems (NeurIPS).
+[42] Hanzhuo Tan, Qi Luo, Ling Jiang, Zizheng Zhan, Jing Li, Haotian Zhang, and Yuqun Zhang. 2026. Prompt-Based Code Completion via Multi-Retrieval
+Augmented Generation. ACM Transactions on Software Engineering and Methodology 35, 1, Article 9 (2026), 28 pages. doi:10.1145/3725812
+[43] Nikolaos Tsantalis, Ameya Ketkar, and Danny Dig. 2022. RefactoringMiner 2.0. IEEE Transactions on Software Engineering 48, 3 (2022), 930–950.
+doi:10.1109/TSE.2020.3007722
+[44] Nikolaos Tsantalis, Matin Mansouri, Laleh Eshkevari, Davood Mazinanian, and Danny Dig. 2018. Accurate and Efficient Refactoring Detection in
+Commit History. In Proceedings of the 40th International Conference on Software Engineering (ICSE).
+[45] Harshil Vejendla. 2025. Drift-Adapter: A Practical Approach to Near Zero-Downtime Embedding Model Upgrades in Vector Databases. In
+Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing. Association for Computational Linguistics, 15938–15949.
+doi:10.18653/v1/2025.emnlp-main.805
+[46] Giuseppe Vietri, Liana V. Rodriguez, Wendy A. Martinez, Steven Lyons, Jason Liu, Raju Rangaswami, Ming Zhao, and Giri Narasimhan. 2018.
+Driving Cache Replacement with ML-based LeCaR. In 10th USENIX Workshop on Hot Topics in Storage and File Systems (HotStorage).
+[47] Wang et al. 2025. CodeRAG-Bench: Can Retrieval Augment Code Generation?. In Findings of the Association for Computational Linguistics: NAACL.
+[48] Wenhui Wang, Furu Wei, Li Dong, Hangbo Bao, Nan Yang, and Ming Zhou. 2020. MiniLM: Deep Self-Attention Distillation for Task-Agnostic
+Compression of Pre-Trained Transformers. In Advances in Neural Information Processing Systems (NeurIPS).
+[49] Yue Wang, Weishi Wang, Shafiq Joty, and Steven C. H. Hoi. 2021. CodeT5: Identifier-Aware Unified Pre-Trained Encoder-Decoder Models for Code
+Understanding and Generation. In Proceedings of EMNLP.
+[50] Shitao Xiao, Zheng Liu, Peitian Zhang, Niklas Muennighoff, Defu Lian, and Jian-Yun Nie. 2023. C-Pack: Packed Resources for General Chinese
+Embeddings. arXiv:2309.07597 [cs.CL]
+Manuscript submitted to ACM
+
+
+36
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+[51] Yuming Xu, Hengyu Liang, Jin Li, et al. 2023. SPFresh: Incremental In-Place Update for Billion-Scale Vector Search. In Proceedings of the 29th ACM
+Symposium on Operating Systems Principles (SOSP).
+[52] Dejiao Zhang, Wasi Uddin Ahmad, Ming Tan, Hantian Ding, Ramesh Nallapati, Dan Roth, Xiaofei Ma, and Bing Xiang. 2024. Code Representation
+Learning at Scale. In The Twelfth International Conference on Learning Representations (ICLR).
+[53] Fengji Zhang et al. 2023. RepoCoder: Repository-Level Code Completion Through Iterative Retrieval and Generation. In Proceedings of EMNLP.
+[54] Senlei Zhang, Tongjun Shi, Dandan Song, Luan Zhang, Shuhao Zhang, Xiaofei Liao, and Hai Jin. 2026. FlowRAG: Continual Learning for Dynamic
+Retriever in Retrieval-Augmented Generation. In Proceedings of the ACM Web Conference 2026. ACM, 2160–2170. doi:10.1145/3774904.3792361
+[55] Zhen Zhang, Xinyu Ma, Weiwei Sun, Pengjie Ren, Zhumin Chen, Shuaiqiang Wang, Dawei Yin, Maarten de Rijke, and Zhaochun Ren. 2025.
+Replication and Exploration of Generative Retrieval over Dynamic Corpora. In Proceedings of the 48th International ACM SIGIR Conference on
+Research and Development in Information Retrieval. ACM, 3325–3334. doi:10.1145/3726302.3730314
+A
+Signal-Independence Evidence
+Section 3.4.3 reports how strongly the four inexpensive signals are associated with one another. Table 15 gives the
+complete 60-value Kendall 𝜏𝑏matrix and Figure 4 shows it. We treat |𝜏| ≥0.5 as a strong association, 0.3 ≤|𝜏| < 0.5 as
+moderate, and |𝜏| < 0.3 as weak.
+Table 15. Pairwise Kendall 𝜏𝑏among the four free signals across 10 repositories.
+Repo
+Lang.
+change↔𝑘-occ
+change↔𝑛𝑠𝑢𝑏
+change↔nn
+𝑘-occ↔𝑛𝑠𝑢𝑏
+𝑘-occ↔nn
+𝑛𝑠𝑢𝑏↔nn
+flask
+Py
+-.012
++.475
+-.110
++.028
++.158
+-.101
+aiohttp
+Py
++.073
++.460
++.111
+-.036
++.073
++.076
+pylint
+Py
+-.064
++.340
+-.118
++.052
++.133
+-.051
+requests
+Py
+-.138
+-.170
+-.073
++.195
++.179
++.016
+click
+Py
++.210
++.516
++.223
++.433
+-.160
+-.177
+cobra
+Go
++.060
++.327
+-.020
++.119
++.231
++.092
+echo
+Go
+-.016
++.341
++.021
++.090
++.029
+-.055
+gin
+Go
+-.232
++.045
++.186
++.121
+-.075
++.056
+lodash
+JS
++.086
++.262
+-.078
++.127
+-.085
++.001
+express
+JS
++.109
++.183
++.011
++.348
++.104
++.147
+Mean 𝜏
++.008
++.278
++.015
++.148
++.059
++.000
+Mean |𝜏|
+.100
+.312
+.095
+.155
+.123
+.077
+Repos with |𝜏| ≥.3
+0
+6
+0
+2
+0
+0
+The matrix separates into one associated pair and five unassociated ones. Change type versus 𝑛𝑠𝑢𝑏has mean |𝜏| = .312
+and reaches the moderate band or above in six of the ten repositories; every other pair has mean |𝜏| ≤.155 and reaches
+it in at most two. Across all 60 cells, 52 satisfy |𝜏| < 0.3.
+The exception is not uniform, which is the more useful observation. Change type and history are strongly associated
+in click (+.516) and flask (+.475), essentially unassociated in gin (+.045), and negatively associated in requests (−.170). A
+definitional relationship between the two would not admit a negative value anywhere, so the association is an empirical
+property of how these repositories evolve rather than an artifact of how the signals are constructed. Where a repository
+accumulates long runs of one change class, history and the current class agree; where evolution is more heterogeneous,
+they diverge.
+This is the empirical prior for Section 6. Retrieval exposure and neighbourhood similarity carry information that
+neither change type nor history contains, so combining them is motivated by measured complementarity rather than
+by stacking redundant features. Change type, by contrast, duplicates history in most repositories—which is consistent
+with the outcome reported in Section 6.4, where cross-validation discards retrieval exposure and the syntactic flag turns
+out to change no decision.
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+37
+chg ↔k-occ
+chg ↔nsub
+chg ↔nn
+k-occ ↔nsub
+k-occ ↔nn
+nsub ↔nn
+flask  (Py)
+aiohttp  (Py)
+pylint  (Py)
+requests  (Py)
+click  (Py)
+cobra  (Go)
+echo  (Go)
+gin  (Go)
+lodash  (JS)
+express  (JS)
+-.01
++.47
+-.11
++.03
++.16
+-.10
++.07
++.46
++.11
+-.04
++.07
++.08
+-.06
++.34
+-.12
++.05
++.13
+-.05
+-.14
+-.17
+-.07
++.20
++.18
++.02
++.21
++.52
++.22
++.43
+-.16
+-.18
++.06
++.33
+-.02
++.12
++.23
++.09
+-.02
++.34
++.02
++.09
++.03
+-.06
+-.23
++.04
++.19
++.12
+-.07
++.06
++.09
++.26
+-.08
++.13
+-.09
++.00
++.11
++.18
++.01
++.35
++.10
++.15
+spread +. 52 to −. 17
+−0.5
+−0.3
+0.0
+0.3
+0.5
+Kendall τb
+Fig. 4. Pairwise signal dependence across the 10 repositories. Fifty-two of the 60 associations fall below |𝜏| = 0.3. The boxed column
+is the exception discussed below: change type and 𝑛𝑠𝑢𝑏are moderately associated on average but range from +0.52 in click to −0.17
+in requests, so the overlap between those two signals is itself repository-dependent.
+Table 16. Spearman rank correlation 𝜌between repository meta-features and signal strength.
+Meta-feature
+change_type
+𝑘-occ
+𝑛𝑠𝑢𝑏
+nn_sim
+size (number of units)
++0.406
++0.248
++0.564
+-0.382
+temperature (substantive-update fraction)
++0.394
+-0.467
++0.539
+-0.127
+annotation density
+-0.614
+-0.136
+-0.795∗
++0.213
+average history length
++0.503
++0.091
+-0.006
++0.285
+𝐻fraction (impacted-unit fraction)
++0.018
+-0.164
++0.358
++0.418
+∗𝑝< 0.05. Larger |𝜌| indicates a stronger monotonic relationship.
+B
+Repository-Level Meta-Features
+Section 3.4.3 reports that the four inexpensive signals differ in how strongly they discriminate impacted units, and
+that the differences are repository-dependent. This appendix records the associations we measured between repository
+characteristics and per-signal strength. We report them for completeness and as motivation for future work on
+applicability envelopes; no policy in this paper consults them, and with only 10 repositories they do not support
+fine-grained routing rules.
+We ask whether repository characteristics are associated with the usefulness of individual signals. Table 16 reports
+Spearman correlations between five repository-level meta-features and per-repository signal strength.
+The strongest observed association is between annotation density and the discrimination of 𝑛𝑠𝑢𝑏(𝜌= −0.795):
+historical substantive-change count becomes less informative in heavily annotated repositories. This runs counter to
+the initial expectation that richer annotation histories would strengthen the usefulness of substantive-change history.
+The aiohttp reversions from RQ1 provide one plausible explanation. In an annotation-heavy project, repeated type
+refinements can create a long history of syntactically substantive edits without necessarily producing persistent repre-
+sentation changes. Repository size is positively associated with 𝑛𝑠𝑢𝑏strength (𝜌= +0.564), and grouping repositories by
+Manuscript submitted to ACM
+
+
+38
+Nannan Zhao, Jiameng Zhang, Taoyu Zhong, Hao Wang, and Bo Wang
+Table 17. Change-type persistence and dominant transition patterns.
+Repository
+Lang.
+Persistence
+Most common transition pattern
+aiohttp
+Py
+95.9%
+signature →signature (69.8%)
+click
+Py
+93.7%
+signature →signature (81.0%)
+pylint
+Py
+94.6%
+implementation →implementation (43.5%); comment →comment (33.2%)
+flask
+Py
+65.0%
+mainly implementation →implementation; mixed evolution
+requests
+Py
+73.1%
+mainly implementation →implementation
+cobra
+Go
+69.8%
+implementation persistence mixed with implementation ↔signature
+echo
+Go
+66.4%
+implementation ↔signature (26.9%)
+gin
+Go
+78.4%
+implementation ↔signature (15.0%)
+lodash
+JS
+73.5%
+implementation persistence and implementation ↔signature
+express
+JS
+82.0%
+mainly implementation →implementation
+these meta-features does not reproduce clean programming-language boundaries. This again points toward evolution
+style rather than language alone.
+We draw no finding from these correlations. Ten repositories cannot distinguish a population-level relationship from
+a coincidence among the projects we happened to select, and the one association that clears 𝑝< 0.05 does so without
+a multiplicity correction across the 20 tested pairs. The value of the table is that it identifies annotation density and
+repository size as the two characteristics most worth controlling for in a larger replication.
+C
+Change-Type Persistence
+Section 3.4 reports that substantive-change persistence varies more by repository than by language. This appendix
+gives the underlying per-repository figures: the rate at which consecutive updates to the same unit share a coarse
+change class, and the dominant transition pattern in each repository.
+The language-level averages are 84.5% for Python, 71.5% for Go, and 77.7% for JavaScript, but the within-language
+spread is larger than the between-language spread: aiohttp, click, and pylint reach 93–96%, whereas flask and requests
+fall to 65–73%, overlapping every Go and JavaScript repository. No policy in this paper consults these values; we report
+them because they are the evidence that the persistence effect of Finding 3 is not a language property.
+D
+Robustness and Supporting Statistics
+This appendix collects three sets of numbers that support claims in the main text without being needed to follow them:
+the test statistics behind the RQ1 displacement comparison, the language-level aggregation of the Track B leaderboard,
+and the substantive-weight sweep.
+RQ1 displacement comparison
+Section 3.2 reports that the three change classes differ in embedding displacement. A Kruskal–Wallis test over the 2,366
+units gives 𝐻= 322.0 with 𝑝= 1.22 × 10−70. All three pairwise Mann–Whitney comparisons have 𝑝< 10−9 and remain
+significant under the Bonferroni-adjusted threshold 𝛼′ = 0.017, with rank-biserial effect sizes between 0.39 and 0.68.
+Because displacement is defined per unit (Section 3.1), each unit enters this comparison exactly once and the groups
+are the three change classes. A unit whose history spans several classes is assigned its most severe, so the class label
+rather than the observation count is the source of dependence here: units with heterogeneous histories are attributed to
+Manuscript submitted to ACM
+
+
+Which Code Changes Need Re-embedding? CIPBench and the Limits of Multi-Signal Index Maintenance
+39
+a class that describes only part of their evolution. The non-independence caveat of Section 7 applies to the per-update
+analyses, where a unit does contribute several observations.
+Language-level Track B results
+Table 18. Mean Hurt@50 by language, averaged over the repositories of each language.
+Lang.
+Random
+Recency
+𝑘-occ
+YW
+Oracle
+Python
+.032
+.031
+.018
+.016
+.009
+Go
+.099
+.110
+.092
+.051
+.025
+JavaScript
+.045
+.065
+.032
+.040
+.034
+Python is comparatively close to the oracle under these baselines, the Go repositories leave the most room for
+improvement, and in the two JavaScript repositories 𝑘-occ has lower mean harm than YW-hist. With three, three and
+two repositories per language respectively, these means should be read as a compact summary of Table 9 rather than as
+language-level estimates.
+Substantive-weight sweep
+Section 6.3 reports that the comparison between the weighted policy and YW-hist is unchanged as the substantive
+coefficient 𝑤0 varies. Table 19 gives the sweep in full.
+Table 19. Mean Δ (Weighted −YW-hist, pp) as a function of 𝑤0. The per-repository weight selections are unchanged at every value
+of 𝑤0, so the sweep isolates the substantive coefficient.
+𝑤0
+Mean Δ (pp)
+Median
+Ties / 20
+0
++0.30
+0
+12
+0.94
++0.30
+0
+12
+3.38
++0.30
+0
+12
+5.06
++0.30
+0
+12
+10
++0.30
+0
+12
+Every summary statistic is identical at every value, and the per-repository weight selections are unchanged through-
+out, so the sweep isolates the substantive coefficient from the rest of the score. Section 6.4 extends the check to the full
+budget range, where the coefficient does alter the selection at six of 130 points.
+Manuscript submitted to ACM

@@ -1,0 +1,1978 @@
+PrairieFire: Igniting High-Throughput Updates in Large-Scale
+Approximate Nearest Neighbor Search
+Yuchen Huang†‡, Baiteng Ma†‡, Yiping Sun‡, Xiao Chen‡, Rui Ma‡, Yue Chen‡, Jinwei Zhang‡
+Xiaocheng Zhong‡, Zhiyong Wang‡, Yao Hu‡, Erci Xu§, Chuliang Weng†
+†East China Normal University,
+‡Xiaohongshu Inc (RedNote),
+§Shanghai Jiao Tong University
+†{ychuang, btma}@stu.ecnu.edu.cn,
+‡{sunyiping, chenxiao4, marui4, chenyue14, zhangjinwei1}@xiaohongshu.com
+‡{zhongxiaocheng, sunzhenghuai, xiahou}@xiaohongshu.com,
+§jostep90@gmail.com,
+†clweng@dase.ecnu.edu.cn
+ABSTRACT
+Arrays of modern NVMe SSDs are approaching memory in terms
+of bandwidth in a single server while offering much lower cost
+per gigabyte. Hence, approximate nearest neighbor search (ANNS)
+for billion-scale vectors in applications such as recommendation,
+search, and retrieval-augmented generation increasingly runs
+on SSD-based systems. Unfortunately, due to the limited update
+throughput of existing SSD-based solutions, the indexed corpus
+cannot keep pace with continuous modifications to data and
+embedding models, thus hindering broader deployment across
+more scenarios and larger scales.
+The bottleneck lies in CPU-intensive update paths, where fore-
+ground insertions incur frequent SSD accesses and background
+reassignments repeatedly relocate each vector, making high up-
+date throughput difficult to achieve even by exhausting available
+hardware. In this paper, using buffered updates and batched local
+rebuilds, we develop PrairieFire with cascaded adjustments, con-
+currency control, and CPU-GPU-SSD cooperation. These co-designs
+avoid frequent SSD accesses in foreground updates and heavy back-
+ground reassignments, achieving high update throughput while
+maintaining excellent search performance.
+Evaluations show that, compared with state-of-the-art systems,
+PrairieFire can sustain ∼3-35× update throughput while main-
+taining ∼3-5× search throughput simultaneously. It also achieves
+∼1.5-8.7× cost efficiency. PrairieFire has been deployed in Red-
+Note’s production environments for two months, improving busi-
+ness metrics (e.g., click-through rate) by higher freshness without
+frequent index rebuilds.
+1
+INTRODUCTION
+Approximate nearest neighbor search (ANNS) over embedding
+vectors underpins online services such as recommendation, search
+engines, advertising, and retrieval-augmented generation [34, 35,
+36, 38, 39]. To reduce storage cost over billions of vectors, recent
+systems try to place raw vectors as cluster lists or as graph nodes
+with neighboring edges from DRAM onto NVMe SSDs [17, 23, 29,
+57, 62]. The corpus of vectors, however, is anything but static. In
+upstream applications, items are continuously created and retired,
+and the underlying embedding models are continuously adjusted
+and synchronized at an hourly or finer cadence to track shifting
+user behavior for better business outcomes [38, 42]. A practical
+ANNS service must therefore find top-𝑘results against the latest
+valid data while continuously absorbing a stream of inserts and
+deletes arising from both dynamic items [24, 64] and continual
+learning of embedding models [22, 69].
+To support updates, based on existing static ANNS [17, 57],
+two notable solutions have been proposed (i.e., OdinANN [24]
+and SPFresh [64]). OdinANN follows the graph structure [57] and
+introduces direct modifications to avoid the inefficiency of peri-
+odic merging (e.g., 1.5-2× search latency and ∼3× peak memory
+usage during merging [55, 67]). SPFresh adopts a partition-based
+structure, which routes vectors to partitions through an in-memory
+centroid index and maintains partitions’ lists on SSDs. To address
+the degraded index quality under continuous updates, SPFresh in-
+troduces a local rebuild mechanism that splits or merges partitions
+and reassigns vectors to their nearest partitions.
+However, when extending SSD-based ANNS to broader large-
+scale scenarios, their update performance becomes a limitation.
+Recent industrial practice points out that, to track user behavior
+in real time, the continual learning [22, 38, 42, 69] of embedding
+models calls for high-throughput updates. For a 0.1B-scale index in
+recommendation systems, maintaining freshness demands an up-
+date throughput of up to 30K queries per second (QPS) to match [29].
+This requirement is comparable to the search throughput of online
+services, making updates the other first-class performance target.
+But even if we deploy an SSD array with >100GB/s bandwidth and
+exhaust all 64 CPU cores on update-only operations, OdinANN and
+SPFresh can only sustain about 6% to 40% of the target.
+Graph-based OdinANN achieves only 2–3 KQPS because each up-
+date searches ∼100 neighbors before modifying links, incurring ∼4–
+7 ms due to inherent multi-hop SSD accesses [29, 30, 62]. Partition-
+based SPFresh routes inserts through in-memory centroids (<1 ms),
+but rewriting SSD posting lists per insertion in foreground still
+incurs unacceptable CPU consumptions. Background per-vector
+relocations after splits or merges require extra CPU cores to deal
+with centroid locations and partition updates. Even with 64 CPU
+cores for update-only requests, it can only reach ∼12 KQPS.
+Hence, we propose to use buffered updates and batched reclus-
+tering for rebuilds, instead of immediate flushes and asynchronous
+reassignments in SPFresh. First, buffered updates can amortize the
+overhead of foreground SSD round trips, where multiple updates to
+the same cluster are accumulated in memory and flushed to SSD as
+a batch. Second, we can recluster an imbalanced region, replacing
+the steady drip of per-vector reassignments with a single batch
+local rebuild. However, it is non-trivial to apply these ideas. There
+are several conflicts and challenges.
+1
+arXiv:2610.23232v1  [cs.DB]  16 Oct 2026
+
+
+Conflicts. For high-performance search, SPFresh takes fine-
+grained partitioning and replicated placement. However, these de-
+signs leave no memory budget for per-list buffers, and make the
+buffering less effective. SPFresh creates up to 16% as many parti-
+tions as vectors, so even small per-partition buffers (e.g., 8 or 16
+vectors) can raise memory footprint to 2–3×. And a single new
+vector can trigger up to 8× insertions, which again cause frequent
+SSD reads/writes even with buffered updates.
+Challenges. Hence, we return to normal-scale partitions (e.g., 1-
+2% of the dataset size) and single-copy placement, but this burdens
+search. In detail, it can suffer more from distribution drift, since
+updates are amortized across fewer partitions, each partition expe-
+riences more modifications, thus reducing the representativeness
+of static centroids. Without replications, more clusters need to be
+searched for each query simultaneously to keep accuracy. To ad-
+dress these, we need dynamic centroid adjustment to track updates,
+high concurrency and better pipelines to support search perfor-
+mance. Moreover, we use reclustering to replace reassignments
+after splits or merges, but reclustering incurs a higher computa-
+tional burden and requires equal or more cores than background
+reassignments, making reclustering inefficient.
+In this paper, we propose PrairieFire with the following key
+techniques:
+• Based on above analysis, PrairieFire organizes a three-level
+partition-based index and supports cascaded updates on cen-
+troids, where insertions and deletions of vectors can be buffered
+and propagated to upper-level centroids, thus avoiding frequent
+SSD round trips and preserving centroid representativeness.
+• Based on the index structure, we develop fine-grained concur-
+rency control to support high concurrency of operations, includ-
+ing insertions, deletions, searches and local rebuilds.
+• We build the co-designed workflow on GPUs, CPUs and high-
+bandwidth SSDs to accelerate centroid routing, partition scan-
+ning, and computing-intensive clustering-based rebuilds.
+We compare PrairieFire with state-of-the-art ANNS that sup-
+port updates on large-scale workloads. Comprehensive evaluations
+show that PrairieFire can sustain ∼3-35× update throughput while
+maintaining ∼3-5× search throughput simultaneously. In addition,
+during the whole process, our search accuracy is comparable to or
+higher than baselines. At last, we evaluate the cost and energy effi-
+ciency of PrairieFire, showing up to 1.5-8.7× hardware efficiency
+of baselines in terms of device acquisition, power consumption, and
+storage footprint. PrairieFire has been running reliably in Red-
+Note’s services for two months, reducing index rebuild frequency
+by over 95% across the dozens of indexes it hosts and improving all
+business metrics (e.g., click-through rate and content impressions).
+2
+BACKGROUND
+2.1
+Freshness Challenges of Large-Scale ANNS
+ANNS has become a fundamental infrastructure component [20,
+21, 27] for large-scale search, recommendation, and advertising
+services over embedding collections that often contain billions of
+vectors. To reduce CapEx and OpEx at this scale, recent ANNS sys-
+tems increasingly rely on SSD-based deployments [17, 23, 57, 62].
+Since modern SSD arrays can provide sufficient bandwidth ap-
+proaching that of DRAM [26, 37], we have deployed SSD-based
+Helmsman [29] at scale for online services in RedNote (a.k.a. Xi-
+aohongshu) [3]. Under strict 5-10ms search latency service level
+agreement (SLA), it only consumes dozens of multi-SSD servers
+to handle vector search services that previously required clusters
+equipped with tens of thousands of CPU cores and PB-level DRAM.
+However, if it can only support search on static collections, using
+SSD-based storage [29] to offload memory pressure alone would
+be insufficient. In practice, vector collections are highly dynamic
+and require continuous updates. Changes to products, articles, and
+embeddings must be reflected promptly to avoid stale or invalid
+results [28, 55, 61]. In the search services, daily full refreshes are
+common to keep the index up-to-date. Moreover, recommenda-
+tion systems frequently retrain and deploy embedding models at
+hourly or finer intervals to capture evolving user behavior [38, 42].
+These model changes can modify vector representations, requiring
+corresponding index updates [22, 69].
+2.2
+Operations for Dynamic Workloads
+To make the dynamic vector changes timely visible in these services,
+three operations [24, 51, 64, 67] are required:
+• Search (Top-𝑘, Vector) takes a query vector as input and re-
+turns the top-𝑘approximate nearest neighbors from the current
+valid collection. In dynamic ANNS, search should be performed
+over the real-time state of the collection, reflecting preceding
+insertions and deletions.
+• Insert (ID, Vector) inserts a new vector into the collection, where
+ID denotes the unique identifier of the vector and Vector denotes
+its embedding representation. After insertion, the new vector
+should be included to subsequent searches and potential results.
+• Delete (ID) removes an existing vector from the collection ac-
+cording to its ID. After deletion, the removed vector would no
+longer appear in subsequent search results.
+2.3
+Existing Solutions
+Graph-based solution. Recent works [24, 55, 67] demonstrate the
+capability to support updatable ANNS by online maintaining the
+SSD-resident graph structure [57].
+Specifically, FreshDiskANN and Greator [55, 67] buffer newly
+inserted vectors in an in-memory graph and periodically merge
+them in batches into the global on-disk graph index. However,
+this mechanism can incur unacceptable memory overhead and
+suboptimal search performance during graph merging (e.g., 32-
+GB peak memory usage and 1.5-2× search latency when merging
+6M vectors on 60-GB index of 100M vectors). To address these
+limitations, OdinANN [24] adopts direct insertion, which searches
+neighboring nodes for each insertion, updates related edges, creates
+a new node, and directly flushes the changes to the NVMe SSD. By
+avoiding periodic merging and optimizing immediate maintenance,
+OdinANN provides higher and more stable performance of updates
+and search with lower memory usage.
+Partition-based solution. Following the partition-based struc-
+ture of SPANN [17], SPFresh [64] stores partition-level metadata
+in memory (e.g., centroid index, concurrency locks, and cluster
+sizes) and stores vector partitions as posting lists on the NVMe
+SSD. It supports streaming updates with a lightweight incremental
+rebalancing protocol, namely LIRE.
+2
+
+
+(a) Increasing CPU cores with 1
+PCIe-Gen5 NVMe SSD.
+(b) Increasing SSDs with 64 cores
+enabled.
+Figure 1: Based on SIFT100M, scaling throughput of updates
+(insert/delete = 1/1) with CPUs (a) and SSDs (b). However,
+scaling both resources fails to achieve the target 30K QPS.
+Under continuous updates, partitions can become imbalanced.
+With LIRE, SPFresh locally splits oversized partitions, merges un-
+dersized partitions, and reassigns vectors to the nearest partitions,
+thereby adapting the index without full rebuilding. As inherited
+from SPANN, SPFresh follows search-optimized layout through
+aggressive fine-grained clustering (i.e., creating centroids whose
+number reaches around 12–16% of the total vector count) and re-
+dundantly inserts vectors into multiple clusters’ posting lists on
+the NVMe SSD [17, 64, 65].
+3
+MOTIVATION
+3.1
+Insufficient Performance
+Since items and embedding models are continuously generated
+and modified to improve user experience and revenue-related met-
+rics [38, 39], we require real-time index updates to ensure embed-
+ding freshness. To replace periodic full-index rebuilding, online
+updates must sustain the required refresh rate, estimated as the
+index cardinality divided by the full-refresh interval [29]. Represen-
+tative workloads [42, 58], rebuilding a billion-vector index every 10
+hours or a 100-million-vector index every hour, thus require ∼30K
+QPS of updates (1 insertion and 1 deletion per update).
+However, existing state-of-the-art solutions fall short of
+production update demands. Even under optimistic update-only
+workloads with concurrent searches disabled, state-of-the-art sys-
+tems OdinANN and SPFresh fall far short of this target. As shown
+in Figure 1a, even when dedicating all threads to updates on up to
+64 CPU cores, they yield only 2–12K QPS in a single-server setup,
+at most 40% of the required 30K QPS.
+OdinANN is bottlenecked by its insertion path. During its inser-
+tion, each new vector must first search the SSD-resident graph to
+identify the top-100 (i.e., the number of neighbors to be connected
+by new edges) nearest existing nodes, after which OdinANN ac-
+quires exclusive locks on these nodes to apply the update. These
+multi-hop SSD accesses from searching existing neighbors intro-
+duce most of the overhead (i.e., 4–7 ms, up to 80% of the total
+time), while lock contention from nodes’ updates further limits
+concurrency of this graph-based structure.
+Partition-based SPFresh delivers better update throughput than
+graph-based OdinANN because it only searches an in-memory cen-
+troid index to locate several nearest clusters for insertion, which is
+faster (i.e., <1 ms) than OdinANN’s on-SSD top-100 graph search. It
+then locks these clusters and updates their SSD pages with batched
+I/O. However, it still remains ∼60% below the required throughput
+when all threads are used for updates.
+(a) Bandwidth utilization with
+increasing cores.
+(b) Cores required to achieve
+target throughput ideally.
+Figure 2: Increasing CPUs under suitable thread alloca-
+tions [64] (i.e., 1 thread for delete, others for insert and back-
+ground as an approximate ratio of 2:1). We compare the actual
+bandwidth usage with the available value (a), and show theo-
+retical cores required to achieve the target throughput (b).
+3.2
+Does Bandwidth Scaling Work?
+Scaling SSD bandwidth fails. To break the bandwidth bottleneck
+of partition-based solutions, we have deployed multiple SSDs to im-
+prove search throughput in industrial services [29], which inspires
+us to explore whether updates benefit similarly from this increased
+I/O bandwidth of modern NVMe SSD arrays [29, 30, 32, 63].
+As shown in Figure 1b, results are disappointing. First, higher
+bandwidth provides little benefit to OdinANN, whose performance
+is dominated by SSD latency rather than bandwidth, due to its
+multi-hop graph-based access pattern [32]. Then, we might expect
+SPFresh to benefit more from increased I/O bandwidth, given its
+bandwidth-friendly batched I/O pattern and partition-based index
+structure [29, 64]. Unfortunately, SPFresh also improves hardly in
+update performance at all, far from the near-linear scaling often
+observed in the pure search-only workloads [29]. Even with 10
+Gen5 NVMe SSDs providing almost an order of magnitude more
+available bandwidth (i.e., ∼120 GB/s), update throughput improves
+by less than 10%.
+To understand the reason, we analyze the bandwidth utilization
+and the achievable throughput as scaling the update concurrency
+by increasing cores, as shown in Figure 2.
+For SPFresh updates, bandwidth is not the bottleneck, but
+the high CPU core consumption is. First, we measure the actual
+bandwidth usage of 10 PCIe-Gen5 SSDs for SPFresh as we increase
+update concurrency. As shown in Figure 2a, even with 10 SSDs
+providing ∼120 GB/s of bandwidth, the bandwidth usage remains
+below 1 GB/s, indicating that the available bandwidth is not the
+bottleneck. Hence, we further estimate how many CPU cores for
+concurrent updates would be required to achieve the target.
+Unfortunately, as shown in Figure 2b, though partition-based
+SPFresh already reduces modification-selection time (i.e., only locat-
+ing the relevant clusters in memory but not searching neighbors on
+SSDs as OdinANN), it still requires 128–256 cores theoretically for
+the target throughput even without reserving CPU cores for search
+requests, which is far beyond the available hardware resources in
+real-world industrial deployments.
+3.3
+Where Does CPU Cost Come From?
+To address the impractical consumption of CPU cores required for
+the target update throughput, we first look back at the update pro-
+cedures in SPFresh, and then analyze where the CPU consumption
+comes from.
+3
+
+
+Foreground:
+Background:
+Host
+Mem
+NVMe
+SSD
+Insert
+Delete
+Locate 
+Clusters
+Traversal
+Add
+Version
+Rebuild
+Flush
+Lists
+Submit
+Locate
+Clusters
+Load
+Lists
+1
+2
+3
+Flush
+Lists
+Load 
+Lists
+2
+3
+1
+Read
+Write
+Traversal
+Split/Merge/Reassign
+Read
+Write
+Figure 3: Update workflow in SPFresh. Main CPU overheads
+are from foreground insertion and background rebuilds.
+Procedure of updates. In SPFresh, update threads consist of
+both foreground threads and background threads. As shown in Fig-
+ure 3, SPFresh supports Insert and Delete operations in foreground
+threads, and performs rebuild operations to maintain the index
+quality in background threads.
+For Insert, 1 it first locates relevant clusters for the new vector by
+searching the in-memory centroid graph via node traversal. Then, it
+updates these clusters’ SSD lists with read-modify-write round-trip
+I/Os (i.e., 2 reads for loading and 3 following writes for flushing
+modifications). Delete is lightweight because it only adds the version
+value of the deleted vector’s ID in the in-memory version map.
+Hence, most of the foreground update threads are allocated for
+Insert (e.g., ∼40 cores, two thirds of the total in update-only stress
+tests) and only 1 core is enough for Delete of SPFresh [64].
+For rebuild, when the size of clusters exceeds a threshold (e.g.,
+>128) or undersized (e.g., <10), the rebuilds are triggered to split
+oversized clusters into two smaller ones or directly append small
+clusters into a larger one. Then, to address the possible violation of
+nearest partition assignments (NPA), it reassigns vectors from these
+rebuilt clusters. In this process, it would first 1 read vector lists
+of these clusters from SSDs, then 2 check whether vectors need
+reassignment, relocate the nearest clusters for vectors potentially
+violating NPA, and 3 finally write them back to SSDs. Due to the
+expensive reassignments [64], the rebuilds are performed with the
+other one third of the total cores in the background.
+Consumption breakdown. Based on Perf [1], we analyze the
+CPU cycles spent on foreground and background, as shown in Fig-
+ure 4. In update-only stress tests with 4–64 threads, foreground
+updates account for 59–62% of the total cycles, while background
+rebuilds contribute the remaining 38–41%. Both paths repeatedly
+perform per-vector centroid searches and posting-list updates by
+traversing in-memory graph and reading/writing their lists on SSDs.
+Specifically, centroid search by graph traversal accounts for around
+30–35% of cycles, while round-trip read-modify-write updates dom-
+inate the remaining cycles.
+Foreground insertions trigger SSD reads and writes for every
+new vector. As a result, updates generate frequent SSD accesses,
+consuming huge CPU resources in I/O processing (e.g., submitting
+commands, polling for completions) and clusters updating (e.g.,
+modifying lists and metadata). And under continuous updates, clus-
+ters can become imbalanced, triggering background rebuilds for
+splitting or merging clusters to maintain the index quality. Then,
+vectors can violate the NPA after splitting/merging imbalanced
+clusters, necessitating background reassignments. The per-vector
+reassignment of vectors further increases CPU cycle consumption
+in background by triggering centroid searches and rewriting on-
+SSD lists for the vectors affected.
+Foreground
+Background
+4 
+core
+8 
+core
+16 
+core
+32 
+core
+64 
+core
+Figure 4: Breakdown of CPU cycles. Trav: locate clusters over
+the centroid graph; Write: flush lists to SSDs; Read: load lists
+from SSDs. Other: remaining activities (e.g., lock spinning).
+4
+OPPORTUNITIES AND CHALLENGES
+4.1
+Buffered Updates and Direct Rebuilds
+Based on these observations, we identify two intuitive opportunities
+for improving index maintenance efficiency and saving CPU cycles
+to achieve higher update throughput.
+Using buffered updates to amortize frequent round-trip
+I/Os of per-vector read-modify-write operations in the fore-
+ground threads. We can buffer new insertions and deletions in
+memory for each cluster instead of being immediately written to
+SSDs. Thus, by accumulating them, we can minimize every cluster’s
+lists read-modify-write I/Os and flush them to the corresponding
+SSD pages in a merged batch. As a result, foreground CPU cycles
+spent on read/write operations from per-vector insertions can be
+substantially reduced.
+Using local reclustering-based rebuilds to avoid per-vector
+relocation of reassignment in the background threads. When
+an imbalanced cluster is split or merged, we can directly fetch its
+nearby clusters and recluster them to generate new centroids and
+posting lists. This preserves partition quality by reconstructing
+neighboring clusters jointly, rather than repeatedly relocating indi-
+vidual vectors [47, 48]. As a result, this generalized LIRE can replace
+per-vector centroid searches and I/Os during relocations with a
+single centroid search for the merged/split cluster’s centroid and
+batched clusters refresh.
+4.2
+Conflicts and Challenges Arising
+However, directly applying these ideas in SPFresh does not work
+well. These two intuitive methods would conflict with current
+search-oriented design choices and limited hardware capabilities.
+We discuss three conflicts (Figure 5) and their corresponding chal-
+lenges (Figure 6) that prevent buffering and reclustering from being
+effective in practice, as follows.
+Memory bloating. The first conflict arises from SPFresh’s fine-
+grained partitioning and buffering. Following SPANN, SPFresh cre-
+ates up to 16% as many clusters as the total number of vectors
+to improve search efficiency [17]. However, maintaining per-list
+buffers for merging each cluster’s SSD flushes further enlarges its
+already high memory footprint. As shown in Figure 5a, SPFresh
+(i.e., Origin) already consumes about 1.5× the raw dataset size. On
+the ∼13GB SIFT100M dataset, increasing the per-list buffer count
+from 2 to 16 adds extra 5-22 GB, and at the count of 16, the total
+memory consumption approaches 3× the dataset size.
+One straightforward solution is to reduce the number of clusters
+to a normal IVF scale [5], making memory usage more affordable.
+However, fewer clusters would absorb more member changes per
+4
+
+
+(a) Memory
+bloating.
+(b) Pseudo
+buffering.
+(c) Computation
+burden.
+Figure 5: We show memory usage comparisons (a) and SSD
+I/O trigger ratios of insertion (b) across various buffer sizes.
+(c) shows the CPU time needed by merge reassignment (M-R),
+split reassignment (S-R), and direct clustering rebuilds (C-R).
+(a) Amplified scan.
+(b) Higher latency.
+(c) More cores.
+Figure 6: (a) shows normalized cluster scanned for re-
+call@10=90% when reducing centroids, with/without cen-
+troid modification. (b) shows search latency before/after re-
+moving replicas. (c) shows background cores of rebalanc-
+ing required to match varying foreground cores of insertion
+with merge-split reassignment (M/S-R) or direct clustering
+rebuilds (C-R).
+cluster under the same update rate, making fixed centroids quickly
+become outdated. Hence, fixed centroids can consequently become
+poorly representative of their evolving members, impairing routing
+accuracy. As shown in Figure 6a, after 100M updates, fewer cen-
+troids require scanning more clusters to maintain recall, especially
+when centroids remain unchanged. With a normal-scale centroid
+count (i.e., ∼2% of the vector count, with ∼50–100 members per
+cluster), the scan overhead increases by up to ∼3×.
+Pseudo buffering. The second issue comes from SPFresh’s
+redundant placement. To mitigate boundary-induced recall loss,
+SPFresh follows SPANN, using RNG checks [60] to place each vector
+into up to 8 clusters. This largely defeats buffered insertion: ideally,
+a buffer size of 𝐵should reduce the SSD-access probability to about
+1/𝐵per insertion. However, as shown in Figure 5b, redundancy
+greatly raises this probability of triggering SSD accesses. With
+buffering 2 vectors for merging I/Os of each partition, replicated
+placements still trigger SSD access with nearly 100% probability;
+even with a buffer budget of 16 vectors per partition, the probability
+of round-trip SSD access remains around 40%.
+Therefore, to make buffering updates effective, we argue that
+redundant placement can be removed. However, this shifts the cost
+to search. As shown in Figure 6b, using single-thread 8-replica
+search as the baseline, we compare search latency with and without
+replicas under increasing search concurrency. Without redundancy,
+search faces higher latency due to reading SSDs and computing
+distances for more cluster lists; when concurrent search threads
+reach 64 CPU cores, search latency further increases sharply due
+to intensified hardware contention on concurrent CPU threads and
+memory bandwidth of DRAM [29].
+Computational burden. The third issue comes from comput-
+ing burden of reclustering-based local rebuilds. While the batched
+clustering avoids per-vector centroid searches and frequent up-
+dates on-SSD posting lists for all vectors affected by imbalanced
+partitions after splitting or merging, it introduces clustering that
+has heavier computing consumption than centroid search during
+background reassignments.
+As shown in Figure 5c, using CPU cycles of relocating all vectors
+after merging undersized clusters (i.e., list size less than 10 [64]) as
+the baseline, we compare per-vector reassignment overhead after
+splitting/merging with local reclustering 64 nearby clusters [48, 64].
+With the common 10-15 Lloyd iterations in K-Means [5, 43, 45] to
+local convergence, direct reclustering can amplify computations.
+Consequently, as shown in Figure 6c, more CPU cores (i.e., C-R)
+can be required for performing local reclustering in background
+threads, to match update throughputs under the same CPU cores
+of foreground threads.
+5
+PRAIRIEFIRE
+5.1
+Considerations
+Addressing these conflicts and trade-offs, to make buffered update
+and batched rebuild practical, we have the following considerations.
+First, we argue to use an index structure with normal
+partitioning granularity, centroid-adaptive design, and
+non-redundant placement. Normal-scale partitioning supports
+buffered updates without an unacceptable memory footprint.
+Centroid-adaptive design is for continuously tracking cluster
+modifications to avoid degraded centroid representativeness.
+Non-redundant placement eliminates the multiple insertion of the
+same vector into different clusters, reducing SSD access frequency
+and avoiding pseudo buffering.
+Second, index operations call for an efficient concurrency con-
+trol mechanism on this update-oriented index structure to pro-
+ceed with minimal contention, enabling concurrent searches, up-
+dates, and index maintenance.
+Third, it is practical to introduce GPUs as extra computa-
+tional resources along with efficient pipelines among various
+hardware (i.e., GPUs, CPUs, and SSDs) to support heavier search
+overhead from our update-oriented index structure, and to enable
+direct clustering-based rebuilds without overwhelming CPUs.
+5.2
+Design Overview
+Following these considerations, we propose PrairieFire. Figure 7
+shows the design overview, including the index structure, concur-
+rency control, and software-hardware co-design pipelines in the
+update-search workflow.
+Index structure ( §5.3). First, with normal-granularity partition-
+ing for affordable buffering, PrairieFire organizes a three-level
+partition-based index [5, 48] across SSDs, memory, and GPUs. From
+bottom to top, it consists of vector partitions as level-2, partition
+centroids as level-1, and routing centroids as level-0 (§5.3.1). Buffer-
+ing updates and search operations are managed across these levels
+simultaneously (§5.3.2), then local rebuild and cascaded centroid-
+adaptation are applied to maintain index quality (§5.3.3).
+5
+
+
+GPUs Memory
+Host
+Memory
+NVMe
+SSDs
+§5.3 Index Structure
+Three-Level Structure
+…
+Routing Centroids
+…
+…
+Search
+§5.4 Concurrency Control
+Worker Threads
+Insert & Delete
+Rebuild
+Update
+§5.5 SW-HW Co-Design in Workflow
+Search
+Update
+Search 
+Routing Centroids . . .
+. . .
+Local Rebuild (clustering)
+Operations
+(Fore. & Back.)
+§5.3.1
+§5.3.2 & §5.3.3
+Search 
+Vector Partitions
+Partition Centroids
+Vector Partitions
+Figure 7: Design Overview of PrairieFire.
+Concurrency control ( §5.4). To support concurrent online
+operations including searches, inserts, deletes, and background lo-
+cal rebuilds, we design a granularity-decoupled locking scheme to
+efficiently reduce concurrency contention. It is designed to narrow
+the scope of locking by decoupling different levels of the hierar-
+chical partition-based index. Then, we use the locking-validation-
+execution pattern to ensure consistency, while preventing upper-
+level locks from unnecessarily blocking operations on unrelated
+lower-level objects in the index.
+Software-hardware co-design ( §5.5). We enable a hetero-
+geneous CPU-GPU-SSD architecture through software-hardware
+co-design in PrairieFire. The array of NVMe SSDs provides high
+I/O bandwidth, while GPUs offer strong parallelism to avoid CPU
+computation burden during foreground search including level-0
+routing centroids and level-2 vector partitions, and background
+clustering-based local rebuilds.
+5.3
+Index Structure
+PrairieFire organizes a bottom-up three-level clustering layout
+across GPUs, host memory, and NVMe SSDs, supporting buffered
+updates and cascaded adjustments.
+5.3.1
+Three-level layout. As shown in Figure 8, PrairieFire orga-
+nizes a three-level layout, we describe each level from bottom to
+top in detail below.
+At Level-2, vectors are clustered into disjoint vector partitions
+(VP), where each maintains its own in-memory buffer and on-SSD
+continuous pages (e.g., 4 pages, 16 KB, can store 128 128-byte SIFT
+vectors). Since clusters are independently updated and different
+clusters’ pages are separated and non-contiguous on SSDs, we use
+per-cluster buffers rather than a shared buffer [18, 55] to avoid
+inter-cluster concurrency contention and keep buffered vectors
+contiguous for cache-friendly access during search. IDs of both
+buffered and on-SSD vectors are kept in host memory for fast
+deletion (§5.3.2), but stored separately in two continuous arrays to
+split buffered and on-SSD data so that IDs of buffered vectors can
+be directly deleted and IDs of on-SSD vectors can be marked for
+deletion with lazy garbage collection during flushes (§5.3.3).
+At Level-1, partition centroids (PC) of level-2 vector partitions
+are clustered in memory, where each level-1 entry (i.e., a partition
+centroid) routes a level-2 vector partition.
+At the top, Level-0 further consists of routing centroids (RC)
+of clusters in level-1 partition centroids. PrairieFire stores a con-
+tiguous host-side level-0 shadow with a one-to-one mapping to
+GPU-resident routing centroids, whose slices are distributed across
+GPUs for acceleration during level-0 search. Lazy synchroniza-
+tion first applies cascaded level-0 centroid adjustments to the host
+…
+Flushed Vec:
+SSDs
+GPUs
+Level-0 Routing Centroids (RC)
+GPU Slices
+GPU#0
+GPU#1
+RC ID:
+RC Vec:
+1 3 5 7… 2 4 6 8…
+Host Memory
+1 2 3 4 5 6 7 8…
+RC Vec:
+Level-1Partition Centroids (PC) 
+Clusters
+3 7…
+PC ID:
+PC Vec:
+4 9…
+…
+2 …
+…
+2 6…
+All Vec ID:
+Buffered Vec:
+4 9…
+7 8…
+…
+Level-0 (RC)
+ Host Shadow
+one-to-one
+mapping  
+lazy
+sync
+Level-2 Vector Partitions (VP) 
+In-Mem Buffer 
+Level-2 Vector Partitions (VP)
+On-SSD Vectors 
+…
+Figure 8: Three-level storage layout of PrairieFire.
+shadow (§5.3.3), then propagates them to GPU memory after the
+current batched search kernel (§5.5.1) completes and before the
+next begins. Thus, each GPU kernel uses routing centroid values
+that may briefly lag the latest host-side adjustments with nearly no
+measurable impact on the recall.
+5.3.2
+Operation paths. Based on the three-level layout described
+above, Figure 9a further shows the foreground operation paths,
+including search, insert, and delete.
+Search first 1 searches level-0 on all flat GPU-resident slices to
+get candidate partition centroid clusters, and 2 searches level-1 to
+find several nearest candidate level-2 vector partitions. Finally, it
+3 scans both buffered and on-SSD vectors of candidate level-2 VP
+to get the final top-𝑘.
+Insert also locates the target vector partition by searching level-
+0 and level-1 ( 1 and 2 ), but only needs the nearest one for update.
+After locating the target VP, PrairieFire 3 appends the new vector
+to its buffer and records the vector’s ID in memory, and further
+records the ID of the partition that receives this new vector in a
+hash-based map.
+Delete first A uses the map structure to find the vector partition
+ID for the vector to be deleted. Then, PrairieFire B conducts the
+deletion. If the vector is still in the buffer, it is removed by swap-last-
+pop (i.e., swapping it with the last entry and popping) to keep the
+layout contiguous. Otherwise, for an on-SSD vector, PrairieFire
+only marks its ID as −1, filters it during search, and performs lazy
+garbage collection during flushes, avoiding frequent SSD accesses
+on the foreground deletion path as well.
+5.3.3
+Flush, local rebuild, and cascaded adjustment. Following the
+above paths, foreground insert and delete can trigger flush and
+rebuild operations when certain conditions are met, and cause
+cascaded adjustments at higher levels.
+In Figure 9b, case 1 shows the level-2 flush. When a buffer
+becomes full (e.g., buffering 3 vectors reaches the budget in the
+figure), or its on-SSD part contains too many invalid items (e.g., 3
+IDs are −1), a flush is triggered. It merges buffered vectors and the
+remaining valid on-SSD vectors, and writes them back to the same
+SSD region as continuous pages. The buffer is then cleared and
+the in-memory ID records are refreshed. Case 2 shows the back-
+ground local rebuild, which is triggered when the vector partition
+becomes imbalanced following SPFresh [64] (i.e., it is undersized
+or oversized). In contrast, PrairieFire directly performs recluster-
+ing on the imbalanced vector partition and its nearby partitions,
+regenerating balanced partitions instead of SPFresh’s per-vector
+conditional reassignments.
+6
+
+
+Foreground Threads
+Search
+Insert
+Delete
+Search Level-0 
+Search Level-1 
+Search 
+Level-2 
+V ID→PC ID
+Look up Map
+Buffered Insert
+A
+Buffered Delete
+B
+In-Mem:
+On-SSD:
+-1
+Flush  & Local Rebuild 
+In-Mem:
+Cascaded Adjustment
+3
+1
+2
+2
+1
+3
+(a) Foreground operation paths.
+In-place Update
+Update Primitives
+Append Insert
+Swap-last-pop 
+Delete
+&
+ID:
+Old
+New
+Vec:
+Old
+New
+Case 
+1:
+Level-2
++
+Case 
+2:
+Cluster
+Undersized
++
+Cluster
+Oversized
+…
+<Local Rebuild>
+Level-1 Cascaded Adjustment
+New C = (In-Buf Vec+ on-SSD Vec) / N
+Update Partition Centroid
+Locate PC Cluster
+Insert & Delete
+Level-0
+Update in Host Shadow
+lazy sync (Store Instr.)
+Cascaded Adjustment
+GPU 
+Copies
+Buffer 
+Full
+Tombstone 
+Heavy
+<Flush>
+(b) Flush, local rebuild, and cascaded adjustment.
+Figure 9: (a) shows foreground operations, especially buffered update (i.e., insert and delete). (b) shows flush and local rebuild at
+level-2, which can trigger cascaded adjustment of centroids to higher levels (i.e., level-1 and level-0) with basic update primitives.
+After flush or local rebuild, PrairieFire applies cascaded ad-
+justment to propagate refreshed centroids to upper levels. A flush
+summarizes multiple but bounded level-2 updates, up to the sum
+of buffer capacity and tombstone threshold, into one centroid up-
+date over up-to-date members. This allows upper-level centroids
+to reflect distribution changes in a timely manner while avoiding
+frequent I/Os from refreshing centroids after every foreground
+update. When local rebuild creates or removes vector partitions,
+PrairieFire inserts new centroids into, or deletes old centroids
+from, the nearest level-1 clusters. These changes are further propa-
+gated to the host shadow with modifications to routing centroids
+values and lazily synchronized to GPUs by low-latency store in-
+structions from CPUs [28, 71].
+All upper-level changes use the same update primitives as level-
+2 buffer, as shown on the right of Figure 9b: in-place update for
+modifying centroids, append for inserting centroids, and swap-
+last-pop for deleting centroids. This keeps centroid arrays densely
+packed and contiguous, making them friendly to SIMD and GPU-
+based distance computing.
+5.4
+Concurrency Control
+5.4.1
+Decoupled locks. To maximize concurrency, we adopt decou-
+pled locks on the hierarchical clustering structure of PrairieFire,
+where all granularities (i.e., G0, G1, G2, corresponding to partition
+centroid cluster, vector partition, and vector) have independent
+control components (Table 1).
+Table 1: Concurrency-control components in PrairieFire.
+Granularity
+Protected Object
+Components
+Partition Centroid
+Cluster
+Level-0 routing centroid
+Level-1 PC cluster
+G0 Per-cluster
+Lock
+Vector
+Partition
+Level-2 vector partition
+Parent PC ID
+G1 Per-cluster
+Lock & Version
+Vector
+Parent vector partition ID
+G2 Per-slot Lock
+Across hierarchical levels, PrairieFire binds each centroid with
+the lower-level cluster member set it represents as one atomic
+concurrency-control unit. Specifically, a level-2 vector partition
+and its corresponding level-1 centroid are protected together as a
+vector partition. Similarly, a level-1 partition centroid cluster and
+its corresponding level-0 routing centroid are protected together as
+a unit. Each cluster entry has its own lock for atomic operations.
+To address online rebuilds at level-2, each vector partition has an
+additional version record for consistency validation.
+In addition, as mentioned in §5.3, PrairieFire maintains a parent
+vector partition ID for each vector to support ID-based deletion and
+remapping. To protect these ID mappings, but avoid expensive per-
+vector locks, we use slot-based locks: each vector ID is hashed to a
+lock slot by ID mod the count of slots. This reduces the lock memory
+footprint from vector scale to slot scale (e.g., from 1B vector locks
+to 0.1M slot locks), while preserving concurrency.
+5.4.2
+Basic
+principles. Relying
+on
+the
+above
+components,
+PrairieFire follows these three principles.
+1. Record-level concurrency consistency. Designed for approx-
+imate top-𝑘results [24, 64], PrairieFire ensures a record-level
+immediate visibility [25, 61]. Once an insert or delete completes, its
+effect is visible to subsequent searches: inserted vectors are included
+for retrieval, and deleted vectors are excluded from results.
+2. Decoupling with version validation. To avoid unnecessary
+blocking (e.g., intra-cluster members should not block each other
+just because they belong to the same parent cluster), PrairieFire
+locks only units used in the current stage and releases them before
+switching to the other granularity in the next stage. Since level-2
+clusters may change between stages (e.g., some of the candidate
+clusters returned by level-1 search might have been rebuilt), the
+level-2 related stage validates recorded versions before access. On
+mismatch, it can fall back to the previous stage or ignore invalid
+items.
+3. Ordered locks. To prevent deadlocks, operations that need
+multiple locks acquire them in a deterministic order: higher-level
+granularity before lower-level granularity (e.g., partition centroid
+cluster before vector partition), and units at the same granularity
+in ascending ID order (i.e., acquiring locks for clusters and slots
+after sorting by IDs).
+5.4.3
+Locking mechanisms. PrairieFire applies locks only to ob-
+jects accessed by each stage, as shown in Figure 10.
+For 1 search level-0, foreground searches and insertions submit
+requests to level-0 workers, where each GPU has a dedicated worker.
+The worker lazily synchronizes dirty level-0 centroids updated
+under exclusive G0 per-cluster locks, and then performs batched
+GPU computation. Foreground threads only receive distances, then
+rank routing centroids (RC) to select the candidate level-1 partition
+centroid clusters.
+7
+
+
+Share Lock:
+Exclusive Lock:
+Fallback:
+Foreground
+Background
+Search
+Insert
+Delete
+(Dirty G0)
+Lazy sync & GPU Batch Dist. 
+Submit L0 Dist. Req
+Rank Level-0 RC ID
+Search Level-0
+1
+L0
+Level-0 Worker:
+L0
+Search Level-1
+2
+Sort Candidate ID
+(Candidate G0)
+Scan Level-1 PC Clusters
+S
+X
+X
+S
+Search Level-2
+3
+Sort Candidate ID
+(Candidate G1)
+Scan Level-2
+Vector Partition
+S
+(Target G1)
+Valid. & Update  VP
+Level-2
+X
+(G2)
+Update V Parent ID
+X
+Insert / Delete
+3
+B
+/
+Look 
+up
+Map
+A
+S (G2)
+Find
+VP ID
+LIRE
+Submit
+Rebuild Level-2
+(Target G1)
+X
+Valid. & Clustering VP
+(G2)
+X
+Update V Parent ID
+(G1)
+Update PC Parent ID
+X
+(G1)
+Find RC ID
+S
+(Target G0)
+X
+Update  RC & Level-1 Cluster
+Locate Cascade Parent
+Update & Delete:
+Insert:
+Search Level-0
+Adjust Level- 0 & 1
+ⅰ
+ⅱ
+c
+ⅲ
+Search Level- 0 & 1
+Sort Candidate ID
+Flush
+Figure 10: Locking actions in the workflow of PrairieFire.
+For search, PrairieFire first performs level-0 1 . It then 2
+acquires shared G0 locks on candidate partition centroid clusters,
+following Principle 3. Then, it scans candidate level-1 clusters to
+get candidate vector partitions. Following Principle 2, it releases
+G0 locks before 3 acquiring shared G1 locks on candidate vector
+partitions, validating their versions and scanning valid vectors for
+final top-𝑘results. Version mismatches are handled by skipping
+invalid vector partitions, which keeps stable recall as evaluations
+of §6 show, but without unnecessary retries.
+For insert, it shares 1 and 2 with search to locate the nearest
+target level-2 vector partition to insert the new vector. It then 3
+acquires an exclusive G1 lock on the target vector partition (VP),
+validates it, and inserts the vector into it. After that, it updates the
+vector-to-partition mapping under an exclusive G2 slot lock on
+the vector ID. If the version validation fails because of background
+rebuilds, it retries 1 and 2 to find the new target VP again.
+For delete, it first A reads the parent vector partition ID under
+a shared G2 slot lock and immediately releases it. It then acquires
+B an exclusive G1 lock on the vector partition to validate whether
+it still contains the vector to be deleted. If true, it deletes the vector
+and removes the vector-to-partition mapping under an exclusive
+G2 slot lock. If the validation fails due to reposition from rebuilds,
+it retries reading the newest parent partition ID ( A ) and tries to
+delete it again.
+During the background rebuild, if a level-2 vector partition
+is undersized or oversized, PrairieFire i performs reclustering.
+By 1 and 2 , it locates nearby vector partitions to be reclustered
+together and then acquires exclusive G1 locks on nearby partitions.
+Valid vector partitions (VP) are then reclustered together, where
+their member vectors’ partition IDs are remapped under G2 locks.
+Further, rebuilds and flushes trigger cascaded adjustment to
+keep upper-level centroids valid and representative. In ii , for up-
+dates from flushes and deletions from reclustering, PrairieFire
+reads the corresponding level-1 cluster under shared G1 locks and
+releases locks after lookups. For inserting a new centroid, it locates
+the target partition centroid cluster through 1 . Then, in iii, it ac-
+quires exclusive G0 lock to update the partition centroid cluster,
+and modifies partition centroid parent (i.e., routing centroid) ID
+under exclusive G1 lock.
+DIMM
+CPU
+GPU
+PCIe
+PCIe
+PCIe
+…
+…
+NVMe SSDs
+NVMe SSDs
+5x ~10 GB/s
+~50 GB/s
+5x ~10 GB/s
+~50 GB/s
+DIMM
+(a) High-bandwidth
+interconnect platform.
+GPU#1
+GPU#1
+…
+Q&V
+Level-0
+…
+Dist.
+GPU
+Rank
+on
+Dist.
+GEMV
+Search Level-0 (Search & Insert    )
+…
+GEMM
+…
+Gather
+Scatter
+…
+GPU
+Rank
+on
+Dist.
+(A)No-Pack
+(B) Pack
+GEMV
+…
+Dist.
+Level-0
+Q&V
+GPU#0
+GPU#0
+(b) Packing multiple search and
+insert queries at level-0.
+Figure 11: (a) shows our hardware platform with high-
+bandwidth interconnects. In (b), (A) corresponds to naive
+no-packing and (B) shows the packing implementation.
+5.5
+Software-Hardware Workflow
+As shown in Figure 11a, to avoid the bandwidth bottleneck of host
+memory [29] and support freshness requirements, PrairieFire runs
+on a CPU-GPU-SSD architecture with high-bandwidth intercon-
+nects that allow direct GPU-SSD I/O with ∼50 GB/s between each
+GPU and 5 NVMe SSDs [9, 40, 53, 68]. This architecture provides
+high theoretical throughput for concurrent search and update, but
+also requires careful software-hardware co-design to avoid bot-
+tlenecks and underutilization. We identify three key stages that
+require customized optimizations: search level-0 on GPUs, search
+level-2 across CPUs, GPUs, and SSDs, and rebuilds on GPUs.
+5.5.1
+Batched Distance Computation for Level-0. As shown in Fig-
+ure 11b, a naive implementation launches a level-0 scan for each
+search or insert independently. It performs GEMV distance compu-
+tation [6] followed by GPU ranking (i.e., radix-based selection [8,
+70]), over all level-0 vectors; both stages are bandwidth-bound. This
+becomes severe at large scale: for 1B-scale SIFT [44], level-0 can
+contain 105–2 × 105 128-dimensional FP16 vectors in experiments.
+GEMV alone reads 24–50 MB per request, requiring 1.4-3 TB/s of
+bandwidth at the target throughput (i.e., 60K aggregated from 30K
+search and 30K update QPS [29]). Moreover, radix-style ranking
+repeatedly reads and writes the distance/id array; four read-write
+passes (32-bit distance / 8 bits per radix pass) add 6–13 MB per
+request. These together can demand ∼1.8–3.8 TB/s that can ex-
+haust the actual GPU memory bandwidth (e.g., two GPUs provide
+2-2.6 TB/s in our platform as §6.1).
+To address this issue, PrairieFire packs concurrent level-0 dis-
+tance computing into continuous dynamic batched GPU opera-
+tions [66] across all GPUs, which allows for better utilization of
+GPU resources and reduces memory bandwidth pressure. As shown
+in (B) of Figure 11b, on each GPU, a worker gathers queries from
+search and insert workers, forms a dense query batch, and com-
+putes query-RC (routing centroid) distances with GEMM. It then
+scatters each query’s distance vector back to its foreground worker,
+which performs GPU ranking to select candidate partition centroid
+clusters. Packing isolated GEMV into batched GEMM reuses rout-
+ing centroid reads across queries, improves arithmetic intensity,
+and significantly reduces per-request bandwidth demand.
+5.5.2
+Parallelizing in-buffer and on-SSD parts during level-2 search.
+In Figure 12a, each selected level-2 vector partition contains two
+8
+
+
+(A) Serial
+Search Level-2     (Search    )
+Get 
+Candidate
+Vector
+Partition
+CPU
+Scan
+Buffer
+SSD 
+GPU
+Scan
+SSD
+IDLE
+IDLE
+Merge
+Final
+Top-k
+(B) Parallel
+Get 
+Candidate
+Vector
+Partition
+CPU
+Scan
+Buffer
+SSD
+GPU
+Scan
+SSD
+Merge
+Final
+Top-k
+Reduced
+Latency
+(a) Parallel in-buf search on CPU and
+on-SSD search on direct SSD-to-GPU.
+Clustering (Rebuild   )
+(A) Standard
+(B) Microscale
+GEMM
+1
+Sort
+2
+Assign
+3
+Reduce
+4
+Update
+5
+New 
+Clusters
+Vectors & Centroids
+n iters …
+G-Mem
+Vectors
+G-Mem
+Centroids
+S-Mem
+Each V[id]:
+    Compute dist-> min C id
+    AtomicAdd(count[C id],1)
+    AtomicAdd(sum[C id], V)
+    Sync & Update  
+…
+1
+2
+3
+4
+New Clusters
+n  loop
+(b) Fuse kernels for
+micro-scale reclustering.
+Figure 12: (a) shows parallel search on vector partitions. (b)
+shows fused clustering, where (A) and (B) correspond to a
+straightforward and the optimized solution, respectively.
+parts: recently updated vectors in the in-memory buffer and flushed
+vectors on SSDs. A naive implementation scans them sequentially,
+which leaves CPUs idle during on-SSD search or leaves SSDs and
+GPUs idle during buffer scanning. PrairieFire instead parallelizes
+these two parts, as shown in Figure 12a(B). The foreground worker
+scans the small in-memory buffer on the CPU, while the on-SSD
+vectors are transferred to GPU directly and scanned for distances,
+and then the distances are moved to CPUs. After both paths finish,
+their candidates are merged by distances to get the final top-𝑘
+on foreground CPU workers. This overlap avoids idle hardware,
+thereby reducing search latency.
+5.5.3
+Fusing kernels for micro-scale clustering. As shown in Fig-
+ure 12b, local rebuilds in PrairieFire are micro-scale: each rebuild
+reclusters at most 64 nearby vector partitions, usually involving
+thousands of vectors. At this scale, standard GPU KMeans back-
+ends [13, 14] are inefficient. Their Lloyd iterations commonly in-
+voke multiple GPU kernels, including GEMM-based distance com-
+putation, sorting, assignment, and reduction for new centroids,
+where kernel launches and intermediate global memory (i.e., G-
+Mem) traffic can result in a rebuild time of up to 10-30 ms, reducing
+GPU efficiency.
+PrairieFire therefore designs a fused micro-scale clustering
+kernel as shown in (B) of Figure 12b. Because the centroids are
+small (e.g., 64×128-dimensional FP32 vectors take only 32 KB), they
+can be cached in GPU shared memory (i.e., S-Mem, hundreds of KB
+per streaming multiprocessor). We use a design in which each GPU
+thread processes one vector, computes distances to all centroids,
+finds the nearest cluster, and immediately updates the cluster’s
+count and vector sum through atomic accumulation. These statistics
+are then used to compute centroids for the next Lloyd iteration. By
+fusing assignment with statistics accumulation, PrairieFire avoids
+materializing and regrouping assignments, reduces global-memory
+traffic, and removes several kernel launches from the CPU side,
+achieving <5ms micro-scale clustering.
+6
+EVALUATION
+We conduct evaluations for the following questions:
+• How does PrairieFire compare with advanced SSD-based
+systems by performance under standard workloads? (§6.2)
+• What are the sensitive configurations of PrairieFire? And
+how do PrairieFire’s techniques and extra hardware con-
+tribute to its performance improvements? (§6.3)
+• What is the hardware efficiency of PrairieFire in terms of
+device price, energy, and storage? (§6.4)
+• How does PrairieFire compare with GPU-based real-time
+ANNS and perform under higher dimensional datasets and
+production workloads? (§6.5)
+6.1
+Experimental Setup
+Platform. For evaluations of run-time performance, we use the
+same platform as our production services’ deployment settings,
+which comes with an EPYC 64-core Genoa CPU, 12-channel DDR5
+memory, 10× 2TB PCIe-Gen5 NVMe TLC SSDs, and 2 NVIDIA RTX
+Pro 5000 Blackwell GPUs.
+Workloads. Following previous work [24, 64], we use three widely
+used standard dynamic workloads, unless otherwise stated.
+• Workload A simulates the scenario, where all vectors are updated
+(i.e., deleted and re-inserted with new embeddings) on a 100M
+subset of SIFT1B [44]. It consists of 128-dimensional uint8 vec-
+tors and its similarity is measured using Euclidean distance. We
+extract two disjoint 100M vectors from SIFT1B, where one is
+used as the initial dataset and the other is used for updates. Each
+update is performed by deleting a vector from inserted vectors
+and inserting a new vector from the update dataset.
+• Workload B has the same setting as Workload A but with 100 mil-
+lion vectors of SPACEV1B [7], which consists of 100-dimensional
+int8 vectors. Different from the uniform distribution of SIFT,
+SPACEV has a skewed distribution [64].
+• Workload C scales up the experiment to 1 billion vectors, where
+the initial dataset is 900M vectors in SIFT1B and the update
+dataset is the remaining 100M vectors.
+Comparisons. We compare PrairieFire with state-of-the-art
+SSD-based ANNS systems that support updates: Greator [67],
+OdinANN [24] and SPFresh [64]. The parameters are kept at
+optimally default values recommended, except that Greator’s
+and OdinANN’s graph-based beam width is set to 16 for better
+bandwidth utilization on multi-SSD setups [29]. We do not include
+FreshDiskANN [55] in comparisons, as it unacceptably incurs
+prohibitive memory consumption–up to 5-6× the dataset size and
+has been proven to perform worse (i.e., maximally 3K QPS updates
+and 5K QPS searches) than others. Since SPFresh’s open-source
+implementation does not support multi-SSD layout, we adapt it to
+support multi-SSD operation using the same storage interface as
+PrairieFire. Specifically, each posting list is stored in one device’s
+contiguous pages and extended with a device identifier to route
+SPDK [4] requests across SSDs. Graph-based SVFusion [52] is
+included as the state-of-the-art GPU-CPU comparison.
+Table 2: Thread allocation. FG: foreground; BG: background.
+Greator
+OdinANN
+SPFresh
+Ours
+Update
+25
+25
+FG:32 & BG:16
+FG:16 & BG:2
+Search
+39
+39
+16
+46
+Thread allocation. As shown in Table 2, we allocate threads to
+make the update-to-search throughput ratio ∼1:1 for each system,
+which is a common requirement in high-freshness applications [29].
+Since graph-based Greator and OdinANN show limited update
+throughput, we set 25 threads to maximize their update throughputs
+first [24] and the remaining threads are used in search. In Greator,
+25 update threads first conduct insertions and deletions then switch
+to merge, per 1% of the process as a batch [67].
+9
+
+
+Better
+Better
+Better
+Better
+Better
+(a) Overall performance on Workload A (i.e., 0.1B-scale SIFT with a uniform distribution).
+Better
+Better
+Better
+Better
+Better
+(b) Overall performance on Workload B (i.e., 0.1B-scale SPACEV with a skewed distribution).
+Better
+Better
+Better
+Better
+Better
+(c) Overall performance on Workload C (i.e., scaling the comparison on the 1B-scale SIFT).
+Figure 13: Performance comparisons about update throughput, search throughput, tail latency, accuracy, and memory usage.
+6.2
+Overall Performance
+6.2.1
+0.1B-scale evaluation. As shown in Figure 13, we first eval-
+uate all systems with Workloads A and B. On both uniform (Fig-
+ure 13a) and skewed (Figure 13b) datasets, PrairieFire outperforms
+the baselines in terms of throughputs of update (∼3-35×) and search
+(∼3-5×). And it also shows lower tail latency, comparable or better
+accuracy (i.e., recall@10), and the same level memory footprint.
+For update, PrairieFire achieves ∼0.4 ms average latency per up-
+date, because of buffered updates with merged I/Os. Hence, only 16
+foreground threads are sufficient to achieve a high update through-
+put. Benefiting from the optimized rebuilds (i.e., optimized GPU-
+based batched reclustering), PrairieFire needs only 2 background
+threads to match ∼40K QPS foreground updates. Greator suffers
+from heavy merge operations on buffered and on-SSD graphs [24],
+leading to the lowest update throughput. While avoiding heavy
+merge operations, OdinANN still suffers from the high latency
+and concurrency limitations of locks over the graph structure and
+cannot achieve high-throughput updates. SPFresh achieves higher
+update throughput than OdinANN, but still hits bottlenecks of
+frequent on-SSD read-modify-write operations and heavy reassign-
+ments, achieving only ∼10-12K QPS updates with 32 foreground
+threads and 16 background threads. Consequently, few threads (i.e.,
+16) are left for search, leading to low search throughput.
+PrairieFire can allocate more threads (i.e., 46) to search, achiev-
+ing much higher search concurrency. With 10 Gen5 NVMe SSDs
+providing more than 100 GB/s of bandwidth and GPUs handling
+computation, the I/O and host-memory-bandwidth bottlenecks in
+the search path can be overcome. As a result, PrairieFire reaches
+comparable recall by searching more clusters (e.g., ∼200) without
+throughput loss. With normal-scale partitions (i.e., 1-2% of the
+dataset size), PrairieFire can buffer up to 8 vectors per cluster,
+while having a stable and acceptable memory usage. While Odi-
+nANN’s memory can fluctuate due to merges on deletions, SPFresh
+has a higher memory usage than ours due to more centroids. Since
+Greator has unacceptably high memory usage (i.e., > 40 GB for the
+0.1B scale and > 280 GB for the 1B scale) due to buffered graph and
+global merge, it is omitted in figures of memory usage.
+6.2.2
+1B-scale evaluation. Then, we scale the experiment to 1 bil-
+lion vectors with Workload C (Figure 13c). Results are similar to the
+0.1B-scale evaluation. Although 1B-scale index has ∼10× centroids
+of centroids (i.e., level-0) on GPUs, which can incur heavier GPU
+bandwidth consumption than 0.1B-scale index, PrairieFire still
+achieves ∼3× higher search throughput and up to ∼27× higher
+update throughput than the baselines. Because we pack distance
+computation of level-0 search together with batched GEMM, much
+global memory traffic can be saved and both throughputs of updates
+and searches still reach 36-39K QPS. Additionally, the recall is also
+higher than baselines.
+6.3
+Sensitivity and Ablation Study
+Trade-off between throughput and memory. With Workload C
+and settings as in Table 2, Figure 14a shows the trade-off between
+throughput and memory usage with varying buffering budgets
+(i.e., vectors buffered and tombstones deleted per cluster). With
+higher memory for buffers, the update throughput can be improved
+by batching SSD accesses. Buffering 8 vectors can achieve a good
+balance between throughput and memory usage, and improvements
+become marginal with higher budgets (e.g., 16).
+10
+
+
+(a) Throughput and memory.
+(b) Update and search.
+Figure 14: Resource and performance trade-offs.
+(a) Cascaded adjustment.
+(b) Performance improvements.
+Figure 15: Ablation study of accuracy and performance.
+Trade-off between update and search. Figure 14b shows the
+trade-off between update and search with varying thread allocation
+from search-heavy setting to update-heavy setting on Workload
+C. Compared to the most advanced baselines of graph-based and
+partition-based methods, our PrairieFire can achieve both high
+update and search throughputs across varying ratios of update to
+search throughput. OdinANN suffers from the high latency and
+concurrency limitations of the graph structure, and thus cannot
+achieve high-throughput updates. SPFresh achieves higher update
+throughput than OdinANN, but more cores than PrairieFire are
+needed to improve update throughput, which leads to a significant
+drop in search throughput.
+Cascaded adjustment. Figure 15a shows the impact of cascaded
+adjustment on recall rate in Workload A. Without cascaded adjust-
+ment (W/O CA), the recall rates can drop by up to 3% in the process,
+even with rebuilds to improve the index quality [64]. Level-1 and
+Level-0 adjustments (i.e., L-1 CA and L-0 CA) can avoid the loss of
+efficacy and improve recall rates by up to 1.5% and 2.9%.
+Performance ablation. Figure 15b shows the throughput improve-
+ments by Workload C, from software designs. Naive implementa-
+tion (Naive) has a coarse-grained lock that objects from the same
+upper-level cluster are locked together, which can lead to high con-
+tention and low throughput. With decoupled locks (i.e., D-L) in §5.4,
+throughputs of update and search can be improved by up to 2.3×
+and 3.2×, respectively. Batched GPU level-0 search (i.e., B(L0)) can
+further improve throughputs by 0.4-0.7× naive’s performance. And
+parallelizing in-buffer and on-SSD search (i.e., P(L2)) can further
+improve search throughputs to 4.6×. And fused background micro-
+scale clustering (i.e., F(B)) can further improve update throughput
+by ∼1.5×, because fewer background threads can support more
+foreground update threads.
+Figure 16 shows the contribution of additional hardware (i.e.,
+GPUs and more SSDs). In Figure 16a, CPU means CPU-only
+PrairieFire with buffering updates and clustering-based rebuilds,
+while +1GPU offloads level-0 search and level-2 on-SSD search from
+half of 10 SSDs to a GPU. +2GPU is the fully equipped configuration
+with two GPUs and 10 SSDs. With different scale subsets from
+SIFT1B, as the scale increases, the bandwidth burden of level-0 flat
+search and level-2 on-SSD search becomes more significant, GPUs
+Update:
+Search:
+(a) GPU contribution.
+(b) SSD contribution.
+Figure 16: Extra hardware contribution for PrairieFire.
+(a) TCA efficiency.
+(b) Power efficiency. (c) Storage efficiency.
+Figure 17: Cost efficiency on device price, energy, and storage.
+can bring up to 3.4× and 4.1× improvement in update and search.
+In Figure 16b, the contribution of SSDs is illustrated, showing how
+additional SSDs enhance the overall system throughput. Since
+update is not I/O-bound, the improvement is mainly observed in
+search operations. With more SSDs, PrairieFire can support linear
+scaling in search performance under concurrent update and search.
+Table 3: Our hardware costs [11, 12, 15]. TCA: total cost of
+acquisition; TDP: thermal design power; CAP: capacity. The
+chassis consists of mainboard and other components.
+Chassis
+CPU
+GPU
+Mem
+SSD
+Total
+TCA 1 × $3K
+1 × $4K
+2 × $6K
+12 × $2K 10 × $0.4K
+$47K
+TDP 1 × 50W 1 × 400W 2 × 300W 12 × 10W
+10 × 8W
+1250W
+CAP
+–
+–
+96 GB
+768 GB
+∼20,000 GB
+–
+Cost Per Unit Storage 125 $/GB
+31 $/GB
+0.2 $/GB
+–
+6.4
+Hardware Efficiency
+Based on evaluations on SIFT1B, Figure 17 shows the hardware effi-
+ciency of PrairieFire in terms of device price, energy, and storage
+footprint. The information about hardware costs in our platform is
+shown in Table 3. For OdinANN and SPFresh, we minimize base-
+lines’ hardware with no GPUs and fewer SSDs (i.e., 2-4 SSDs), which
+can reach the performance of §6.2 and reduce the cost to ∼32K and
+the total power to ∼600W, respectively.
+Efficiency of acquisition cost. We use aggregate throughputs
+of updates and searches on Workload C under the thread config-
+urations in Table 2 as the performance metric, and use the total
+cost of acquisition (TCA) from Table 3 as the cost metric. As shown
+in Figure 17a, although PrairieFire requires two additional GPUs
+and thus has about 1.5× higher total device cost than OdinANN and
+SPFresh, it achieves 3–5× higher aggregate throughput, leading to
+a 2.2–3.4× improvement in devices’ cost efficiency.
+Power efficiency. We use the aggregate throughput as the perfor-
+mance metric, and use the thermal design power (TDP) as the cost
+metric, when evaluating power efficiency. As shown in Figure 17b,
+although PrairieFire incurs about 650W higher consumption than
+OdinANN and SPFresh due to additional GPUs, it still achieves a
+∼1.5–2.4× improvement in cost efficiency in terms of QPS per watt.
+11
+
+
+(a) CPU-GPU.
+(b) Dimensions.
+(c) Long-term stability.
+Figure 18: CPU-GPU, high-dim and long-term comparisons.
+Storage-cost efficiency. Following recent work [29, 32], we evalu-
+ate storage-cost efficiency by combining the index footprint on each
+storage device with its unit cost. For multi-SSD SPFresh, each clus-
+ter occupies 16 KB SSD space but needs only one block-mapping
+entry in memory. Thus, it adds 2.5 TB SSD space while saving
+about 10 GB memory, making its storage cost 8–10% higher than
+the single-SSD version, i.e., about 2.55K$. OdinANN reserves twice
+the SSD space for updates, leading to over 1.3 TB SSD and 85 GB
+memory usage, costing about 2.9K$.
+In contrast, though GPU memory is additionally introduced in
+PrairieFire, only centroid-cluster centroids are stored on GPUs,
+whose GPU memory footprint of the SIFT1B index is below 50 MB
+(<$10 under Table 3). By reducing centroid counts, PrairieFire
+also reduces SSD and host-memory usage to about 0.4 TB and
+50 GB, respectively. The host memory mainly includes 14 GB update
+buffers, 3-4 GB centroids, and others for metadata such as IDs,
+parent mappings, and locks structure. As a result, the storage cost
+of PrairieFire is ∼1.65K$. As shown in Figure 17c, this achieves
+4.9–8.7× storage-cost efficiency of baselines.
+6.5
+GPU-based comparison, high-dimensional
+datasets, and production evaluation
+We compare PrairieFire with SVFusion [52], a state-of-the-art
+graph-based real-time GPU ANNS, replicating its index to maxi-
+mize multi-GPU performance. We use the optimal CPU–GPU mode
+of SVFusion given its lack of I/O optimizations. Our system deliv-
+ers approximately 2× higher update and search throughput over
+Workload A as shown in Figure 18a, suggesting that partition-based
+methods better suit concurrent update–search workloads on GPUs.
+In addition to Workloads A and B of SIFT and SPACEV (i.e.,
+ST-128 and SV-100), we evaluate 768-dimensional Wikipedia (i.e.,
+WK-768) [10] and 960-dimensional Gist (i.e., GS-960) [49] against
+OdinANN, the state-of-the-art graph-based system, as baselines in
+update–search workloads. Though Figure 18b shows diminishing
+gain of our system as dimensionality increases due to higher search
+I/O than graph-based methods, PrairieFire maintains over ∼10×
+update throughput and ∼1.5× search throughput.
+We further evaluate PrairieFire over multiple epochs in one of
+our production 128-dim recommendation workloads (Figure 18c),
+where each epoch corresponds to an embedding model update and
+a full index refresh. During the first refresh, clustering through
+local rebuilds improves centroid quality, yielding 3-5% recall gains.
+Then, recall would remain stable across subsequent epochs.
+7
+DEPLOYMENT
+Crash Recovery. Addressing durability of crash recovery, we apply
+the Kafka-based write-ahead log (WAL) [2] and unique incremen-
+tal ID assignment mechanism with PrairieFire in our industrial
+Kafka
+Write Ahead Log 
+WAL 
+(Insert,Delete)
+Event-stream
+PRAIRIEFIRE
+Non
+Persistent
+Routing
+Centroids
+Partition
+Centroids
+Buffered
+Vectors
+Persistent
+Vector Partitions
+IDs:
+Vectors:
+B
+A
+1
+2
+Figure 19: Write-ahead log (WAL) for crash recovery.
+deployments [25]. This reuses the existing infrastructure, avoiding
+a redundant WAL implementation in PrairieFire. As shown in
+Figure 19, during crash recovery, PrairieFire first A sends the
+vector IDs persisted on SSDs to the event-stream servers, which
+compare them against the complete set of valid IDs in the WAL
+to identify updates (i.e., inserts and deletes) that require replay.
+Locally, PrairieFire reconstructs 1 partition centroids and then
+2 routing centroids from the persisted vector partitions. The up-
+dates requiring replay are subsequently B dispatched from Kafka
+to PrairieFire nodes to restore the crashed index.
+Deployment status. Addressing both high throughput and fresh-
+ness requirements, PrairieFire has been deployed in RedNote’s
+search, recommendation, and advertising services for two months.
+As an example, for one recommendation index whose embeddings
+are refreshed twice per hour, PrairieFire reduced full index re-
+builds from 48 per day to one, handling embedding updates across
+all intervening epochs through streaming rebuilds. Replacing peri-
+odic rebuilds with streaming updates improved recommendation
+quality, with business metrics including exposure, click-through
+rate, and revenue yield increasing by 0.5–2 percentage points.
+8
+RELATED WORK
+As real-world workloads now require ANNS systems to support bil-
+lions of vectors [39, 54, 56], in-memory solutions [5, 16, 19, 46, 65]
+are replaced by disk-based approaches. DiskANN [57] and Star-
+ling [62] are representative examples following the graph-based
+pattern. PipeANN [23] further optimizes the graph-based approach
+by pipelining the search process. These graph-based systems have
+higher throughput than cluster-based SPANN [17] on a single SSD,
+because they consume less I/O bandwidth. However, as the array
+of modern SSDs becomes more powerful, cluster-based approaches
+can also achieve high throughput with low latency [17, 29, 30, 64],
+becoming popular again. At the same time, freshness requirements
+are also increasing [38, 42], FreshDiskANN, Greator, OdinANN,
+SPFresh, and SVFusion [24, 52, 55, 64, 67] are proposed to sup-
+port updatable ANNS in large-scale scenarios, but their perfor-
+mance is limited under high update rates. Quake [48] is proposed
+for CPU-only index maintenance and does not support concur-
+rent update and search. GPU-based, FPGA-based, and CXL-based
+ANNS [31, 32, 33, 34, 41, 50, 59, 63] are also proposed to address
+the limitation of CPUs, but they do not support updates.
+9
+CONCLUSION
+We argue that buffered update and cluster-based index are effective
+for supporting updatable ANNS in large-scale scenarios. We pro-
+pose PrairieFire, a CPU-GPU-SSD ANNS system that supports
+high-throughput updates, preserving high-throughput search. Eval-
+uations show that it can achieve the performance requirements of
+high-freshness applications while maintaining high cost efficiency,
+energy efficiency, and storage efficiency.
+12
+
+
+REFERENCES
+[1] 2009. Perf. Linux Foundation. https://en.wikipedia.org/wiki/Perf_(Linux).
+[2] 2012. Apache Kafka. https://kafka.apache.org/
+[3] 2013. RedNote. Xiaohongshu Inc. https://rednote.com/.
+[4] 2015. Storage Performance Development Kit (SPDK). https://github.com/spdk.
+[5] 2017.
+Faiss:
+A
+library
+for
+efficient
+similarity
+search.
+Facebook.
+https://engineering.fb.com/2017/03/29/data-infrastructure/faiss-a-library-for-
+efficient-similarity-search/.
+[6] 2018.
+Distances in Faiss Wiki. Facebook Research.
+https://github.com/
+facebookresearch/faiss/wiki/MetricType-and-distances.
+[7] 2020. SPACEV Dataset. Microsoft. https://github.com/microsoft/SPTAG/tree/
+main/datasets/SPACEV1B.
+[8] 2022. cub::RadixRankAlgorithm. NVIDIA Research. https://nvidia.github.io/
+cccl/cub/.
+[9] 2022. NVIDIA Magnum IO. NVIDIA Corporation. https://www.nvidia.com/en-
+us/data-center/magnum-io/.
+[10] 2024. Wikipedia Dataset. Wikimedia. https://huggingface.co/datasets/wikimedia/
+wikipedia.
+[11] 2025. NVIDIA RTX Pro 5000 Blackwell GPU.
+https://www.nvidia.com/en-
+us/products/workstations/professional-desktop-gpus/rtx-pro-5000/.
+[12] 2025. The 4th Generation AMD EPYC Processors. https://www.amd.com/en/
+products/processors/server/epyc/4th-generation-9004-and-8004-series.html.
+[13] 2026. cuVS KMeans GPU Implementation. NVIDIA Corporation. https://github.
+com/rapidsai/cuvs/blob/main/cpp/src/cluster/detail/kmeans.cuh.
+[14] 2026.
+Faiss GPU KMeans Implementation. Meta AI.
+https://github.com/
+facebookresearch/faiss/blob/main/faiss/gpu/perf/PerfClustering.cpp.
+[15] 2026. Storage Costs. https://www.dramexchange.com/.
+[16] Ilias Azizi, Karima Echihabi, and Themis Palpanas. 2023. ELPIS: Graph-Based
+Similarity Search for Scalable Data Science. Proc. VLDB Endow. (2023). https:
+//doi.org/10.14778/3583140.3583166
+[17] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li,
+Mao Yang, and Jingdong Wang. 2021. SPANN: Highly-efficient Billion-scale
+Approximate Nearest Neighborhood Search. Advances in Neural Information
+Processing Systems (2021).
+https://proceedings.neurips.cc/paper/2021/hash/
+299dc35e747eb77177d9cea10a802da2-Abstract.html
+[18] Siying Dong, Andrew Kryczka, Yanqin Jin, and Michael Stumm. 2021. Evolution
+of Development Priorities in Key-value Stores Serving Large-scale Applications:
+The RocksDB Experience. In Proceedings of the 19th USENIX Conference on File
+and Storage Technologies (FAST ’21). USENIX Association, USA. https://www.
+usenix.org/conference/fast21/presentation/dong
+[19] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast approximate
+nearest neighbor search with the navigating spreading-out graph. Proc. VLDB
+Endow. (2019). https://doi.org/10.14778/3303753.3303754
+[20] Jianyang Gao and Cheng Long. 2023. High-Dimensional Approximate Nearest
+Neighbor Search: with Reliable and Efficient Distance Comparison Operations. In
+Proceedings of the 2023 International Conference on Management of Data (SIGMOD
+’23). Association for Computing Machinery, New York, NY, USA. https://doi.
+org/10.1145/3589282
+[21] Jianyang Gao and Cheng Long. 2024. RaBitQ: Quantizing High-Dimensional
+Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor
+Search. In Proceedings of the 2024 ACM SIGMOD International Conference on
+Management of Data (SIGMOD ’24). Association for Computing Machinery, New
+York, NY, USA. https://doi.org/10.1145/3654970
+[22] Dipam Goswami, Liying Wang, Bartłomiej Twardowski, and Joost van de Weijer.
+2025. Query Drift Compensation: Enabling Compatibility in Continual Learning
+of Retrieval Embedding Models. CoRR (2025). https://arxiv.org/abs/2506.00037
+[23] Hao Guo and Youyou Lu. 2025. Achieving Low-Latency Graph-Based Vector
+Search via Aligning Best-First Search Algorithm with SSD. In Proceedings of the
+19th USENIX Symposium on Operating Systems Design and Implementation (OSDI
+’25). USENIX Association, USA.
+https://www.usenix.org/conference/osdi25/
+presentation/guo
+[24] Hao Guo and Youyou Lu. 2026. OdinANN: Direct Insert for Consistently Stable
+Performance in Billion-Scale Graph-Based Vector Search. In Proceedings of the
+24th USENIX Conference on File and Storage Technologies (FAST ’26). USENIX
+Association, USA. https://www.usenix.org/conference/fast26/presentation/guo
+[25] Rentong Guo, Xiaofan Luan, Long Xiang, Xiao Yan, Xiaomeng Yi, Jigao Luo,
+Qianya Cheng, Weizhi Xu, Jiarui Luo, Frank Liu, Zhenshan Cao, Yanliang Qiao,
+Ting Wang, Bo Tang, and Charles Xie. 2022. Manu: a cloud native vector database
+management system. Proc. VLDB Endow. (2022). https://doi.org/10.14778/3554821.
+3554843
+[26] Gabriel Haas and Viktor Leis. 2023. What Modern NVMe Storage Can Do, and
+How to Exploit it: High-Performance I/O for High-Performance Storage Engines.
+Proc. VLDB Endow. (2023). https://doi.org/10.14778/3598581.3598584
+[27] Guoyu Hu, Shaofeng Cai, Tien Tuan Anh Dinh, Zhongle Xie, Cong Yue, Gang
+Chen, and Beng Chin Ooi. 2025. HAKES: Scalable Vector Database for Embedding
+Search Service. Proc. VLDB Endow. (2025).
+https://doi.org/10.14778/3746405.
+3746427
+[28] Yuchen Huang, Xiaopeng Fan, Song Yan, and Chuliang Weng. 2024. Neos:
+A NVMe-GPUs Direct Vector Service Buffer in User Space. In 2024 IEEE 40th
+International Conference on Data Engineering (ICDE ’24). IEEE, USA.
+https:
+//doi.org/10.1109/ICDE60146.2024.00289
+[29] Yuchen Huang, Baiteng Ma, Yiping Sun, Yang Shi, Xiao Chen, Xiaocheng Zhong,
+Zhiyong Wang, Yao Hu, Erci Xu, and Chuliang Weng. 2026. The Clustering
+Strikes Back: Building Cost-Effective and High-Performance ANNS at Scale
+with Helmsman. In Proceedings of the 20th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI ’26). USENIX Association, USA. https:
+//www.usenix.org/conference/osdi26/presentation/huang-yuchen
+[30] Yuchen Huang, Baiteng Ma, Erci Xu, and Chuliang Weng. 2026. Don’t Surrender
+to Low QPS/$: Fast and Cost-Efficient ANNS with TridentANN. In 2026 ACM/IEEE
+53rd International Symposium on Computer Architecture (ISCA ’26). IEEE, USA.
+https://doi.ieeecomputersociety.org/10.1109/ISCA66397.2026.00033
+[31] Junhyeok Jang, Hanjin Choi, Hanyeoreum Bae, Seungjun Lee, Miryeong Kwon,
+and Myoungsoo Jung. 2023. CXL-ANNS: Software-Hardware Collaborative
+Memory Disaggregation and Computation for Billion-Scale Approximate Nearest
+Neighbor Search. In Proceedings of the 2023 USENIX Annual Technical Conference
+(ATC ’23). USENIX Association, USA. https://www.usenix.org/conference/atc23/
+presentation/jang
+[32] Haodi Jiang, Hao Guo, Minhui Xie, Jiwu Shu, and Youyou Lu. 2026. High-
+Throughput, Cost-Effective Billion-Scale Vector Search with a Single GPU. In
+Proceedings of the 2026 ACM SIGMOD International Conference on Management of
+Data (SIGMOD ’26). Association for Computing Machinery, New York, NY, USA.
+https://doi.org/10.1145/3769799
+[33] Wenqi Jiang, Hang Hu, Torsten Hoefler, and Gustavo Alonso. 2025. Fast Graph
+Vector Search via Hardware Acceleration and Delayed-Synchronization Traversal.
+Proc. VLDB Endow. (2025). https://doi.org/10.14778/3749646.3749655
+[34] Wenqi Jiang, Shigang Li, Yu Zhu, Johannes De Fine Licht, Zhenhao He, Runbin
+Shi, Cedric Renggli, Shuai Zhang, Theodoros Rekatsinas, Torsten Hoefler, and
+Gustavo Alonso. 2023. Co-design Hardware and Algorithm for Vector Search.
+In Proceedings of the International Conference for High Performance Computing,
+Networking, Storage and Analysis (SC ’23). Association for Computing Machinery,
+New York, NY, USA. https://doi.org/10.1145/3581784.3607045
+[35] Wenqi Jiang, Suvinay Subramanian, Cat Graves, Gustavo Alonso, Amir Yazdan-
+bakhsh, and Vidushi Dadu. 2025. RAGO: Systematic Performance Optimization
+for Retrieval-Augmented Generation Serving. In Proceedings of the 52nd Annual
+International Symposium on Computer Architecture (ISCA ’25). Association for
+Computing Machinery, New York, NY, USA. https://doi.org/10.1145/3695053.
+3731093
+[36] Wenqi Jiang, Marco Zeller, Roger Waleffe, Torsten Hoefler, and Gustavo Alonso.
+2024. Chameleon: A Heterogeneous and Disaggregated Accelerator System
+for Retrieval-Augmented Language Models. Proc. VLDB Endow. (2024). https:
+//doi.org/10.14778/3696435.3696439
+[37] Maximilian Kuschewski, Jana Giceva, Thomas Neumann, and Viktor Leis. 2025.
+High-Performance Query Processing with NVMe Arrays: Spilling without Killing
+Performance. In Proceedings of the 2025 International Conference on Management
+of Data (SIGMOD ’25). Association for Computing Machinery, New York, NY,
+USA. https://doi.org/10.1145/3698813
+[38] Hyunsung Lee, Sungwook Yoo, Dongjun Lee, and Jaekwang Kim. 2023. How
+Important is Periodic Model update in Recommender System?. In Proceedings
+of the 46th International ACM SIGIR Conference on Research and Development in
+Information Retrieval (SIGIR ’23). Association for Computing Machinery, New
+York, NY, USA. https://doi.org/10.1145/3539618.3591934
+[39] Jie Li, Haifeng Liu, Chuanghua Gui, Jianyu Chen, Zhenyuan Ni, Ning Wang, and
+Yuan Chen. 2018. The Design and Implementation of a Real Time Visual Search
+System on JD E-commerce Platform. In Proceedings of the 19th International
+Middleware Conference Industry (Middleware ’18). Association for Computing
+Machinery, New York, NY, USA. https://doi.org/10.1145/3284028.3284030
+[40] Shaobo Li, Yirui Eric Zhou, Yuqi Xue, Yuan Xu, and Jian Huang. 2025. Managing
+Scalable Direct Storage Accesses for GPUs with GoFS. In Proceedings of the 31st
+Symposium on Operating Systems Principles (SOSP ’25). Association for Computing
+Machinery, New York, NY, USA. https://doi.org/10.1145/3731569.3764857
+[41] Zhonggen Li, Xiangyu Ke, Yifan Zhu, Bocheng Yu, Baihua Zheng, and Yunjun Gao.
+2025. Scalable Graph Indexing using GPUs for Approximate Nearest Neighbor
+Search. In Proceedings of the 2025 International Conference on Management of
+Data (SIGMOD ’26). Association for Computing Machinery, New York, NY, USA.
+https://doi.org/10.1145/3769825
+[42] Zhuoran Liu, Leqi Zou, Xuan Zou, Caihua Wang, Biao Zhang, Da Tang, Bolin
+Zhu, Yijie Zhu, Peng Wu, Ke Wang, and Youlong Cheng. 2022. Monolith: Real
+Time Recommendation System with Collisionless Embedding Table. ArXiv (2022).
+https://arxiv.org/abs/2209.07663
+[43] Stuart P. Lloyd. 1982. Least squares quantization in PCM. IEEE Transactions on
+Information Theory (1982). https://doi.org/10.1109/TIT.1982.1056489
+[44] David G. Lowe. 2004. Distinctive Image Features from Scale-Invariant Keypoints.
+In International Journal of Computer Vision. https://link.springer.com/article/10.
+1023/B:VISI.0000029664.99615.94
+13
+
+
+[45] James B. MacQueen. 1967. Some methods for classification and analysis of
+multivariate observations. https://api.semanticscholar.org/CorpusID:6278891
+[46] Yu A. Malkov and D. A. Yashunin. 2020. Efficient and Robust Approximate
+Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs.
+IEEE Transactions on Pattern Analysis and Machine Intelligence (2020).
+https:
+//doi.org/10.1109/TPAMI.2018.2889473
+[47] Jason Mohoney, Anil Pacaci, Shihabur Rahman Chowdhury, Umar Farooq Minhas,
+Jeffery Pound, Cedric Renggli, Nima Reyhani, Ihab F Ilyas, Theodoros Rekatsinas,
+and Shivaram Venkataraman. 2024. Incremental IVF Index Maintenance for
+Streaming Vector Search. ArXiv (2024). https://arxiv.org/abs/2411.00970
+[48] Jason Mohoney, Devesh Sarda, Mengze Tang, Shihabur Rahman Chowdhury,
+Anil Pacaci, Ihab F. Ilyas, Theodoros Rekatsinas, and Shivaram Venkataraman.
+2025. Quake: Adaptive Indexing for Vector Search. In Proceedings of the 19th
+USENIX Symposium on Operating Systems Design and Implementation (OSDI
+’25). USENIX Association, USA.
+https://www.usenix.org/conference/osdi25/
+presentation/mohoney
+[49] Aude Oliva and Antonio Torralba. 2001. Modeling the shape of the scene: a
+holistic representation of the spatial envelope.
+https://people.csail.mit.edu/
+torralba/code/spatialenvelope/.
+[50] Hiroyuki Ootomo, Akira Naruse, Corey Nolet, Ray Wang, Tamas Feher, and Yong
+Wang. 2024. CAGRA: Highly Parallel Graph Construction and Approximate
+Nearest Neighbor Search for GPUs. In 2024 IEEE 40th International Conference
+on Data Engineering (ICDE) (ICDE ’24). IEEE, USA.
+https://doi.org/10.1109/
+ICDE60146.2024.00323
+[51] James Jie Pan, Jianguo Wang, and Guoliang Li. 2024. Survey of vector database
+management systems. The VLDB Journal (2024). https://doi.org/10.1007/s00778-
+024-00864-x
+[52] Yuchen Peng, Dingyu Yang, Zhongle Xie, Ji Sun, Lidan Shou, Ke Chen, and Gang
+Chen. 2026. SVFusion: A CPU-GPU Co-Processing Architecture for Large-Scale
+Real-Time Vector Search. Proc. VLDB Endow. (2026). https://doi.org/10.14778/
+3796195.3796216
+[53] Shi Qiu, Weinan Liu, Yifan Hu, Jianqin Yan, Zhirong Shen, Xin Yao, Renhai Chen,
+Gong Zhang, and Yiming Zhang. 2025. GeminiFS: A Companion File System
+for GPUs. In Proceedings of the 23rd USENIX Conference on File and Storage
+Technologies (FAST ’25). USENIX Association, USA. https://www.usenix.org/
+conference/fast25/presentation/qiu
+[54] Harsha Vardhan Simhadri, George Williams, Martin Aumüller, Matthijs Douze,
+Artem Babenko, Dmitry Baranchuk, Qi Chen, Lucas Hosseini, Ravishankar Kr-
+ishnaswamy, Gopal Srinivasa, Suhas Jayaram Subramanya, and Jingdong Wang.
+2022. Results of the NeurIPS’21 Challenge on Billion-Scale Approximate Nearest
+Neighbor Search. In Proceedings of the NeurIPS 2021 Competitions and Demon-
+strations Track (NeurIPS). https://big-ann-benchmarks.com/neurips21.html
+[55] Aditi Singh, Suhas Jayaram Subramanya, Ravishankar Krishnaswamy, and Har-
+sha Vardhan Simhadri. 2021.
+FreshDiskANN: A Fast and Accurate Graph-
+Based ANN Index for Streaming Similarity Search.
+CoRR (2021).
+https:
+//arxiv.org/abs/2105.09613
+[56] Yongye Su, Yinqi Sun, Minjia Zhang, and Jianguo Wang. 2024.
+Vexless: A
+Serverless Vector Data Management System Using Cloud Functions. In Pro-
+ceedings of the 2024 ACM SIGMOD International Conference on Management of
+Data (SIGMOD ’24). Association for Computing Machinery, New York, NY, USA.
+https://doi.org/10.1145/3654990
+[57] Suhas Jayaram Subramanya, Devvrit, Rohan Kadekodi, Ravishankar Kr-
+ishaswamy, and Harsha Vardhan Simhadri. 2019. DiskANN: Fast Accurate
+Billion-point Nearest Neighbor Search on a Single Node. Advances in Neural
+Information Processing Systems (2019).
+https://www.microsoft.com/en-
+us/research/publication/diskann-fast-accurate-billion-point-nearest-
+neighbor-search-on-a-single-node/
+[58] Yiping Sun, Yang Shi, and Jiaolong Du. 2024. A Real-Time Adaptive Multi-
+Stream GPU System For Online Approximate Nearest Neighborhood Search.
+In Proceedings of the 33rd ACM International Conference on Information and
+Knowledge Management (CIKM ’24). Association for Computing Machinery, New
+York, NY, USA. https://doi.org/10.1145/3627673.3680054
+[59] Bing Tian, Haikun Liu, Yuhang Tang, Shihai Xiao, Zhuohui Duan, Xiaofei Liao,
+Hai Jin, Xuecang Zhang, Junhua Zhu, and Yu Zhang. 2025. Towards High-
+throughput and Low-latency Billion-scale Vector Search via CPU/GPU Col-
+laborative Filtering and Re-ranking. In Proceedings of the 23rd USENIX Con-
+ference on File and Storage Technologies (FAST ’25). USENIX Association, USA.
+https://www.usenix.org/conference/fast25/presentation/tian-bing
+[60] Godfried T. Toussaint. 1980. The relative neighbourhood graph of a finite planar
+set. In Pattern Recognition. https://doi.org/10.1016/0031-3203(80)90066-7
+[61] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li, Xi-
+angyu Wang, Xiangzhou Guo, Chengming Li, Xiaohai Xu, Kun Yu, Yuxing Yuan,
+Yinghao Zou, Jiquan Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang, Yihua Mo,
+Jun Gu, Ruiyi Jiang, Yi Wei, and Charles Xie. 2021. Milvus: A Purpose-Built Vec-
+tor Data Management System. In Proceedings of the 2021 International Conference
+on Management of Data (SIGMOD ’21). Association for Computing Machinery,
+New York, NY, USA. https://doi.org/10.1145/3448016.3457550
+[62] Mengzhao Wang, Weizhi Xu, Xiaomeng Yi, Songlin Wu, Zhangyang Peng, Xi-
+angyu Ke, Yunjun Gao, Xiaoliang Xu, Rentong Guo, and Charles Xie. 2024.
+Starling: An I/O-Efficient Disk-Resident Graph Index Framework for High-
+Dimensional Vector Similarity Search on Data Segment. In Proceedings of the
+2024 ACM SIGMOD International Conference on Management of Data (SIG-
+MOD ’24). Association for Computing Machinery, New York, NY, USA. https:
+//doi.org/10.1145/3639269
+[63] Yang Xiao, Mo Sun, Ziyu Song, Bing Tian, Jie Sun, Jie Zhang, Zeke Wang, Zonghui
+Wang, Wenzhi Chen, and Fei Wu. 2026. FlashANNS: GPU-Driven Asynchronous
+I/O Pipelining for Eliminating Storage-Compute Bottlenecks in Billion-Scale Sim-
+ilarity Search. In Proceedings of the 2026 ACM SIGMOD International Conference
+on Management of Data (SIGMOD ’26). Association for Computing Machinery,
+New York, NY, USA. https://doi.org/10.1145/3786652
+[64] Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li,
+Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, and Mao Yang. 2023. SPFresh:
+Incremental In-Place Update for Billion-Scale Vector Search. In Proceedings of
+the 29th Symposium on Operating Systems Principles (SOSP ’23). Association for
+Computing Machinery, New York, NY, USA. https://doi.org/10.1145/3600006.
+3613166
+[65] Zehai Yang and Shimin Chen. 2026. RAIRS: Optimizing Redundant Assignment
+and List Layout for IVF-Based ANN Search. In Proceedings of the 2026 ACM SIG-
+MOD International Conference on Management of Data (SIGMOD ’26). Association
+for Computing Machinery, New York, NY, USA. https://doi.org/10.1145/3786687
+[66] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-
+Gon Chun. 2022. Orca: A Distributed Serving System for Transformer-Based
+Generative Models. In Proceedings of the 16th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI ’22). USENIX Association, USA. https:
+//www.usenix.org/conference/osdi22/presentation/yu
+[67] Song Yu, Shengyuan Lin, Shufeng Gong, Yongqing Xie, Ruicheng Liu, Yijie
+Zhou, Ji Sun, Yanfeng Zhang, Guoliang Li, and Ge Yu. 2025. A Topology-Aware
+Localized Update Strategy for Graph-Based ANN Index. Proc. VLDB Endow.
+(2025). https://doi.org/10.14778/3778092.3778108
+[68] Ziqi Yuan, Haoyang Zhang, Yirui Zhou, Apoorve Mohan, I-Hsin Chung,
+Seetharami Seelam, and Jian Huang. 2025. Cost-Efficient LLM Training with
+Lifetime-Aware Tensor Offloading via GPUDirect Storage. In Advances in Neural
+Information Processing Systems (NeurIPS ’25). Curran Associates, Inc.
+https:
+//neurips.cc/virtual/2025/loc/san-diego/poster/118717
+[69] Han Zhang, Hongwei Shen, Yiming Qiu, Yunjiang Jiang, Songlin Wang, Sulong
+Xu, Yun Xiao, Bo Long, and Wen-Yun Yang. 2021. Joint Learning of Deep Retrieval
+Model and Product Quantization based Embedding Index. In Proceedings of
+the 44th International ACM SIGIR Conference on Research and Development in
+Information Retrieval (SIGIR ’21). Association for Computing Machinery, New
+York, NY, USA. https://doi.org/10.1145/3404835.3462988
+[70] Jingrong Zhang, Akira Naruse, Xipeng Li, and Yong Wang. 2023. Parallel Top-K
+Algorithms on GPU: A Comprehensive Study and New Methods. In Proceedings
+of the International Conference for High Performance Computing, Networking,
+Storage and Analysis (SC ’23). Association for Computing Machinery, New York,
+NY, USA. https://doi.org/10.1145/3581784.3607062
+[71] Haoru Zhao, Jingkai He, Jingyao Zeng, Mingkai Dong, and Dong Du. 2026.
+Disentangling Graph Dependencies for Efficient Billion-Scale GPU Vector Search
+with FlowANN. In Proceedings of the 20th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI ’26). USENIX Association, USA. https:
+//www.usenix.org/conference/osdi26/presentation/zhao
+14

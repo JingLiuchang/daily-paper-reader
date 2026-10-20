@@ -1,0 +1,1530 @@
+RETRIEVING
+COMPLEMENTARY
+EVIDENCE
+FOR
+MULTI-HOP RAG WITH SEMANTIC GAIN GRAPHS
+Zeliang Li1, Xiaofen Xing1, Kailing Guo1, and Xiangmin Xu1,2
+1South China University of Technology
+2Foshan University
+ABSTRACT
+Multi-hop retrieval-augmented generation (RAG) requires finding documents
+whose evidence is useful in combination. Query relevance and graph connectivity
+help locate related content, but neither directly measures the additional informa-
+tion one document contributes given another. We introduce SG2RAG, a frame-
+work that represents this complementarity through semantic gain. Offline, a large
+language model assesses the relevant and nonredundant information contributed
+by one chunk given another within neighborhoods proposed by semantic simi-
+larity. These ordered assessments are aggregated into symmetric edge weights
+to construct a reusable Semantic Gain Graph. Online, controlled Personalized
+PageRank starts from query-relevant seeds and ranks complementary evidence
+beyond the initial retrieval set. Experiments on MuSiQue, 2Wiki, and HotpotQA
+with two language model backbones show that SG2RAG achieves the best aver-
+age EM, F1, and Recall@10 among the evaluated single-retrieval methods. Under
+identical candidate support and propagation, semantic gain improves average F1
+and Recall@10 over similarity weighting by 4.08 and 4.31 points. Analyses of
+supporting documents and improvements in three iterative retrieval frameworks
+further support its effectiveness as a reusable retrieval component.
+1
+INTRODUCTION
+Retrieval-Augmented Generation (RAG) (Lewis et al., 2020) has become an important paradigm for
+mitigating hallucinations in Large Language Models (LLMs) and supporting knowledge-intensive
+applications (Song & Lee, 2026; Chu et al., 2026). By incorporating external evidence, RAG im-
+proves the groundedness and reliability of LLM outputs, making knowledge organization and re-
+trieval effectiveness critical to its reasoning capability (Li et al., 2025). Early studies improve re-
+trieval by preserving the semantic coherence of text snippets through heuristic chunking (Hostnik &
+Robnik-ˇSikonja, 2025; Zhao et al., 2025) and summarization (Ji et al., 2024; Hosking et al., 2024).
+However, these methods remain overly reliant on semantic similarity. In multi-hop reasoning (Wei
+et al., 2025), key evidence is distributed across documents, and a document with weak query similar-
+ity may become critical once another document is known. Because similarity-based retrievers score
+each document primarily against the query, they do not directly represent how documents complete
+one another. Iterative methods expand the context through multi-round retrieval-generation interac-
+tions (Shao et al., 2023; Yue et al., 2025), but introduce substantial inference overhead while leaving
+cross-document complementarity implicit.
+To better organize complex evidence structures, recent studies have introduced graph-based retrieval
+into RAG (Wang et al., 2026), moving from similarity-based retrieval toward topology-based evi-
+dence expansion. LightRAG (Guo et al., 2024), for example, constructs LLM-assisted entity-relation
+graphs and retrieves contexts through entity linking and graph traversal. This topology extends re-
+trieval beyond direct query matches, but connectivity does not reveal which neighboring documents
+contribute useful evidence. Methods such as HippoRAG2 (Jimenez Gutierrez et al., 2024; Guti´errez
+et al., 2025) incorporate query-document relevance to constrain the traversal scope, yet still rely on
+entity-level relations organized by LLMs rather than explicitly assessing cross-document comple-
+mentarity. As Figure 1 illustrates, traversal from the query-relevant “Mugain” document can follow
+entity co-occurrence links to “Deep Blue Sea” and “Doria Ragland”, which do not support the tar-
+1
+arXiv:2610.15285v1  [cs.IR]  11 Oct 2026
+
+
+Who is Mugain's mother-in-law?
+Steven 
+Spielberg
+Priscilla 
+Pointer
+Prince Harry
+Mugain
+shark 
+film
+Harry 
+Wainwright
+Eochaid 
+Feidlech
+Connad 
+Cerr
+Deep Blue Sea 
+(1999 film) ....
+Priscilla Marie Pointer( born 
+May 18, 1924) ....
+Doria L. Ragland( born 
+September 2, 1956) is ...
+Mugain, daughter 
+of Eochaid  ...
+Harry ... ( born 
+1899 date of death 
+unknown) ....
+Mugain, daughter 
+of  ... queen in the 
+Ulster
+Conchobar 
+mac 
+Nessa is the king of 
+Ulster 
+... 
+his 
+mother is Ness
+Tjuyu ... was an Egyptian 
+noblewoman 
+and 
+the 
+mother of queen ...
+Neferneferuaten 
+Nefertiti ... was an 
+Egyptian queen ...
+Doria L. Ragland ... the 
+mother-in law of Prince 
+Harry...
+gain: 0.8
+gain: 0.6
+Doria L. Ragland is  ... 
+mother-in-law of ...
+Mugain, daughter, ... 
+queen in the Ulster 
+Minamoto ... was the 
+mother 
+of 
+Prince 
+Morinaga.
+Maria Thins was the 
+mother-in-law of Joh... 
+Tjuyu ... was an Egyptian 
+noblewoman 
+and 
+the 
+mother of queen ...
+Query
+Index Document
+Entity Nodes
+focusing on 
+keywords
+Doria 
+Ragland
+mother-in-
+law
+daughter 
+of
+mother-in-
+law
+Conventional 
+Graph RAG
+SG²RAG(Ours)
+Naive RAG
+Figure 1: Naive RAG retrieves query-similar texts but misses implicit complementary evidence.
+GraphRAG extends retrieval through topology, but connected documents such as “Deep Blue Sea”
+do not necessarily support the target relation. Starting from query-relevant seeds, SG2RAG follows
+gain-weighted connections to recover complementary evidence showing that the “King of Ulster’s
+mother” is “Mugain’s mother-in-law.”
+get family relation, while evidence needed to complete the reasoning chain may not be favored by
+topology or document-level relevance. Existing retrievers therefore locate evidence through query
+relevance or expand it through graph connectivity, but neither makes cross-document complemen-
+tarity a first-class retrieval relation.
+To address this gap, we propose SG2RAG, a Semantic Gain Graph based Retrieval-Augmented
+Generation framework. SG2RAG makes cross-document complementarity a first-class retrieval re-
+lation, moving evidence discovery beyond independent query-document matching and topology-
+only expansion. It represents document chunks as nodes and estimates the relevant, novel, and
+significant evidence that one chunk contributes when another is available. These ordered assess-
+ments are aggregated into pair-level strengths that form a reusable Semantic Gain Graph. Similarity
+provides efficient candidate support and query entry points, while semantic gain defines the graph
+relation and routing preference. During retrieval, controlled Personalized PageRank (PPR) (Page
+et al., 1999) composes local gain-weighted connections into a multi-hop evidence ranking anchored
+to the query. Our contributions are threefold. (1) We formulate multi-hop evidence discovery around
+document-level conditional evidence contribution as an explicit retrieval objective rather than inde-
+pendent query relevance or topology alone. (2) We introduce the Semantic Gain Graph as a reusable
+complementarity index whose pair strengths are derived from ordered evidence-contribution assess-
+ments, and develop query-anchored controlled PPR to compose these relations into globally coordi-
+nated multi-hop evidence rankings. (3) Extensive experiments across two LLM backbones show that
+SG2RAG achieves the best average performance, isolate semantic-gain weighting under fixed graph
+support and propagation, validate the score with gold supporting-document pairs, and demonstrate
+modularity in iterative retrieval frameworks.
+2
+RELATED WORK
+2.1
+RETRIEVAL-AUGMENTED GENERATION
+RAG grounds LLM generation in external knowledge, improving factuality and reducing halluci-
+nations in knowledge-intensive tasks (Lewis et al., 2020; Vidyarthi et al., 2026; Jiang et al., 2025).
+Retrieval advances refine knowledge units through fine-grained segmentation, as in MetaChunking
+(Zhao et al., 2024) and SAKIRAG (Tao et al., 2025), and semantic chunking (Moreno-Cediel et al.,
+2025), while dense embeddings efficiently match these units to queries (Lee et al., 2024; Zhang et al.,
+2025). Although effective for locally self-contained evidence, this flat, similarity-driven pipeline
+struggles with multi-hop reasoning, where supporting evidence is distributed across implicitly re-
+lated chunks and may have low query similarity (Wei et al., 2025). Iterative methods, including
+iterDRAG (Yue et al., 2025), RT-RAG (Shi et al., 2026), and iterRetGen (Shao et al., 2023), address
+this limitation through query rewriting, question decomposition, and repeated retrieval-generation
+interactions. However, they incur online inference costs while leaving complementary relations
+among knowledge units implicit in the flat corpus index.
+2
+
+
+Embedding 
+Model
+Embedding Vector E
+Baseline vi 
+Semantic Gain Prediction 
+Redundant
+Significant
+Novel
+Semantic Gain Estimator 
+0.1
+0.6
+0.9
+0.1
+0.6
+0.9
+Semantic Gain Graph 
+User Query: Who is Mugain's 
+mother-in-law?
+……
+0.8
+0.7
+0.6 0.5
+0.4
+0.3
+Nodes Similarity Vector S
+……
+1/h 1/h
+1/h
+0
+0
+0
+Controlled Personalization 
+Seed Nodes Pi
+[e1, e2, …, eN]
+Embedding 
+Model
+Embedq
+Controlled PPR Walk 
+……
+1
+1
+1
+0
+0.21
+0.34
+Generator 
+Mg 
+Answer: Ness
+[e1, e2, …, eN]
+Converged Vector R
+Candidate vj 
+Merge
+Novel
+Significant
+Minor
+Redundant
+Semantic Gain Quantification 
+0.1
+0.3
+0.6
+0.9
+1.0
+Control
+Document 
+(i) Semantic Gain Graph Construction
+(ii) Controlled PPR Search
+SG²RAG Pipeline
+Document 
+Semantic Gain 
+Graph Constuction
+Controlled 
+PPR Search
+Augmented 
+Generation
+Who is Mugain's 
+mother-in-law?
+(iii) Augmented 
+Generation
+Query
+Answer
+graph
+Knowledge
+(
+,
+)
+sg
+j
+i
+v
+v
+∣
+M
+R
+Embedq
+S 
+E
+Rank
+[d1, d2, …, dk]
+Index
+Obtain Neighbor Nodes 
+Filtering and Anchoring 
+Figure 2: Framework of SG2RAG. The offline stage estimates ordered evidence contribution and
+aggregates the assessments into pair-level strengths in a reusable Semantic Gain Graph. The online
+stage uses query-relevant seeds to anchor controlled PPR over these complementarity relations.
+2.2
+GRAPH-BASED RAG
+Graph-based RAG addresses the limitations of flat retrieval by organizing knowledge into structured
+indexes. RAPTOR (Sarthi et al., 2024) builds a hierarchical tree through recursive clustering and
+summarization. GraphRAG (Edge et al., 2024) and LightRAG (Guo et al., 2024) construct entity-
+relation graphs for entity linking and graph expansion. Building on such structures, KG2RAG (Zhu
+et al., 2025) expands semantically retrieved seeds under knowledge graph guidance and organizes
+the evidence into coherent paragraphs. Together, these methods capture associations beyond surface
+similarity. However, most graph-based retrievers remain governed by topology. Unconstrained
+expansion can introduce noisy nodes and retrieval drift. PathRAG (Chen et al., 2026) uses flow-
+based pruning to remove redundant information from retrieved relational paths. LinearRAG (Zhuang
+et al., 2025) and HippoRAG2 (Jimenez Gutierrez et al., 2024; Guti´errez et al., 2025) restrict traversal
+to improve topic relevance, but still assume that topological neighbors are useful without explicitly
+estimating document complementarity. GraphReader (Li et al., 2024) and GeAR (Shen et al., 2025)
+improve control through LLM agents that direct graph traversal, at the cost of additional online
+inference and tighter coupling to agentic reasoning. SG2RAG instead makes estimated evidence
+contribution part of a reusable document graph, rather than treating complementarity as an implicit
+consequence of topology or a query-time ranking signal.
+3
+PRELIMINARIES
+Given a corpus D = {di}N
+i=1, conventional Graph-RAG methods transform unstructured documents
+into a relation graph Grel = (Vrel, Erel) through information extraction (Edge et al., 2024; Guo
+et al., 2024; Guti´errez et al., 2025). The nodes represent knowledge units such as entities and
+phrases, while the edges encode extracted relations, shared mentions, or other associations. Given a
+query q, semantic matching identifies query-relevant seed nodes Vq ⊆Vrel, and graph propagation
+ranks additional nodes. Retrieval is therefore governed largely by topology induced from recurring
+mentions and extracted relations. In contrast, SG2RAG represents each document chunk di as a node
+vi and assigns an ordered assessment wij to the useful and nonredundant evidence contributed by dj
+when di is available. The ordered records are aggregated into a symmetric pair strength aij for graph
+traversal. Thus, assessment direction specifies how evidence contribution is measured, while pair
+strength determines how the graph is traversed. Query matching locates entry nodes, and controlled
+PPR (Page et al., 1999) ranks graph-reachable evidence over this reusable complementarity index.
+3
+
+
+4
+METHODOLOGY
+This section presents SG2RAG as a complementarity-indexed retrieval framework with offline Se-
+mantic Gain Graph construction and online query-anchored controlled PPR, as shown in Figure 2.
+4.1
+SEMANTIC GAIN GRAPH CONSTRUCTION
+Given a corpus, SG2RAG first segments documents into chunks and represents each chunk as a
+graph node v ∈V. Because user queries are unavailable during offline construction, SG2RAG pre-
+computes reusable query-independent complementarity relations, separating corpus-level evidence
+completion from query-specific seed selection. To avoid exhaustive comparison among all chunk
+pairs, we adopt a coarse-to-fine graph construction strategy. Let E ∈RN×d denote the embedding
+matrix of all N chunks. By evaluating the top-n candidates of each node jointly in a single LLM re-
+quest, graph construction requires only N LLM requests in total. For each node vi, we first retrieve
+its top-n nearest neighbors according to cosine similarity:
+N(vi) = Top-n (cos(ei, E)) ,
+(1)
+where N(vi) denotes the local semantic neighborhood of vi. Similarity sparsifies the pairs to be
+assessed, while semantic gain assigns their retrieval utility. Similarity therefore defines candidate
+support rather than final routing, allowing graph search to move beyond direct query similarity
+within that support.
+Inspired by conditional gain in set functions (Iyer et al., 2021) and novelty-aware selection (Car-
+bonell & Goldstein, 1998), we define semantic gain as an operational measure of conditional evi-
+dence contribution. For an ordered pair, it scores the relevant, novel, and significant information that
+vj adds when vi is available. Unlike query-conditioned reranking, this assessment defines a reusable
+document-to-document relation without reference to a query. An LLM-based scorer Msg interprets
+each baseline-candidate pair under a fixed rubric R and returns the bounded score record
+wij = Msg(vj | vi, R) ∈[0, 1].
+(2)
+Because the score is conditioned on one ordered baseline-candidate pair, it is local rather than
+marginal gain conditioned on the complete retrieved set. Thus, wij and wji are evaluated sepa-
+rately and need not be equal. Assessment direction and traversal direction serve different roles.
+Each observed score is retained as an ordered record, and the default method defines the symmet-
+ric pair strength aij = aji = P
+e∈Eij we, where Eij contains all available records for the pair. A
+missing reverse record can result from nonreciprocal Top-n proposal rather than zero contribution
+in the reverse order. Interpreting records as directed arcs would therefore turn proposal sparsity
+into a one-way reachability constraint. Pair Sum avoids this constraint while retaining all observed
+assessments. After degree normalization, a pair with greater aggregated gain receives a larger rela-
+tive transition probability. The rubric R defines four intervals, namely Redundant, Minor, Signifi-
+cant, and Novel. Evaluating all local neighborhoods yields the undirected semantic gain multigraph
+Gsg = (V, Esg). Section 5.6 provides further analysis.
+4.2
+CONTROLLED PPR SEARCH
+Given the Semantic Gain Graph Gsg, the online stage uses query relevance to locate entry points
+rather than to determine the final ranking directly. SG2RAG matches the query with chunk nodes
+and uses the most relevant chunks to construct a personalization vector. Controlled PPR then remains
+anchored to this query-relevant region while expanding through semantic-gain connections.
+For a query q, we compute its relevance scores to all chunk nodes as S = Embedq·E. Standard PPR
+uses the all-node vector (P all
+q )i = S+
+i / P
+l S+
+l , where S+
+i = max(Si, 0), with a uniform fallback
+if the denominator is zero. Controlled PPR retains the Top-h query-similar chunks as the seed set
+and uses (P ctrl
+q
+)i = I(vi ∈Vq)/|Vq|. An optional LLM-based Filter can refine these candidates
+before propagation, giving Vq = FilterM(Top-h(S)). Without the filter, Vq = Top-h(S). If the
+filter returns an empty set, we fall back to the unfiltered Top-h set. Each retained seed receives mass
+1/|Vq|, while all other nodes receive zero. We use P ctrl
+q
+as both the initial distribution and the restart
+vector
+r(0) = P ctrl
+q
+,
+r(t+1) = αT · r(t) + (1 −α) · P ctrl
+q
+,
+(3)
+4
+
+
+where T is the column-stochastic transition matrix derived from the symmetric pair strengths
+described above.
+Let NG(vi) denote the neighbors of vi in the Semantic Gain Graph and let
+di = P
+vl∈NG(vi) ail be its weighted degree. For di > 0, Tji = aij/di, so column i represents
+propagation from vi to its graph neighbors. If di = 0, we set Tii = 1 and all other entries in col-
+umn i to zero, treating vi as a self-loop. The ordered assessments determine pair strength, while the
+symmetric adjacency determines reachability. Weighted-degree normalization then converts each
+aij into a relative routing preference, assigning less transition probability to weakly complementary
+connections when stronger alternatives are available. Query anchoring and propagation depth are
+controlled separately by P ctrl
+q
+and the restart probability 1 −α. Following the value recommended
+in prior work (Guti´errez et al., 2025), we set α = 0.5 by default. Here, r(t) is the ranking vector at
+iteration t. The iteration stops when ∥r(t+1) −r(t)∥1 < ϵ. After convergence, the stationary ranking
+has the path expansion
+R = (1 −α)(I −αT )−1P ctrl
+q
+= (1 −α)
+∞
+X
+ℓ=0
+αℓT ℓP ctrl
+q
+,
+(4)
+where I is the identity matrix. The transition matrix T encodes query-independent relative pair-
+wise complementarity, while P ctrl
+q
+supplies query relevance through uniform mass on the selected
+seeds. Each term T ℓP ctrl
+q
+aggregates length-ℓpaths through normalized semantic-gain connections,
+while αℓdiscounts longer paths. Thus, R composes local complementarity relations into a query-
+anchored multi-hop ranking. It is not a reranking of the Top-h seed set because it assigns scores to
+graph-reachable chunks beyond the initial query-based retrieval, subject to the fixed graph support.
+This path aggregation does not compute set-conditioned marginal gain over the complete retrieved
+context. We then select the top-k nodes as retrieved evidence, denoted by D = Index (Top-k(R)).
+The retrieved chunks are concatenated with the query and fed into the generator LLM Mg to pro-
+duce the final answer A = Mg(D, q).
+5
+EXPERIMENTS
+5.1
+DATASETS
+We evaluate our method on the curated MuSiQue (Trivedi et al., 2022), HotpotQA (Yang et al.,
+2018), and 2WikiMultiHopQA (2Wiki) (Ho et al., 2020) datasets provided by HippoRAG2
+(Guti´errez et al., 2025). Each dataset contains 1000 queries together with supporting documents,
+distractors, and ground-truth answers for retrieval and QA evaluation. The document collections
+contain 11656 documents for MuSiQue, 9811 for HotpotQA, and 6119 for 2Wiki. MuSiQue is
+considered more challenging, while HotpotQA is relatively easier.
+5.2
+BASELINES
+We compare SG2RAG with four groups of representative baselines.
+First, we evaluate pure
+LLMs without retrieval, including Qwen2.5-72B-Instruct (abbreviated as Qwen-72B) (Yang et al.,
+2024) and Llama-3.3-70B-Instruct (abbreviated as Llama-70B) (Grattafiori et al., 2024). Sec-
+ond, we consider standard dense-retrieval RAG methods using BGE-M3 (Chen et al., 2024),
+text-embedding-v31, and Qwen3-Embedding-8B (abbreviated as Qwen3-Emb) (Zhang et al.,
+2025). We additionally construct a strong Qwen3-Emb w/ Reranker baseline to test whether
+query-conditioned LLM reranking can account for the gains of SG2RAG. Third, we compare with
+structure-augmented retrieval methods, including LightRAG (Guo et al., 2024), PathRAG (Chen
+et al., 2026), KG2RAG (Zhu et al., 2025), HippoRAG2 (Guti´errez et al., 2025), and RAPTOR
+(Sarthi et al., 2024). HippoRAG2 uses Filter by default, and KG2RAG also enables its filtering
+module, implemented as a reranker. Finally, to evaluate the modularity of SG2RAG, we compare it
+with representative iterative retrieval methods, including GeAR (Shen et al., 2025), iterDRAG (Yue
+et al., 2025), iterRetGen (Shao et al., 2023), and RT-RAG (Shi et al., 2026).
+1A closed-source embedding model sourced from https://bailian.console.aliyun.com/
+5
+
+
+Table 1: Performance of retrieval methods under Qwen-72B and Llama-70B backbone settings
+across three multi-hop datasets. The bold values indicate the best performance among the main
+methods, and underlined values indicate the second-best performance. Arrows on SG2RAG indicate
+whether applying Filter improves performance over its unfiltered variant.
+Methods
+Musique
+2Wiki
+HotpotQA
+Average
+EM
+F1
+Recall
+EM
+F1
+Recall
+EM
+F1
+Recall
+EM
+F1
+Recall
+Qwen-72B as LLM Backbone
+No Retrieval
+5.10
+13.57
+-
+26.50
+30.81
+-
+25.60
+34.64
+-
+19.07
+26.34
+-
+Dense retriever
+BGE-M3
+23.80
+34.11
+68.92
+44.20
+50.77
+75.23
+52.90
+66.19
+93.85
+40.30
+50.36
+79.33
+text-embedding-v3
+25.50
+36.30
+64.06
+42.90
+49.67
+85.48
+50.90
+64.15
+92.15
+39.77
+50.04
+80.56
+Qwen3-Emb
+27.20
+38.91
+69.76
+45.10
+51.63
+84.95
+53.90
+67.08
+93.85
+42.07
+52.54
+82.85
+Qwen3-Emb w/ Reranker
+28.20
+39.95
+70.79
+48.00
+54.31
+77.68
+57.00
+69.87
+95.25
+44.40
+54.71
+81.24
+Structure-Augmented RAG
+LightRAG (EMNLP 2025)
+15.72
+25.03
+33.16
+38.69
+48.55
+75.03
+42.30
+57.41
+76.39
+32.24
+43.66
+61.53
+PathRAG (AAAI 2026)
+27.10
+35.98
+-
+46.00
+52.11
+-
+51.10
+64.02
+-
+41.40
+50.70
+-
+KG2RAG (NAACL 2025)
+27.20
+38.24
+62.63
+53.70
+61.91
+91.88
+56.70
+70.33
+95.64
+45.87
+56.83
+83.38
+RAPTOR (ICLR 2024)
+26.60
+38.64
+68.68
+46.70
+53.66
+74.42
+54.40
+67.40
+91.85
+42.57
+53.23
+78.32
+HippoRAG2 (ICML 2025)
+28.70
+40.72
+74.02
+51.10
+58.49
+87.20
+55.40
+68.75
+96.35
+45.07
+55.99
+85.86
+SG2RAG w/o Filter (Ours)
+30.00
+40.79
+70.57
+53.10
+61.47
+90.62
+56.30
+69.33
+95.20
+46.47
+57.20
+85.46
+SG2RAG (Ours)
+29.40↓
+41.38↑
+71.63↑
+55.00↑
+62.92↑
+90.55↓
+57.30↑
+70.56↑
+96.10↑
+47.23↑
+58.29↑
+86.09↑
+Llama-70B as LLM Backbone
+No Retrieval
+6.90
+16.67
+-
+29.20
+35.34
+-
+29.70
+40.63
+-
+21.93
+30.88
+-
+Dense retriever
+BGE-M3
+26.20
+38.56
+68.92
+45.00
+52.15
+75.23
+53.00
+66.21
+93.85
+41.40
+52.31
+79.33
+text-embedding-v3
+26.50
+39.58
+64.06
+55.20
+63.12
+85.48
+53.30
+67.52
+92.15
+45.00
+56.74
+80.56
+Qwen3-Emb
+27.03
+40.40
+69.76
+56.00
+64.53
+84.95
+54.90
+69.24
+93.85
+45.98
+58.06
+82.85
+Qwen3-Emb w/ Reranker
+29.60
+43.03
+71.74
+52.60
+60.37
+77.70
+57.00
+70.75
+95.20
+46.40
+58.05
+81.55
+Structure-Augmented RAG
+LightRAG (EMNLP 2025)
+14.46
+23.18
+28.48
+34.10
+40.37
+55.65
+33.03
+42.34
+37.50
+27.20
+35.30
+40.54
+PathRAG (AAAI 2026)
+25.10
+33.56
+-
+44.80
+50.48
+-
+55.30
+67.48
+-
+41.73
+50.51
+-
+RAPTOR (ICLR 2024)
+27.70
+41.35
+69.18
+46.70
+53.66
+74.45
+54.80
+69.21
+91.75
+43.07
+54.74
+78.46
+KG2RAG (NAACL 2025)
+27.40
+41.18
+63.78
+60.40
+68.37
+92.26
+56.40
+70.84
+94.85
+48.07
+60.13
+83.63
+HippoRAG2 (ICML 2025)
+29.60
+43.24
+73.69
+57.10
+65.18
+84.07
+56.40
+70.76
+96.40
+47.70
+59.73
+84.72
+SG2RAG w/o Filter (Ours)
+29.40
+43.28
+70.69
+60.80
+68.91
+90.95
+56.40
+71.44
+95.45
+48.87
+61.21
+85.70
+SG2RAG (Ours)
+32.10↑
+45.22↑
+72.18↑
+61.00↑
+69.08↑
+90.73↓
+57.70↑
+71.74↑
+96.10↑
+50.26↑
+62.01↑
+86.34↑
+5.3
+IMPLEMENTATION DETAILS
+We evaluate two unified LLM backbone settings using Qwen-72B and Llama-70B, with Qwen3-
+Emb as the shared embedding model. Within each setting, the same LLM is used for all applicable
+LLM-dependent stages, including graph construction, semantic-gain scoring, reranking or filtering,
+and answer generation. For the main comparison in Table 1, SG2RAG and HippoRAG2 use their
+LLM-based Filter to ensure a fair comparison under the same filtered-retrieval setting. KG2RAG
+retains its built-in reranker, which is required by its original pipeline. We also report the unfiltered
+SG2RAG variant to isolate the performance of semantic-gain-guided propagation. All subsequent
+ablation experiments disable Filter so that changes can be attributed to graph weighting and prop-
+agation rather than additional LLM filtering. All methods report Exact Match (EM), F1, and Re-
+call@10. EM and F1 measure final QA performance, while Recall@10 measures the coverage of
+annotated supporting documents.
+5.4
+MAIN RESULTS
+Single Retrieval and Generation. Table 1 reports results under the Qwen-72B and Llama-70B
+backbone settings. Among the dense retrievers, Qwen3-Emb provides the strongest overall per-
+formance. Adding the matched LLM reranker improves its average EM and F1 by 2.33 and 2.17
+points with Qwen-72B, while reducing Recall by 1.61 points. With Llama-70B, it yields only a
+0.42-point EM gain, leaves F1 essentially unchanged, and reduces Recall by 1.30 points. This pat-
+tern exposes a structural limitation of reranking. It can only reorder documents already returned by
+dense retrieval and cannot reach missing support, which is particularly restrictive when multi-hop
+evidence has weak direct similarity to the query. SG2RAG instead builds a reusable complemen-
+tarity index offline. Query similarity locates entry seeds, and controlled PPR follows semantic-gain
+connections to rank graph-reachable evidence beyond the initial dense list. Even without Filter,
+SG2RAG outperforms Qwen3-Emb with the matched reranker by 2.07, 2.49, and 4.22 points in
+average EM, F1, and Recall with Qwen-72B, with corresponding gains of 2.47, 3.16, and 4.15
+points under Llama-70B. Because no additional query-time filtering is used, this comparison dis-
+tinguishes complementarity-indexed graph retrieval from LLM reranking. KG2RAG and Hip-
+6
+
+
+Table 2: Iterative retrieval results with Qwen-72B. “w/ SG2RAG” replaces the per-iteration retriever
+while preserving the original framework.
+Methods
+Musique
+2Wiki
+HotpotQA
+Average
+EM
+F1
+EM
+F1
+EM
+F1
+EM
+F1
+GeAR (ACL 2025)
+35.70
+51.49
+49.40
+67.35
+49.90
+70.66
+45.00
+63.17
+iterDRAG (ICLR 2025)
+35.60
+47.85
+56.60
+71.40
+57.50
+72.03
+49.90
+63.76
+w/ SG2RAG
+37.20 (+1.60 ↑)
+51.33 (+3.48 ↑)
+64.70 (+8.10 ↑)
+73.11 (+1.71 ↑)
+61.60 (+4.10 ↑)
+74.66 (+2.63 ↑)
+54.50 (+4.60 ↑)
+66.37 (+2.61 ↑)
+iterRetgen (EMNLP 2023)
+30.80
+43.36
+48.70
+55.77
+55.40
+68.70
+44.97
+55.94
+w/ SG2RAG
+31.20 (+0.40 ↑)
+43.14 (−0.22 ↓)
+54.60 (+5.90 ↑)
+62.86 (+7.09 ↑)
+56.50 (+1.10 ↑)
+69.39 (+0.69 ↑)
+47.43 (+2.46 ↑)
+58.46 (+2.52 ↑)
+RT-RAG (WWW 2026)
+27.20
+40.77
+55.20
+69.43
+52.10
+59.09
+44.83
+56.43
+w/ SG2RAG
+31.00 (+3.80 ↑)
+44.70 (+3.93 ↑)
+57.30 (+2.10 ↑)
+70.96 (+1.53 ↑)
+56.20 (+4.10 ↑)
+64.23 (+5.14 ↑)
+48.17 (+3.34 ↑)
+59.96 (+3.53 ↑)
+Table 3: Ablation study results. GS denotes the use of a greedy strategy on the semantic gain graph.
+Methods
+Musique
+2Wiki
+HotpotQA
+Average
+EM
+F1
+Recall
+EM
+F1
+Recall
+EM
+F1
+Recall
+EM
+F1
+Recall
+Naive
+27.20
+38.91
+69.76
+45.10
+51.63
+84.95
+53.90
+67.08
+93.85
+42.07
+52.54
+82.85
+MMR
+18.50
+29.34
+52.64
+36.30
+41.85
+61.12
+44.90
+56.67
+69.10
+33.23
+42.62
+60.95
+Sim w/ Controlled PPR
+26.30
+38.34
+68.60
+47.40
+54.62
+82.33
+53.70
+66.40
+92.55
+42.47
+53.12
+81.15
+SG2 w/ GS
+27.20
+38.64
+68.50
+52.10
+59.98
+85.68
+55.30
+68.52
+93.85
+44.87
+55.71
+82.68
+SG2 w/ PPR
+28.10
+38.99
+70.22
+50.70
+58.68
+89.95
+53.70
+66.77
+94.85
+44.17
+54.81
+85.00
+SG2RAG
+30.00
+40.79
+70.57
+53.10
+61.47
+90.62
+56.30
+69.33
+95.20
+46.47
+57.20
+85.46
+poRAG2 also outperform reranked dense retrieval on the average metrics, showing the value of graph
+propagation over a flat candidate list. SG2RAG without Filter further surpasses both graph base-
+lines in average EM and F1 under both backbone settings while maintaining comparable or higher
+Recall. Together, these results show that SG2RAG builds a more effective retrieval graph by
+encoding document complementarity rather than connectivity alone, enabling controlled PPR
+to prioritize evidence chains not favored by query similarity or topology alone. With Filter,
+SG2RAG achieves the best average EM, F1, and Recall under both backbone settings, outperform-
+ing HippoRAG2 by 2.16, 2.30, and 0.23 points with Qwen-72B and by 2.56, 2.28, and 1.62 points
+with Llama-70B. It also obtains the highest F1 on all three datasets under both backbone settings,
+indicating that the improvement is consistent across the evaluated benchmarks.
+Iterative Retrieval and Generation. As shown in Table 2, SG2RAG can replace the single-retrieval
+component of an iterative framework while preserving its overall reasoning procedure. Because iter-
+ative frameworks compute Recall differently, we use EM and F1 under the same generation setting
+to indicate whether retrieval reaches answer-bearing documents. This replacement improves aver-
+age EM by 4.60, 2.46, and 3.34 points for iterDRAG, iterRetGen, and RT-RAG, respectively, with
+corresponding F1 gains of 2.61, 2.52, and 3.53 points. The SG2RAG-enhanced iterDRAG also out-
+performs GeAR by 9.50 points in average EM and 3.20 points in average F1. These consistent gains
+show that the quality of the underlying retriever remains crucial beyond query decomposition and
+multi-round interaction. Controlled propagation over the semantic gain graph retrieves evidence
+with higher complementary value, making SG2RAG a flexible plug-and-play retriever for itera-
+tive multi-hop reasoning.
+5.5
+ABLATION STUDY
+We conduct ablation studies to determine whether the gains arise from the complementarity-indexed
+graph, the propagation strategy, or query anchoring. All ablations use Qwen-72B without Filter, so
+SG2RAG in this subsection refers to the unfiltered configuration. Naive RAG is the same Qwen3-
+Emb dense baseline reported under Qwen-72B in Table 1, and its results are reproduced here. Table
+3 compares it with MMR (Carbonell & Goldstein, 1998), Sim w/ Controlled PPR, SG2 w/ GS, and
+SG2 w/ PPR. Sim w/ Controlled PPR and SG2RAG use identical Top-n candidate pairs and the same
+controlled PPR procedure. Their only difference is whether cosine similarity or semantic gain de-
+fines the edge weights. SG2 w/ GS replaces controlled PPR with a two-hop greedy strategy. SG2 w/
+PPR uses P all
+q , which distributes mass over all graph nodes according to normalized query similarity
+rather than restricting it uniformly to the Top-h seeds. The full unfiltered configuration achieves the
+best performance across all datasets and metrics. It outperforms MMR by 13.24 EM, 14.58 F1, and
+24.51 Recall points on average, showing that marginal-relevance selection does not effectively cap-
+ture cross-document complementarity. Compared with Sim w/ Controlled PPR, SG2RAG improves
+average EM, F1, and Recall by 4.03, 4.08, and 4.31 points. Because candidate support and propaga-
+7
+
+
+G-G
+(n=474)
+G-D
+(n=3358)
+D-D
+(n=10521)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Semantic Gain (pair score)
+0.44
+0.33
+0.26
+p = 8.0e-70
+p = 4.9e-23
+(a) MuSiQue: Gain by pair type
+G-G
+(n=764)
+G-D
+(n=2247)
+D-D
+(n=4464)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Semantic Gain (pair score)
+0.63
+0.37
+0.25
+p = 1.8e-247
+p = 9.4e-104
+(b) 2Wiki: Gain by pair type
+G-G
+(n=601)
+G-D
+(n=4747)
+D-D
+(n=8354)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Semantic Gain (pair score)
+0.52
+0.37
+0.33
+p = 4.9e-99
+p = 4.0e-59
+(c) HotpotQA: Gain by pair type
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+False positive rate (G-D)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+True positive rate (G-G)
+(d) MuSiQue: ROC
+Semantic Gain (AUC=0.638)
+Cosine (AUC=0.456)
+Gain ROC (95% CI)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+False positive rate (G-D)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+True positive rate (G-G)
+(e) 2Wiki: ROC
+Semantic Gain (AUC=0.759)
+Cosine (AUC=0.449)
+Gain ROC (95% CI)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+False positive rate (G-D)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+True positive rate (G-G)
+(f) HotpotQA: ROC
+Semantic Gain (AUC=0.701)
+Cosine (AUC=0.548)
+Gain ROC (95% CI)
+Figure 4: Cross-dataset validity of semantic gain. Panels (a)–(c) compare score distributions for
+Gold–Gold (G–G), Gold–Distractor (G–D), and Distractor–Distractor (D–D) pairs. Panels (d)–(f)
+compare semantic gain with cosine similarity in distinguishing G–G from G–D pairs.
+tion are held fixed, these gains isolate the value of encoding complementarity in the graph and
+cannot be explained by applying diffusion to a similarity graph alone. Compared with SG2 w/
+GS, the full unfiltered configuration improves average EM, F1, and Recall by 1.63, 1.49, and 2.78
+points, verifying that controlled PPR composes local gain relations more effectively than greedy
+expansion. Compared with SG2 w/ PPR, SG2RAG further improves average EM, F1, and Recall
+by 2.33, 2.39, and 0.46 points. This comparison shows that uniform restart mass on query-relevant
+Top-h seeds provides stronger topic anchoring than similarity-weighted mass over every node.
+5.6
+ROBUSTNESS TO PAIR-WEIGHT AGGREGATION
+EM
+F1
+R@10
+EM
+F1
+R@10
+EM
+F1
+R@10
+Metric
+DIRECTED
+SYMMETRIC
+REVERSED
+RANDOM SWAP
+MuSiQue
+2Wiki
+HotpotQA
+-2.20
+-1.64
+-0.88
+-1.60
+-1.99
+-1.20
+-1.80
+-1.35
+-0.95
++0.10
++0.22
+-0.23
+-0.20
++0.06
++0.03
+-0.60
+-0.38
++0.05
+-1.30
+-0.98
+-1.15
+-2.30
+-2.42
+-3.17
+-1.00
+-0.80
+-0.60
+-1.60
+-1.11
+-1.95
+-2.00
+-2.31
+-2.54
+-0.40
+-0.19
+-0.65
+-3
+-2
+-1
+0
+1
+2
+3
+Difference from
+DEFAULT
+(percentage points)
+Figure 3: Effects of alternative edge-weight treat-
+ments on SG2RAG. Values are percentage-point dif-
+ferences from the default pair-sum PPR reference.
+Figure 3 compares alternative treatments of
+the same candidate pairs using the Qwen-72B
+results of SG2RAG. The default Pair Sum
+aggregates the available ordered assessments
+into symmetric pair strengths. Pair Mean, la-
+beled Symmetric in the figure, averages those
+assessments instead and remains within 0.60
+points of Pair Sum across all metrics. This
+small difference shows that retrieval is robust
+to how multiple assessments on a pair are ag-
+gregated. Directed instead interprets each or-
+dered assessment as a directed transition arc.
+Reversed flips those arcs while preserving their weights, and Random Swap randomizes their as-
+signment. These directed treatments produce larger reductions because Top-n proposal membership
+is not necessarily reciprocal. A missing reverse record represents an unobserved assessment, but
+directed PPR turns it into a hard one-way reachability constraint. The pair-level variants retain
+the observed conditional assessments in the connection strength while allowing traversal from ei-
+ther endpoint. The results therefore support the distinction between ordered evidence-contribution
+assessment and symmetric graph traversal.
+5.7
+VALIDITY OF SEMANTIC GAIN
+We evaluate semantic gain across all three benchmarks using gold supporting annotations only for
+post-hoc analysis. A G–G record links two documents annotated as supporting evidence for the same
+query, while G–D and D–D records are defined by the endpoint annotations. This analysis uses the
+original ordered assessment wij before pair aggregation, so Pair Sum, Pair Mean, and directional
+transition treatments do not change the score analyzed here. Supporting-document membership
+provides an empirical proxy for useful cross-document complementarity and is never used during
+8
+
+
+graph construction. The upper panels of Figure 4 show the same G–G > G–D > D–D ordering
+across datasets. The respective mean scores are 0.44, 0.33, and 0.26 on MuSiQue, 0.63, 0.37, and
+0.25 on 2Wiki, and 0.52, 0.37, and 0.33 on HotpotQA. All G–G differences from the comparison
+groups are statistically significant. This consistent hierarchy shows that the scorer assigns larger
+values to records whose endpoints contain more answer-supporting information. The lower panels
+treat G–G as positive and G–D as negative. Semantic gain obtains AUC values of 0.638, 0.759,
+and 0.701 on MuSiQue, 2Wiki, and HotpotQA, compared with 0.456, 0.449, and 0.548 for cosine
+similarity. Because both signals are evaluated on the same candidate records, the improvements of
+0.182, 0.310, and 0.153 show that semantic gain encodes an evidence-contribution relation not
+captured by similarity alone. This validates the ordered assessments before pair aggregation and
+controlled PPR without treating semantic gain as a theoretically verified latent utility.
+5.8
+EFFECT OF OTHER SETTINGS
+0.0
+1.5
+3.0
+4.5
+Difference (percentage points)
+7B
+14B
+32B
+72B
+Model Size
++2.33
++3.34
++3.32
++4.66
+Average F1
+0.0
+1.5
+3.0
+4.5
+Difference (percentage points)
++4.86
++4.85
++5.01
++2.61
+Average Recall
+-5.0
+-2.5
+0.0
+2.5
+5.0
+Difference (percentage points)
+MuSiQue
+2Wiki
+HotpotQA
+Dataset
+-1.35
++0.61
++0.98
++1.17
++4.74
++0.81
+F1
+-0.50
+-0.25
+0.00
+0.25
+0.50
+Difference (percentage points)
++0.33
+-0.13
+-0.25
++0.41
++0.08
+-0.15
+Recall@10
+(a) SG²RAG Gain over Naive RAG
+(b) Difference from Binary
+Naive RAG (0)
+SG²RAG Gain
+Fine-grained
+Coarse-grained
+Figure 5: Effects of Other Settings. Panel (a) shows the
+average F1 and Recall gains of SG2RAG over Naive RAG
+across Qwen2.5. Panel (b) shows the F1 and Recall@10 dif-
+ferences of Fine-grained and Coarse-grained semantic gain
+from Binary scoring.
+LLMs of different sizes. Figure 5(a)
+compares semantic-gain scoring with
+Qwen2.5 models at 7B, 14B, 32B,
+and 72B scales. SG2RAG improves
+average F1 and Recall over Naive
+RAG at every scale. The F1 gain in-
+creases overall from 2.33 points at 7B
+to 4.66 points at 72B, while the Re-
+call gain remains between 4.85 and
+5.52 points. The consistent improve-
+ments from 7B onward demonstrate
+robustness across evaluator capaci-
+ties, while the stronger gains at 72B
+show that additional model capacity
+can further improve performance.
+Semantic Gain Granularity.
+Us-
+ing Llama-70B, we compare Binary
+scoring with Fine-grained scores at
+two decimal places and the default
+Coarse-grained scores at one decimal
+place. Figure 5(b) reports their differ-
+ences from Binary. Coarse-grained scoring improves F1 by 1.17, 4.74, and 0.81 points on MuSiQue,
+2Wiki, and HotpotQA, respectively, while all Recall@10 changes remain within 0.41 points. Fine-
+grained scoring is less consistent, decreasing F1 by 1.35 points on MuSiQue despite modest gains
+on 2Wiki and HotpotQA.
+Overall, these results show that SG2RAG remains effective across evaluator scales and benefits
+from coarse-grained scoring that preserves useful distinctions without requiring excessive numerical
+precision.
+6
+CONCLUSION
+We presented SG2RAG, which organizes retrieval around the additional evidence that document
+chunks contribute to one another. Its Semantic Gain Graph aggregates ordered assessments of ev-
+idence contribution into symmetric connection strengths, while controlled Personalized PageRank
+uses query-relevant seeds to guide retrieval across the graph. Results on three multi-hop question
+answering benchmarks with two language model backbones demonstrate improvements over the
+evaluated dense retrieval and graph-based baselines. Comparisons with identical candidate pairs
+and propagation isolate the contribution of semantic gain, while experiments with iterative retrieval
+demonstrate its usefulness beyond a single retrieval round. The current graph is constructed offline
+within similarity-based neighborhoods, so retrieval remains limited by the connections established
+before a query is available. Future work will explore adaptive candidate expansion and query-aware
+graph refinement to better capture evidence needs that emerge during retrieval.
+9
+
+
+REFERENCES
+Jaime G Carbonell and Jade Goldstein. The use of mmr, diversity-based reranking for reordering
+documents and producing summaries. In SIGIR, volume 98, pp. 290941–291025, 1998.
+Boyu Chen, Zirui Guo, Zidan Yang, Yuluo Chen, Junze Chen, Zhenghao Liu, Chuan Shi, and Cheng
+Yang. Pathrag: Pruning graph-based retrieval augmented generation with relational paths. In
+Proceedings of the AAAI conference on artificial intelligence, volume 40, pp. 30183–30191, 2026.
+Jianlv Chen, Shitao Xiao, Peitian Zhang, Kun Luo, Defu Lian, and Zheng Liu. Bge m3-embedding:
+Multi-lingual, multi-functionality, multi-granularity text embeddings through self-knowledge dis-
+tillation, 2024. URL https://arxiv.org/abs/2402.03216.
+Changwook Chu, Yongtae Jeong, Hansam Cho, Jaehoon Kim, Jungmin Lee, Byungwoo Bang, Jun-
+yeon Lee, Uiseok Song, and Seoung Bum Kim. Cats-rag: Contextual augmented triplet synthesis
+for rag in technical qa. Expert Systems with Applications, pp. 131491, 2026.
+Darren Edge, Ha Trinh, Newman Cheng, Joshua Bradley, Alex Chao, Apurva Mody, Steven Truitt,
+Dasha Metropolitansky, Robert Osazuwa Ness, and Jonathan Larson. From local to global: A
+graph rag approach to query-focused summarization. arXiv preprint arXiv:2404.16130, 2024.
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad
+Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, et al. The llama 3 herd of models. arXiv
+preprint arXiv:2407.21783, 2024.
+Zirui Guo, Lianghao Xia, Yanhua Yu, Tu Ao, and Chao Huang. Lightrag: Simple and fast retrieval-
+augmented generation. arXiv preprint arXiv:2410.05779, 2024.
+Bernal Jim´enez Guti´errez, Yiheng Shu, Weijian Qi, Sizhe Zhou, and Yu Su. From rag to memory:
+Non-parametric continual learning for large language models. arXiv preprint arXiv:2502.14802,
+2025.
+Xanh Ho, Anh-Khoa Duong Nguyen, Saku Sugawara, and Akiko Aizawa. Constructing a multi-hop
+qa dataset for comprehensive evaluation of reasoning steps. In Proceedings of the 28th Interna-
+tional Conference on Computational Linguistics, pp. 6609–6625, 2020.
+Tom Hosking, Hao Tang, and Mirella Lapata. Hierarchical indexing for retrieval-augmented opinion
+summarization. Transactions of the Association for Computational Linguistics, 12:1533–1555,
+2024.
+Marko Hostnik and Marko Robnik-ˇSikonja. Retrieval-augmented code completion for local projects
+using large language models. Expert Systems with Applications, 292:128596, 2025.
+Rishabh Iyer, Ninad Khargoankar, Jeff Bilmes, and Himanshu Asanani. Submodular combinatorial
+information measures with applications in machine learning. In Algorithmic learning theory, pp.
+722–754. PMLR, 2021.
+Yuelyu Ji, Zhuochun Li, Rui Meng, Sonish Sivarajkumar, Yanshan Wang, Zeshui Yu, Hui Ji, Yushui
+Han, et al. Rag-rlrc-laysum at biolaysumm: Integrating retrieval-augmented generation and read-
+ability control for layman summarization of biomedical texts. In Proceedings of the 23rd Work-
+shop on Biomedical Natural Language Processing, pp. 810–817, 2024.
+Zhuoxuan Jiang, Tianyang Zhang, Shengguang Bai, Lin Lin, Haotian Zhang, Yinong Xun, Jiawei
+Ren, Wen Si, and Shaohua Zhang. Towards enterprise-specific question-answering for it opera-
+tions and maintenance based on retrieval-augmented generation mechanism. Expert Systems with
+Applications, pp. 130961, 2025.
+Bernal Jimenez Gutierrez, Yiheng Shu, Yu Gu, Michihiro Yasunaga, and Yu Su. Hipporag: Neurobi-
+ologically inspired long-term memory for large language models. Advances in Neural Information
+Processing Systems, 37:59532–59569, 2024.
+Chankyu Lee, Rajarshi Roy, Mengyao Xu, Jonathan Raiman, Mohammad Shoeybi, Bryan Catan-
+zaro, and Wei Ping. Nv-embed: Improved techniques for training llms as generalist embedding
+models. arXiv preprint arXiv:2405.17428, 2024.
+10
+
+
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal,
+Heinrich K¨uttler, Mike Lewis, Wen-tau Yih, Tim Rockt¨aschel, et al. Retrieval-augmented gener-
+ation for knowledge-intensive nlp tasks. Advances in neural information processing systems, 33:
+9459–9474, 2020.
+Shilong Li, Yancheng He, Hangyu Guo, Xingyuan Bu, Ge Bai, Jie Liu, Jiaheng Liu, Xingwei Qu,
+Yangguang Li, Wanli Ouyang, et al. Graphreader: Building graph-based agent to enhance long-
+context abilities of large language models. arXiv preprint arXiv:2406.14550, 2024.
+Xiaopeng Li, Pengyue Jia, Derong Xu, Yi Wen, Yingyi Zhang, Wenlin Zhang, Wanyu Wang, Yichao
+Wang, Zhaocheng Du, Xiangyang Li, et al. A survey of personalization: From rag to agent. ACM
+Transactions on Information Systems, 2025.
+Antonio Moreno-Cediel, Eva Garcia-Lopez, Antonio Garcia-Cabot, and David De-Fitero-
+Dominguez. Optimising retrieval performance in rag systems: A new growing window semantic
+chunking strategy to address weak semantic boundaries. Knowledge-Based Systems, pp. 114896,
+2025.
+Lawrence Page, Sergey Brin, Rajeev Motwani, and Terry Winograd. The pagerank citation ranking:
+Bringing order to the web. Technical report, Stanford infolab, 1999.
+Parth Sarthi, Salman Abdullah, Aditi Tuli, Shubh Khanna, Anna Goldie, and Christopher D Man-
+ning. Raptor: Recursive abstractive processing for tree-organized retrieval. In The Twelfth Inter-
+national Conference on Learning Representations, 2024.
+Zhihong Shao, Yeyun Gong, Yelong Shen, Minlie Huang, Nan Duan, and Weizhu Chen. Enhancing
+retrieval-augmented large language models with iterative retrieval-generation synergy. In Find-
+ings of the Association for Computational Linguistics: EMNLP 2023, pp. 9248–9274, 2023.
+Zhili Shen, Chenxin Diao, Pavlos Vougiouklis, Pascual Merita, Shriram Piramanayagam, Enting
+Chen, Damien Graux, Andre Melo, Ruofei Lai, Zeren Jiang, et al. Gear: Graph-enhanced agent
+for retrieval-augmented generation. In Findings of the Association for Computational Linguistics:
+ACL 2025, pp. 12049–12072, 2025.
+Yuling Shi, Maolin Sun, Zijun Liu, Mo Yang, Yixiong Fang, Tianran Sun, and Xiaodong Gu. Rea-
+soning in trees: Improving retrieval-augmented generation for multi-hop question answering.
+arXiv preprint arXiv:2601.11255, 2026.
+Eunji Song and Hwansoo Lee. Defending financial rag systems against jailbreak attacks. Expert
+Systems With Applications, 2026.
+Wenyu Tao, Xiaofen Xing, Zeliang Li, and Xiangmin Xu. Saki-rag: Mitigating context fragmen-
+tation in long-document rag via sentence-level attention knowledge integration. In Proceedings
+of the 2025 Conference on Empirical Methods in Natural Language Processing, pp. 1195–1213,
+2025.
+Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot, and Ashish Sabharwal. Musique: Multihop
+questions via single-hop question composition. Transactions of the Association for Computational
+Linguistics, 10:539–554, 2022.
+Aditi Vidyarthi, Motilal Khoirom Singh, and Dennis Singh Moirangthem. Sagerag: Query rewrit-
+ing for retrieval enhancement and retrieval-augmented generation for grounded responses in ai
+research assistance. Expert Systems with Applications, pp. 131160, 2026.
+Jing Wang, Zhiwei Xu, Siyuan Liu, Ye Lu, and Tao Li. Towards efficient graph-rag via structure-
+aware intermediate representation: Incremental collaborative exploration on knowledge graph.
+Knowledge-Based Systems, pp. 115884, 2026.
+Qikai Wei, Huansheng Ning, Chunlong Han, and Jianguo Ding. A query-aware multi-path knowl-
+edge graph fusion approach for enhancing retrieval-augmented generation in large language mod-
+els. Knowledge-Based Systems, 2025.
+11
+
+
+An Yang, Beichen Zhang, Binyuan Hui, Bofei Gao, Bowen Yu, Chengpeng Li, Dayiheng Liu, Jian-
+hong Tu, Jingren Zhou, Junyang Lin, et al. Qwen2. 5-math technical report: Toward mathematical
+expert model via self-improvement. arXiv preprint arXiv:2409.12122, 2024.
+Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William Cohen, Ruslan Salakhutdinov,
+and Christopher D Manning. Hotpotqa: A dataset for diverse, explainable multi-hop question
+answering. In Proceedings of the 2018 conference on empirical methods in natural language
+processing, pp. 2369–2380, 2018.
+Zhenrui Yue, Honglei Zhuang, Aijun Bai, Kai Hui, Rolf Jagerman, Hansi Zeng, Zhen Qin, Dong
+Wang, Xuanhui Wang, and Michael Bendersky. Inference scaling for long-context retrieval aug-
+mented generation. arXiv preprint arXiv:2410.04343, 2025.
+Yanzhao Zhang, Mingxin Li, Dingkun Long, Xin Zhang, Huan Lin, Baosong Yang, Pengjun
+Xie, An Yang, Dayiheng Liu, Junyang Lin, Fei Huang, and Jingren Zhou.
+Qwen3 embed-
+ding: Advancing text embedding and reranking through foundation models.
+2025.
+URL
+https://arxiv.org/abs/2506.05176.
+Jihao Zhao, Zhiyuan Ji, Yuchen Feng, Pengnian Qi, Simin Niu, Bo Tang, Feiyu Xiong, and Zhiyu
+Li. Meta-chunking: Learning text segmentation and semantic completion via logical perception.
+arXiv preprint arXiv:2410.12788, 2024.
+Jihao Zhao, Zhiyuan Ji, Zhaoxin Fan, Hanyu Wang, Simin Niu, Bo Tang, Feiyu Xiong, and Zhiyu
+Li. Moc: Mixtures of text chunking learners for retrieval-augmented generation system. In Pro-
+ceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume
+1: Long Papers), pp. 5172–5189, 2025.
+Xiangrong Zhu, Yuexiang Xie, Yi Liu, Yaliang Li, and Wei Hu. Knowledge graph-guided retrieval
+augmented generation. In Proceedings of the 2025 Conference of the Nations of the Americas
+Chapter of the Association for Computational Linguistics: Human Language Technologies (Vol-
+ume 1: Long Papers), pp. 8912–8924, 2025.
+Luyao Zhuang, Shengyuan Chen, Yilin Xiao, Huachi Zhou, Yujing Zhang, Hao Chen, Qinggang
+Zhang, and Xiao Huang. Linearrag: Linear graph retrieval augmented generation on large-scale
+corpora. arXiv preprint arXiv:2510.10114, 2025.
+12

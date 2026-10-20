@@ -1,0 +1,2075 @@
+Beyond Downstream QA: Rethinking How We Evaluate Agent Memory
+Sebastian-Antonio Toma1,2∗, Jean de Kernier1, Mike Ply1, Oliviu Matei2
+1Amazon Web Services
+2Technical University of Cluj-Napoca, Romania
+Sebastian.Toma@campus.utcluj.ro
+Abstract
+Agent memory benchmarks evaluate whether an agent’s re-
+sponses reflect correct knowledge, measuring downstream
+question-answering accuracy as a proxy for memory quality.
+We show this evaluation paradigm is incomplete: it conflates
+memory correctness with retrieval and generation quality, pro-
+ducing both false positives where correct responses mask bro-
+ken memory and false negatives where incorrect responses
+blame correct memory for retrieval failures. We introduce
+FEB-30, a benchmark of 30 fact-evolution trajectories span-
+ning 6 diagnostic categories and 3 difficulty levels, constructed
+via paradigm inversion: documents are generated from known
+fact trajectories, yielding deterministic ground truth without
+human annotation. Each trajectory defines how a fact should
+evolve across multi-author artifacts (documents, emails, con-
+versations), enabling direct inspection of the memory store
+after each ingestion step. Applying FEB-30 to a representative
+memory system, we demonstrate that intrinsic and extrinsic
+evaluation diverge by an average of 16 percentage points, with
+44% of trajectories exceeding meaningful divergence thresh-
+olds. Diagnostic decomposition reveals that the system cor-
+rectly classifies memory operations (create, update, reinforce,
+supersede) only 20% of the time, a failure entirely invisible
+to extrinsic evaluation, and that failure modes differ system-
+atically by category and difficulty. We release the benchmark,
+document generation pipeline, and scoring framework to sup-
+port reproducible evaluation of agent memory systems.1
+1
+Introduction
+Large language model (LLM) agents operating over ex-
+tended time horizons require persistent external memory to
+accumulate knowledge beyond the ephemeral context win-
+dow (Sumers et al. 2024; Jiang et al. 2026). As these systems
+grow more complex, with over a dozen distinct architectures
+published since 2023 (Latimer et al. 2026; Packer et al. 2024;
+Rasmussen et al. 2025; Chhikara et al. 2025; Zhu et al. 2026),
+the question of how to evaluate them becomes pressing.
+A survey of current benchmarks reveals a systematic lim-
+itation: every existing evaluation measures memory quality
+extrinsically, by posing questions to the agent and grading its
+responses (Maharana et al. 2024; Wu et al. 2026; Hu, Wang,
+and McAuley 2026; Uddin et al. 2026; Liu and Yadav 2026;
+1https://github.com/amazon-science/feb-30-benchmark
+∗Corresponding author.
+Jung et al. 2026). This produces a single composite score that
+conflates memory, retrieval, and generation quality. When the
+system fails, one cannot identify which component is respon-
+sible; when it succeeds, one cannot confirm the memory is
+actually correct (Toma and Matei 2026).
+We identify two concrete failure modes that extrinsic eval-
+uation cannot detect:
+• False positives (LLM compensation): A strong gener-
+ation model can produce correct responses despite in-
+correct or incomplete memory state, by reasoning over
+partial retrieval results at inference time. Extrinsic evalu-
+ation scores this as success.
+• False negatives (retrieval bottleneck): A memory sys-
+tem may correctly store and update facts, yet fail to re-
+trieve them for a specific query due to embedding mis-
+match or retrieval cutoff. Extrinsic evaluation blames the
+memory system for a retrieval failure.
+We propose intrinsic evaluation, direct comparison of the
+memory store contents against known ground truth at each
+stage of knowledge evolution, as a complementary evaluation
+paradigm. The relationship mirrors unit versus end-to-end
+testing in software engineering: intrinsic evaluation checks
+the memory component’s internal state directly, while ex-
+trinsic evaluation only observes end-to-end behavior, so a
+passing end-to-end test can mask a broken component just as
+a correct component can fail end-to-end due to an integration
+bottleneck. A parallel from NLP history motivates the same
+shift: in the 2010s, word embeddings were evaluated only
+through downstream task performance until intrinsic evalu-
+ation (analogy tasks, similarity correlations) enabled faster
+progress by isolating representation quality (Baroni, Dinu,
+and Kruszewski 2014; Schnabel et al. 2015). Our contribu-
+tions are:
+1. FEB-30, a benchmark of 30 fact-evolution trajectories
+with deterministic ground truth, spanning 6 diagnostic
+categories that isolate distinct failure modes invisible to
+extrinsic evaluation. The benchmark comprises:
+• Fact-evolution trajectories with atomic claim ground
+truth at each state.
+• A paradigm-inversion document generation pipeline
+using multi-model rotation and 3-judge verification.
+arXiv:2610.22209v1  [cs.CL]  15 Oct 2026
+
+
+• A scoring framework measuring both intrinsic (claim
+coverage, update detection, false update rate) and ex-
+trinsic (QA accuracy) metrics.
+2. Intrinsic evaluation methodology for agent memory:
+direct inspection of memory state against known ground
+truth at each stage of knowledge evolution, enabling di-
+agnostic decomposition of failures by pipeline stage.
+3. Empirical evidence that intrinsic and extrinsic evaluation
+diverge by 16 percentage points on average, with 44%
+of trajectories exceeding meaningful divergence and fail-
+ure modes differing systematically by category.
+2
+Related Work
+Agent Memory Benchmarks.
+MemoryAgentBench (Hu,
+Wang, and McAuley 2026) defines four memory com-
+petencies (retention, temporal reasoning, knowledge up-
+dates, and information integration) evaluated through QA
+interactions. Memora (Uddin et al. 2026) introduces the
+FAMA metric that penalizes reliance on invalidated mem-
+ories, decomposing performance into freshness-aware com-
+ponents. LongMemEval-V2 (Wu et al. 2026) tests long-term
+memory along five temporal reasoning capabilities. AMA-
+Bench (Zhao et al. 2026) evaluates long-horizon memory for
+agentic applications. STATE-Bench (Liu and Yadav 2026)
+measures whether agents improve at tasks through accu-
+mulated experience. MEME (Jung et al. 2026) introduces
+controlled state trajectories with multi-entity evolution, the
+closest methodology to ours, though still evaluated through
+the response layer.
+All these benchmarks share a common structure: pose
+queries to the agent, grade responses against expected an-
+swers. None directly inspects the memory store.
+Memory Architecture Surveys.
+Recent surveys (Jiang
+et al. 2026; Du 2026; Luo et al. 2026; Hu et al. 2025; Huang
+et al. 2026) catalog memory architectures and operations.
+Du et al. (Du et al. 2025) define six core memory opera-
+tions (consolidation, updating, indexing, forgetting, retrieval,
+condensation), decisions that should be evaluated at the op-
+eration level, not only through downstream responses. The
+Anatomy of Agentic Memory survey (Jiang et al. 2026) iden-
+tifies benchmark saturation as a key concern, yet proposes
+more extrinsic benchmarks as the solution.
+Conflict Detection Benchmarks.
+ConflictBank (Su et al.
+2024) benchmarks LLM behavior under knowledge conflicts
+but evaluates at query time, not at the memory consolidation
+stage. MAGIC (Lee, Lee, and Kim 2025) tests multi-hop
+conflict detection in retrieval-augmented generation. These
+address a related but distinct problem: they test whether a
+model can reason about conflicts in retrieved context, not
+whether a memory system correctly detects and resolves con-
+flicts during ingestion.
+Paradigm Inversion.
+RIKER (Roig 2025) introduced the
+concept of generating evaluation corpora from known ground
+truth for RAG evaluation, avoiding the expense and subjec-
+tivity of human annotation on real documents. We extend
+Cat
+Name
+Design constraint
+C1
+LLM
+Compensa-
+tion
+Memory wrong in a way QA
+still works
+C2
+Retrieval
+Bottle-
+neck
+Memory correct but hard to re-
+trieve
+C3
+Classification
+Focus
+on
+cre-
+ate/update/reinforce/conflict
+decision correctness
+C4
+Synthesis Quality
+Multi-observation →correct
+fact formation
+C5
+Temporal Correct-
+ness
+Fact must evolve correctly over
+time
+C6
+Multi-Author
+Artifacts from different author
+roles
+Table 1: FEB-30 diagnostic categories with design con-
+straints.C1 andC2are designedtoproduceintrinsic-extrinsic
+divergence; C3–C6 test dimensions where intrinsic evalua-
+tion provides richer signal than extrinsic.
+this approach to temporal fact evolution, generating multi-
+document sequences where ground truth is a trajectory of
+states rather than a static set of facts.
+Intrinsic vs. Extrinsic Evaluation.
+The distinction be-
+tween intrinsic and extrinsic evaluation is well-established in
+NLP for embeddings (Baroni, Dinu, and Kruszewski 2014;
+Schnabel et al. 2015) and parsing. The Future AGI practi-
+tioner framework (Future AGI 2026) explicitly argues that
+direct memory store inspection is an anti-pattern. A con-
+current survey (Toma and Matei 2026) documents this gap
+systematically across 15 benchmarks, arguing for comple-
+mentary intrinsic evaluation. We present the first benchmark
+and empirical results that validate this argument.
+3
+Benchmark Design: FEB-30
+FEB-30 (Fact Evolution Benchmark, 30 trajectories) is orga-
+nized along diagnostic categories and difficulty levels (Sec-
+tion 3.4). The name is a deliberate analogy: February 30 is a
+date that does not exist, the calendar approaches it asymptoti-
+cally (February 28, sometimes 29) but never reaches 30. Sim-
+ilarly, recent benchmarks and surveys have moved progres-
+sively closer to intrinsic evaluation, introducing memory-
+specific tasks (Hu, Wang, and McAuley 2026), decomposing
+scores into memory-aware components (Uddin et al. 2026),
+and defining controlled state trajectories (Jung et al. 2026),
+yet remain on the extrinsic side of the threshold, never di-
+rectly inspecting the memory store, as illustrated by (Toma
+and Matei 2026). FEB-30 crosses it.
+3.1
+Diagnostic Categories
+Each category targets a specific gap in extrinsic-only evalu-
+ation (Table 1):
+C1 (LLM Compensation) constructs scenarios where
+memory state is incorrect (e.g., outdated fact not updated,
+contradictions unresolved) but a strong LLM still produces
+correct answers by reasoning over retrieved fragments, so a
+system that never updates its facts scores well extrinsically.
+
+
+Level
+Docs
+States
+Signal clarity
+L1
+1–2
+2–3
+Claims nearly explicit
+L2
+3–4
+3–4
+Claims embedded in context
+L3
+4–5
+4–5
+Requires inference
+Table 2: Difficulty levels in FEB-30.
+C2 (Retrieval Bottleneck) constructs scenarios where
+facts are correctly stored but queries are phrased to produce
+low embedding similarity (vocabulary mismatch, different
+abstraction level). The memory is correct, only retrieval fails.
+C3 (Classification Accuracy) tests whether the system
+correctly classifies each observation as a create, update, re-
+inforce, or conflict operation, decisions extrinsic evaluation
+cannot observe directly.
+C4 (Synthesis Quality) tests whether multiple observa-
+tions from different artifacts merge into correct, well-formed
+facts, with ground truth specifying which should form a sin-
+gle fact versus separate facts.
+C5 (Temporal Correctness) tests whether the memory
+state correctly reflects temporal evolution: linear progression
+(A→B→C), retraction, and gradual drift across artifacts.
+C6 (Multi-Author Attribution) tests whether source
+identity affects consolidation correctly: corroboration from
+different authors should raise confidence differently than rep-
+etition from one, and disagreement should trigger conflict
+detection.
+3.2
+Difficulty Levels
+At L1 (Table 2), target claims appear almost verbatim in gen-
+erated documents with minimal surrounding noise. At L2,
+claims are embedded within realistic document context and
+require extraction from longer passages. At L3, claims must
+be inferred from combinations of statements, and documents
+contain substantial unrelated content that could mislead ex-
+traction systems.
+3.3
+Trajectory Schema
+Each trajectory is defined as a JSON structure specifying:
+• A unique trajectory ID, category, difficulty, and domain
+assignment.
+• A type indicating the evolution pattern (linear-evolution,
+contradiction, scope-expansion, retraction, stable, or
+gradual-drift).
+• A sequence of states, each containing a set of atomic
+claims representing the expected memory contents after
+processing documents up to that state.
+• Per-state docClaims, the subset of claims that the docu-
+ment for that state should contain (new information only,
+not cumulative repetition).
+• An expected action per state transition (create, update,
+reinforce, conflict, or supersede).
+• Author role and document type metadata for multi-author
+trajectories.
+Claims are required to be atomic (one assertable proposi-
+tion per claim) and self-contained (understandable without
+reference to other claims). This ensures scoring is unambigu-
+ous: each claim either is or is not entailed by the system’s
+fact store.
+The key design choice is docClaims vs. claims: docu-
+ments contain only new information per state. The system
+must retain prior knowledge across document ingestions,
+testing actual memory persistence, not single-document ex-
+traction.
+3.4
+Distribution
+FEB-30 contains 30 trajectories across 6 categories, dis-
+tributed across difficulty levels (10 at L1, 10 at L2, 10 at L3).
+Trajectories span 6 technical domains (infrastructure, secu-
+rity, financial operations, machine learning, data engineering,
+and containers) to avoid domain-specific bias. These trajec-
+tories instantiate the benchmark in a technical and business-
+operations setting, but the methodology is domain-agnostic
+as the same paradigm-inversion construction can produce tra-
+jectories for any domain in which facts evolve across multi-
+author artifacts, by substituting the domain’s own topics and
+observation categories. The total corpus comprises 147 gen-
+erated documents: 127 trajectory state documents and 20
+noise documents (4 per C2 trajectory to test retrieval under
+distraction).
+4
+Document Generation Pipeline
+We adopt paradigm inversion (Roig 2025): rather than anno-
+tating ground truth on real documents (expensive and subjec-
+tive), we generate documents from known fact trajectories,
+making the trajectory itself the ground truth. Algorithm 1
+formalizes the pipeline.
+4.1
+Multi-Model Rotation
+Documents are generated using 6 models across 5 providers,
+rotated per state index within each trajectory to simulate dif-
+ferent human authors with different writing styles. No single
+model generates more than 30% of total documents. Fol-
+lowing evidence that multi-source synthetic data mitigates
+distribution collapse (Schaffelder and Gatt 2026) and re-
+duces single-generator bias (van Elburg, van der Putten, and
+Marx 2025), this additionally simulates the natural stylistic
+variation of multi-author corpora.
+The generation models are all different from the system’s
+extraction model (which uses a different LLM family), avoid-
+ing the stylistic bias that inflates scores when the same model
+generates and extracts (van Elburg, van der Putten, and Marx
+2025).
+4.2
+Style-Grounded Generation
+Documents follow a realism gradient across difficulty levels:
+1. Style-grounded (L1/L2): An LLM generates a new doc-
+ument for the trajectory claims but mimics the tone, vo-
+cabulary, and structure of a real reference document.
+2. Hybrid injection (L3): Claims are inserted into actual
+human-written documents from unrelated domains, pro-
+ducing text that is approximately 90% authentic.
+
+
+Algorithm 1 Document Generation with Verification
+Input: Trajectory T with states {s0, . . . , sn}
+Each state si has claims Ci (expected memory state, used by
+scorer) and docClaims ˆCi (new info for this document)
+Input: Generator pool M = {m1, . . . , m6}, Judge pool
+J = {j1, j2, j3}
+Input: Style references RAMI, REnron
+Output: Verified document set DT
+1: for each state si ∈T do
+2:
+m ←M[i mod |M|]
+// rotate model
+3:
+r ←SelectStyle(type(si), diff(T), R)
+4:
+for k = 1 to 3 do
+5:
+if diff(T) = L3 then
+6:
+h ←SelectHost(domain(T), R)
+7:
+dk ←Inject(m, ˆCi, h)
+8:
+else
+9:
+dk ←Generate(m, ˆCi, r, diff(T))
+10:
+end if
+11:
+V ←V
+j∈J
+h
+Entail(j, dk, ˆCi) ∧¬Halluc(j, dk, T)
+i
+12:
+if V = true then
+13:
+DT ←DT ∪{dk}; break
+14:
+else
+15:
+m ←M[(i + k) mod |M|]
+16:
+end if
+17:
+end for
+18: end for
+19: DT ←DT ∪GenerateNoise(M, cat(T), domain(T))
+20: Constraint: ∀m ∈M : |{d ∈DT
+: gen(d) =
+m}|/|DT | ≤0.3
+21: return DT
+For style-grounded generation, documents are typed
+(meeting notes, email, architecture review, status update,
+executive briefing) and matched to style references from a
+curated set of 12 AMI meeting summaries (Carletta et al.
+2005) and 12 Enron emails (Klimt and Yang 2004) selected
+for diversity in length, formality, and structure.
+Document length and noise scale with difficulty:
+• L1: 200–400 words, no noise claims, target claims nearly
+explicit.
+• L2: 400–800 words, 2–3 unrelated noise claims, target
+claims embedded in context.
+• L3: 600–1000 words, 4–5 noise claims, subtle and am-
+biguous signal.
+For L3 trajectories, host documents are selected from unre-
+lated domains (e.g., product design meetings, energy pipeline
+discussions) to ensure no semantic overlap with the trajec-
+tory topic, making scoring unambiguous: any relevant fact
+the system extracts must come from the injected section.
+4.3
+Verification Pipeline
+The verification criterion (Algorithm 1, line 6) requires unan-
+imous agreement from 3 independent judge models (different
+from the generators), following the multi-judge grounding
+methodology of (Uddin et al. 2026) and (Roig 2025). Each
+judge assesses: (1) all target claims are inferable from the
+document, (2) no extra factual information beyond the tra-
+jectory is introduced, and (3) the document reads naturally.
+Additionally, documents underwent human review, with
+11% requiring content corrections (forward leakage, narra-
+tive contradictions, cross-document inconsistencies, numeric
+mismatches) and 28% requiring scaffolding removal (code
+fences, LLM preamble such as “generated email about...” or
+“injected claims into...”) that does not affect extraction.
+5
+Evaluation Framework
+We evaluate each system using both intrinsic and extrinsic
+metrics on the same trajectories, enabling direct measure-
+ment of their divergence.
+5.1
+Intrinsic Metrics
+After processing all artifacts for a trajectory T, we compare
+the system’s fact store F against the expected claims Ci at
+each state si. Let Entail(f, c) = 1 if fact f entails claim
+c (determined by embedding similarity > 0.8 followed by
+LLM judge verification).
+Claim coverage at state si:
+Cov(si) = |{c ∈Ci : ∃f ∈F, Entail(f, c) = 1}|
+|Ci|
+(1)
+Fact accuracy across the trajectory:
+Acc(T) = 1
+|T|
+|T |−1
+X
+i=0
+Cov(si)
+(2)
+Update detection recall, where U
+= {si
+: ai
+∈
+{update, supersede}} is the set of states requiring a change:
+UDR(T) = |{si ∈U : changed(F, si−1, si)}|
+|U|
+(3)
+False update rate, where R = {si : ai = reinforce}:
+FUR(T) = |{si ∈R : changed(F, si−1, si)}|
+|R|
+(4)
+Additionally, we report fact count (number of active facts
+per trajectory, detecting duplication or loss) and confidence
+MAE ( 1
+|T |
+P
+i |cexpected(si) −cactual(si)|).
+5.2
+Extrinsic Metrics
+For each trajectory, we generate diagnostic questions whose
+answers depend on the final memory state. The system re-
+trieves relevant facts via its standard retrieval mechanism,
+then an LLM generates an answer. A judge model scores each
+answer as YES (1.0), PARTIAL (0.5), or NO (0.0) against
+the expected answer derived from ground-truth claims.
+5.3
+Divergence Metric
+The key metric is mean absolute divergence (MAD) be-
+tween intrinsic and extrinsic scores:
+MAD = 1
+N
+X
+T
+|Acc(T) −Extr(T)|
+(5)
+
+
+MAD quantifies how much information is lost by relying
+on extrinsic evaluation alone, without requiring an arbitrary
+threshold. As a secondary interpretable metric, we report the
+divergence rate: the percentage of trajectories where the two
+evaluations disagree by more than τ = 0.15:
+DivRate = 1
+N
+X
+T
+⊮[|Acc(T) −Extr(T)| > τ]
+(6)
+6
+Experiments
+6.1
+System Under Test
+To demonstrate the benchmark’s diagnostic utility, we eval-
+uate a representative agent memory system (Figure 1). The
+system follows the dominant architectural pattern shared by
+virtually all contemporary memory systems, Hindsight (La-
+timer et al. 2026), Mem0 (Chhikara et al. 2025), Ariadne-
+Mem (Zhu et al. 2026), and commercial agent memory ser-
+vices alike: (1) extract structured observations from artifacts
+(documents, emails, meeting transcripts), (2) embed them,
+(3) retrieve related existing facts via vector search, (4) clas-
+sify the relationship via LLM (create, update, reinforce, con-
+flict, or skip), and (5) synthesize into evolving facts with
+history. This extract-embed-classify-synthesize pipeline rep-
+resents the current state of the art; despite surface differences
+in implementation details (confidence stepping in Hindsight,
+entropy-aware gating in AriadneMem, Add/Update/No-op
+in Mem0), the core information flow is shared. The specific
+system is not the contribution; any system implementing this
+pattern could be substituted. Our goal is to demonstrate what
+the benchmark reveals about this class of systems, not to
+evaluate a particular implementation.
+We adopt a two-layer terminology: observations are static,
+atomic factual statements extracted from a single artifact
+(typed into categories such as decisions, commitments, or
+milestones), while facts are the evolving, synthesized knowl-
+edge units that the system maintains over time. Observa-
+tions are immutable once extracted; facts are the persistent
+memory that gets created, reinforced, updated, or superseded
+as new observations arrive. Not all observations aggregate
+into facts: some are too granular or transient (e.g., a one-
+time action item), and evaluating observations in isolation
+would only measure extraction completeness and atomicity,
+not whether the system forms and maintains correct knowl-
+edge. Other systems use different terms for similar concepts
+(Hindsight calls atomic extractions “facts” and synthesized
+summaries “observations”; Mem0 uses “memories” for both
+layers without distinction), but the underlying two-layer pat-
+tern, extraction followed by aggregation, is shared. Intrinsic
+evaluation targets the fact layer, as this is the knowledge state
+that determines system behavior.
+Each fact maintains a numeric confidence score (0–1),
+strengthened by +0.1 per reinforcing observation and ad-
+justable by the LLM on create, update, or supersede deci-
+sions. A temporal guard prevents stale observations from
+overwriting newer knowledge: if an observation is older than
+the matched fact’s last update, update and supersede deci-
+sions are automatically downgraded to reinforce. Facts track
+a full chronological history (statement, confidence, change
+type, and trigger observation at each step), enabling intrinsic
+evaluation to inspect the complete evolution path. The sys-
+tem additionally tracks the number of distinct contributing
+authors per fact, counting unique contributors across support-
+ing observations, which enables C6 (multi-author) evalua-
+tion. Retrieval uses hybrid search combining BM25 (Robert-
+son and Zaragoza 2009) keyword matching (weight 0.3) with
+k-NN vector similarity (weight 0.7) over 1024-dimensional
+embeddings. All LLM classification and synthesis calls use
+temperature 0 for deterministic outputs; remaining variance
+across runs comes from the embedding retrieval layer. The
+system runs on cloud-hosted LLM APIs for both extraction
+and synthesis (prompts and models in Appendices B, D).
+Formally, for each new observation o with embedding
+eo, the system retrieves the most similar existing fact f =
+arg maxf ′∈F sim(eo, ef ′) and classifies the action:
+a = ClassifyLLM(o, f) ∈{create, reinforce, update, . . .}
+(7)
+A temporal guard enforces recency: a ←reinforce if a ∈
+{update, supersede} ∧to < tlast
+f . Regardless of action, the
+observation is linked to the fact: Sf ←Sf ∪{o}, where
+Sf is the set of supporting observations for f. Confidence
+evolves as:
+c(t+1)
+f
+=
+
+
+
+
+
+
+
+
+
+cLLM(o)
+if a = create
+min(c(t)
+f
++ 0.1, 1)
+if a = reinforce
+cLLM(s(t+1)
+f
+)
+if a ∈{update, supersede}
+c(t)
+f
+if a = none
+(8)
+and the fact statement as:
+s(t+1)
+f
+=
+
+
+
+
+
+InitLLM(o)
+if a = create
+s(t)
+f
+if a ∈{reinforce, none}
+AggLLM(s(t)
+f , o)
+if a ∈{update, supersede}
+(9)
+6.2
+Results
+Finding 1: Intrinsic-Extrinsic Divergence.
+Across all 30
+trajectories (Table 3), the mean absolute divergence between
+intrinsic and extrinsic evaluation is 0.168 ± 0.025 (over 16
+percentage points), with 44% of trajectories exceeding the
+τ = 0.15 threshold (N=11 runs). Using a stricter pass/fail
+criterion (≥0.5 vs. <0.5), in 21±4% of trajectories one eval-
+uation method passes while the other fails, meaning a practi-
+tioner relying on extrinsic evaluation alone would reach the
+wrong conclusion about system correctness in roughly 1 out
+of 5 cases (Cohen’s κ = 0.118, barely above chance), con-
+firming the two evaluation methods carry largely independent
+signal. A Pearson correlation between intrinsic and extrin-
+sic scores across all 330 paired evaluations is r = 0.423
+(p < 10−15), so r2 ≈0.18: only 18% of the variance in
+one score is explained by the other, 82% independent. The
+signed mean divergence is +0.118 ± 0.029, indicating in-
+trinsic scores are systematically higher than extrinsic: the
+system’s memory is on average better than what QA evalua-
+tion reveals. A Wilcoxon signed-rank test over all 330 paired
+trajectory evaluations (W = 4042, p < 10−16) confirms
+this divergence is statistically significant, establishing that
+
+
+Ingestion Path (per state si of trajectory T )
+Artifact
+Ingestion
+Observation
+Extraction
+Fact Synthesis (per observation)
+Embed +
+Retrieve
+LLM
+Classify
+Apply
+Action
+Fact
+Store
+-
+-
+-
+-
+-
+
+create | reinforce | update | supersede | none
+⋆Intrinsic Scoring (per state si)
+Load Ground
+Truth Ci
+Embed +
+Retrieve
+LLM Entail-
+ment Judge
+Compute
+Cov(si)
+-
+-
+-
+?
+Extrinsic Scoring (per trajectory T )
+Load
+Question
+Embed +
+Retrieve
+LLM
+Answer
+LLM Judge
+Extr(T)
+-
+-
+-
+?
+Figure 1: System architecture showing the write path (ingestion and fact synthesis), intrinsic and extrinsic scoring pipelines. For
+each trajectory state si, intrinsic evaluation compares ground-truth claims Ci against the fact store via embedding retrieval and
+LLM entailment. Extrinsic evaluation queries the store and judges the response against expected answers. ⋆= proposed here.
+Category
+Intr. (%)
+Extr. (%)
+MAD
+DivRate (%)
+C1: LLM Comp.
+82.2±2.9
+54.5±10.8
+.295±.084
+67.3
+C2: Retrieval
+60.3±4.7
+50.9±2.9
+.135±.034
+45.5
+C3: Classif.
+70.8±8.2
+48.9±16.4
+.258±.117
+54.5
+C4: Synthesis
+52.8±3.1
+49.2±2.4
+.104±.036
+21.2
+C5: Temporal
+59.3±5.2
+47.3±4.5
+.144±.062
+45.5
+C6: Multi-Auth.
+41.5±4.8
+41.8±5.7
+.106±.049
+34.5
+Overall
+60.6±1.6
+48.8±2.9
+.168±.025
+43.6
+Diff.
+Intr. (%)
+Extr. (%)
+MAD
+DivRate (%)
+L1
+68.0±3.2
+50.9±4.2
+.178±.051
+54.5
+L2
+67.0±4.5
+47.7±7.8
+.224±.071
+50.0
+L3
+46.7±1.6
+47.7±3.3
+.103±.045
+26.4
+60.6±1.6
+48.8±2.9
+.168±.025
+43.6
+Table 3: Intrinsic (fact accuracy %) and extrinsic (QA accuracy %) scores by category (left) and difficulty (right), averaged across
+N=11 runs (± std). MAD = mean absolute divergence between intrinsic and extrinsic per trajectory. DivRate = percentage
+with divergence > τ=0.15. C1 shows highest MAD (.295): memory quality is systematically better than what QA evaluation
+reveals. Per-trajectory scores are in Appendix I.
+the two evaluation methods measure fundamentally different
+properties of the system. C1 (LLM Compensation) shows the
+highest MAD (0.295 ± 0.084): intrinsic scores 82.2% while
+extrinsic scores only 54.5%, confirming that memory quality
+is systematically underestimated by response-based evalua-
+tion. C5 (Temporal) and C6 (Multi-Author) show the lowest
+intrinsic scores (59.3% and 41.5%), identifying temporal
+evolution and source attribution as the hardest dimensions,
+yet extrinsic evaluation reports near-uniform scores across
+all categories, masking these weaknesses.
+Finding 2: Difficulty and Divergence.
+DivRate decreases
+with difficulty (L1: 55%, L2: 50%, L3: 26%). At L1, intrinsic
+substantially exceeds extrinsic (68.0 ± 3.2 vs. 50.9 ± 4.2),
+meaning the system stores correct knowledge that retrieval
+fails to surface for QA. At L3, both scores converge near
+47%, but diverge on individual trajectories in opposite di-
+rections (some false positives, some false negatives). MAD
+varies across levels (.178, .224, .103), indicating disagree-
+ment persists at all difficulty levels. Classification accuracy
+degrades sharply with difficulty (33.8 →16.5 →10.1%),
+confirming that the system’s ability to correctly label actions
+deteriorates as signal becomes more subtle.
+Finding 3: Category-Specific Failure Modes.
+Diagnostic
+decomposition reveals distinct failure patterns. The overall
+false update rate is 22.2 ± 1.2%: the system modifies facts
+when it should only reinforce. Update detection recall is
+73.6±2.6%. Classification accuracy (whether the system cor-
+rectly labels the action as create/reinforce/update/supersede)
+is only 20.1 ± 2.7%, with C2 (4.5%) and C5 (0.4%) near
+zero. Confidence MAE is 0.106 ± 0.002 across all trajecto-
+ries. C6 (Multi-Author) shows the lowest intrinsic accuracy
+(41.5%), identifying multi-author source attribution as the
+system’s weakest dimension. These insights are invisible to
+extrinsic evaluation, which reports a near-uniform 42–55%
+across most categories (per-category/difficulty breakdowns
+in Appendix F).
+Finding 4: Actionable Diagnostics.
+The intrinsic metrics
+directly identify which pipeline stage to improve: (1) classifi-
+cation accuracy is 20.1% overall, meaning the system rarely
+assigns the correct action label even when its fact state ends
+up partially correct; (2) multi-author source attribution (C6:
+41.5%) does not adequately leverage author identity; (3) false
+updates (22.2%) indicate overly aggressive modification on
+reinforcement signals. None of these are recoverable from
+
+
+extrinsic scores.
+Finding 5: Robustness Across Systems.
+To test whether
+the intrinsic–extrinsic divergence is an artifact of a particular
+system implementation, corpus version, or backbone model,
+we evaluate four configurations spanning two factors: sys-
+tem configuration (simpler vs. main) and corpus (pre-release
+vs. the publicly released set), plus the main configuration
+with an upgraded backbone model. The simpler system on
+the pre-release corpus gives MAD = 0.164 ± 0.027, Di-
+vRate = 43.3%, signed divergence +0.088 ± 0.034, and
+κ = 0.104. Holding the corpus fixed (pre-release) but
+upgrading to the main system configuration shifts intrin-
+sic accuracy up most sharply among all four configura-
+tions (57.6% →61.1%) and raises DivRate to its highest
+value (49.4%, MAD = 0.181 ± 0.022, signed divergence
++0.126 ± 0.025). Switching to the publicly released corpus
+on top of the main system configuration (used for all other
+results in this paper) pulls DivRate back down to 43.6%
+(MAD = 0.168±0.025, signed divergence +0.118±0.029,
+κ = 0.118), close to the simpler-system starting point; the
+system upgrade and the corpus release thus move DivRate in
+opposite directions and partially cancel. Finally, re-scoring
+the main configuration with an upgraded backbone model
+gives MAD = 0.158 ± 0.035, DivRate = 39.7%, signed
+divergence +0.121 ± 0.036, and κ = 0.035. Across all
+four configurations, intrinsic accuracy remains in a narrow
+57.6–61.4% band, extrinsic accuracy is essentially flat (48.5–
+49.2%), and signed divergence stays positive throughout;
+pass/fail agreement stays near chance in every configuration,
+falling further under the upgraded backbone, consistent with
+weak-to-absent agreement rather than a single stable value.
+The configuration used for the main results in this paper
+adds retrieval relevance filtering, concurrent fact-update han-
+dling, and improved large-document extraction; the simpler-
+system ablation lacks these refinements, which accounts for
+its modestly lower intrinsic accuracy. All configurations im-
+plement the same extract-embed-classify-synthesize pattern
+(Figure 1). The divergence therefore persists across all four,
+with full statistics in Appendix H.
+6.3
+Diagnostic Decomposition
+A key advantage of intrinsic evaluation is diagnostic decom-
+position: when a system fails, we can identify which pipeline
+stage is responsible:
+• Extraction failures: Claims present in artifacts but not
+captured by the system’s observation layer.
+• Synthesis failures: Claims extracted but incorrectly
+merged, duplicated, or lost during fact aggregation.
+• Update failures: State transitions missed or false updates
+applied.
+• Conflict failures: Contradictions not detected or resolved
+incorrectly.
+Table 4 reveals three co-occurring failure patterns that in-
+tensify with difficulty. First, the claim miss rate rises from
+58% at L1 to 88% at L3, indicating that subtle or embedded
+claims are increasingly lost during extraction. Second, fact
+count inflates from 9.1 to 20.7, showing the system fragments
+knowledge into many small, partially redundant facts rather
+than synthesizing them into coherent evolving beliefs. Third,
+classification accuracy degrades from 37% to 10%, mean-
+ing the system rarely identifies the correct action (create vs.
+update vs. reinforce) at higher difficulty. These three signals
+are mutually reinforcing: poor classification leads to creating
+new facts instead of updating existing ones (inflating count),
+which in turn fragments claims across facts (increasing miss
+rate on claim-level matching). None of these diagnostics are
+available from the extrinsic QA score, which remains flat at
+∼50% regardless of the underlying failure pattern.
+7
+Discussion and Limitations
+Complementary, Not Replacement.
+Intrinsic evaluation
+does not replace extrinsic evaluation, it complements it. Ex-
+trinsic captures end-to-end utility as intrinsic enables diag-
+nosis. A system scoring high on both is genuinely effective;
+high extrinsic but low intrinsic signals fragility (dependent
+on LLM compensation); high intrinsic but low extrinsic in-
+dicates a retrieval or generation bottleneck.
+Synthetic Document Validity.
+Generated documents may
+not capture all properties of real multi-author text. We miti-
+gate this through style grounding, multi-model rotation, and
+hybrid injection at L3. Future work should validate transfer
+via rank correlation with human-annotated real document
+sequences.
+Scope and Limitations.
+FEB-30 targets factual evolution
+across multi-author artifacts. It does not evaluate episodic
+memory, procedural memory, or single-turn conversational
+recall, capabilities addressed by existing benchmarks. The
+benchmark contains 30 trajectories, sufficient for diagnostic
+evaluation but not for fine-grained statistical comparisons.
+Scoring relies on embedding similarity thresholds and LLM
+judges, introducing potential measurement noise.
+8
+Conclusion
+We introduced FEB-30, the first benchmark designed for in-
+trinsic evaluation of agent memory systems. By constructing
+trajectories where the expected memory state is known at ev-
+ery step, we demonstrated that intrinsic and extrinsic evalua-
+tion diverge by an average of 16 percentage points, with 44%
+of trajectories showing meaningful disagreement, revealing
+false positives and false negatives invisible to response-based
+benchmarks. Diagnostic decomposition showed the system
+correctly classifies memory operations only 20% of the time
+(degrading from 34% at L1 to 10% at L3), a dimension ex-
+trinsic evaluation cannot measure.
+We argue that intrinsic evaluation should become standard
+practice alongside extrinsic benchmarks, analogous to how
+intrinsic evaluation of embeddings complemented down-
+stream task evaluation in NLP. We release FEB-30, the gen-
+eration pipeline, and the scoring framework for reproducible
+evaluation of agent memory.
+
+
+Category
+Miss (%)
+Fact Count
+ClassAcc (%)
+C1: LLM Comp.
+54.0±4.5
+13.6±1.0
+41.7±2.8
+C2: Retrieval
+74.5±4.2
+20.8±1.3
+4.5±5.7
+C3: Classif.
+60.5±7.9
+14.8±1.4
+30.7±12.3
+C4: Synthesis
+72.2±2.6
+14.9±1.0
+17.4±2.4
+C5: Temporal
+68.0±5.3
+21.0±1.0
+0.4±1.1
+C6: Multi-Auth.
+87.5±3.5
+12.0±0.8
+28.8±7.3
+Overall
+71.4±2.1
+16.6±0.4
+20.1±2.7
+Diff.
+Miss (%)
+Fact Count
+ClassAcc (%)
+L1
+54.4±5.1
+9.6±0.9
+33.8±6.8
+L2
+61.1±3.2
+14.7±0.7
+16.5±2.7
+L3
+86.3±1.6
+22.4±0.8
+10.1±4.3
+Overall
+71.4±2.1
+16.6±0.4
+20.1±2.7
+Table 4: Diagnostic decomposition by category (left) and difficulty (right), averaged across N=11 runs (± std). Miss Rate =
+percentage of expected claims not found in the fact store. Fact Count = average active facts per trajectory (lower indicates better
+synthesis). ClassAcc = action classification accuracy. C6 shows highest miss rate (88%); fact count inflates from 9.6 at L1 to
+22.4 at L3.
+References
+Amazon Artificial General Intelligence. 2025. The Amazon
+Nova Family of Models: Technical Report and Model Card.
+arXiv:2506.12103.
+Amazon Web Services. 2024. Amazon Titan Text Embed-
+dings. AWS AI Service Card.
+Anthropic. 2025. Claude Haiku 4.5 System Card. Anthropic
+model system card.
+Baroni, M.; Dinu, G.; and Kruszewski, G. 2014. Don’t Count,
+Predict! A Systematic Comparison of Context-Counting vs.
+Context-Predicting Semantic Vectors. In Proceedings of the
+52nd Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), 238–247. Association
+for Computational Linguistics.
+Carletta, J.; Ashby, S.; Bourban, S.; Flynn, M.; Guillemot,
+M.; Hain, T.; Kadlec, J.; Karaiskos, V.; Kraaij, W.; Kronen-
+thal, M.; et al. 2005. The AMI Meeting Corpus: A Pre-
+Announcement. In Proc. MLMI Workshop.
+Chhikara, P.; Khant, D.; Aryan, S.; Singh, T.; and Yadav, D.
+2025. Mem0: Building Production-Ready AI Agents with
+Scalable Long-Term Memory. arXiv preprint.
+Du, P. 2026. Memory for Autonomous LLM Agents: Mech-
+anisms, Evaluation, and Emerging Frontiers. arXiv preprint.
+Du, Y.; Huang, W.; Zheng, D.; Wang, Z.; Montella, S.; La-
+pata, M.; et al. 2025. Rethinking Memory in LLM based
+Agents: Representations, Operations, and Emerging Topics.
+arXiv preprint.
+Future AGI. 2026. Evaluating Agent Memory Systems: A
+Practitioner’s 4-Dimension Framework. Industry blog post.
+Practitioner source, not peer-reviewed.
+Hu, Y.; Liu, S.; Yue, Y.; Zhang, G.; Liu, B.; and Zhu, F. 2025.
+Memory in the Age of AI Agents. arXiv preprint.
+Hu, Y.; Wang, Y.; and McAuley, J. 2026. Evaluating Memory
+in LLM Agents via Incremental Multi-Turn Interactions. In
+ICLR.
+Huang, W.-C.; Zhang, W.; Liang, Y.; Bei, Y.; Chen, Y.; Feng,
+T.; et al. 2026. A Survey of Agent Memory in the Sec-
+ond Half: Towards Self-Evolving and Long-Horizon Agents.
+Transactions on Machine Learning Research. Survey Certi-
+fication.
+Jiang, D.; Li, Y.; Wei, S.; Yang, J.; Kishore, A.; and Zhao, A.
+2026. Anatomy of Agentic Memory: Taxonomy and Empir-
+ical Analysis of Evaluation and System Limitations. arXiv
+preprint.
+Jung, S.; Rubinstein, A.; Uselis, A.; Yun, S.; and Oh, S. J.
+2026. MEME: Multi-Entity and Evolving Memory Evalua-
+tion. In Advances in Neural Information Processing Systems
+(NeurIPS), Datasets and Benchmarks Track.
+Klimt, B.; and Yang, Y. 2004. The Enron Corpus: A New
+Dataset for Email Classification Research. In Proc. European
+Conference on Machine Learning (ECML).
+Latimer, C.; Boschi, N.; Neeser, A.; Bartholomew, C.; Sri-
+vastava, G.; Wang, X.; et al. 2026. Hindsight: Structured
+Agent Memory that Retains, Recalls, and Reflects. In Pro-
+ceedings of the 64th Annual Meeting of the Association for
+Computational Linguistics (Volume 3: System Demonstra-
+tions), 275–285. Association for Computational Linguistics.
+Lee, J.; Lee, K.; and Kim, T. 2025. MAGIC: A Multi-Hop
+and Graph-Based Benchmark for Inter-Context Conflicts in
+Retrieval-Augmented Generation. arXiv preprint.
+Liu, L.; and Yadav, N. 2026. Introducing STATE-Bench: A
+Benchmark for AI Agent Memory. Microsoft Open Source
+Blog. Industry source.
+Luo, J.; Tian, Y.; Cao, C.; Luo, Z.; Lin, H.; and Li, K. 2026.
+From Storage to Experience: A Survey on the Evolution of
+LLM Agent Memory Mechanisms. arXiv preprint.
+Maharana, A.; Lee, D.-H.; Tulyakov, S.; Bansal, M.; Bar-
+bieri, F.; and Fang, Y. 2024. Evaluating Very Long-Term
+Conversational Memory of LLM Agents. In Proceedings of
+the 62nd Annual Meeting of the Association for Computa-
+tional Linguistics (Volume 1: Long Papers), 13851–13870.
+Association for Computational Linguistics.
+Packer, C.; Fang, V.; Patil, S. G.; Lin, K.; Wooders, S.; and
+Gonzalez, J. E. 2024. MemGPT: Towards LLMs as Operat-
+ing Systems. In ICLR.
+Rasmussen, P.; Paliychuk, P.; Beauvais, T.; Ryan, J.; and
+Chalef, D. 2025. Zep: A Temporal Knowledge Graph Archi-
+tecture for Agent Memory. arXiv preprint.
+Robertson, S.; and Zaragoza, H. 2009. The Probabilistic
+Relevance Framework: BM25 and Beyond. Foundations and
+Trends in Information Retrieval, 3(4): 333–389.
+
+
+Roig, J. 2025. Scalable and Reliable Evaluation of AI Knowl-
+edge Retrieval Systems: RIKER and the Coherent Simulated
+Universe. arXiv preprint.
+Schaffelder, M.; and Gatt, A. 2026. Synthetic Eggs in Many
+Baskets: The Impact of Synthetic Data Diversity on LLM
+Fine-Tuning. In Findings of the Association for Computa-
+tional Linguistics: ACL 2026.
+Schnabel, T.; Labutov, I.; Mimno, D.; and Joachims, T. 2015.
+Evaluation Methods for Unsupervised Word Embeddings. In
+Proceedings of the 2015 Conference on Empirical Methods
+in Natural Language Processing, 298–307. Association for
+Computational Linguistics.
+Su, Z.; Zhang, J.; Qu, X.; Zhu, T.; Li, Y.; Sun, J.; Li, J.;
+Zhang, M.; and Cheng, Y. 2024. ConflictBank: A Bench-
+mark for Evaluating the Influence of Knowledge Conflicts
+in LLMs. In Advances in Neural Information Processing
+Systems (NeurIPS), Datasets and Benchmarks Track.
+Sumers, T.; Yao, S.; Narasimhan, K. R.; and Griffiths, T. L.
+2024. Cognitive Architectures for Language Agents. Trans-
+actions on Machine Learning Research.
+Toma, S.-A.; and Matei, O. 2026.
+What Agent Memory
+Benchmarks Miss: The Gap Between Response Quality and
+Knowledge State Correctness. In Proceedings of InnoComp
+2026, Communications in Computer and Information Sci-
+ence. Springer. To appear.
+Uddin, M. N.; Shubham, K.; Blanco, E.; Baral, C.; and Wang,
+G. 2026. From Recall to Forgetting: Benchmarking Long-
+Term Memory for Personalized Agents. In Findings of the
+Association for Computational Linguistics: ACL 2026.
+van Elburg, J.; van der Putten, P.; and Marx, M. 2025. Can
+We Evaluate RAGs with Synthetic Data? arXiv preprint.
+Wu, D.; Ji, Z.; Kawatkar, A.; Kwan, B.; Gu, J.-C.; and Peng,
+N. 2026. LongMemEval-V2: Evaluating Long-Term Agent
+Memory Toward Experienced Colleagues. arXiv preprint.
+Zhao, Y.; Yuan, B.; Huang, J.; Yuan, H.; Yu, Z.; Xu, H.;
+Hu, L.; Shankarampeta, A.; Huang, Z.; Ni, W.; Tian, Y.;
+and Zhao, J. 2026. AMA-Bench: Evaluating Long-Horizon
+Memory for Agentic Applications. In Proceedings of the
+43rd International Conference on Machine Learning, vol-
+ume 306, 162781–162809. PMLR.
+Zhu, W.; Chen, X.; Wang, Z.; Wang, J.; Dong, X.; and Huang,
+M. 2026. AriadneMem: Threading the Maze of Lifelong
+Memory for LLM Agents. arXiv preprint.
+Appendix
+A
+Trajectory Examples
+A.1
+c5-linear: Linear Temporal Evolution
+{
+"id": "c5-linear",
+"topic": "Database migration from PostgreSQL
+to Aurora",
+"category": "C5",
+"difficulty": "L1",
+"trajectoryType": "linear-evolution",
+"customer": "Meridian Corp",
+"extrinsicQA": ["Describe Meridian Corp’s
+database migration: source, target, timeline,
+status?"],
+"states": [
+{
+"index": 0,
+"timestamp": "2025-01-15",
+"claims": [
+"Customer runs PostgreSQL 14 on-premise",
+"Production database holds approx 3 TB"
+],
+"action": "create",
+"confidence": 0.9
+},
+{
+"index": 1,
+"timestamp": "2025-03-20",
+"claims": [
+"Customer runs PostgreSQL 14 on-premise",
+"Production database holds approx 3 TB",
+"Evaluating Aurora and AlloyDB"
+],
+"docClaims": [
+"Evaluating Aurora and AlloyDB",
+"PoC planned for Q2"
+],
+"action": "update",
+"confidence": 0.8,
+"changeReason": "Architecture review"
+}
+]
+}
+si
+Action
+Expected claims Ci (cumulative)
+0
+create
+“PostgreSQL 14 on-premise in Frank-
+furt”; “3 TB database”
+1
+update
++“Evaluating Aurora and AlloyDB”
+2
+update
++“Chose Aurora”; “Cutover Q3 2025”
+3
+update
++“DMS replication running”; “95%
+stored procedures validated”
+Table 5: State evolution for c5-linear.
+Each state’s document contains only docClaims (new in-
+formation): the s2 document mentions the Aurora decision
+and Q3 timeline but does not repeat that the database is 3 TB.
+The system must retain s0 claims from memory.
+Intrinsic scoring inspects the fact store after each artifact
+is ingested. At each state si, the system should have a fact
+containing all claims from Ci, with history showing the cor-
+rect transitions. If the system creates separate facts for each
+state (fragmentation) or drops s0 claims (retention failure),
+intrinsic scoring detects it at the state where it occurs.
+Extrinsic scoring poses the question to an agent that re-
+trieves from the memory system’s fact store and generates
+an answer: “Describe the database migration: source, target,
+timeline, and status.” A strong LLM can answer this cor-
+rectly even if the fact store is fragmented across 4 separate
+facts, as long as retrieval surfaces all fragments.
+Actual result (N=11 runs): Intrinsic = 40–67%, Extrin-
+sic = 50%. The system partially fragments the fact, which
+intrinsic detects but extrinsic masks.
+
+
+A.2
+c4-out-of-order: Out-of-Order Ingestion
+This trajectory tests temporal robustness: a newer document
+(the decision) arrives first, then an older document (the eval-
+uation) arrives second. The system must enrich the existing
+fact with context from the earlier document without over-
+writing the confirmed decision.
+{
+"id": "c4-out-of-order",
+"topic": "Compute platform decision",
+"category": "C4",
+"difficulty": "L2",
+"trajectoryType": "linear-evolution",
+"customer": "Vertex AI Labs",
+"extrinsicQA": ["What compute platform did
+Vertex AI Labs choose, what alternatives
+were considered, and why?"],
+"states": [
+{
+"index": 0,
+"timestamp": "2025-03-10",
+"claims": [
+"Customer chose ECS Fargate",
+"Decision driven by sub-100ms response"
+],
+"action": "create",
+"confidence": 0.9
+},
+{
+"index": 1,
+"timestamp": "2025-01-20",
+"claims": [
+"Customer chose ECS Fargate",
+"Decision driven by sub-100ms response",
+"Lambda rejected due to cold starts",
+"EKS rejected as over-complex"
+],
+"docClaims": [
+"Evaluating Lambda, ECS Fargate, and EKS",
+"Lambda cold starts concern given p99 SLA",
+"EKS too complex for team of 4"
+],
+"action": "update",
+"confidence": 0.9,
+"changeReason": "Earlier evaluation doc
+enriches fact without overwriting"
+},
+{
+"index": 2,
+"timestamp": "2025-05-15",
+"claims": [
+"Customer chose ECS Fargate",
+"Decision driven by sub-100ms response",
+"Lambda rejected due to cold starts",
+"EKS rejected as over-complex",
+"Running 12 Fargate services at 50K rps"
+],
+"docClaims": [
+"12 Fargate services at 50K rps peak",
+"34ms avg response, within target"
+],
+"action": "update",
+"confidence": 0.95,
+"changeReason": "Operational review confirms"
+}
+]
+}
+si
+Timestamp
+Action
+Expected claims Ci (cumulative)
+0
+2025-03-10
+create
+“Chose ECS Fargate”; “Sub-100ms
+response”
+1
+2025-01-20
+update
++“Lambda rejected (cold starts)”;
+“EKS rejected (complexity)”
+2
+2025-05-15
+update
++“12 Fargate services at 50K rps”
+Table 6: State evolution for c4-out-of-order. Note s1 times-
+tamp is older than s0.
+Key challenge: State 1 has timestamp 2025-01-20,
+which is older than state 0’s 2025-03-10. The system
+ingests the decision document first, then receives an earlier
+evaluation document. The temporal guard should prevent the
+older document from overwriting the decision; instead, the
+system should enrich the fact with the evaluation context
+(why Lambda and EKS were rejected).
+What intrinsic reveals: If the system overwrites “chose
+ECS Fargate” with “evaluating Lambda, ECS Fargate, and
+EKS” (a regression), intrinsic scoring detects the loss of the
+decision claim. If it correctly enriches, all 4 claims from C1
+are present. Extrinsic QA may still pass either way if the
+LLM reasons over both fragments.
+B
+System Prompts
+B.1
+Observation Extraction
+The prompts below are generalized for reproducibility. Un-
+like the other prompts in this section, which are domain-
+agnostic, this prompt is grounded in the benchmark’s
+business/customer-relationship domain, since the extrac-
+tion categories define what the system treats as a fact-
+worthy observation. The {categories} placeholder be-
+low stands for the domain-specific observation categories
+actually used (e.g. a decision, a commitment, an action
+item). Each extracted observation is further structured into
+who/what/when/why/where fields; the statement referred
+to below is the what field.
+You are analyzing text from a multi-author artifact.
+Extract observations and entities from the text.
+Observation guidelines:
+- Extract every distinct piece of domain-relevant
+information.
+- Each observation must contain exactly ONE factual
+claim.
+- Every observation must be directly supported by
+the source text.
+- Each observation’s statement must be self-contained
+and understandable without the source document.
+- Resolve all pronouns and references.
+- Include temporal grounding when dates are available.
+- Categories: {categories}
+- Confidence: "High" = explicitly stated;
+"Medium" = discussed but not finalized;
+"Low" = inferred.
+
+
+Entity guidelines:
+- Extract all people mentioned by name, using the
+most complete form of each name.
+- Extract other domain-relevant entities: {entity_types}
+B.2
+Fact Synthesis
+You are synthesizing knowledge from observations
+into evolving facts.
+Decide how the new observation relates to existing
+facts:
+- "create": New knowledge not covered by any fact.
+- "update": Adds new details to an existing fact.
+MERGE new information with existing.
+- "reinforce": Confirms without adding new info.
+- "supersede": Contradicts an existing fact.
+- "none": Purely procedural, no lasting value.
+Critical rules for "update":
+- MUST preserve all details from existing statement.
+- ADD new information (metrics, timelines, people).
+- PREFER updating over creating.
+Almost every observation matching an existing fact
+should be "update." If in doubt, use "update."
+Input:
+New observation: {observation.what}
+Existing facts for this topic: {existing_facts}
+C
+Evaluation Prompts
+C.1
+Claim Entailment Judge
+Given the system’s active facts and an expected claim, deter-
+mines whether the claim is entailed.
+Given these facts from a knowledge base:
+1. {fact_1}
+2. {fact_2}
+...
+Claim to verify: "{expected_claim}"
+Which fact (if any) best matches or contains the
+information in this claim?
+Reply in this exact format:
+FACT_NUMBER: <number or 0 if no fact matches>
+SCORE: <YES if clearly states the claim,
+PARTIAL if related but incomplete,
+NO if no fact matches>
+Scoring: YES = 1.0, PARTIAL = 0.5, NO = 0.0
+C.2
+Answer Generation (Extrinsic)
+Asks an agent using the memory system, given retrieved facts
+and a diagnostic question, to generate an answer.
+Answer the following question based ONLY on the
+facts provided. If the facts don’t contain enough
+information, say "I don’t have that information."
+Facts:
+1. {retrieved_fact_1}
+2. {retrieved_fact_2}
+...
+Question: {extrinsicQA_question}
+Answer concisely.
+C.3
+Answer Judge (Extrinsic)
+Compares the generated answer against the expected answer.
+Does the generated answer contain the same
+information as the expected answer?
+Generated answer: "{generated_answer}"
+Expected answer: "{expected_answer}"
+Answer YES if the generated answer conveys the
+same key information.
+Answer PARTIAL if it contains some but not all
+key information.
+Answer NO if it contradicts or misses the expected
+information entirely.
+Answer with exactly one word: YES, PARTIAL, or NO.
+Scoring: YES = 1.0, PARTIAL = 0.5, NO = 0.0
+D
+Models Used
+Table 7 lists all models used in the system under test and
+the evaluation scorer. The system uses a single frontier LLM
+for both observation extraction (converting artifact text into
+atomic observations) and fact synthesis (classifying the re-
+lationship between new observations and existing facts, then
+rewriting the fact statement). Titan Embeddings V2 (Ama-
+zon Web Services 2024) generates 1024-dimensional vectors
+for semantic search. Retrieval combines BM25 (Robertson
+and Zaragoza 2009) keyword matching (weight 0.3) with k-
+NN vector similarity (weight 0.7). The evaluation scorer uses
+Claude Haiku 4.5 (Anthropic 2025) for judging and Amazon
+Nova Pro (Amazon Artificial General Intelligence 2025) for
+answer generation. All LLM calls use temperature 0 for de-
+terministic outputs. All models are accessed via cloud-hosted
+APIs.
+Component
+Model
+Temp.
+System under test
+Observation extraction
+Frontier LLM
+0
+Fact synthesis
+Frontier LLM
+0
+Embedding
+Titan Embeddings V2 (1024-dim)
+–
+Retrieval
+BM25 (0.3) + k-NN (0.7)
+–
+Evaluation scorer
+Claim entailment judge
+Claude Haiku 4.5
+0
+Answer generation
+Amazon Nova Pro
+0
+Answer judge
+Claude Haiku 4.5
+0
+Embedding (claim matching)
+Titan Embeddings V2 (1024-dim)
+–
+Table 7: All models used in the system and evaluation
+pipeline.
+
+
+E
+Per-State Coverage Degradation
+Table 8 shows how claim coverage degrades as more doc-
+uments are ingested within a trajectory. Later states require
+the system to retain earlier claims while incorporating new
+information, testing memory persistence.
+State
+All (%)
+L1 (%)
+L2 (%)
+L3 (%)
+s0 (n=330)
+64.7±28.8
+67.5±24.4
+76.4±22.1
+50.2±32.4
+s1 (n=330)
+65.3±22.1
+72.7±23.6
+70.3±20.3
+52.9±16.0
+s2 (n=319)
+58.2±20.8
+68.2±23.0
+60.6±17.9
+46.1±13.4
+s3 (n=242)
+57.8±18.8
+62.3±27.1
+68.4±14.8
+48.2±8.6
+s4 (n=110)
+49.7±11.4
+–
+57.3±10.9
+47.8±10.7
+s5 (n=44)
+50.8±10.8
+–
+–
+50.8±10.8
+s6 (n=22)
+52.3±10.4
+–
+–
+52.3±10.4
+Table 8: Claim coverage (%) by state index, averaged across
+all trajectories and N=11 runs. n = number of trajectory×run
+pairs that reach this state (not all trajectories have the same
+number of states). Coverage decreases at later states as the
+system must retain earlier claims while integrating new in-
+formation. L3 trajectories start lower and degrade further.
+Coverage drops from 65% at s0 to 50% at s4, confirm-
+ing that memory retention degrades as trajectories progress.
+At L2, the drop is steepest between s1 (70%) and s2 (61%),
+suggesting the system struggles to retain claims once 3+ doc-
+uments have been processed. L3 starts lowest (50% at s0) due
+to the extraction challenge of hybrid-injection documents.
+Note that fact coverage (whether the system creates any
+fact related to the trajectory topic) is 98.8% overall , the
+system almost always creates a fact. The low claim coverage
+reported here reflects that the created facts are incomplete or
+fragmented, not that they are entirely absent.
+Trajectory length (number of states) is moderately corre-
+lated with lower intrinsic accuracy (Spearman ρ = −0.45,
+p < 0.02): trajectories with 2–3 states average ∼71% accu-
+racy while those with 5–7 states average ∼49%. This con-
+firms that longer fact evolution sequences are harder to track,
+independently of the difficulty level assignment.
+F
+Update Detection, False Updates, and
+Confidence Calibration
+Table 9 shows update detection recall (UDR), false update
+rate (FUR), and confidence MAE per category and difficulty,
+all averaged across N=11 runs.
+C1 and C6 show both low UDR (∼51%) and high FUR
+(∼39%): the system misses true updates while simultane-
+ously making false updates, a double failure that intrinsic
+evaluation exposes but extrinsic cannot distinguish from sim-
+ple low accuracy. C2 and C5 achieve near-perfect UDR with
+zero false updates, indicating the classification challenge is
+category-specific rather than a general system weakness.
+Confidence calibration is relatively uniform across cat-
+egories (range 0.092–0.124), with an overall MAE of
+0.106 indicating systematic miscalibration of approximately
+10 points. C6 (Multi-Author) shows the worst calibration
+(0.124), likely because the system does not adequately adjust
+confidence based on author diversity. Calibration degrades
+Category
+UDR (%)
+FUR (%)
+Conf. MAE
+C1: LLM Comp.
+51.4±6.0
+39.4±1.9
+0.105±0.005
+C2: Retrieval
+94.8±4.3
+0.0±0.0
+0.092±0.009
+C3: Classif.
+70.5±9.6
+45.5±6.0
+0.117±0.007
+C4: Synthesis
+81.4±3.3
+15.7±2.1
+0.097±0.006
+C5: Temporal
+90.6±2.2
+0.0±0.0
+0.108±0.007
+C6: Multi-Auth.
+50.8±7.4
+38.6±3.1
+0.124±0.005
+Difficulty
+L1
+55.2±3.9
+37.4±2.4
+0.089±0.003
+L2
+81.6±5.3
+19.4±1.3
+0.112±0.003
+L3
+84.1±2.1
+9.8±0.7
+0.118±0.004
+Overall
+73.6±2.6
+22.2±1.2
+0.106±0.002
+Table 9: Update detection recall (UDR), false update rate
+(FUR), and confidence MAE per category and difficulty, av-
+eraged across N=11 runs (± std across runs). C2 and C5
+never produce false updates but C1 and C6 frequently mis-
+classify reinforcements as updates. Confidence calibration is
+worst for C6 (multi-author) and best for C4 (synthesis). FUR
+decreases with difficulty because at L3 the system rarely
+modifies facts.
+slightly with difficulty (0.089 at L1 to 0.118 at L3), consistent
+with the system being less certain about harder trajectories.
+G
+Metric Correlations
+To validate that our intrinsic metrics capture meaningful sig-
+nal, we compute correlations between claim miss rate, intrin-
+sic accuracy, and extrinsic accuracy across all 30 trajectories
+(using per-trajectory means across N=11 runs).
+Comparison
+Pearson r
+p-value
+Miss rate vs. Intrinsic accuracy
+−0.841
+5.9 × 10−9
+Miss rate vs. Extrinsic accuracy
+−0.391
+3.2 × 10−2
+Intrinsic vs. Extrinsic accuracy
++0.552
+1.6 × 10−3
+Table 10: Pearson correlations across 30 trajectories. Miss
+rate strongly predicts intrinsic accuracy (r = −0.84) but
+weakly predicts extrinsic accuracy (r = −0.39), confirm-
+ing that intrinsic metrics capture signal that extrinsic eval-
+uation misses. The moderate intrinsic-extrinsic correlation
+(r = 0.55) indicates the two methods share some signal but
+measure substantially different properties.
+The strong negative correlation between miss rate and
+intrinsic accuracy (r = −0.84, p < 10−8) validates that
+claim coverage is the primary driver of intrinsic scores.
+The weaker correlation between miss rate and extrinsic ac-
+curacy (r = −0.39) confirms that extrinsic evaluation is
+less sensitive to extraction failures , consistent with LLM
+compensation masking missing claims at query time. The
+moderate positive correlation between intrinsic and extrinsic
+(r = 0.55) shows they are related but far from equivalent,
+reinforcing the paper’s argument that both are needed.
+Table 11 shows the signed divergence (intrinsic −extrin-
+sic) per category. Positive values indicate intrinsic scores
+
+
+higher than extrinsic (memory underestimated by QA).
+Category
+Signed Div.
+Interpretation
+C1: LLM Comp.
++0.276 ± 0.260
+Memory much better than QA reveals
+C2: Retrieval
++0.094 ± 0.137
+Memory slightly better
+C3: Classif.
++0.220 ± 0.276
+Memory much better than QA reveals
+C4: Synthesis
++0.036 ± 0.173
+Nearly neutral
+C5: Temporal
++0.120 ± 0.160
+Memory moderately better
+C6: Multi-Auth.
+−0.003 ± 0.158
+No directional bias
+Table 11: Signed divergence (intrinsic −extrinsic) per cat-
+egory. C1 shows strong positive bias by design: memory is
+correct but QA underestimates. C6 shows no directional bias:
+both metrics are equally poor at capturing multi-author attri-
+bution.
+H
+Robustness Across Systems: Configuration
+Comparison
+Table 12 reports headline statistics for the four configurations
+discussed in Finding 5 of the main paper. All values are
+averaged across N=11 runs. The four configurations are:
+• Simpler sys.: a simpler configuration of the memory sys-
+tem, on the pre-release corpus.
+• Main sys.: the main system configuration, on the same
+pre-release corpus (differs from Simpler sys. only in the
+system).
+• Main (released): the main system configuration, on the
+publicly released corpus used for all other results in this
+paper (differs from Main sys. only in the corpus).
+• Upgraded backbone: the main system configuration with
+a newer-generation frontier model as the backbone, re-
+placing the one used in all other configurations, on the
+publicly released corpus.
+The intrinsic–extrinsic divergence holds across all four: posi-
+tive signed divergence, near-chance pass/fail agreement, and
+MAD and DivRate in a narrow range, indicating the finding
+is not an artifact of a single system implementation, corpus
+version, or backbone model.
+Beyond these aggregate statistics, the paper’s category-
+level findings are also preserved under the upgraded back-
+bone. Comparing per-category metrics between the main
+configuration and the upgraded backbone, the category rank-
+ings are highly stable: Spearman rank correlation across the
+six categories is ρ = 0.94 for MAD, ρ = 0.89 for intrin-
+sic accuracy, and ρ = 0.94 for classification accuracy. The
+named extremes the paper relies on are unchanged: C1 (LLM
+Compensation) has the highest MAD and the highest classi-
+fication accuracy, C6 (Multi-Author) has the lowest intrinsic
+accuracy, and C5 (Temporal) has the lowest classification ac-
+curacy, in both configurations. The only differences are adja-
+cent swaps among already-close values, never a reordering of
+these extremes, indicating the diagnostic category structure
+is not an artifact of a particular backbone model.
+I
+Per-Trajectory Results
+Table 13 shows individual trajectory scores averaged across
+N=11 runs. Intr. = fact accuracy (Eq. 2 in the main paper):
+mean claim coverage across all states of the trajectory. Across
+runs, intrinsic accuracy ranges from 56.9% to 63.3% (std =
+1.6%) and extrinsic from 45.0% to 55.0% (std = 2.9%), con-
+firming high reproducibility despite LLM non-determinism.
+Intrinsic scoring is more stable than extrinsic because it eval-
+uates the persistent store directly rather than depending on
+retrieval + generation.
+
+
+Metric
+Simpler sys.
+Main sys.
+Main (released)
+Upgraded backbone
+Intrinsic (%)
+57.6 ± 1.8
+61.1 ± 1.6
+60.6 ± 1.6
+61.4 ± 1.3
+Extrinsic (%)
+48.8 ± 2.7
+48.5 ± 2.1
+48.8 ± 2.9
+49.2 ± 3.4
+MAD
+0.164 ± 0.027
+0.181 ± 0.022
+0.168 ± 0.025
+0.158 ± 0.035
+DivRate (%)
+43.3 ± 6.0
+49.4 ± 7.2
+43.6 ± 6.1
+39.7 ± 6.1
+Signed divergence
++0.088 ± 0.034
++0.126 ± 0.025
++0.118 ± 0.029
++0.121 ± 0.036
+Cohen’s κ
+0.104
+0.082
+0.118
+0.035
+Table 12: Headline statistics across the four configurations of Finding 5, each averaged over N=11 runs. Main (released) is the
+configuration used for all other results in this paper. Positive signed divergence and near-chance κ persist in every configuration.
+Trajectory
+Cat
+Diff
+Intr. (%)
+Extr. (%)
+MAD
+Miss (%)
+FC
+CA (%)
+Dir
+c1-confidence-001
+C1
+L1
+100.0±0.0
+95.5±14.4
+.045
+11±21
+6.4±4.8
+100±0
+=
+c1-duplicate-facts-001
+C1
+L1
+100.0±0.0
+50.0±0.0
+.500
+17±5
+8.0±3.7
+100±0
+↑
+c1-stale-state-001
+C1
+L2
+83.3±12.3
+45.5±33.4
+.470
+69±9
+14.5±8.2
+0±0
+↑
+c1-wrong-provenance-001
+C1
+L2
+79.1±5.1
+45.5±14.4
+.336
+34±14
+21.3±5.0
+6±13
+↑
+c1-unresolved-conflict-001
+C1
+L3
+48.5±4.8
+36.4±22.3
+.121
+99±4
+15.8±5.0
+2±7
+↑
+c2-phrasing-mismatch-001
+C2
+L1
+76.1±3.6
+50.0±0.0
+.261
+31±3
+10.6±5.0
+0±0
+↑
+c2-temporal-mismatch-001
+C2
+L1
+59.1±13.0
+50.0±0.0
+.121
+60±15
+10.8±4.5
+3±10
+↑
+c2-buried-fact-001
+C2
+L2
+61.8±3.9
+54.5±14.4
+.127
+67±7
+13.6±7.7
+0±0
+↑
+c2-compound-narrow-001
+C2
+L3
+45.5±9.0
+50.0±0.0
+.076
+89±7
+24.0±9.8
+20±23
+=
+c2-multi-fact-scatter-001
+C2
+L3
+59.1±6.6
+50.0±0.0
+.091
+84±6
+31.9±17.0
+0±0
+↑
+c3-reinforce-001
+C3
+L1
+84.1±12.0
+59.1±19.3
+.250
+32±15
+10.8±4.4
+68±44
+↑
+c3-entity-split-001
+C3
+L2
+90.9±19.3
+63.6±22.3
+.273
+30±24
+10.3±5.6
+0±0
+↑
+c3-subtle-update-001
+C3
+L2
+59.1±28.7
+27.3±44.5
+.409
+24±22
+10.9±7.8
+55±14
+↑
+c3-contradiction-001
+C3
+L3
+49.2±6.6
+45.5±14.4
+.098
+87±8
+22.9±13.5
+0±0
+=
+c4-simple-merge-001
+C4
+L1
+50.0±7.1
+50.0±0.0
+.030
+95±15
+7.2±5.7
+0±0
+=
+c4-dedup-001
+C4
+L2
+54.5±14.4
+50.0±0.0
+.045
+98±0
+14.8±9.4
+100±0
+=
+c4-out-of-order-001
+C4
+L2
+48.2±5.7
+50.0±0.0
+.036
+60±7
+6.1±3.4
+5±14
+=
+c4-scope-expansion-001
+C4
+L2
+78.4±7.7
+45.5±14.4
+.330
+34±15
+19.1±7.5
+0±0
+↑
+c4-compound-001
+C4
+L3
+37.5±0.0
+50.0±0.0
+.125
+100±0
+19.1±6.8
+0±0
+↓
+c4-noise-filter-001
+C4
+L3
+48.2±8.3
+50.0±0.0
+.055
+72±3
+18.3±7.4
+0±0
+=
+c5-delayed-update-001
+C5
+L1
+62.1±7.4
+40.9±19.3
+.212
+60±6
+12.6±6.7
+0±0
+↑
+c5-linear-001
+C5
+L1
+64.5±15.6
+50.0±0.0
+.164
+55±19
+12.4±5.5
+0±0
+↑
+c5-retraction-001
+C5
+L2
+64.5±11.6
+50.0±0.0
+.164
+60±6
+16.0±7.8
+0±0
+↑
+c5-gradual-drift-001
+C5
+L3
+53.0±13.9
+50.0±0.0
+.091
+81±8
+24.4±14.8
+2±6
+=
+c5-scope-narrowing-001
+C5
+L3
+52.3±8.9
+45.5±14.4
+.091
+85±11
+33.1±14.5
+0±0
+↑
+c6-authority-override-001
+C6
+L1
+25.8±20.6
+13.6±22.3
+.121
+97±7
+6.4±3.4
+3±10
+↑
+c6-corroboration-001
+C6
+L1
+58.0±6.0
+50.0±0.0
+.080
+73±14
+9.9±4.8
+64±37
+↑
+c6-disagreement-001
+C6
+L2
+50.0±0.0
+45.5±14.4
+.045
+97±0
+14.7±4.1
+0±0
+=
+c6-cross-role-synthesis-001
+C6
+L3
+37.5±11.9
+50.0±0.0
+.148
+84±7
+15.7±12.6
+0±0
+↓
+c6-repetition-001
+C6
+L3
+36.4±6.4
+50.0±0.0
+.136
+85±9
+11.3±5.4
+77±27
+↓
+Table 13: Per-trajectory results averaged across N=11 runs (± std). MAD = mean absolute divergence between intrinsic and
+extrinsic for that trajectory. Miss = claim miss rate (%, complement of claim coverage Eq. 1 in the main paper, computed across
+all claims in all states). FC = average fact count. CA = classification accuracy (%). Dir = direction of divergence: ↑= intrinsic
+> extrinsic (memory underestimated), ↓= extrinsic > intrinsic (LLM compensates), = = gap < 5 points.
