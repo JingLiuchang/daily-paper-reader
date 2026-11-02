@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-10-11 ~ 2026-10-20</span>
+      <span class="dpr-home-dashboard-kicker">2026-10-24 ~ 2026-11-02</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 20 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 17 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>7</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>13</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>6</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>11</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-10-20 07:48:43 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-02 05:18:52 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,9 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>2026年10月11日至20日共筛选20篇论文，精读7篇、速读13篇，重点关注无DRAM过滤检索与磁盘ANNS存储优化。最值得看的是两篇9.0分精读：AiSAQ的过滤检索方案与ConStore的预取和存储协同设计，另外速读中Agent长期记忆方向（MemCode、MemComposer）也值得关注。普通读者可先读这两篇精读，理解其思路，再根据实际场景判断是否深入查看代码或实验。</p>
+<p>10月24日至11月2日日报筛读17篇论文，精读6篇、速读11篇，主线锁定LLM Agent记忆与高效检索。</p>
+<p>最值得看的是两篇9分精读：把Agent长期记忆做成推荐系统设计，以及用动态帕累托前沿统一索引服务双向量查询。</p>
+<p>普通读者可先读这两篇建立框架，再用ConMem等8分速读补上记忆错位与评测视角。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +80,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">7 篇</strong>
+    <strong class="dpr-home-dashboard-count">6 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="AiSAQ-in-Filtering for DRAM-free Filtered Information Retrieval">AiSAQ-in-Filtering for DRAM-free Filtered Information Retrieval</span></li><li><span class="dpr-home-dashboard-paper-title" title="ConStore: Search-Overlapped Prefetch and Co-Retrieval-Aware Content Storage for Disk-Based ANNS">ConStore: Search-Overlapped Prefetch and Co-Retrieval-Aware Content Storage for Disk-Based ANNS</span></li><li><span class="dpr-home-dashboard-paper-title" title="PrairieFire: Igniting High-Throughput Updates in Large-Scale Approximate Nearest Neighbor Search">PrairieFire: Igniting High-Throughput Updates in Large-Scale Approximate Nearest Neighbor Search</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Agent Memory as Recommendation: Recommender-System Design for Long-Term Memory of LLM Agents">Agent Memory as Recommendation: Recommender-System Design for Long-Term Memory of LLM Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="ACTIVE: A Dynamic Pareto-Frontier-Based Unified Index for Dual-Vector Query">ACTIVE: A Dynamic Pareto-Frontier-Based Unified Index for Dual-Vector Query</span></li><li><span class="dpr-home-dashboard-paper-title" title="Proactive Memory for Event-Driven LLM Agents">Proactive Memory for Event-Driven LLM Agents</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-ann <strong>4</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-db <strong>1</strong></span><span class="dpr-home-dashboard-tag">vq-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>5</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +93,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">13 篇</strong>
+    <strong class="dpr-home-dashboard-count">11 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="MemCode: Discrete Semantic Representations for Long-Term Agent Memory">MemCode: Discrete Semantic Representations for Long-Term Agent Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="MemComposer: Learning to Assemble Memories for LLM Agents via Reinforcement Learning">MemComposer: Learning to Assemble Memories for LLM Agents via Reinforcement Learning</span></li><li><span class="dpr-home-dashboard-paper-title" title="CertEx: Exact Visual Retrieval at Scale by Certified Exclusion">CertEx: Exact Visual Retrieval at Scale by Certified Exclusion</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="ConMem: Counterfactual Multi-Scenario Probing for Resolving LLM Memory Misalignment">ConMem: Counterfactual Multi-Scenario Probing for Resolving LLM Memory Misalignment</span></li><li><span class="dpr-home-dashboard-paper-title" title="The Right Fact, the Wrong Decision: SciValidityBench for Scientific Agent Memory">The Right Fact, the Wrong Decision: SciValidityBench for Scientific Agent Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="Adaptive Memory Index Evolution for Agents">Adaptive Memory Index Evolution for Agents</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>12</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>11</strong></span></div>
 </section>
 </div>
 
