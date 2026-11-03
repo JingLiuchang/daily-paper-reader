@@ -30,6 +30,7 @@ except Exception:  # pragma: no cover - 兼容 package 导入路径
   from src.source_backend_router import group_queries_by_source, merge_pipeline_results
   from src.source_config import ARXIV_SOURCE_KEY, get_source_backend, load_config_with_source_migration, normalize_source_list
 from subscription_plan import build_pipeline_inputs
+from retrieval_health import require_successful_recall, strict_retrieval
 from supabase_source import (
   count_papers_by_date_range,
   get_supabase_read_config,
@@ -696,6 +697,7 @@ def rank_papers_for_queries_via_supabase(
       filter_sources=normalize_source_list(q.get("paper_sources")) if query_filter_sources else None,
     )
     log(f"[Supabase BM25] {msg} | tag={q.get('tag') or ''}")
+    require_successful_recall(msg)
 
     sim_scores: Dict[str, Dict[str, float | int]] = {}
     for rank_idx, row in enumerate(rows, start=1):
@@ -1084,6 +1086,8 @@ def main() -> None:
         log(f"[WARN] Supabase BM25 未命中（source={source_key}）。")
       return result_sb
     except Exception as e:
+      if strict_retrieval():
+        raise
       if source_key == ARXIV_SOURCE_KEY:
         log(f"[WARN] Supabase BM25 异常，将回退本地 BM25：{e}")
         return None

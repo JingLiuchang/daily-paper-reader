@@ -386,6 +386,10 @@ def fetch_category_in_windows(
                 for candidate in (cat_max_left, cat_max_right):
                     if candidate and (max_published_new is None or candidate > max_published_new):
                         max_published_new = candidate
+            elif os.environ.get('DPR_STRICT_ARXIV_FETCH') == '1':
+                # Do not advance crawl/seen state or publish carryover as success
+                # when a window could not be fetched, including partial pages.
+                raise RuntimeError(f'arXiv fetch failed: {category} {start_str}..{end_str}') from e
             time.sleep(5)
         finally:
             group_end()
@@ -501,9 +505,14 @@ def fetch_all_domains_metadata_robust(
         start_date = end_date - timedelta(minutes=1)
 
     # 按周拆分窗口，避免单次查询过大（尤其 cs* 这种大类）
-    windows = iter_time_windows(start_date, end_date, chunk_days=chunk_days)
+    window_end = end_date
+    if os.environ.get('DPR_STRICT_ARXIV_FETCH') == '1':
+        start_date, window_end, source_desc = resolve_supabase_time_window(
+            end_date=end_date, days=days,
+        )
+    windows = iter_time_windows(start_date, window_end, chunk_days=chunk_days)
     start_str = start_date.strftime("%Y%m%d%H%M")
-    end_str = end_date.strftime("%Y%m%d%H%M")
+    end_str = window_end.strftime("%Y%m%d%H%M")
     
     group_start("Step 1 - fetch arXiv")
     log(f"🌍 [Global Ingest] Window: {start_str} TO {end_str} ({source_desc})")
