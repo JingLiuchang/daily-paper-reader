@@ -1,0 +1,741 @@
+Title: CoWalk: Cooperative Walks for Agentic Batch Queries on Disk-Resident Graphs
+
+URL Source: https://arxiv.org/pdf/2610.38404v1
+
+Published Time: Fri, 30 Oct 2026 01:15:16 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# CoWalk: Cooperative Walks for Agentic Batch Queries on Disk-Resident Graphs 
+
+## Qiao Liang 1,2, Zhiguang Chen 1, Yue Yu 2, Nong Xiao 1
+
+> 1
+
+Sun Yat-sen University 2Pengcheng Laboratory 
+
+liangqao@mail2.sysu.edu.cn 
+
+## Abstract 
+
+Workloads such as query rewriting, deep research and group-relative policy optimization (GRPO) issue batches of seman-tically related vector queries. Existing disk-resident approxi-mate nearest neighbor (ANN) systems process these queries independently. On three workloads, 31 to 67 percent of the I/Os of a batch fetch a page that another query of the batch has already fetched. A page cache shared by the batch re-moves these I/Os, yet it makes a single-thread search only 1.1 to 1 .2× faster, because the search time goes to distance computation and the cache does not change the walk of any query. We present CoWalk, which runs the queries of a batch as cooperating walks on one thread. Every query keeps its own candidate list, a page is read once per batch, and the full-precision vector on every fetched page is ranked by ev-ery query of the batch. A query therefore reaches the target recall with a shorter candidate list, which computes fewer distances and issues fewer I/Os. At recall@10 of 0.95, CoW-alk answers a batch on one thread 1.6 to 1 .9× faster than the fastest per-query baseline and issues 2.8 to 6 .9× fewer I/Os. On a server it serves 3.0 to 6 .9× the throughput of that baseline at a similar batch latency. 
+
+## 1 Introduction 
+
+Modern LLM agents now issue batches of semantically re-lated vector queries. Query rewriting sends 𝑁 paraphrases of a question in parallel [17, 32] (Figure 1). Deep-research agents decompose a task into concurrent retrieval sub-tasks. Anthropic’s Research system spins up 3–5 subagents in par-allel and the subagents use 3+ tools in parallel [2], and Paral-lelSearch [37] trains the agent with RL to decompose a ques-tion and issue the sub-queries concurrently. Post-training algorithms such as GRPO [28], applied to search agents [12], sample multiple rollouts from the same prompt and produce semantically related searches. HQI [20] reports that Apple’s vector search workloads often need to be processed in a batch setting. In all of these patterns the batch members come from one intent and share semantic substance. We measure this on three workloads, deep research (OpenResearcher [16]), conversational Q&A (QuAC+CANARD [5, 7]), and narrative reading comprehension (NarrativeQA [15]). Figure 2 shows that mean intra-batch cosine distance on these workloads is 2.4×, 2 .1×, and 1 .3× tighter than random query pairs respec-tively. Existing disk-resident ANN systems process every query on its own. Queries that are close search the same part of the index, so a batch reads the same data from SSD again and again. With per-query PipeANN [11] at recall@10 of 0.95, 67%, 31%, and 38% of the I/Os of a batch on the three workloads fetch a page that a batch-mate already fetched (Sec. 2.3). A cluster-based index such as SPANN [4] repeats 27% to 68% of its cluster I/Os on the same batches. A cluster index knows its clusters before the first I/O and could deduplicate them across the batch, but it reads every full-precision vector of a cluster it probes. A graph index reads one node at a time and selects it by a compressed distance held in memory. Even if every query stops as early as the ground truth allows and the batch removes every User Paul Anka fame era LLM rewriter              
+
+> q1:Paul Anka first became famous during the late era
+> q2:Paul Anka first became famous in the late 1950s
+> q3:“first became famous” “Paul Anka” late
+> q4:Paul Anka first became famous in the late 1950s
+> q5:“first became famous” “late” “Anka”
+> q6:“first became famous” “late 1950s” “Paul Anka”
+> q7:Paul Anka fame late 1950s
+> q8:Paul Anka was first famous in the late 1950s a batch of B= 8 queries retrieve
+> Embedding space
+> q1
+> q2
+> q3
+> q4
+> q5q6
+> q7q8
+> corpus queries
+
+Figure 1. An LLM rewriter expands one user intent into a batch of paraphrased queries that cluster within a small region of embedding space (OpenResearcher trajectory 38476, 𝐵 =8). arXiv:2610.38404v1 [cs.DB] 28 Oct 2026 0.0 0.5 1.0      
+
+> cos distance
+> 025k 50k
+> trajectory count  OR (97k)
+> 0.0 0.2 0.4
+> cos distance
+> 01k 2k
+> QuAC+CANARD
+> 0.0 0.2 0.4
+> cos distance
+> 0400 800
+> NarrativeQA
+> intra-traj random pairs
+
+Figure 2. Pairwise cosine distance between queries of the same batch and between random query pairs. repeated cluster, a cluster index reads 5 .0 to 7 .2× the data that per-query PipeANN reads without any deduplication (Sec. 2.4). We therefore build on a graph index. On a graph index the direct fix is a page cache shared by the batch. We build this baseline and call it GLRU. It removes nearly all repeated I/Os, yet on one thread it is only 1 .1 to 1.2× faster than PipeANN (Sec. 2.5). On one thread a search spends its time computing PQ and exact distances, because with up to 32 I/Os in flight per query its I/Os complete while it computes. A cache removes I/Os but leaves the compu-tation unchanged. A cached page serves only the queries whose walks ask for it, although the full-precision vector on it is a candidate result for every batch-mate. When every query walks with a short candidate list, 29 to 48% of the true neighbors that its own walk misses lie on pages that a batch-mate read. GLRU never ranks these pages for that query, so it needs the same candidate list length 𝐿 as PipeANN and computes as much. We present CoWalk, which runs the 𝐵 queries of a batch as cooperating walks on one thread (Sec. 3). Every query keeps its own candidate list and selects its own next nodes, as a per-query search does. The walks cooperate in three ways. A page is read once per batch. When a page arrives, CoWalk computes the exact distance from its node to every query of the batch, and at the end every query ranks all nodes the batch read. A query therefore reaches the target recall with a smaller candidate list, fewer I/Os, and less computation. A single PipeANN query with 4 I/Os in flight waits for I/Os 54 to 73% of its time. One CoWalk thread keeps the I/Os of all 
+
+𝐵 walks in flight and processes whichever page completes first, so 4 I/Os in flight per query keep it computing. CoWalk does not share graph neighbors across queries. PQ-scoring a fetched node’s neighbors for the whole batch makes a batch 1.3 to 2 .4× slower on one thread (Sec. 5.3). We evaluate CoWalk on the three workloads against Pi-peANN and GLRU. On one thread at recall@10 of 0 .95, CoW-alk answers a batch 1 .9×, 1 .8×, and 1 .6× faster than PipeANN and 1 .8×, 1 .8×, and 1 .6× faster than GLRU. It issues 2 .8 to 6.9× fewer I/Os than PipeANN. On a server, with every sys-tem at its knee thread count and each CoWalk batch on several threads, CoWalk serves 3 .0 to 6 .9× its throughput and 2 .0 to 3 .0× its queries per dollar while keeping the batch latency at 0 .74 to 1 .08 × that of PipeANN. 
+
+Contributions. This paper makes four contributions. 
+
+• We characterize agent batch retrieval on three work-loads. We quantify the intra-batch similarity and the repeated I/Os it causes on both graph and cluster disk indexes, and we show why a graph index is the better base for batches (Sec. 2). 
+
+• We show that a batch-scoped page cache removes the repeated I/Os but leaves most of the latency, and we identify what it leaves unused (Sec. 2.5). 
+
+• We design CoWalk, which runs a batch as cooperat-ing walks on one thread that share pages and exact distances while every query keeps its own candidate list (Sec. 3). 
+
+• We evaluate CoWalk on three workloads, reaching 1 .6to 1 .9× lower latency than PipeANN at recall 0 .95, and we measure how much each form of cooperation and each rejected design alternative contributes (Sec. 5). The source code of CoWalk is available at https://github. com/OhhhhPi/SWARM .
+
+## 2 Background and Motivation 
+
+2.1 Disk-Resident ANN Indexes 
+
+Graph indexes. Disk-resident graph ANN indexes store the dataset as a Vamana graph [30]. Each vector becomes a node with 𝑅 out-edges to other vectors, and the graph is laid out on SSD so that one I/O returns one node’s full-precision vector together with the identifiers of its 𝑅 neigh-bors. A compressed product-quantization (PQ) code of every vector is held in DRAM and supports fast approximate dis-tance computation against any candidate node. A search query maintains a length-𝐿 candidate list sorted by PQ dis-tance and runs a beam search. At each hop the query pops up to beam_width unvisited nodes, fetches them from disk, PQ-scores the fetched nodes’ neighbors against its own lookup table, and inserts the results back into the candi-date list. The walk terminates when no unvisited nodes re-main, and the query ranks the nodes it fetched by exact dis-tance. DiskANN [30] introduced this layout. PipeANN [11] pipelines the I/O and compute stages of the walk so that SSD latency is overlapped with PQ scoring. We use PipeANN as our per-query baseline throughout. 
+
+Cluster indexes. Cluster-based indexes such as SPANN [4] and SPFresh [36] partition the dataset into clusters. The cen-troids stay in memory, and the full-precision vectors of each cluster are stored together on SSD. A query ranks the cen-troids, reads the nearest clusters, and computes the exact distance to every vector it read. The clusters to read are known before the first I/O is issued. No compressed code filters the vectors of a cluster, so probing a cluster reads all of them. 
+
+> 2
+
+2.2 Agent Batch Workloads 
+
+Six concrete agentic patterns drive the shift to batched re-lated retrieval. Query rewriting generates 𝑁 paraphrases for a single question, hedging against embedding-space brittle-ness [17, 32]. Post-training algorithms like GRPO [28], when applied to memory or deep-research agents [12], sample mul-tiple rollouts from the same prompt and naturally produce semantically related searches. HyDE [10] prompts an LLM to draft 𝑁 hypothetical answers and uses each answer’s embed-ding as a separate query. Sub-question decomposition splits a complex question into atomic sub-questions, each issued as its own retrieval call [25, 38]. Plan-and-execute deep-research agents , exemplified by Perplexity Deep Research, OpenAI Deep Research, and Anthropic Skill agents [1, 23, 24], dis-patch 5 to 20 retrieval sub-tasks in parallel per planning step. Claim-grounded fact-checking treats each generated sentence as a separate query for evidence grounding [19, 35]. The shared property across all six patterns is that the batch members originate from one intent and vary in surface form rather than in semantic substance. In our three evaluation workloads the mean batch size is 33 .5 (OpenResearcher), 7 .2(QuAC+CANARD), and 29 .7 (NarrativeQA). 
+
+Batch members are close. If a batch genuinely comes from a single user intent, its queries should be measurably closer in embedding space than random pairs drawn from the same workload. We test this on the three datasets below. 
+
+OpenResearcher [16] is a deep-research-agent bench-mark. It provides 97 ,630 multi-turn research trajectories, each one an offline deep-research session run by a GPT-OSS-120B agent and averaging 33 .5 retrievals issued as browser.search 
+
+tool calls. Its corpus consists of 14 .9M FineWeb web-crawl passages. 
+
+QuAC+CANARD is a conversational QA workload over Wikipedia. Each dialog is a sequence of follow-up ques-tions that drill into a single Wikipedia article. CANARD [7] rewrites each turn to stand on its own, so every one of the 5,644 dialogs becomes a batch of self-contained queries that retrieve independently yet still probe the same article (40 ,527 queries in total). 
+
+NarrativeQA [15] is a reading-comprehension workload over 1 ,572 books and movie scripts with 46 ,765 human-written questions. For OpenResearcher we use its official corpus embed-dings produced by Qwen3-Embedding-8B (4096d) and en-code queries with the same model. For QuAC+CANARD we use the 21M-passage DPR Wikipedia corpus [13] as the un-derlying collection. For NarrativeQA we chunk the original corpus at 100-word granularity. On QuAC+CANARD and NarrativeQA we encode queries and passages with e5-base-v2 (768d). In all three, every query is self-contained and independent of the other queries of its batch. Figure 2 shows that queries of the same batch are systematically closer than random OpenResearcher QuAC+CANARD NarrativeQA 10 1
+
+> 10 2
+> 10 3
+> 10 4
+> MB read per batch
+> 2.4 GB 204 MB 552 MB 762 MB 149 MB 294 MB 127 MB 21 MB 59 MB 42 MB 14 MB 37 MB
+> cluster index cluster index, deduplicated graph index graph index, deduplicated
+
+Figure 3. Data read from SSD per batch, with the graph index at recall@10 of 0 .95 and the cluster index at a lower bound. pairs on all three workloads. Cross-panel absolute distances are not directly comparable, because OpenResearcher uses a different embedding model and dimensionality from the other two. QuAC+CANARD and NarrativeQA share one em-bedding model, but their corpora differ, so even their mean random-pair distances differ slightly (0 .29 vs 0 .27). We there-fore read each panel through the intra-versus-random gap .Intra-batch pairs lie 58 .5% closer than random pairs on Open-Researcher (0 .36 vs 0 .87), 52 .3% closer on QuAC+CANARD (0 .14 vs 0 .29), and 21 .0% closer on NarrativeQA (0 .22 vs 0 .27). NarrativeQA’s smaller gap is structural, because each batch groups independent reading-comprehension questions about different characters and scenes in one narrative. 
+
+2.3 Per-Query Search Repeats I/Os 
+
+Queries that are close search the same part of an index. On a graph index their walks start from the same entry point and expand many of the same nodes. On a cluster index they rank many of the same centroids first. A system that processes each query on its own issues these I/Os once per query. We count the repeated I/Os on both index families on the first 1 ,000 batches of each workload. For the graph index we run PipeANN per query at recall@10 of 0 .95 and give each batch a page cache that never evicts. The cache misses of a batch are then its distinct pages and the hits are its repeated I/Os. For the cluster index we measure offline and build nothing on disk. We partition each corpus with 𝑘 -means into clusters of 64 vectors on average, replicate boundary vectors into nearby clusters as SPANN does, and rank the centroids for every query. A cluster index ranks the vectors it reads by exact distance, so the recall of a query is the fraction of its true top-10 that lies in the clusters it probes. We let every query stop as early as the ground truth allows. A query probes clusters in centroid order until 9 of its true top-10 are found, but never more than 344, 715, and 369 clusters on the three workloads, the single depth at which the mean recall over all queries reaches 0 .95. The mean recall is then 0 .89 
+
+> 3
+
+to 0 .90, below the 0 .95 of PipeANN. For each batch we then compare the clusters its queries request against the distinct clusters among them. Figure 3 shows the data a batch reads with and without the repeats. On the graph index 67%, 31%, and 38% of the I/Os of a batch on OpenResearcher, QuAC+CANARD, and NarrativeQA fetch a page that a batch-mate already fetched. On OpenResearcher the share grows with the batch, from 40% for 𝐵 ∈[ 2, 6] to 69% for 𝐵 ∈[ 60 , 102 ]. On the cluster index 68%, 27%, and 47% of the cluster I/Os are repeats. The repeats come from the workload, and both index families pay for them. 
+
+2.4 Graph or Cluster Index 
+
+Even after a batch removes every repeated I/O, a cluster index has worse lower bounds on batch latency and throughput than per-query PipeANN. If it keeps only its centroids in memory, as SPANN does, it reads every full-precision vector of a probed cluster from SSD. Even if each query stops as soon as the ground truth allows, after 72 to 146 clusters on average, a deduplicated batch reads 5 .0 to 7 .2× the data of PipeANN without deduplication (Figure 3), and reading it at the 11 .0 GB/s of one thread takes 1 .9 to 7 .0× the batch latency of PipeANN. If it keeps PQ codes in memory instead and reranks only the best candidates from SSD, its recall still requires the probed clusters to contain the true neighbors, so on OpenRe-searcher every query probes about 1 ,500 clusters and scans about 150K codes to reach a mean recall of 0 .95. Before any I/O, a batch then takes at least 6 .3× the single-thread latency of PipeANN with 8-bit codes and 1 .2 to 1 .7× with 4-bit codes. Queries that probe the same cluster read the same codes but compute their own distances, so ranking the candidates reranked by the whole batch still leaves 1 .1 to 1 .4×.A graph index avoids both costs because its edges lead toward the query, so it scores only the neighbors of the nodes it expands and reads only the nodes among its 𝐿 best. On OpenResearcher PipeANN reaches recall 0 .95 with about 190 I/Os and 12 ,500 PQ distances per query. We therefore build CoWalk on a graph index. 
+
+2.5 A Page Cache Is Not Enough 
+
+On a graph index the direct way to remove the repeated I/Os is a page cache shared by the queries of a batch. We build this baseline on PipeANN and call it GLRU (Sec. 5.1). On one thread it reads every distinct page of a batch exactly once. Yet on one thread GLRU answers a batch only 1 .1 to 1 .2×
+
+faster than PipeANN (Sec. 5.3). On one thread the search time is computation. For every fetched node a query computes the exact distance of the node and the PQ distances of its neighbors, and the I/Os of later nodes complete in the meantime. PipeANN overlaps I/O and computation by keeping several I/Os in flight per query. With 32 I/Os in flight it only waits for I/Os 16%, 13%, and 21% of its time on the three workloads. A cache that removed all of this waiting would make a batch at most 1 .19, 1.15, and 1 .26 × faster. A cache therefore removes only I/Os whose latency is already hidden, and it leaves the computation unchanged. The computation is set by the path of the walk, because the path decides which nodes a query fetches and how many distances it computes. The cache is passive and serves only the I/Os the walk has already decided to issue, so it does not change the path. As a result GLRU reaches the same recall as PipeANN at the same 𝐿 and computes as many distances. We measure this gain in Sec. 5.3. The cache leaves the full-precision vectors on its pages unused. We let every query of a batch walk on its own with a short candidate list, 𝐿 of 70, 304, and 248, while the batch reads each page once. The walk of a query then misses 9 .3%, 8.5%, and 7 .7% of its true top-10, and 48%, 29%, and 38% of the missed neighbors lie on pages that a batch-mate read. These pages are already in memory, but a cache returns each page only to the walks that select it, so the query never ranks these neighbors. 
+
+## 3 CoWalk Design 
+
+3.1 Overview 
+
+CoWalk answers a batch of 𝐵 queries on one thread with the same disk-resident Vamana index, PQ codes, and parameters as PipeANN. It runs one walk per query. Each walk keeps its own candidate list of length 𝐿 sorted by PQ distance, selects its own next nodes from that list, keeps up to four I/Os pending, and stops when its list holds no unexpanded node and none of its I/Os is pending. A query’s walk therefore selects nodes by the same rule as a per-query search, from a list which is only filled by its own expansions. A batch of one query has no batch-mate, and its walk would keep only 4 I/Os in flight, so CoWalk runs it with PipeANN. The walks share three things (Figure 4). They share I/Os, so a page that several walks select is read once (Sec. 3.2). They share exact distances, so every query ranks every node that any walk of the batch read (Sec. 3.3). They share one thread, which keeps the I/Os of all walks in flight and processes whichever page completes first (Sec. 3.4). The walks do not share the neighbors they discover, and Sec. 3.5 explains why. Figure 4 follows the thread through one round. Each query selects the best node from its candidate list ①. If the batch has already read the selected node, CoWalk expands it at once from the neighbor list it keeps in its cache, as 𝑞 1 does for node 𝑏 , which was read for 𝑞 2. Otherwise the thread issues an I/O for the node’s page ②. When an I/O completes ③,CoWalk PQ-scores the neighbors of its node for the queries that selected it and inserts them into their candidate lists ④.The first time a node is read, CoWalk also adds a row for it to the batch’s exact-distance table, with its exact distance to every query ⑤. Each query returns the 𝐾 nodes with the                  
+
+> 4One thread SSD Candidate lists
+> per query, by PQ, length L
+> q1
+> q2
+> qB
+> Exact distances
+> shared, a row per read node
+> q1q2qB
+> bc
+> a
+> result: top-Kper column
+> Cache
+> fetched neighbor lists
+> bfor q2
+> cfor qB
+> vector neighbor list
+> page of a, read for q1
+> 1select
+> 2issue I/O 3
+> hit, no I/O
+> 4PQ, q1only 5
+> exact, every query
+
+Figure 4. CoWalk on one thread. smallest exact distance in its column of the table. Algorithm 1 states the whole procedure. 
+
+3.2 Sharing I/Os 
+
+When a walk selects a node, CoWalk looks up the page that holds it. If another walk has already issued an I/O for that page, the query joins that I/O and issues nothing. If the page has already been read in this batch, CoWalk expands the node for the query at once. Only otherwise does it issue a new I/O. When an I/O completes, CoWalk copies the neighbor list of its node into a record that stays in memory until the batch ends (Sec. 4). A page is therefore read at most once per batch. Expanding a node works as in a per-query search, but only for the queries that selected it. For each such query, CoWalk computes the PQ distance to every neighbor of the node and inserts the neighbor into that query’s candidate list if it ranks among the top 𝐿 . Other queries do not see these neighbors. Each query skips the neighbors it has already PQ-scored, because a second score gives the same distance and cannot change its list. 
+
+3.3 Sharing Exact Distances 
+
+A page holds the full-precision vector of a node. The first time any walk reads the node, CoWalk computes the exact distance from that vector to every query of the batch and stores the distances as one row of the batch’s exact-distance table, which has one column per query. This includes the queries whose walks have already stopped, because a node that a batch-mate reads later can still be one of their nearest neighbors. One kernel loads the vector once and scores it against four queries at a time (Sec. 4). No query needs the 
+
+Algorithm 1 CoWalk for a batch 𝑞 1, . . . , 𝑞 𝐵 on one thread. 
+
+Require: list length 𝐿 , I/Os per query 𝑤 =4
+
+Ensure: top-𝐾 of every query  
+
+> 1:
+
+for each 𝑞 𝑖 : 𝐶 𝑖 ← { entry point } 
+
+> 2:
+
+𝐸 ← an empty table with one column per query  
+
+> 3:
+
+Issue( 𝑞 𝑖 ) for every 𝑞 𝑖 ; submit the queued I/Os  
+
+> 4:
+
+while some I/O is pending do  
+
+> 5:
+
+wait until at least one I/O completes  
+
+> 6:
+
+for all completed I/Os of a page 𝑝 do  
+
+> 7:
+
+Expand( 𝑝 , the queries that selected nodes on 𝑝 ) 
+
+> 8:
+
+end for  
+
+> 9:
+
+Issue( 𝑞 𝑖 ) for every walking 𝑞 𝑖 ; submit  
+
+> 10:
+
+for all 𝑛 first read in this round do  
+
+> 11:
+
+add to 𝐸 the row of exact distances of 𝑛  
+
+> 12:
+
+end for  
+
+> 13:
+
+end while  
+
+> 14:
+
+return the top-𝐾 of each column of 𝐸  
+
+> 15:
+
+procedure Issue( 𝑞 𝑖 ) 
+
+> 16:
+
+while 𝑞 𝑖 has fewer than 𝑤 pending I/Os do  
+
+> 17:
+
+𝑛 ← the best unexpanded node of 𝐶 𝑖  
+
+> 18:
+
+if none, stop 𝑞 𝑖 when nothing is pending; return  
+
+> 19:
+
+if the page of 𝑛 is being read then  
+
+> 20:
+
+add 𝑞 𝑖 to the queries waiting for that page  
+
+> 21:
+
+else if the page of 𝑛 has been read in this batch 
+
+then  
+
+> 22:
+
+Expand(that page, {𝑞 𝑖 }) 
+
+> 23:
+
+else  
+
+> 24:
+
+queue an I/O for the page for 𝑞 𝑖  
+
+> 25:
+
+end if  
+
+> 26:
+
+end while  
+
+> 27:
+
+end procedure  
+
+> 28:
+
+procedure Expand( 𝑝 , 𝑃 ) 
+
+> 29:
+
+for all 𝑞 𝑖 ∈ 𝑃 do  
+
+> 30:
+
+PQ-score the neighbors of the node on 𝑝 that 𝑞 𝑖 
+
+has not scored  
+
+> 31:
+
+insert them into 𝐶 𝑖  
+
+> 32:
+
+end for  
+
+> 33:
+
+end procedure 
+
+vector after this step. Each query returns the 𝐾 nodes with the smallest exact distance in its column. Every query thus ranks every node that the batch read. A per-query search ranks only the nodes its own walk read, so a true neighbor enters its result only if its own walk reaches that node, and only a longer candidate list can make the walk reach it. In CoWalk a true neighbor of a query that a batch-mate read is already in the query’s column of the table. The query reaches the same recall with a shorter candidate list, which expands fewer nodes and so issues fewer I/Os and fewer PQ comparisons (Sec. 5.3).              
+
+> 5exact distances to all queries PQ for one selecting query I/O in flight done, awaiting thread joined I/O
+> CPU
+> thread
+> I/O
+> q1, 2 I/Os
+> q2, 2 I/Os
+> q3, 2 I/Os 6 I/Os of the thread
+> 3232112332
+> joins q1one page, two selecting queries time
+
+Figure 5. One CoWalk thread serving three queries, with two I/Os per query shown for clarity. Durations are illustrative. Exact distances only rank. They never enter a candidate list, so a batch-mate’s I/Os change which nodes a query ranks at the end but not which nodes its walk selects. A query far from the rest of its batch is therefore never pulled toward the region its batch-mates search. The price is one exact distance per read node and query of the batch, which grows with 𝐵 .
+
+3.4 One Thread for All Walks 
+
+All walks issue their I/Os to one io_uring instance on the thread. The thread waits until at least one I/O completes and expands the node of every completed page for the queries that selected it. It then lets every walking query with fewer than four pending I/Os select more nodes, and it submits all I/Os queued in this round with one system call. Only then does it compute the exact distances of the nodes read for the first time in this round, so the new I/Os are in flight while it does. The exact distances never enter a candidate list, so computing them after the submission leaves every selection unchanged. Figure 5 shows this loop for three queries with two I/Os each. On the CPU lane a grey block is the PQ work for one query that selected a page, and a red block is the exact distances from the page’s node to the whole batch. A page is expanded as soon as it completes, whichever walk it belongs to, so the I/Os of one query complete while the thread works on the pages of the others. A completed I/O waits (hatched) only while the thread is busy, and the thread blocks only when none of the I/Os of the 𝐵 walks has completed. When 
+
+𝑞 2 selects a node whose page 𝑞 1 is already reading, 𝑞 2 joins that I/O, and the page gets a grey block for each of them and one red block. With 𝐵 walks the thread has up to 4 𝐵 
+
+I/Os in flight (2 𝐵 in Figure 5 for clarity), so four per query keep it computing where a single PipeANN query needs up to 32 (Sec. 2.5). More I/Os per query would not help, because a query selects all of its pending I/Os from the same candidate list, before their neighbors arrive, so each extra I/O is more likely to fetch a node the query would no longer select (Sec. 5.3). The alternative is a walk in synchronous hops. Every query issues its I/Os for the hop, and the thread waits for all of them before it processes any page. One slow I/O then holds up every walk of the batch, and the thread idles while the last I/Os of a round are in flight. Sec. 5.3 runs this schedule with the same sharing. 
+
+3.5 What CoWalk Does Not Share 
+
+A read page holds both the vector of a node and its neighbor list. Both arrive with the same I/O, so a natural design would also share the neighbor list and PQ-score its neighbors for every query of the batch. CoWalk shares only the vector. The query that selected a node ranked it among its 𝐿 best by distance to its own vector, so the neighbors of the node are the most promising candidates that query has. A batch-mate receives these neighbors through a node ranked by distance to another query vector, and even its nearest batch-mate lies at some distance from it, so they are less promising for it than the neighbors of the nodes it selected itself. In an earlier hop-synchronous version of the walk that scored every neighbor for the whole batch, 16%, 14%, and 10% of the neighbors of a query’s own nodes entered its candidate list, but only 5 .6%, 7 .3%, and 6 .0% of the neighbors of the nodes its nearest batch-mate selected, and 3 .5%, 5 .6%, and 4 .1% excluding neighbors that its own nodes also list. Scoring them for the whole batch would add 𝐵 PQ distances per neighbor, and PQ is already the largest stage of the walk. The value of an exact distance does not depend on which query selected the node. It costs one distance per query and read node, and it ranks the node exactly for every query of the batch (Sec. 3.3). Sec. 5.3 measures a variant that scores the neighbors for the whole batch. 
+
+## 4 Implementation 
+
+We implement CoWalk in the code base of PipeANN and reuse its index format, PQ distance code, and io_uring 
+
+reader. 
+
+Cross-query SIMD kernel. The exact distances of a node go to every query of the batch. CoWalk computes them with an AVX-512 kernel that loads each block of the node vector once and multiplies it into four accumulators, one per query. The vector is thus read once per four queries, and the four independent fused multiply-adds overlap in the pipeline. 
+
+Scored neighbors. Each query records the neighbors it has PQ-scored in an array of node ids indexed by a hash of the id, with at least 2 𝐿𝑅 entries for out-degree 𝑅 . A collision 
+
+> 6
+
+Table 1. Evaluation workloads. Tighter: intra- vs. random-pair cosine gap (Sec. 2.2); ¯ 𝐵 : mean batch size. Workload 𝑁 ×𝑑 Embedding Batches ¯𝐵 Tighter OpenResearcher 14.9M ×4096 Qwen3-8B 97,630 33.5 58 .5% QuAC+CANARD 21M ×768 e5-base 5,644 7.2 52 .3% NarrativeQA 0.77M ×768 e5-base 1,572 29.7 21 .0% 
+
+Table 2. Index and search parameters. Parameter Value Graph max out-degree 𝑅 128 (OR), 64 (others) Build candidate list 𝐿 𝑏 256 (OR), 128 (others) PQ code 192 B/vector (OR), 96 B (others) Beam width (I/Os in flight per query) CoWalk 4; PipeANN, GLRU 32 overwrites an entry, which can only make the query score a neighbor again and never drops a candidate. 
+
+Node records. When an I/O completes, CoWalk copies the neighbor list of the node into a record that lives until the batch ends, and the I/O buffer returns to the pool. A hash table indexed by page id points to the records, so a later pick of the node by any query of the batch expands it without an I/O. 
+
+Several threads per batch. With 𝑘 threads per batch, the queries are dealt round-robin to the threads, which share the page table through atomic updates without locks. A thread enters a page in the table when it issues the I/O, so another thread that picks the page waits for that I/O and does not read it again. During the walk a thread computes exact distances only for its own walking queries. After all walks end it fills in the rest, including the nodes the other threads read, so the records also keep the node’s vector. 
+
+## 5 Evaluation 
+
+We evaluate CoWalk against the strongest per-query base-lines on three application-realistic workloads, organized around three questions. 
+
+• How much faster is CoWalk end to end, on a personal device and on a server (Sec. 5.2)? 
+
+• Where does the speedup come from, and how much does each design choice contribute (Sec. 5.3)? 
+
+• How would throughput grow with more SSDs (Sec. 5.4)? 
+
+5.1 Experimental Setup 
+
+Hardware. We run every experiment on a single server: 
+
+• CPU : dual-socket AMD EPYC 9754 (Zen 4c, 256 cores / 512 threads, two NUMA nodes, AVX-512). We pin every run to one NUMA node with numactl ;
+
+• Memory : 1 .5 TB DDR5 (24 ×64 GB, 4800 MT/s); 
+
+• SSD : Huawei eKitStor Xtreme 116P (30 .72 TB, PCIe 5.0 ×4); 0 50 100   
+
+> B
+> 0.00 0.25 0.50 0.75 1.00
+> CDF
+> OpenResearcher
+> 510
+> B
+> QuAC+CANARD
+> 20 40
+> B
+> NarrativeQA
+
+Figure 6. Batch-size ( 𝐵 ) distribution per workload. 
+
+• OS : Ubuntu 24 .04 with Linux kernel 6 .8. 
+
+Datasets. Table 1 lists the three workloads, which span three application domains and differ widely in scale, embed-ding dimension, and intra-batch tightness. Figure 6 shows their batch-size distributions. Only OpenResearcher has batches of one query, 8% of the batches we run and 0 .3% of their queries. CoWalk runs them with PipeANN (Sec. 3.1), so we report recall and single-thread latency over the batches with 
+
+𝐵 ≥2. 
+
+Parameters. Table 2 lists the index and search parame-ters. All systems share one disk-resident Vamana index per workload and build no auxiliary structures. 
+
+Baselines. We compare against two per-query baselines on the same index and I/O engine. 
+
+• PipeANN [11] is the strongest per-query system and our main point of comparison. 
+
+• GLRU runs PipeANN and gives the queries of a batch, which run on different threads, one shared page cache of 32 ,768 pages. The cache is emptied when the batch ends, so every hit comes from a page that another query of the same batch has read. At recall 0 .95 no batch of the three workloads evicts a page. We test no other cache policy because GLRU is already at the ceiling of caching. On one thread GLRU reads every distinct page of a batch exactly once, a floor that no cache can beat. On 128 threads it reads 12%, 2 .5%, and 2 .3% more, because two queries of a batch that run at the same time can both miss a page before its first I/O completes. We omit Starling [33] because a single 4096-d OpenRe-searcher vector is 16 KB and a 768-d vector on our other two workloads is 3 KB, so no 4 KB page holds more than one node and the optimization does not apply. We also omit cluster-based disk indexes such as SPANN [4], which read more data or compute more distances per batch than a graph index at the same recall (Sec. 2.4). 
+
+Scenarios. We evaluate two deployments at recall@10 of 0.90 and 0 .95. 
+
+Personal device. A personal knowledge base shares a lap-top or workstation with the model, its runtime, and whatever         
+
+> 710 2
+> 0.90 0.95 1.00
+> recall@10
+> OR
+> 10 1
+> walk latency (ms)
+> 0.80 0.85 0.90 0.95 1.00 QuAC
+> 10 110 2
+> 0.8 0.9 1.0 NQA
+> 0100 10 100
+> walk latency (ms)
+> 510
+> batch size B 20 30 40 60
+> 20 40 100
+> 60 200 CoWalk GLRU PipeANN
+
+Figure 7. Single-thread walk latency. Top: recall@10 vs. la-tency. Bottom: latency vs. 𝐵 at recall 0 .95. 10 1 10 2 10 3        
+
+> 0.90 0.95 1.00
+> recall@10
+> OR
+> 10 110 2
+> walk latency (ms)
+> 0.80 0.85 0.90 0.95 1.00 QuAC
+> 10 110 2
+> 0.8 0.9 1.0 NQA
+> CoWalk GLRU PipeANN P50 P99
+
+Figure 8. Single-thread walk latency percentiles over batches vs. recall@10. the model offloads to memory. Cores and memory are scarce on these devices, and retrieval must keep latency low and re-call high while using few resources to keep user experience. Throughput matters less in this scenario. We give every sys-tem one thread and measure the time from a batch’s arrival until all 𝐵 queries complete as latency. 
+
+Server. An online service cares more about throughput and cost. Retrieval is a small part of a request whose time goes mostly to post-processing and LLM decoding, so we care more about the QPS served per unit of cost. We run each system at its knee, the smallest thread count that reaches 95% of its peak QPS. A PipeANN thread serves one query at a time, and CoWalk runs each batch on 𝑘 threads (Sec. 5.2). 
+
+5.2 End-to-End Performance 
+
+Personal device. Figure 7 shows single-thread latency. In the top row each curve sweeps 𝐿 , and each point is the mean recall and mean latency over all batches with 𝐵 ≥2 at one 𝐿 . A curve further to the left reaches the same recall in less time. The bottom row plots the mean latency of the batches of 0.8 0.9     
+
+> recall@10
+> 10 3
+> 10 4
+> QPS (knee T)
+> OpenResearcher
+> 0.8 0.9
+> recall@10
+> 10 4
+> QuAC+CANARD
+> 0.8 1.0
+> recall@10
+> 10 4
+> NarrativeQA
+> PipeANN ( T=56/64/64) GLRU ( T=48/64/88) CoWalk ( T=128/96/96)
+
+Figure 9. Throughput at each system’s knee thread count vs. recall@10. each size 𝐵 , with every system at the smallest 𝐿 of its sweep that reaches recall 0 .95. At recall 0 .95 CoWalk answers a batch in 62, 25, and 71 ms on OpenResearcher, QuAC+CANARD, and NarrativeQA. Pi-peANN takes 115, 45, and 116 ms, which is 1 .9×, 1 .8×, and 1.6× longer, and GLRU takes 1 .8×, 1 .8×, and 1 .6× longer. At recall 0 .90 the gap to PipeANN is 1 .9×, 2 .3×, and 2 .0×.Figure 8 replaces the mean over batches with the P50 and the P99. CoWalk’s P50 at recall 0 .95 is 29, 25, and 71 ms, 2.4×, 1 .8×, and 1 .6× below PipeANN’s and 2 .4×, 1 .8×, and 1.6× below GLRU’s. Its P99 is 224, 43, and 111 ms, 1 .5×, 1 .8×,and 1 .7× below PipeANN’s and 1 .5×, 1 .7×, and 1 .6× below GLRU’s. CoWalk also reaches higher recall. In the bottom row the speedup over PipeANN grows from 1 .6× at 𝐵 =4 to 2.0× at 𝐵 =12 on QuAC+CANARD and stays near 1 .8× on NarrativeQA. On OpenResearcher it is 1 .4× at 𝐵 =2, 2 .0× on average for 𝐵 from 10 to 30, and 1 .4× for 𝐵 ≥60. On one thread I/O is not the bottleneck. With 32 I/Os in flight a PipeANN walk waits on I/Os for only 13 to 21% of its time, and the other I/Os complete while it computes. All three systems therefore spend most of their time computing PQ and exact distances, and this computation grows with 𝐿 .GLRU walks with the same 𝐿 as PipeANN and only skips the repeated I/Os, so its curves almost overlap those of PipeANN. CoWalk is faster because every query also ranks the nodes its batch-mates fetched. It reaches recall 0 .95 with 𝐿 of 70, 304, and 248, against 184, 688, and 464 for PipeANN. Its 𝐵 
+
+walks keep the thread computing with 4 I/Os in flight per query, where PipeANN and GLRU need up to 32. Sec. 5.3 measures both. On OpenResearcher all three curves in the bottom row are jagged. Each point averages only the batches of one exact size, and half of the sizes have at most six batches. Batches of the same size take different times per query, and so few batches do not average these differences out. 
+
+Server. Figure 9 shows throughput with every system at its knee, the smallest thread count that reaches 95% of its peak QPS. PipeANN and GLRU hand the queries of a batch to different threads, and their batch latency is the time from the start of the batch’s first query to the end of its last. CoWalk 
+
+> 8
+
+runs a batch on 𝑘 threads and 𝑇 /𝑘 batches at a time (Sec. 4), and its batch latency is the time from the start of the batch until the last of its 𝑘 threads finishes the exact distances. We use about four queries per thread of an average batch. The server runs use the first 4 ,000 batches of OpenResearcher and all batches of the other two, whose mean sizes of 29 .5, 7.2, and 29 .7 give 𝑘 =8, 2, and 8. In these runs the batches of one query, 0 .3% of the OpenResearcher queries, still run the walk of CoWalk. Figure 9 runs CoWalk with this 𝑘 at its knee of 128, 96, and 96 threads. At recall 0 .95 on the thread ladder of Figure 13, CoWalk serves 17 .4K, 10 .0K, and 11 .1K QPS, which is 6 .9×, 4 .0×, and 3.0× the throughput of PipeANN and 3 .0×, 2 .8×, and 1 .9×
+
+that of GLRU. At recall 0 .90 it serves 6 .0×, 3 .7×, and 3 .2×
+
+the throughput of PipeANN. Its batch latency at the knee is 28, 34, and 32 ms, 0 .74 to 1 .08 × the 37, 32, and 29 ms of PipeANN. GLRU reaches a lower batch latency of 15, 22, and 24 ms at its knee. Figure 13 places every thread count of every system at its QPS and batch latency, so it compares the systems at equal latency. We take the CoWalk configuration, over all 𝑘 and thread counts, with the highest QPS whose batch latency does not exceed that of a baseline at its knee. Within the batch latency of PipeANN it serves 6 .9×, 3 .6×, and 2 .6× the QPS of PipeANN, with 𝑘 of 8, 4, and 8. Within the batch latency of GLRU it serves 2 .6×, 2 .5×, and 1 .7× the QPS of GLRU, with 𝑘 of 16, 4, and 8. With 𝑘 =1 CoWalk reaches its highest throughput, 17 .9K, 10 .1K, and 12 .9K QPS at recall 0 .95, so the 𝑘 above keeps 97%, 99%, and 86% of it. When threads are added step by step (Figure 13), CoWalk with 𝑘 =1 on 8 threads (OpenResearcher) or 16 threads (the other two) already exceeds the peak that PipeANN reaches on 128. Its batch latency is 62 ms with one batch at a time and 66 ms with 16 on OpenResearcher, and grows to 97, 45, and 126 ms at the knee, 3 .5×, 1 .3×, and 4 .0×
+
+that of the 𝑘 above. Sec. 5.3 measures other values of 𝑘 .With many threads the SSD limits CoWalk, so its through-put is the I/Os the SSD completes per second divided by the I/Os a query needs. CoWalk issues 2 .8 to 6 .9× fewer I/Os per query than PipeANN, because batch-mates read each page once and exact-distance sharing lowers 𝐿 . Four I/Os in flight per query instead of 32 also contribute, because at equal 𝐿 
+
+GLRU, which also reads each page once per batch, issues 7 to 10% more I/Os than CoWalk. Sec. 5.3 measures the two effects. 
+
+Cost. Table 3 prices every system at its knee in Figure 13. We use the on-demand rates of Google Cloud C2D instances in us-central1, $0 .0296 per vCPU-hour and $0 .0040 per GiB-hour of memory, and $0 .08 per GiB-month of Local SSD. Each thread takes one vCPU. Memory is the peak resident memory of the index and the search at the knee, which Sec. 5.3 measures. Every index fits on one 375 GiB Local SSD. vCPUs account for 96% to 98% of the hourly cost, so the 
+
+Table 3. Cost at the knee (recall 0 .95, Google Cloud on-demand prices). Mq/$: million queries per dollar. Ratio: Mq/$ over PipeANN. System Threads GiB $/h KQPS Mq/$ Ratio 
+
+OpenResearcher 
+
+PipeANN 56 3.5 1.71 2.5 5.4 1.0×
+
+GLRU 48 5.2 1.48 5.7 14.0 2.6×
+
+CoWalk 𝑘 =1 56 5.0 1.72 17.9 37.6 7.0×
+
+CoWalk 𝑘 =8 128 4.6 3.84 17.4 16.3 3.0×
+
+QuAC+CANARD 
+
+PipeANN 64 3.0 1.95 2.5 4.7 1.0×
+
+GLRU 64 3.5 1.95 3.6 6.6 1.4×
+
+CoWalk 𝑘 =1 64 3.0 1.95 10.1 18.8 4.0×
+
+CoWalk 𝑘 =2 96 3.3 2.89 10.0 12.4 2.7×
+
+NarrativeQA 
+
+PipeANN 64 0.8 1.94 3.7 6.9 1.0×
+
+GLRU 88 1.4 2.65 5.7 7.8 1.1×
+
+CoWalk 𝑘 =1 56 1.2 1.70 12.9 27.4 4.0×
+
+CoWalk 𝑘 =8 96 0.8 2.88 11.1 13.8 2.0×0.8 1.0     
+
+> recall@10
+> 10 0
+> 10 1
+> I/Os per batch (K)  OpenResearcher
+> 0.75 1.00
+> recall@10
+> 10 0
+> QuAC+CANARD
+> 0.5 1.0
+> recall@10
+> 10 0
+> 10 1
+> NarrativeQA
+> PipeANN GLRU CoWalk
+
+Figure 10. I/Os per batch vs. recall@10. queries served per dollar follow the QPS per thread at the knee. With the 𝑘 of Figure 9 CoWalk serves 3 .0×, 2 .7×, and 2.0× the queries per dollar of PipeANN, against 2 .6×, 1 .4×,and 1 .1× for GLRU. With 𝑘 =1 its knee needs 56 to 64 threads, and the ratio rises to 7 .0×, 4 .0×, and 4 .0×.
+
+5.3 Analysis 
+
+This section explains the results of Sec. 5.2. It first counts I/Os. It then changes one design choice of CoWalk at a time and measures latency and throughput again. Last, it varies the I/Os in flight per query and the threads per batch. 
+
+I/O count. Figure 10 plots the I/Os of a batch against recall. Each curve sweeps 𝐿 , and a lower curve issues fewer I/Os at the same recall. At recall 0 .95 a batch costs CoWalk 901, 1,849, and 5 ,007 I/Os. PipeANN issues 6 .9×, 2 .9×, and 2 .8×
+
+as many and GLRU 2 .2×, 2 .0×, and 1 .8× as many.                     
+
+> 9B=2-6 B=7-20 B=21-59 B=60-102 all ( B≥ 2)
+> 025 50 75 100
+> % single-thread walk time
+> 819 25 22 51 59 58 56 57 26 14 8819 19 15 12 14 exact dist. PQ dist. I/O other
+
+Figure 11. Single-thread walk time by stage and batch-size bucket (OpenResearcher). 050 100 150 
+
+> 1-thread latency (ms)
+> 1.62× 1.04× 2.41×
+> OpenResearcher
+> 020 40
+> 1.88× 1.35× 1.30×
+> QuAC+CANARD
+> 050 100
+> 1.58× 1.08× 1.53×
+> NarrativeQA
+> CoWalk No exact sharing Hop-sync Neighbor sharing
+> 0510 15 20
+> knee QPS (K)
+> 0.46× 0.94× 0.35×
+> CoWalk No exact sharing Hop-sync Neighbor sharing
+> 0510
+> 0.46× 0.93× 1.19×
+> CoWalk No exact sharing Hop-sync Neighbor sharing
+> 0510 15
+> 0.53× 0.94× 1.07×
+
+Figure 12. Single-thread batch latency and knee throughput of CoWalk and three variants at recall 0 .95. 10 3 10 4  
+
+> QPS
+> 10 1
+> 10 2
+> batch latency (ms)
+> OpenResearcher
+> 10 310 4
+> QPS
+> 10 1
+> QuAC+CANARD
+> 10 310 4
+> QPS
+> 10 2
+> NarrativeQA
+> PipeANN GLRU CoWalk k=1 CoWalk k=2 CoWalk k=4 CoWalk k=8 CoWalk k=16 knee
+
+Figure 13. Batch latency vs. throughput at recall 0 .95 per total thread count, with 𝑘 threads per CoWalk batch (thick line: the 𝑘 chosen in the text). Fewer I/Os become throughput. With many threads the SSD limits CoWalk. On OpenResearcher at 128 threads the de-vice delivers 10 .8 GB/s to CoWalk and 10 .4 GB/s to PipeANN. CoWalk reads 0 .57 MB per query and PipeANN 3 .9 MB, a 6.9× gap close to the 7 .1× gap in QPS at 128 threads. Fewer I/Os explain little of the latency on one thread. GLRU removes the same redundant I/Os as CoWalk. At the same 𝐿 of 64, 384, and 256 it issues 938, 2 ,086, and 5 ,550 per batch against 856, 1 ,953, and 5 ,128 for CoWalk, yet at these 
+
+𝐿 it is only 1 .1 to 1 .2× faster than PipeANN. One thread leaves the SSD far from its limit. A CoWalk thread on Open-Researcher reads 0 .29 GB/s, against 10 .4 to 10 .8 GB/s at 128 threads. At these 𝐿 GLRU is as fast as CoWalk on one thread, at 57, 26, and 74 ms against 59, 26, and 73 ms. The single-thread gain of CoWalk therefore comes from the smaller 𝐿 
+
+that exact-distance sharing allows (Figure 12). On one thread CoWalk serves 518, 290, and 424 QPS at recall 0 .95, against 277, 162, and 260 for PipeANN. Figure 11 shows where its time goes. PQ comparisons are the largest stage in every batch-size bucket at 51 to 59% of walk time, and they take 43% and 47% over all batches of QuAC+CANARD and Nar-rativeQA. As batches grow, exact distances rise from 3% to 25% because each fetched node is scored for more queries, and I/O falls from 26% to 7%. Blocked waiting for I/Os is 1%, 11%, and 3% of walk time on the three workloads with 4 I/Os in flight per query, against 16%, 13%, and 21% for PipeANN with up to 32 (Sec. 2.5). 
+
+Design choices. Figure 12 changes one design choice of CoWalk at a time. Every variant runs at the 𝐿 where it reaches recall 0 .95. The top row is the mean batch latency on one thread, and the bottom row is the QPS at the knee of the variant. Each QPS is the median of three runs. The first bar of every panel is CoWalk, and the label above every other bar is its value relative to CoWalk. 
+
+Exact-distance sharing. Without exact-distance sharing each query ranks only the nodes its own walk fetched. Page sharing stays, so at equal 𝐿 the walk reads the same pages. Recall at equal 𝐿 falls by 0 .044, 0 .025, and 0 .029, and recall 0.95 needs 𝐿 of 184, 688, and 464 instead of 70, 304, and 248. The larger 𝐿 raises latency by 1 .6×, 1 .9×, and 1 .6× and lowers throughput by 2 .2×, 2 .2×, and 1 .9×.
+
+Pipelined walk. CoWalk keeps up to four I/Os in flight for every query and processes a page as soon as it completes. The hop-synchronous variant changes only this schedule. It issues one round of I/Os for all queries and waits for the whole round before it processes any page. With the same sharing it has 1 .04 ×, 1 .35 ×, and 1 .08 × the latency and 1 .07 ×,1.08 ×, and 1 .06 × lower throughput. 
+
+Sharing neighbors. CoWalk PQ-scores a fetched node’s neighbors only for the queries that picked the node (Sec. 3.5). Our first design scored them for every query in the batch, and the neighbor-sharing variant restores it. At equal 𝐿 it computes 3 .7×, 2 .2×, and 3 .2× the PQ distances per query and reads 7 to 10% fewer pages, at a recall that is equal or up to 0 .008 higher. On OpenResearcher this costs 2 .4× the la-tency on one thread and 2 .9× lower throughput, because PQ comparisons take more than half of a walk there (Figure 11). 
+
+> 10
+
+On QuAC+CANARD and NarrativeQA recall 0 .95 needs 𝐿 
+
+of 289 and 208 instead of 304 and 248, so the variant reads 13% and 23% fewer pages per query. It is still 1 .3× and 1 .5×
+
+slower on one thread, but its throughput at the knee is 1 .19 ×
+
+and 1 .07 × that of CoWalk. CoWalk keeps the selective design because it is faster on one thread on all three workloads and its throughput loss on OpenResearcher is larger than the gains on the other two. We bound what a cheaper selection rule could gain. We call a true top-10 neighbor of a query recoverable if it appears only in the neighbor lists of nodes that its batch-mates selected and its PQ distance would have entered the query’s candidate list when such a node was read. A rule that added exactly the recoverable neighbors at no cost would lower the single-thread latency and raise the throughput on 128 threads at recall 0 .90 and 0 .95 by at most 1.1×, 1 .2×, and 1 .6×. This first-order estimate comes from the hop-synchronous variant. Selective sharing therefore has little room on OpenResearcher and QuAC+CANARD, and NarrativeQA leaves the most to a cheaper selection rule. 
+
+Sensitivity. Two parameters set how many I/Os and queries one thread interleaves, the I/Os in flight per query and the threads per batch 𝑘 . Every system runs at the 𝐿 where it reaches recall 0 .95. 
+
+I/Os in flight per query. The thread computes without waiting only if the I/Os in flight of the whole batch outnum-ber the pages it processes during the latency of one I/O. A PipeANN query on one thread has only its own I/Os, and raising them from 4 to 32 cuts its batch latency to 0 .30 to 0.54 of the latency at 4. A CoWalk thread draws its I/Os from all 𝐵 walks of its batch, so 4 per query give it up to 4 𝐵 in flight, and this default is within 1 .11 × of the lowest latency over 1 to 16 per query. More I/Os per query add up to 20% more pages, because a query selects all of its pending I/Os from the same candidate list before their neighbors arrive. On 128 threads the SSD is saturated, and the I/Os in flight matter less. 
+
+Threads per batch. Figure 13 fixes each system’s 𝐿 and adds threads step by step. Each point is one thread count, placed at its QPS and the mean latency of a batch, and the black-edged point is the knee. CoWalk has one line for each 
+
+𝑘 from 1 to 16. A curve further to the lower right serves more queries at a lower batch latency. A larger 𝑘 lowers the batch latency of CoWalk and also lowers its throughput. With 𝑘 =16 the batch latency at the knee is 15, 12, and 18 ms, 2 .5×, 2 .6×,and 1 .6× below PipeANN. The throughput falls to 89%, 46%, and 75% of the 𝑘 =1 knee, which is still 6 .3×, 1 .8×, and 2 .6×
+
+that of PipeANN. A thread that receives no query of its batch idles. Every QuAC+CANARD batch has 4 to 12 queries, so with 𝑘 =16 only 45% of the threads hold a query on average. The best 𝑘 depends on the batch sizes, the hardware, and the latency target. On our server we recommend about four queries per thread of an average batch, the 𝑘 of Sec. 5.2. 
+
+Memory. We measure the peak resident memory of each system at its knee, leaving out the query and ground-truth files of the benchmark. A CoWalk thread keeps a record of every node its walks read until the batch ends, because a later pick of the same node needs the node’s neighbor list. With 𝑘 =1 every query has its exact distance to a node once the node is processed, so the record holds only the neighbor list, 576 B on OpenResearcher and 320 B on the other two workloads (Sec. 4). The search then takes 38, 6 .6, and 17 MiB per CoWalk thread, against 10, 6 .6, and 10 MiB per PipeANN thread. With the index the process needs 5 .0, 3 .0, and 1 .2 GiB, against 3 .5, 3 .0, and 0 .8 GiB for PipeANN and 5 .2, 3 .5, and 1.4 GiB for GLRU. With the 𝑘 of Sec. 5.2 the other threads of the batch compute exact distances to a node after the walks end, so the record also keeps the node’s vector, 16 .6 KB on OpenResearcher and 3 .3 KB on the other two. A thread walks only its share of the batch, and CoWalk needs 4 .6, 3 .3, and 0.8 GiB. Memory costs at most 1 .4% of the hourly price in Table 3. 
+
+5.4 More SSDs 
+
+Our node has more cores than one SSD can feed, so on many threads both systems stop at the device (Figure 13). We project what more SSDs would buy on OpenResearcher from two measured quantities per system, the peak QPS of one SSD and the QPS of one thread. Throughput is the smaller of a device bound, which grows with the SSD count, and a CPU bound of 128 threads times the per-thread QPS. Each SSD carries 18 .8K QPS of CoWalk and 2 .6K of PipeANN. One CoWalk thread serves 510 QPS on the batches of the thread ladder (518 on the first 1 ,000 batches in Sec. 5.3), and one PipeANN thread with 32 I/Os in flight serves 277. CoWalk runs out of cores between three and four SSDs, at about 65K QPS. PipeANN needs about thirteen SSDs to keep the same threads busy and stops near 35K QPS. The ratio narrows from the peak ratio of 7 .1× on one SSD to the per-thread ratio of 1 .8× once both are bound by CPU. The projection assumes that throughput grows linearly with threads, which CoWalk does within 7% up to 16 threads, and that a PipeANN thread keeps its single-thread QPS. 
+
+## 6 Related Work 
+
+Agentic retrieval workloads. LLM agents turn one in-tent into many retrieval calls. Query rewriting and HyDE issue 𝑁 paraphrases or hypothetical answers [10, 17, 32], decomposition issues one call per sub-question [25, 37, 38], deep-research agents fan out across subagents [2, 23], fact-checkers ground each generated sentence [19, 35], and RL post-training samples many rollouts per prompt [12, 28]. These works treat retrieval as a black box and pay for each call in full. 
+
+Disk-resident graph ANN. HNSW [18] and NSG [9] dominate in-memory ANN search [34], and DiskANN [30]          
+
+> 11 10 110 2
+> walk latency (ms)
+> 0.90 0.95 1.00
+> recall@10
+> OpenResearcher
+> 10 1
+> walk latency (ms)
+> 0.80 0.85 0.90 0.95 1.00
+> QuAC+CANARD
+> 10 110 2
+> walk latency (ms)
+> 0.80 0.85 0.90 0.95 1.00
+> NarrativeQA
+> CoWalk T=1 PipeANN T= 124816 32
+
+Figure 14. Batch-parallel PipeANN on 𝑇 threads vs. single-thread CoWalk: recall@10 vs. walk latency. moves them to SSD by paging a Vamana graph and pruning with in-RAM PQ codes. PipeANN [11] overlaps I/O with PQ, Starling [33] co-locates a walk’s nodes on disk, and FreshDiskANN [29] and SPFresh [36] add streaming up-dates. These target single-query latency, so a batch reruns the search 𝐵 times, refetching the same pages, and each query ranks only the nodes its own walk fetched. GPU indexes such as CAGRA [22] batch many independent queries for throughput but still run each query’s walk separately rather than sharing it across a related batch. CoWalk keeps the in-dex format of DiskANN and the pipelined I/Os of PipeANN, reads each page once per batch, and lets every query rank every node the batch fetched. 
+
+Multi-vector retrieval. A parallel line of work indexes each item as a set of token embeddings under the Chamfer (MaxSim) score [14]. Most systems pool every token into one single-vector index and query it per token, as in Col-BERTv2 [27], PLAID [26], and EMVB [21]. MUVERA [6] instead encodes each set as one fixed-dimensional vector, DESSERT [8] as an LSH sketch, and IGP [3] and GEM [31] build proximity graphs over token sets. This line is orthog-onal to CoWalk. Multi-vector retrieval returns one ranked list per set-valued query, whereas CoWalk serves a batch of single-vector point queries that share an intent but keep independent top-𝐾 results. 
+
+## 7 Discussion and Limitations 
+
+Idle cores. A per-query system with idle cores can spread the 𝐵 queries of a batch over 𝑇 threads. Figure 14 compares this batch-parallel PipeANN with CoWalk on one thread. At recall 0 .95 batch-parallel PipeANN on 2 threads takes 65, 27, and 71 ms, against 62, 25, and 71 ms for single-thread CoWalk. With 4 threads it is faster on all three workloads, and with 32 threads it finishes a batch in 16, 9, and 11 ms. It pays for this with 𝑇 cores and unchanged I/Os per query, so it gives up the throughput of Sec. 5.2. CoWalk can also spread a batch over 𝑘 threads (Sec. 5.2). On 8 threads with one batch at a time it finishes a batch in 10 .8, 10 .2, and 15 .3 ms, against 24 .3, 10 .5, and 23 .2 ms for batch-parallel PipeANN on 8 threads. OR QuAC NQA 0.0 0.5 1.0 1.5 2.0      
+
+> time per query, PipeANN / CoWalk
+> OR QuAC NQA 0.0 0.2 0.4 0.6 0.8 1.0
+> I/Os per query, CoWalk / PipeANN
+> original batches random, B=4 random, B=16 random, B=64
+
+Figure 15. Original vs. random batches at recall 0 .95, single thread. 
+
+Unrelated queries. CoWalk gains only when the queries of a batch search the same region of the graph. The agentic batches of Sec. 2.2 have this property. Batches of unrelated queries do not. Figure 15 replaces each workload’s batches with 𝐵 queries drawn at random from all its queries. CoWalk then reads at most 14% fewer pages per query than PipeANN, against 65 to 88% fewer on the original batches, and its recall at equal 𝐿 is up to 0 .015 lower than that of PipeANN. On one thread CoWalk is then slower than PipeANN. At recall 0 .95 it spends 1 .2 to 1 .4× more time per query for 𝐵 of 4 and 16 and 1 .5 to 2 .5× more for 𝐵 =64, while it spends 1 .6 to 2 .2×
+
+less on the original batches. On 128 threads, where the SSD limits both systems, its throughput on random batches of 16 is 1 .10 ×, 1 .26 ×, and 1 .28 × that of PipeANN. Unrelated batches thus make CoWalk slower than PipeANN on one thread and remove most of its gain on many threads. 
+
+Read-path-only implementation. CoWalk shares the read path only. Concurrent inserts and deletes during a walk fall back to the per-query update path of PipeANN, and a joint update path is left to future work. This fits our target setting, where agent retrieval is read-dominated and index refresh runs in the background. 
+
+## 8 Conclusion 
+
+LLM agents issue batches of related queries drawn from a single intent. On three workloads, queries of the same batch lie 1 .3 to 2 .4× closer than random pairs, and 31 to 67% of the I/Os of per-query search fetch a page that a batch-mate already fetched. A page cache shared by the batch removes these I/Os but leaves the walk of every query and its distance computations unchanged. CoWalk runs the queries of a batch as cooperating walks on one thread. Every query keeps its own candidate list, a page is read once per batch, and every query ranks every node the batch fetched, so a query reaches its recall with a shorter candidate list. At recall@10 of 0 .95, CoWalk answers a batch on one thread 1 .6 to 1 .9× faster than the strongest per-query baseline, and on a server it serves 3.0 to 6 .9× its throughput at a similar batch latency. We see CoWalk as a step toward retrieval back ends designed for batched agent retrieval. 
+
+> 12
+
+## References 
+
+[1] Anthropic. 2025. Equipping Agents for the Real World with Agent Skills. https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills . Accessed 2026-06-09. [2] Anthropic. 2025. How We Built Our Multi-Agent Research Sys-tem. https://www.anthropic.com/engineering/multi-agent-research-system . Accessed 2026-09-22. [3] Zheng Bian, Man Lung Yiu, and Bo Tang. 2025. IGP: Efficient Multi-Vector Retrieval via Proximity Graph Index. In Proceedings of the 48th International ACM SIGIR Conference on Research and Development in Information Retrieval (Padua, Italy) (SIGIR ’25) . Association for Computing Machinery, New York, NY, USA, 2524–2533. https://doi. org/10.1145/3726302.3730004 
+
+[4] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li, Mao Yang, and Jingdong Wang. 2021. SPANN: highly-efficient billion-scale approximate nearest neighbor search. In Pro-ceedings of the 35th International Conference on Neural Information Processing Systems (NIPS ’21) . Curran Associates Inc., Red Hook, NY, USA, Article 398, 14 pages. [5] Eunsol Choi, He He, Mohit Iyyer, Mark Yatskar, Wen-tau Yih, Yejin Choi, Percy Liang, and Luke Zettlemoyer. 2018. QuAC: Question Answering in Context. In Proceedings of the 2018 Conference on Em-pirical Methods in Natural Language Processing , Ellen Riloff, David Chiang, Julia Hockenmaier, and Jun’ichi Tsujii (Eds.). Association for Computational Linguistics, Brussels, Belgium, 2174–2184. https: //doi.org/10.18653/v1/D18-1241 
+
+[6] Laxman Dhulipala, Majid Hadian, Rajesh Jayaram, Jason Lee, and Vahab Mirrokni. 2026. MUVERA: Multi-Vector Retrieval via Fixed Dimensional Encodings. arXiv:2405.19504 [cs.DS] https://arxiv.org/ abs/2405.19504 
+
+[7] Ahmed Elgohary, Denis Peskov, and Jordan Boyd-Graber. 2019. Can You Unpack That? Learning to Rewrite Questions-in-Context. In Pro-ceedings of the 2019 Conference on Empirical Methods in Natural Lan-guage Processing and the 9th International Joint Conference on Natu-ral Language Processing (EMNLP-IJCNLP) , Kentaro Inui, Jing Jiang, Vincent Ng, and Xiaojun Wan (Eds.). Association for Computational Linguistics, Hong Kong, China, 5918–5924. https://doi.org/10.18653/ v1/D19-1605 
+
+[8] Joshua Engels, Benjamin Coleman, Vihan Lakshman, and Anshumali Shrivastava. 2023. DESSERT: An Efficient Algorithm for Vector Set Search with Vector Set Queries. In Thirty-seventh Conference on Neural Information Processing Systems . https://openreview.net/forum?id= kXfrlWXLwH 
+
+[9] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast approximate nearest neighbor search with the navigating spreading-out graph. Proc. VLDB Endow. 12, 5 (Jan. 2019), 461–474. https: //doi.org/10.14778/3303753.3303754 
+
+[10] Luyu Gao, Xueguang Ma, Jimmy Lin, and Jamie Callan. 2023. Precise Zero-Shot Dense Retrieval without Relevance Labels. In Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , Anna Rogers, Jordan Boyd-Graber, and Naoaki Okazaki (Eds.). Association for Computational Linguistics, Toronto, Canada, 1762–1777. https://doi.org/10.18653/v1/2023.acl-long.99 
+
+[11] Hao Guo and Youyou Lu. 2026. Achieving Low-Latency Graph-Based Vector Search via Aligning Best-First Search Algorithm with SSD. 
+
+ACM Trans. Storage 22, 2, Article 12 (March 2026), 30 pages. https: //doi.org/10.1145/3793926 
+
+[12] Bowen Jin, Hansi Zeng, Zhenrui Yue, Jinsung Yoon, Sercan Arik, Dong Wang, Hamed Zamani, and Jiawei Han. 2025. Search-R1: Training LLMs to Reason and Leverage Search Engines with Reinforcement Learning. arXiv:2503.09516 [cs.CL] https://arxiv.org/abs/2503.09516 
+
+[13] Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey Edunov, Danqi Chen, and Wen-tau Yih. 2020. Dense Pas-sage Retrieval for Open-Domain Question Answering. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Pro-cessing (EMNLP) , Bonnie Webber, Trevor Cohn, Yulan He, and Yang Liu (Eds.). Association for Computational Linguistics, Online, 6769–6781. 
+
+https://doi.org/10.18653/v1/2020.emnlp-main.550 
+
+[14] Omar Khattab and Matei Zaharia. 2020. ColBERT: Efficient and Effec-tive Passage Search via Contextualized Late Interaction over BERT. In 
+
+Proceedings of the 43rd International ACM SIGIR Conference on Research and Development in Information Retrieval (Virtual Event, China) (SI-GIR ’20) . Association for Computing Machinery, New York, NY, USA, 39–48. https://doi.org/10.1145/3397271.3401075 
+
+[15] Tomáš Kočiský, Jonathan Schwarz, Phil Blunsom, Chris Dyer, Karl Moritz Hermann, Gábor Melis, and Edward Grefenstette. 2018. The NarrativeQA Reading Comprehension Challenge. Transactions of the Association for Computational Linguistics 6 (2018), 317–328. 
+
+https://doi.org/10.1162/tacl_a_00023 
+
+[16] Zhuofeng Li, Dongfu Jiang, Xueguang Ma, Haoxiang Zhang, Ping Nie, Yuyu Zhang, Kai Zou, Jianwen Xie, Yu Zhang, and Wenhu Chen. 2026. OpenResearcher: A Fully Open Pipeline for Long-Horizon Deep Research Trajectory Synthesis. arXiv preprint arXiv:2603.20278 (2026). [17] Xinbei Ma, Yeyun Gong, Pengcheng He, hai zhao, and Nan Duan. 2023. Query Rewriting in Retrieval-Augmented Large Language Models. In The 2023 Conference on Empirical Methods in Natural Language Processing . https://openreview.net/forum?id=gXq1cwkUZc 
+
+[18] Yu A. Malkov and D. A. Yashunin. 2020. Efficient and Robust Approx-imate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs. IEEE Trans. Pattern Anal. Mach. Intell. 42, 4 (April 2020), 824–836. https://doi.org/10.1109/TPAMI.2018.2889473 
+
+[19] Sewon Min, Kalpesh Krishna, Xinxi Lyu, Mike Lewis, Wen-tau Yih, Pang Koh, Mohit Iyyer, Luke Zettlemoyer, and Hannaneh Hajishirzi. 2023. FActScore: Fine-grained Atomic Evaluation of Factual Precision in Long Form Text Generation. In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing , Houda Bouamor, Juan Pino, and Kalika Bali (Eds.). Association for Computational Lin-guistics, Singapore, 12076–12100. https://doi.org/10.18653/v1/2023. emnlp-main.741 
+
+[20] Jason Mohoney, Anil Pacaci, Shihabur Rahman Chowdhury, Ali Mousavi, Ihab F. Ilyas, Umar Farooq Minhas, Jeffrey Pound, and Theodoros Rekatsinas. 2023. High-Throughput Vector Similarity Search in Knowledge Graphs. Proc. ACM Manag. Data 1, 2, Article 197 (June 2023), 25 pages. https://doi.org/10.1145/3589777 
+
+[21] Franco Maria Nardini, Cosimo Rulli, and Rossano Venturini. 2024. Efficient Multi-vector Dense Retrieval with Bit Vectors. In European Conference on Information Retrieval . Springer, 3–17. [22] Hiroyuki Ootomo, Akira Naruse, Corey Nolet, Ray Wang, Tamas Feher, and Yong Wang. 2024. CAGRA: Highly Parallel Graph Construction and Approximate Nearest Neighbor Search for GPUs . In 2024 IEEE 40th International Conference on Data Engineering (ICDE) . IEEE Computer Society, Los Alamitos, CA, USA, 4236–4247. https://doi.org/10.1109/ ICDE60146.2024.00323 
+
+[23] OpenAI. 2025. Introducing Deep Research. https://openai.com/index/ introducing-deep-research/ . Accessed 2026-06-09. [24] Perplexity AI. 2025. Introducing Perplexity Deep Research. 
+
+https://www.perplexity.ai/hub/blog/introducing-perplexity-deep-research . Accessed 2026-06-09. [25] Ofir Press, Muru Zhang, Sewon Min, Ludwig Schmidt, Noah A. Smith, and Mike Lewis. 2023. Measuring and Narrowing the Compositionality Gap in Language Models. In The 2023 Conference on Empirical Methods in Natural Language Processing . https://openreview.net/forum?id= feiAVaSXdb 
+
+[26] Keshav Santhanam, Omar Khattab, Christopher Potts, and Matei Za-haria. 2022. PLAID: An Efficient Engine for Late Interaction Retrieval. In Proceedings of the 31st ACM International Conference on Informa-tion & Knowledge Management (Atlanta, GA, USA) (CIKM ’22) . Asso-ciation for Computing Machinery, New York, NY, USA, 1747–1756. 
+
+> 13
+
+https://doi.org/10.1145/3511808.3557325 
+
+[27] Keshav Santhanam, Omar Khattab, Jon Saad-Falcon, Christopher Potts, and Matei Zaharia. 2022. ColBERTv2: Effective and Efficient Retrieval via Lightweight Late Interaction. In Proceedings of the 2022 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies , Marine Carpuat, Marie-Catherine de Marneffe, and Ivan Vladimir Meza Ruiz (Eds.). Associa-tion for Computational Linguistics, Seattle, United States, 3715–3734. 
+
+https://doi.org/10.18653/v1/2022.naacl-main.272 
+
+[28] Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang, Y. K. Li, Y. Wu, and Daya Guo. 2024. DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models. arXiv:2402.03300 [cs.CL] https://arxiv. org/abs/2402.03300 
+
+[29] Aditi Singh, Suhas Jayaram Subramanya, Ravishankar Krishnaswamy, and Harsha Vardhan Simhadri. 2021. FreshDiskANN: A Fast and Accurate Graph-Based ANN Index for Streaming Similarity Search. 
+
+CoRR abs/2105.09613 (2021). arXiv:2105.09613 https://arxiv.org/abs/ 2105.09613 
+
+[30] Suhas Jayaram Subramanya, Devvrit, Rohan Kadekodi, Ravishankar Krishaswamy, and Harsha Vardhan Simhadri. 2019. DiskANN: fast accurate billion-point nearest neighbor search on a single node . Curran Associates Inc., Red Hook, NY, USA. [31] Yao Tian, Zhoujin Tian, Xi Zhao, Ruiyuan Zhang, and Xiaofang Zhou. 2026. GEM: A Native Graph-based Index for Multi-Vector Retrieval. arXiv:2603.20336 [cs.IR] https://arxiv.org/abs/2603.20336 
+
+[32] Liang Wang, Nan Yang, and Furu Wei. 2023. Query2doc: Query Expan-sion with Large Language Models. In The 2023 Conference on Empirical Methods in Natural Language Processing . https://openreview.net/ forum?id=QH4EMvwF8I 
+
+[33] Mengzhao Wang, Weizhi Xu, Xiaomeng Yi, Songlin Wu, Zhangyang Peng, Xiangyu Ke, Yunjun Gao, Xiaoliang Xu, Rentong Guo, and Charles Xie. 2024. Starling: An I/O-Efficient Disk-Resident Graph Index Framework for High-Dimensional Vector Similarity Search on Data Segment. Proc. ACM Manag. Data 2, 1, Article 14 (March 2024), 27 pages. https://doi.org/10.1145/3639269 
+
+[34] Mengzhao Wang, Xiaoliang Xu, Qiang Yue, and Yuxiang Wang. 2021. A comprehensive survey and experimental comparison of graph-based approximate nearest neighbor search. Proc. VLDB Endow. 14, 11 (July 2021), 1964–1978. https://doi.org/10.14778/3476249.3476255 
+
+[35] Jerry Wei, Chengrun Yang, Xinying Song, Yifeng Lu, Nathan Zixia Hu, Jie Huang, Dustin Tran, Daiyi Peng, Ruibo Liu, Da Huang, Cosmo Du, and Quoc V Le. 2024. Long-form factuality in large language models. In The Thirty-eighth Annual Conference on Neural Information Processing Systems . https://openreview.net/forum?id=4M9f8VMt2C 
+
+[36] Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li, Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, and Mao Yang. 2023. SPFresh: Incremental In-Place Update for Billion-Scale Vector Search. In Proceedings of the 29th Symposium on Operating Systems Principles (Koblenz, Germany) (SOSP ’23) . Association for Computing Machinery, New York, NY, USA, 545–561. https://doi.org/ 10.1145/3600006.3613166 
+
+[37] Shu Zhao, Tan Yu, Anbang Xu, Japinder Singh, Aaditya Shukla, and Rama Akkiraju. 2025. ParallelSearch: Train your LLMs to Decom-pose Query and Search Sub-queries in Parallel with Reinforcement Learning. arXiv:2508.09303 [cs.CL] https://arxiv.org/abs/2508.09303 
+
+[38] Denny Zhou, Nathanael Schärli, Le Hou, Jason Wei, Nathan Scales, Xuezhi Wang, Dale Schuurmans, Claire Cui, Olivier Bousquet, Quoc V Le, and Ed H. Chi. 2023. Least-to-Most Prompting Enables Com-plex Reasoning in Large Language Models. In The Eleventh Interna-tional Conference on Learning Representations . https://openreview.net/ forum?id=WZH7099tgfM

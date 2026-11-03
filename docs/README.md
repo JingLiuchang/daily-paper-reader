@@ -51,14 +51,14 @@
       <span class="dpr-home-dashboard-kicker">2026-11-03</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 4 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 25 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
-    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>0</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>2 次</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>13</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>12</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-03 02:22:41 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-03 03:37:31 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,9 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日完成4篇论文精读，重点聚焦多跳RAG的上下文选择与长期对话智能体的异构记忆对齐。</p>
-<p>最值得看的是两篇8.0分工作：SpectRAG用加权块图做token预算内的上下文筛选，ETAMem则解耦并对齐异构长期记忆。</p>
-<p>普通读者可先读这两篇的方法与实验部分，重点关注“预算受限检索”和“记忆解耦对齐”如何落地。</p>
+<p>2026-11-03 日报完成：25 篇论文，13 篇精读，重点集中在向量检索与近似最近邻搜索。最值得看的是两篇 9.0 分工作，分别研究单近邻图上的地理过滤近似最近邻搜索和近邻图索引的无损压缩。普通读者可先读这两篇，再结合 8.0 分的双向量查询统一索引与执行前计划选择速读。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -80,12 +78,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">4 篇</strong>
+    <strong class="dpr-home-dashboard-count">13 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="SpectRAG: Weighted Chunk Graphs for Token-Budgeted Context Selection in Multi-Hop Retrieval-Augmented Generation">SpectRAG: Weighted Chunk Graphs for Token-Budgeted Context Selection in Multi-Hop Retrieval-Augmented Generation</span></li><li><span class="dpr-home-dashboard-paper-title" title="ETAMem: Decoupling and Aligning Heterogeneous Memory for Long-Term Conversational Agents">ETAMem: Decoupling and Aligning Heterogeneous Memory for Long-Term Conversational Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Retrieving from Your Own Mistakes: On-Policy Training of Embedding Models for Multi-Hop Retrieval-Augmented Generation">Retrieving from Your Own Mistakes: On-Policy Training of Embedding Models for Multi-Hop Retrieval-Augmented Generation</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Geo-Filtered Approximate Nearest-Neighbor Search on a Single Proximity Graph">Geo-Filtered Approximate Nearest-Neighbor Search on a Single Proximity Graph</span></li><li><span class="dpr-home-dashboard-paper-title" title="Lossless Compression of Proximity Graph Indexes for Efficient Approximate Nearest Neighbors Search">Lossless Compression of Proximity Graph Indexes for Efficient Approximate Nearest Neighbors Search</span></li><li><span class="dpr-home-dashboard-paper-title" title="Fast Approximate Line Nearest Neighbor Search">Fast Approximate Line Nearest Neighbor Search</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>4</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>7</strong></span><span class="dpr-home-dashboard-tag">vector-db <strong>4</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>2</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -93,12 +91,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">0 篇</strong>
+    <strong class="dpr-home-dashboard-count">12 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p class="dpr-home-dashboard-empty">今日暂无推荐。</p>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="ACTIVE: A Dynamic Pareto-Frontier-Based Unified Index for Dual-Vector Query">ACTIVE: A Dynamic Pareto-Frontier-Based Unified Index for Dual-Vector Query</span></li><li><span class="dpr-home-dashboard-paper-title" title="Fidelity Synopses: Pre-Execution Plan Selection for Approximate Vector Search">Fidelity Synopses: Pre-Execution Plan Selection for Approximate Vector Search</span></li><li><span class="dpr-home-dashboard-paper-title" title="HNSecW: A Logarithmic-Time MPC Protocol for Approximate Nearest Neighbor Search">HNSecW: A Logarithmic-Time MPC Protocol for Approximate Nearest Neighbor Search</span></li></ul>
   </div>
-
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>8</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>3</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span></div>
 </section>
 </div>
 
