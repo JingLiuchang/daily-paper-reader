@@ -158,35 +158,40 @@ def compute_embeddings(
   if not texts:
     return np.zeros((0, 0), dtype=np.float32)
 
-  total = len(texts)
-  log(f"[INFO] 正在为 {total} 条记录计算向量表示...")
-  encode_kwargs: Dict[str, Any] = {
-    "convert_to_numpy": True,
-    "normalize_embeddings": True,
-    "batch_size": batch_size,
-  }
-
-  embeddings_list: List[np.ndarray] = []
-  start_time = time.time()
-  processed = 0
-  next_log_at = log_every if log_every > 0 else 0
-  for start in range(0, total, batch_size):
-    batch = texts[start : start + batch_size]
-    batch_emb = model.encode(batch, **encode_kwargs)
-    embeddings_list.append(batch_emb)
-    processed += len(batch)
-    if log_every > 0:
-      while processed >= next_log_at and next_log_at <= total:
-        elapsed = time.time() - start_time
-        rate = processed / elapsed if elapsed > 0 else 0.0
-        log(f"[INFO] Embedding 进度: {processed}/{total} (~{rate:.2f} paper/s)")
-        next_log_at += log_every
-    elif processed == total:
-      elapsed = time.time() - start_time
-      rate = processed / elapsed if elapsed > 0 else 0.0
-      log(f"[INFO] Embedding 进度: {processed}/{total} (~{rate:.2f} paper/s)")
-
-  return np.vstack(embeddings_list)
+  from daily_model_cache import ModelCache
+  cache = ModelCache("paper-vector-v1")
+  context = [getattr(model, 'model_name', type(model).__name__),
+             getattr(model, 'endpoint', ''), max_length,
+             getattr(model, 'max_seq_length', None), 'normalize_embeddings=True']
+  keys = [[context, text] for text in texts]
+  vectors = [cache.get(key) for key in keys]
+  def valid(value):
+    return isinstance(value, list) and len(value) > 0 and all(
+        isinstance(v, (float, int)) and np.isfinite(v) for v in value) and np.linalg.norm(value) > 0
+  missing = [i for i, value in enumerate(vectors) if not valid(value)]
+  dimensions = {len(v) for v in vectors if valid(v)}
+  if len(dimensions) > 1:
+    missing = list(range(len(texts)))
+  log(f"[cache:paper-vector] hits={len(texts)-len(missing)} misses={len(missing)}")
+  try:
+    for offset in range(0, len(missing), batch_size):
+      indices = missing[offset:offset+batch_size]
+      encoded = np.asarray(model.encode([texts[i] for i in indices], convert_to_numpy=True,
+                           normalize_embeddings=True, batch_size=batch_size))
+      if encoded.ndim != 2 or len(encoded) != len(indices) or not np.isfinite(encoded).all():
+        raise ValueError('Invalid embedding response; not cached')
+      if dimensions and encoded.shape[1] not in dimensions:
+        raise ValueError('Embedding dimensions changed; change model/cache revision')
+      for i, vector in zip(indices, encoded):
+        value = vector.tolist()
+        if not valid(value):
+          raise ValueError('Invalid embedding vector; not cached')
+        vectors[i] = value
+        cache.put(keys[i], value)
+      log(f"[cache:paper-vector] computed={min(offset+batch_size, len(missing))}/{len(missing)}")
+    return np.asarray(vectors, dtype=np.float32)
+  finally:
+    cache.close()
 
 
 class EmbeddingCoarseFilter:

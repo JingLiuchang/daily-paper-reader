@@ -147,6 +147,7 @@ class RankGlobalPoolTest(unittest.TestCase):
                     "results": [
                         {"index": 1, "relevance_score": 0.95},
                         {"index": 0, "relevance_score": 0.80},
+                        {"index": 2, "relevance_score": 0.10},
                     ]
                 }
 
@@ -172,7 +173,7 @@ class RankGlobalPoolTest(unittest.TestCase):
             self.assertEqual(len(intent_queries), 1)
             ranked = intent_queries[0].get("ranked") or []
             ranked_ids = [item.get("paper_id") for item in ranked]
-            self.assertEqual(ranked_ids, ["p1", "p2"])
+            self.assertEqual(ranked_ids, ["p1", "p2", "p3"])
             self.assertEqual(saved.get("global_candidate_ids"), ["p2", "p1", "p3"])
             self.assertEqual(saved.get("global_pool_lane_top_k"), 30)
             self.assertEqual(saved.get("global_pool_limit"), 60)

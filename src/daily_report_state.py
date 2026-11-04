@@ -6,6 +6,10 @@ import tempfile
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Tuple
 from urllib.parse import urlparse
+try:
+    from daily_history import canonical_id
+except ImportError:
+    from src.daily_history import canonical_id
 
 
 def daily_state_path(docs_dir: str, date_str: str) -> str:
@@ -184,7 +188,14 @@ def bootstrap_daily_state_from_sidebar(
 
 def _normalize_state(state: Dict[str, Any], date_str: str) -> Dict[str, Any]:
     papers = [_normalize_record(item) for item in (state.get("papers") or []) if isinstance(item, dict)]
-    papers = sorted(papers, key=_paper_sort_key)
+    merged = {}
+    for paper in papers:
+        key = canonical_id(paper["paper_id"])
+        if key in merged:
+            merged[key] = _merge_versions(merged[key], paper)
+        else:
+            merged[key] = paper
+    papers = sorted(merged.values(), key=_paper_sort_key)
     token = str(date_str or state.get("date") or "").strip()
     return {
         "date": token,
@@ -206,6 +217,7 @@ def _normalize_record(raw: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "paper_id": paper_id,
         "route": route,
+        "version_routes": sorted(set(raw.get("version_routes") or []) | {route}),
         "title": _clean_text(raw.get("title")),
         "section": _normalize_section(raw.get("section")),
         "tags": _normalize_tags(raw.get("tags")),
@@ -274,6 +286,9 @@ def _iter_run_records(run_papers: Any) -> Iterable[Dict[str, Any]]:
 
 
 def _find_match_index(records: List[Dict[str, Any]], paper_id: str, route: str) -> int:
+    for index, record in enumerate(records):
+        if canonical_id(paper_id) == canonical_id(record["paper_id"]):
+            return index
     clean_paper_id = _clean_text(paper_id)
     clean_route = _clean_text(route)
     for index, record in enumerate(records):
@@ -296,6 +311,8 @@ def _merge_record(
     incoming: Dict[str, Any],
     generated_at: str,
 ) -> Dict[str, Any]:
+    if existing["paper_id"] != incoming["paper_id"] and canonical_id(existing["paper_id"]) == canonical_id(incoming["paper_id"]):
+        return _merge_versions(existing, incoming)
     score_existing = existing.get("score")
     score_incoming = incoming.get("score")
     if score_existing is None:
@@ -306,6 +323,7 @@ def _merge_record(
         merged_score = max(score_existing, score_incoming)
     return _normalize_record(
         {
+            "version_routes": sorted(set(existing.get("version_routes", [])) | set(incoming.get("version_routes", []))),
             "paper_id": _clean_text(incoming.get("paper_id")) or existing.get("paper_id"),
             "route": _clean_text(incoming.get("route")) or existing.get("route"),
             "title": _clean_text(incoming.get("title")) or existing.get("title"),
@@ -447,3 +465,15 @@ def _infer_sidebar_paper_id(payload: Dict[str, Any], route: str) -> str:
                 return tail
     route_tail = _clean_text(route).rstrip("/").split("/")[-1]
     return route_tail or _clean_text(route)
+
+
+def _merge_versions(left, right):
+    def preference(p):
+        return (p['section'] != 'deep', p.get('first_seen_at') or '9999', p['route'])
+    representative = dict(min((left, right), key=preference))
+    representative['version_routes'] = sorted(set(left.get('version_routes', [])) | set(right.get('version_routes', [])))
+    representative['tags'] = _merge_tags(left.get('tags'), right.get('tags'))
+    times = [p.get('first_seen_at') for p in (left, right) if p.get('first_seen_at')]
+    representative['first_seen_at'] = min(times) if times else ''
+    representative['updated_at'] = max(left.get('updated_at', ''), right.get('updated_at', ''))
+    return _normalize_record(representative)

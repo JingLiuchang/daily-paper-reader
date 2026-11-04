@@ -743,6 +743,23 @@ def _filter_batch(
     max_output_tokens: int,
     debug_dir: str,
 ) -> tuple[int, List[Dict[str, str]], List[Dict[str, Any]]]:
+    from daily_model_cache import ModelCache, fingerprint
+    from pathlib import Path
+    cache = ModelCache("daily-score-v1")
+    context = [filter_model, DEFAULT_DEEPSEEK_BASE_URL, max_output_tokens, all_requirements,
+               fingerprint(Path(__file__).read_text(encoding="utf-8"))]
+    keys = {doc["id"]: [context, doc] for doc in batch}
+    hits, missing = [], []
+    for doc in batch:
+        value = cache.get(keys[doc["id"]])
+        try:
+            hits.extend(validate_filter_results([doc], [value])) if value is not None else missing.append(doc)
+        except (ValueError, TypeError, KeyError):
+            missing.append(doc)
+    print(f"[cache:score] hits={len(hits)} misses={len(missing)}", flush=True)
+    if not missing:
+        cache.close()
+        return batch_idx, batch, hits
     client = _make_filter_client(api_key, filter_model, max_output_tokens)
     runner = _make_filter_runner(
         client,
@@ -750,16 +767,16 @@ def _filter_batch(
         debug_dir=debug_dir,
         base_tag=f"batch_{batch_idx:03d}",
     )
-    return (
-        batch_idx,
-        batch,
-        recover_filter_results(
-            batch,
-            runner,
-            max_attempts=MAX_FILTER_RETRIES,
+    try:
+        results = recover_filter_results(
+            missing, runner, max_attempts=MAX_FILTER_RETRIES,
             debug_tag=f"batch_{batch_idx:03d}",
-        ),
-    )
+        )
+        for item in results:
+            cache.put(keys[item["id"]], item)
+        return batch_idx, batch, hits + results
+    finally:
+        cache.close()
 
 
 def process_file(
@@ -782,7 +799,9 @@ def process_file(
     papers = data.get("papers") or []
     queries = data.get("queries") or []
     if not papers or not queries:
-        log("[WARN] missing papers or queries, skip.")
+        log("[INFO] no candidates; writing empty scoring result.")
+        data["llm_ranked"] = []
+        save_json(data, output_path)
         return
 
     config = load_config(config_path)

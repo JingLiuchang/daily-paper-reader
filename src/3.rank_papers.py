@@ -512,7 +512,10 @@ def process_file(
   papers_list = data.get("papers") or []
   all_queries = data.get("queries") or []
   if not papers_list or not all_queries:
-    log(f"[WARN] 文件 {os.path.basename(input_path)} 中缺少 papers 或 queries，跳过。")
+    log(f"[INFO] 文件 {os.path.basename(input_path)} 中没有候选，写入空结果。")
+    data["papers"] = []
+    data["queries"] = []
+    save_json(data, output_path)
     return
 
   # 仅使用语义查询（intent_query 或兼容旧的 llm_query）进行 rerank。
@@ -575,7 +578,8 @@ def process_file(
     group_start(f"Query {q_idx}/{len(queries)} tag={q.get('tag') or ''}")
     documents = build_documents(papers_by_id, top_ids)
     docs_with_idx = list(enumerate(documents))
-    random.shuffle(docs_with_idx)
+    # Stable batches allow exact cache reuse without assuming pointwise scores.
+    # global_candidate_ids already has deterministic RRF order.
 
     query_tokens = estimate_tokens(q_text, encoder)
     batches = iter_batches(
@@ -596,12 +600,8 @@ def process_file(
         log(
           f"[INFO] 发送批次 {batch_idx}/{len(batches)} | docs={len(batch_docs)}"
         )
-        response = reranker.rerank(
-          query=q_text,
-          documents=batch_docs,
-          top_n=len(batch_docs),
-          model=rerank_model,
-        )
+        from daily_model_cache import cached_rerank
+        response = cached_rerank(reranker, q_text, batch_docs, rerank_model)
         if isinstance(response, dict) and "output" in response:
           results = response.get("output", {}).get("results", [])
         else:

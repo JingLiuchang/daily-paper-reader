@@ -609,6 +609,8 @@ def main() -> None:
     if trace_ids:
         print(f"[TRACE] 启用论文追踪: {', '.join(trace_ids)}", flush=True)
 
+    from daily_history import filter_file
+    daily_history_filter = "-" not in run_date_token
     archive_dir = os.path.join(ROOT_DIR, "archive", run_date_token)
     raw_path = os.path.join(archive_dir, "raw", f"arxiv_papers_{run_date_token}.json")
     bm25_path = os.path.join(
@@ -661,45 +663,59 @@ def main() -> None:
                 *(["--ignore-seen"] if args.fetch_ignore_seen else []),
             ],
         )
+    if daily_history_filter and not skip_fetch:
+        filter_file(raw_path, ROOT_DIR)
     if trace_ids:
         print_trace_retrieval("RAW", raw_path, trace_ids)
-    run_step(
-        "Step 2.1 - BM25",
-        [python, os.path.join(SRC_DIR, "2.1.retrieval_papers_bm25.py")],
-    )
-    if trace_ids:
-        print_trace_retrieval("BM25", bm25_path, trace_ids)
-    run_step(
-        "Step 2.2 - Embedding",
-        [
-            python,
-            os.path.join(SRC_DIR, "2.2.retrieval_papers_embedding.py"),
-            "--device",
-            str(args.embedding_device),
-            "--batch-size",
-            str(args.embedding_batch_size),
-        ],
-    )
-    if trace_ids:
-        print_trace_retrieval("EMBEDDING", embedding_path, trace_ids)
-    run_step(
-        "Step 2.3 - RRF",
-        [python, os.path.join(SRC_DIR, "2.3.retrieval_papers_rrf.py")],
-    )
-    if trace_ids:
-        print_trace_retrieval("RRF", rrf_path, trace_ids)
-    run_step(
-        "Step 3 - Rerank",
-        [python, os.path.join(SRC_DIR, "3.rank_papers.py")],
-    )
-    if trace_ids:
-        print_trace_retrieval("RERANK", rerank_path, trace_ids)
-    run_step(
-        "Step 4 - LLM refine",
-        [python, os.path.join(SRC_DIR, "4.llm_refine_papers.py")],
-    )
-    if trace_ids:
-        print_trace_llm("LLM", llm_path, trace_ids)
+    raw_empty = False
+    if not skip_fetch and os.path.exists(raw_path):
+        with open(raw_path, encoding="utf-8") as handle:
+            raw_empty = not json.load(handle)
+    if raw_empty:
+        os.makedirs(os.path.dirname(llm_path), exist_ok=True)
+        with open(llm_path, "w", encoding="utf-8") as handle:
+            json.dump({"papers": [], "queries": [], "llm_ranked": []}, handle)
+        print('[history] No unseen papers; skipping model stages.', flush=True)
+    else:
+        run_step(
+            "Step 2.1 - BM25",
+            [python, os.path.join(SRC_DIR, "2.1.retrieval_papers_bm25.py")],
+        )
+        if trace_ids:
+            print_trace_retrieval("BM25", bm25_path, trace_ids)
+        run_step(
+            "Step 2.2 - Embedding",
+            [
+                python,
+                os.path.join(SRC_DIR, "2.2.retrieval_papers_embedding.py"),
+                "--device",
+                str(args.embedding_device),
+                "--batch-size",
+                str(args.embedding_batch_size),
+            ],
+        )
+        if trace_ids:
+            print_trace_retrieval("EMBEDDING", embedding_path, trace_ids)
+        run_step(
+            "Step 2.3 - RRF",
+            [python, os.path.join(SRC_DIR, "2.3.retrieval_papers_rrf.py")],
+        )
+        if daily_history_filter:
+            filter_file(rrf_path, ROOT_DIR)
+        if trace_ids:
+            print_trace_retrieval("RRF", rrf_path, trace_ids)
+        run_step(
+            "Step 3 - Rerank",
+            [python, os.path.join(SRC_DIR, "3.rank_papers.py")],
+        )
+        if trace_ids:
+            print_trace_retrieval("RERANK", rerank_path, trace_ids)
+        run_step(
+            "Step 4 - LLM refine",
+            [python, os.path.join(SRC_DIR, "4.llm_refine_papers.py")],
+        )
+        if trace_ids:
+            print_trace_llm("LLM", llm_path, trace_ids)
     run_step(
         "Step 5 - Select",
         [

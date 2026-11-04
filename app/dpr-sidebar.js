@@ -971,9 +971,25 @@
     ].join(' ').toLowerCase();
   }
 
+  function arxivWorkFromRoute(route) {
+    var match = String(route || '').match(/(?:^|\/)(\d{4}\.\d{4,5})(?:v\d+)?(?=-|$)/);
+    return match ? match[1] : '';
+  }
+
   function paperReadStatus(paper, readMap) {
     var id = paperIdentity(paper);
-    return normalizeReadStatus(id && readMap && readMap[id]);
+    var direct = normalizeReadStatus(id && readMap && readMap[id]);
+    if (direct) return direct;
+    var work = arxivWorkFromRoute(id);
+    if (!work) return '';
+    var aliases = Object.keys(readMap || {}).filter(function (key) {
+      return arxivWorkFromRoute(key) === work;
+    }).sort();
+    for (var key of aliases) {
+      var status = normalizeReadStatus(readMap[key]);
+      if (status) return status;
+    }
+    return '';
   }
   function paperIdentity(paper) {
     return (paper && paper.id) || paperIdFromHref(paper && paper.href) || '';
@@ -2890,6 +2906,7 @@
         computeModelReadSummary: computeModelReadSummary,
         axisSectionStateKey: axisSectionStateKey,
         renderBodyHtml: renderBodyHtml,
+        paperReadStatus: paperReadStatus,
         normalizeReadStatus: normalizeReadStatus,
         statusForMarkIndex: statusForMarkIndex,
         shouldAutoMarkRead: shouldAutoMarkRead,

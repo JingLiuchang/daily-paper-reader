@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
@@ -418,7 +419,7 @@ def collect_seen_ids(
 
     seen = set()
     for day in list_date_dirs(archive_root):
-        if day == today_str:
+        if day == today_str and "-" in today_str:
             continue
         rec_dir = os.path.join(archive_root, day, "recommend")
         if not os.path.isdir(rec_dir):
@@ -449,6 +450,9 @@ def collect_seen_ids(
                         if not item_tag_keys.intersection(active_tag_keys):
                             continue
                     seen.add(canonical_paper_id(pid))
+    if "-" not in today_str:
+        from daily_history import published_ids
+        seen.update(published_ids(Path(archive_root).parent))
     return seen
 
 
@@ -1126,7 +1130,7 @@ def main() -> None:
 
     archive_root = os.path.join(ROOT_DIR, "archive")
     today_date = parse_date_str(TODAY_STR)
-    if args.carryover_only or ignore_seen_ids:
+    if args.carryover_only or ignore_seen_ids or "-" in TODAY_STR:
         seen_ids = set()
         if ignore_seen_ids:
             log("[INFO] skims/backfill 模式：已关闭历史 seen_ids 过滤（输出数量更完整）。")

@@ -2007,3 +2007,15 @@ testExpandedAxisSectionSetSerializesCorrectly();
 testReadStatusNormalization();
 
 console.log('dpr sidebar v2 tests passed');
+
+// A consolidated version must inherit old route marks without rewriting user storage.
+{
+  const api = loadSidebarForTest().__test;
+  const paper = {id: '202611/03/2610.37176v1-old'};
+  const marks = {'202611/03/2610.37176v2-new': 'read'};
+  const before = JSON.stringify(marks);
+  assert.equal(api.paperReadStatus(paper, marks), api.normalizeReadStatus('read'));
+  assert.notEqual(api.paperReadStatus(paper, marks), '');
+  assert.equal(JSON.stringify(marks), before);
+  assert.equal(api.paperReadStatus({id:'202611/03/2610.99999v1-other'}, marks), '');
+}

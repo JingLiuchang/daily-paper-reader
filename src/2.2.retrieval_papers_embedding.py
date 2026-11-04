@@ -1459,9 +1459,12 @@ def main() -> None:
           group_end()
         else:
           group_start(f"Step 2.2 - compute embeddings ({os.path.basename(input_path)})")
-          coarse_result = filter_inst.filter(items=papers, queries=arxiv_queries)
+          from filter import compute_embeddings
+          paper_embeddings = compute_embeddings(
+              filter_inst.model, papers, batch_size=filter_inst.batch_size,
+              max_length=filter_inst.max_length,
+          )
           group_end()
-          paper_embeddings = coarse_result["embeddings"]
 
         group_start(f"Step 2.2 - rank queries ({os.path.basename(input_path)})")
         result_local = rank_papers_for_queries(
