@@ -1,0 +1,1145 @@
+Title: Recast: Refinement-Centered Approximate Nearest Neighbor Search Optimized for Storage
+
+URL Source: https://arxiv.org/pdf/2611.02765v1
+
+Published Time: Tue, 03 Nov 2026 05:16:06 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# Recast: Refinement-Centered Approximate Nearest Neighbor Search Optimized for Storage 
+
+# Zehai Yang Fengyi Tao Wenzhuo Dong Shimin Chen *
+
+yangzehai20z@ict.ac.cn taofengyi20@mails.ucas.ac.cn dongwenzhuo20@mails.ucas.ac.cn chensm@ict.ac.cn ACS, SKLP, Institute of Computing Technology, Chinese Academy of Sciences University of Chinese Academy of Sciences, Beijing, China 
+
+## ABSTRACT 
+
+Large-scale ANNS systems often exploit storage in addition to DRAM for supporting vector search. The central question is how to divide the work between memory and storage for achieving both high query throughput-recall and good index maintenance perfor-mance. Existing storage-optimized ANNS paradigms fall short of providing a complete answer: disk-resident graph indexes have difficulty in supporting efficient vector deletions, while posting list based systems often incur larger amount of disk I/Os for queries. In this paper, we introduce a refinement-centered paradigm for storage-optimized ANNS systems. We propose Recast as a concrete design of this paradigm. Recast stores the raw vectors on disk, and keeps an IVF index with our proposed RecastQ quantization encoding in memory. For an ANNS query, Recast selects nprobe inverted lists, and performs SIMD-based FastScan on the RecastQ codes in the lists to compute a list of refinement candidates in mem-ory. Then, it performs disk I/Os to retrieve the candidate vectors, compute exact distances, and refine the top-𝐾 result. To reduce disk I/Os, RecastQ supports the computation of uncertainty intervals so that the true distance falls in the corresponding interval with high probability. Then, we propose a QUIC policy to select a minimal set of candidates to refine based on the uncertainty intervals, thereby minimizing the number of I/Os for retrieving the candidate vec-tors. For index maintenance, both the on-disk raw vectors and the in-memory IVF structure are amenable to insertions and deletions. Experiments on real-world data sets show that Recast processes batched insertions and deletions 3 .10–37 .27 × faster than SPFresh and OdinANN, while its QPS at 0.99 recall changes by at most 6 .9% after updating 50% of the corpus. For static queries at 0.99 recall, Recast achieves 1 .56–2 .01 × the QPS of the strongest baseline with the matched memory budget on each data set, while requiring 1 .22– 6.75 × less external storage than the evaluated systems. At matched in-memory space, RecastQ also provides a better Recall–refinement frontier than RaBitQ. 
+
+## KEYWORDS 
+
+Vector Database, Approximate Nearest Neighbor Search, Vector Quantization, Refinement, Storage 
+
+## 1 INTRODUCTION 
+
+Approximate nearest-neighbor search (ANNS) for embedding vec-tors is widely used in recommendation [39], image retrieval [32], 
+
+> ∗Corresponding author.
+> This work is licensed under a Creative Commons Attribution 4.0 Interna-tional License.
+
+retrieval-augmented generation [30], and sparse-attention opti-mized KV-cache in large language model serving [12, 31]. For suffi-ciently large vector collections, it is often uneconomical to keep all the vectors and the search structures in DRAM. Therefore, large-scale ANNS systems often exploit storage in addition to DRAM for supporting vector search. For storage-optimized ANNS systems, the central question is how to divide the work between memory and storage for achieving high query throughput without sacrificing the recall and index maintenance performance. Existing storage-optimized ANNS systems take two influential paradigms. Disk-resident graph indexes, such as DiskANN [42], Starling [44], and OdinANN [23], store the vectors and a proximity graph on disk and exploit memory for keeping part of the search structures and caching recent entries to accelerate graph traversal. Posting list based systems, such as SPANN [11] and SPFresh [47], store each vector into (possibly multiple) posting lists on disk and use an in-memory index to select and retrieve postings for subse-quent distance evaluation. While both paradigms have shown good storage ANNS performance, neither provides a complete answer to the above question: graph-based solutions have difficulty in sup-porting efficient vector deletions, and posting list based systems often incur larger amount of disk I/Os for queries. In this paper, we would like to rethink the design of storage-optimized ANNS systems. One natural way is to revisit a widely used main-memory ANNS paradigm: IVF PQ with FastScan and Refinement. IVF narrows the search to a subset of inverted lists, vec-tor quantization keeps per-vector state compact, and PQ FastScan accelerates distance computation on compressed codes with SIMD operations [3, 28, 41]. Given the short candidate list computed by IVF PQ with FastScan, Refinement then accesses a small number of candidate vectors and computes exact distances to obtain highly accurate top-𝐾 results. Together, these features form an effective scan-and-refine paradigm that achieves high query throughput-recall performance. At the same time, the IVF structure is known to be amenable to index maintenance. Inspired by the main-memory IVF PQ with FastScan and Re-finement, we propose Recast (Refinement-Centered Approximate nearest neighbor search optimized for STorage). Recast stores the exact vectors on disk, and keeps the IVF structure and quantization codes in memory. Note that quantization can effectively reduce the memory footprint to a small fraction (e.g., 1/4–1/10) of the original data set size. For an ANNS query, Recast selects nprobe inverted lists whose centroids are closest to the query vector, and scans the quantization codes in the nprobe lists to compute the list of refine-ment candidates in memory. Then, Recast performs disk I/Os to retrieve the candidate vectors, compute exact distances, and refine the top-𝐾 result. Recast brings the following benefits: 
+
+> 1arXiv:2611.02765v1 [cs.DB] 2 Nov 2026
+
+• Benefit 1: Efficient index maintenance . Both the on-disk and in-memory structures of Recast can efficiently support index maintenance. For on-disk structures, Recast only per-forms vector-record and metadata updates for vector insertions and deletions, without maintaining graph connectivity or repli-cated postings. In comparison, the existing paradigms have to either modify the graph structure or update potentially multi-ple postings for each updated vector. For in-memory structures, insertions and deletions can also be easily handled in the IVF structure of Recast . 
+
+• Benefit 2: Independent I/O operations . Unlike the dependent I/Os due to graph traversals in graph-based solutions, Recast issues independent disk I/Os for the candidate vectors. Therefore, it is straight-forward to optimize disk accesses with asynchro-nous I/Os, and deduplicate and merge the I/O requests for vectors on the same disk page. However, Recast faces and addresses two important challenges: 
+
+• Challenge 1: Minimizing the number of disk I/Os . Com-pared to the refinement in the main-memory IVF index, the refinement in Recast performs disk I/Os, incurring drastically higher cost. Consequently, it is important to minimize the num-ber of candidates to refine. The conventional fixed-𝑅 policy selects the top-𝑅 candidates which are closest to the query vector. However, a fixed 𝑅 can hardly capture the difference across queries: a large 𝑅 incurs wasteful disk I/Os on easy queries, whereas a small 𝑅 down-grades the recall on difficult queries. Figure 1 shows that the per-query optimal 𝑅 ∗ 
+
+> 𝑞
+
+for obtaining all top-10 results can be or-ders of magnitude different across queries on SIFT100M and DEEP100M data sets with PQ and OPQ encodings. To address this issue, we propose RecastQ encoding and Quic (Query-aware Uncertainty-guIded Candidate selection). RecastQ enables Recast to associate the estimated distance 𝑑 𝑖 
+
+for every vector 𝑖 with an uncertainty interval [𝐿 𝑖 , 𝑈 𝑖 ] so that 
+
+𝑑 𝑖 ∈ [ 𝐿 𝑖 , 𝑈 𝑖 ] with high probability. In this way, Quic can select a minimal set of candidates that contain the top-𝐾 neighbors for a query with high confidence. Moreover, RecastQ performs bit-gain-aware grouping, which assigns higher encoding bit budget to vector dimensions with higher variance for improving the encoding quality and reducing the uncertainty interval size. 
+
+• Challenge 2: Reducing in-memory computation cost . Af-ter optimizing the disk I/O accesses, we find that the cost of in-memory IVF computation sometimes surpasses the I/O cost. The in-memory search consists of (1) selecting nprobe IVF lists, which computes the distances of all list centroids, and (2) scan-ning the RecastQ codes in the chosen lists. For (1), we encode the list centroids in PQ and employ FastScan to accelerate the dis-tance computation for centroids. For (2), we implement FastScan on the RecastQ codes. We design the layout of RecastQ to be compatible with that of PQ4 FastScan, which stores codes in 32-vector packed blocks. Unlike the int8 operations in PQ FastScan, we perform 32-bit floating point SIMD operations to improve the accuracy of the distance computation. Experiments on real-world data sets show that Recast processes batched insertions and deletions 3 .10–37 .27 × faster than SPFresh and OdinANN, while its QPS at 0.99 recall changes by at most 6 .9% 10 1 10 2 10 3 10 4 10 5  
+
+> Oracle depth R*
+> q
+> 00.25 0.5 0.75 1
+> Query CDF
+> SIFT-PQ SIFT-OPQ DEEP-PQ DEEP-OPQ
+
+Figure 1: Distribution of per-query optimal 𝑅 ∗ 
+
+> 𝑞
+
+for obtaining all top-10 results under the fixed-𝑅 refinement policy. 
+
+after updating 50% of the corpus. For static queries at 0.99 recall, Recast achieves 1 .56–2 .01 × the QPS of the strongest baseline with the matched memory budget on each data set, while requiring 1.22–6 .75 × less external storage than the evaluated systems. At matched in-memory space, RecastQ also provides a better Recall– refinement frontier than RaBitQ. The paper makes the following contributions: 
+
+• To our knowledge, we are the first to introduce the refinement-centered paradigm for storage-optimized ANNS systems, which provides a promising answer to the central question for achieving good query throughput, recall, and index maintenance perfor-mance. We propose Recast as a concrete design of this paradigm. 
+
+• We propose RecastQ encoding, which supports uncertainty interval computation and fast distance estimation, and Quic policy, which for each query minimizes the set of refinement candidates to reduce the I/O overhead. 
+
+• We build an end-to-end Recast system. Our experiments compar-ing Recast with state-of-the-art storage-optimized ANNS sys-tems show that Recast achieves 1.56-2.01 × the query through-put of the strongest baseline at 0.99 recall, and shows strong performance stability under dynamic workloads. 
+
+## 2 STORAGE-OPTIMIZED ANNS PARADIGMS 
+
+We compare storage-optimized ANNS paradigms in this section. Table 1 summarizes the comparison. For fair comparison, we assume the same allocated memory budget across different systems, which is used by in-memory structures for both query processing and update support. We consider five aspects of the design in the table, including three aspects on ANNS query processing, one aspect on index main-tenance, and one aspect on the space cost. (1) Query performance 
+
+summarizes the ANNS throughput-recall performance. (2) Amount of disk data accessed accounts for not only raw vectors but also auxiliary structures retrieved from disk during query processing. (3) 
+
+Dependent I/Os indicates whether an I/O read decision can depend on information returned by previous I/Os in the same query, which may have adverse impact on I/O efficiency. (4) Maintenance support 
+
+qualitatively describes whether and how efficient the systems sup-port vector insertions and deletions. (5) Storage footprint compares the total amount of storage space consumed by vector data and auxiliary structures required by queries and updates. In the following, Section 2.1 and 2.2 review the existing paradigms, then Section 2.3 introduce the refinement-centered paradigm. 
+
+## 2.1 Disk-Resident Graph Indexes 
+
+Static disk-resident graphs. DiskANN [42] is the first static disk-resident solution. It stores vertices (i.e., exact vectors along with graph adjacency lists) on disk, while keeping compressed PQ codes 
+
+> 2
+
+Table 1: Comparing storage-optimized ANNS paradigms. Paradigm Representative systems Query performance (w/ same mem size) Amount of disk data accessed Dependent I/Os Maintenance support Storage footprint 
+
+Static disk graph DiskANN [42], Starling [44] High Low Yes - Moderate Dynamic disk graph OdinANN [23] Moderate High Yes Moderate Moderate Static posting list SPANN [11] Moderate High No - High Dynamic posting list SPFresh [47] Moderate High No Moderate High 
+
+Refinement-centered Recast High Low No Strong Low 
+
+and preserving a vertex cache in memory. Starling [44] constructs a sampling-based in-memory navigation graph to get better entry points for the disk graph search, and improves I/O locality by plac-ing vertices and out-neighbors in the same disk blocks as much as possible. MARGO [50] further improves the disk data layout by pri-oritizing out-edges based on their importance in the graph search. GPS [49] appends out-neighbors’ adjacency lists to each vertex en-try on disk so that an I/O obtains more graph structure information. PipeANN [22] gives up the strict compute-I/O order across search steps and issues asynchronous I/Os based on the current candidate pool, regardless of uncompleted I/Os or computation. 
+
+Dynamic disk-resident graphs. For updates, FreshDiskANN [40] follows a main+delta design. It constructs one or more TempIndexes for insertions and a DeleteList in memory, in addition to the read-only disk-resident graph. When the memory is full, FreshDiskANN merges the three structures to compute a new disk-resident graph. IP-DiskANN [46] proposes an in-place deletion algorithm, which approximates the in-neighbors of a deleted vertex by vertices vis-ited during the graph search, but has to periodically scan the full index to remove dangling edges. OdinANN [23] performs direct vec-tor insertions to reduce foreground performance variation during updates. For deletions, it buffers the deleted vector IDs in memory and merges the deletes to the disk graph periodically. 
+
+Representative systems and performance aspects. In this pa-per, we consider DiskANN [42] and Starling [44] as two classical solutions, and OdinANN [23] as the state-of-the-art solution in the paradigm of disk-resident graphs. As shown in Table 1, the graph-based solutions store adjacency lists with vectors on disk, leading to a moderate storage footprint. Moreover, there are dependency among I/O operations during graph search. Furthermore, OdinANN achieves moderate index update performance. However, compared to the static solutions, OdinANN allocates large per-thread I/O buffers for improving I/O efficiency, and keeps significant metadata, such as vector mapping and allocation structures, in memory. Given the same memory budget, OdinANN has to reduce the PQ code length, which leads to less accurate distance estimation, incurring higher amount of disk I/Os and lower query performance. 
+
+## 2.2 Posting List Based Systems 
+
+Static posting list based systems. SPANN [11] performs hierar-chical clustering to generate a large number of posting lists so that each posting fits into a small number of disk blocks (e.g., 10–100KB). Then, it assigns (boundary) vectors to multiple postings for better recall, and constructs an in-memory index on the medoids (i.e., vectors closest to the centroids of postings). A query first searches the in-memory index to obtain candidate postings, then reads the candidate postings to compute the top-𝐾 result. 
+
+Dynamic posting list based systems. SPFresh [47] adds incre-mental in-place update support to SPANN. Vector updates are han-dled locally in posting lists. If a posting exceeds an upper threshold, SPFresh splits it into two smaller ones. If the size of a posting is smaller than a lower threshold, SPFresh deletes it and reassigns its vectors to nearby postings. 
+
+Representative systems and performance aspects. In this paper, we evaluate SPANN [11] and SPFresh [47] as two representative solutions in the paradigm of posting list based systems. As shown in Table 1, they incur high storage cost because vectors can be stored redundantly in multiple postings. Moreover, the I/Os for retrieving postings are independent of each other in a query. Furthermore, since full postings of vectors are retrieved, SPANN and SPFresh read higher amount of disk data than graph based solutions, which can adversely impact the query performance. 
+
+## 2.3 This Paper: Refinement-Centered Paradigm 
+
+We introduce a refinement-centered paradigm for storage-optimized ANNS systems. As shown in Table 1, it achieves a low storage footprint for storing vectors without per-vector adjacency lists or redundant assignment. Moreover, it keeps an IVF structure on com-pressed vector encodings in memory. Both the in-memory structure and the on-disk vectors are update friendly. Furthermore, a query searches the in-memory IVF index to obtain a list of refinement candidates, then issues selective, independent I/Os for retrieving the candidate vectors for refinement. Finally, as will be described in the Recast design, the RecastQ encoding and the Quic policy minimize the number of candidate vectors and the amount of disk I/Os, thereby improving the query performance. 
+
+## 3 RECAST OVERVIEW 
+
+We propose Recast (Refinement-Centered Approximate nearest neighbor search optimized for STorage) as a concrete design of the refinement-centered paradigm. In the following, Section 3.1 overviews the Recast architecture. Then, Section 3.2 and 3.3 de-scribe its ANNS query and update support, respectively. 
+
+## 3.1 Recast Architecture 
+
+Figure 2 depicts the Recast architecture. We describe the in-memory and on-disk structures, then analyze the space cost. 
+
+In-memory structures. Recast constructs an IVF index in mem-ory. It is composed of a list of centroids and the IVF lists. First, list centroids are encoded in PQ codes for saving space and reducing computation cost. The same PQ quantizer is used for 
+
+> 3
+
+Memory 
+
+Storage ID to Disk Location Map    
+
+> …
+> (For Deletion) Packed PQ Codes List IDs Packed PQ Codes List IDs Packed PQ Codes List IDs IVF List Centroids
+> Packed RecastQ Codes Norms Scales Errors Bit-gain-aware Codes …
+> List 1
+> …
+> List nlist
+> IVF Lists
+> List 1
+> …
+> List nlist
+> …
+> ID Vector List Files Query Codebook, PCA Matrix, Dimension Grouping QUIC
+> Async I/O Planner Refine Top-K abcdef
+
+Figure 2: Recast architecture and query data flow. 
+
+build-time list assignment, post-build insertion, and query-time IVF list selection. Let 𝐷 be the number of vector dimensions. We set the codes to use 𝐷 PQ groups, each taking 4 bits. Suppose each dimension is a 32-bit floating point number. Then, this reduces the centroid size from 4 𝐷 to 0 .5𝐷 bytes, an 8 × space saving. Moreover, PQ FastScan delivers 4 .5× speedup for the IVF list selection. Second, each IVF list stores RecastQ codes packed in Faiss FastScan blocks. A RecastQ code consists of 𝑀 code groups, each taking 4 bits, and three bytes, which encode the norm , the scale , and the error (cf. Section 5.2). Hence, each vector’s RecastQ code takes 0.5𝑀 + 3 bytes. Note that we do not store any vector IDs or disk block addresses in memory because a vector’s disk location can be computed from its IVF list ID and in-list offset. For each vector, this saves at least 4B of memory space. 
+
+On-disk structures. First, Recast creates a list file for each in-memory IVF list. A list file stores the vector records in the same order as the associated IVF list. A vector record consists of a 32-bit vector ID and the exact vector. Suppose the disk page size is 𝐵 and the vector record size is 𝑆 . Each page contains 𝑛 𝐵 = ⌊ 𝐵 𝑆 ⌋ records. Hence, for the 𝑗 -th RecastQ code in IVF list 𝑖 , the associated vector record is the ( 𝑗 mod 𝑛 𝐵 ) records in page ⌊ 𝑗 𝑛 𝐵 ⌋ in list file 𝑖 .Second, Recast also maintains an ID-to-disk-location map. It is not accessed in ANNS queries, but used only for deletions. Finally, to support quick system restart, it is optional to store a backup copy of the in-memory structures on disk. (This is not depicted in Figure 2.) Note that if the backup copy does not exist, one can always rebuild the in-memory IVF index from the list files. 
+
+Space cost analysis. For the memory space, suppose there are 𝑁 
+
+vectors. The IVF lists take 𝑁 (0.5𝑀 + 3) bytes. Since a list ID takes 4B, the IVF list centroids take 𝑛𝑙𝑖𝑠𝑡 (0.5𝐷 + 4) bytes. In total, the in-memory IVF index takes 𝑛𝑙𝑖𝑠𝑡 (0.5𝐷 + 4) + 𝑁 (0.5𝑀 + 3) bytes. For a given memory budget, 𝑀 can be easily derived. For the disk footprint, the list files take about 𝑁 𝑛 𝐵 𝐵 bytes, and the ID-to-disk-location map takes 8 𝑁 bytes. In total, the on-disk structures take 𝑁   
+
+> ⌊𝐵 /𝑆 ⌋
+
+𝐵 + 8𝑁 bytes. Since the dimensions of the vector data sets are often on the order of 100–1000, 𝑆 ≫ 8. Therefore, the disk footprint of Recast is often quite close to 𝑁 𝑆 , the space required for storing the raw vectors. 
+
+Algorithm 1 Recast ANNS algorithm. 
+
+Require: query 𝑞 , output size 𝐾 , number of lists to probe 𝑛𝑝𝑟𝑜𝑏𝑒 ,uncertainty interval scale 𝑧 , I/O queue depth 𝑄  
+
+> 1:
+
+L ← SelectIVFLists (𝑞, 𝑛𝑝𝑟𝑜𝑏𝑒 ) 
+
+> 2:
+
+C, 𝜃 𝐾 ← ScanWithQUIC (𝑞, L, 𝐾, 𝑧 ) 
+
+> 3:
+
+𝑅𝑒𝑠𝑢𝑙𝑡 ← AIOReadAndRefine (𝑞, C, 𝐾, 𝑄 ) 
+
+> 4:
+
+return 𝑅𝑒𝑠𝑢𝑙𝑡 
+
+## 3.2 ANNS Algorithm 
+
+Algorithm 1 lists the Recast ANNS algorithm. The query data flow is illustrated in Figure 2. First, given a query, Recast selects 𝑛𝑝𝑟𝑜𝑏𝑒 
+
+IVF lists by performing PQ FastScan on the packed centroid codes (Line 1, Step (a) and (b)). Second, it scans the packed RecastQ codes in the selected IVF lists to compute the estimated distance and the uncertainty interval for each item in the lists, while the refinement selector applies the Quic policy (Line 2, Step (c) and (d)). Specifically, the selector computes a top-𝐾 upper bound 𝜃 𝐾 ,and obtains a minimal set of refinement candidates, whose lower bounds of the uncertainty intervals ≤ 𝜃 𝐾 (cf. Sections 4). Finally, Recast derives the disk locations of the refinement candidates, plans and issues asynchronous I/Os, and computes accurate vector distances for refinement (Line 3, Step(e) and (f)). The vector IDs in the returned vector records are used to produce the top-𝐾 result. 
+
+Optimizing I/O Operations for Retrieving Vectors. Given the set C of refinement candidates, Recast computes the disk locations of the |C| vectors (cf. Section 3.1). Then, it sorts (list file ID, disk page ID)s and merges items that are mapped to the same disk page or adjacent disk pages into a single I/O request. Given the queue depth 𝑄 , a query worker submits 𝑄 I/O requests initially. Whenever submitted I/O requests complete, it refills the released slots with remaining requests. In this way, Recast exploits the independent nature of the I/O requests and the parallelism of the underlying storage devices (e.g., SSDs) for improving I/O efficiency. 
+
+Cost Analysis. First, SelectIVFLists takes 𝑂 (𝑛𝑙𝑖𝑠𝑡 · 𝐷 ) work. Second, ScanWithQUIC scans an average 𝑛𝑝𝑟𝑜𝑏𝑒 𝑛𝑙𝑖𝑠𝑡 𝑁 RecastQ codes, computes the top-𝐾 upper bound 𝜃 𝐾 using an 𝑂 (𝐾 )-sized heap, and checks the uncertainty lower bound of each item against 𝜃 𝐾 . Third, AIOReadAndRefine takes 𝑂 (| 𝐶 | log |𝐶 |) work for the sorting and planning, issues up to |𝐶 | asynchronous I/O requests, computes 
+
+|𝐶 | full distances, and uses a heap of size 𝑂 (𝐾 ) to obtain the top-𝐾 
+
+result. In summary, for an ANNS query, Recast takes 𝑂 (𝑛𝑙𝑖𝑠𝑡 · 𝐷 + 
+
+> 𝑛𝑝𝑟𝑜𝑏𝑒 𝑛𝑙𝑖𝑠𝑡
+
+𝑁 (𝑀 + log 𝐾 ) + | 𝐶 |( log |𝐶 | + log 𝐾 + 𝐷 )) computation work, and performs 𝑂 (| 𝐶 |) I/O accesses. 
+
+## 3.3 Index Maintenance 
+
+The index insertion and deletion algorithms are shown in Algo-rithm 2. Note that the index structures are updated in place, avoiding the cost of background maintenance tasks used in previous solu-tions [23, 40]. Moreover, for a batch of requests, both insertion and deletion procedures divide the requests based on the relevant lists, and perform the update operations of each list in parallel. For insertions, Recast reserves the vector IDs for the input vectors (Line 2), assigns the vectors to the IVF lists with the closest centroids (Line 3), and encodes the vectors into RecastQ codes (Line 4). Then, it groups the insert requests by the assigned lists (Line 
+
+> 4
+
+Algorithm 2 Insertion and deletion algorithms.  
+
+> 1:
+
+procedure InsertBatch( 𝑋 ) 
+
+> 2:
+
+𝐼𝐷 𝑋 ← ReserveVectorIDs (| 𝑋 |)  
+
+> 3:
+
+𝐿 𝑋 ← AssignLists (𝑋 ) 
+
+> 4:
+
+(𝐶𝑜𝑑𝑒 𝑋 , 𝑈 𝑋 ) ← EncodeBatch (𝑋 ) 
+
+> 5:
+
+(𝐺, 𝐼𝐷 𝐺 , 𝑋 𝐺 , 𝐶𝑜𝑑𝑒 𝐺 , 𝑈 𝐺 ) ← 
+
+GroupInsertsByList (𝐿 𝑋 , 𝐼𝐷 𝑋 , 𝑋, 𝐶𝑜𝑑𝑒 𝑋 , 𝑈 𝑋 ) 
+
+> 6:
+
+for each touched list ℓ ∈ 𝐺 in parallel do  
+
+> 7:
+
+AppendPackedRecordsInMem( ℓ, 𝐶𝑜𝑑𝑒 𝐺 [ℓ], 𝑈 𝐺 [ℓ]) 
+
+> 8:
+
+𝐴 𝐺 [ℓ] ← AppendRecordsOnDisk( ℓ, 𝐼𝐷 𝐺 [ℓ], 𝑋 𝐺 [ℓ]) 
+
+> 9:
+
+AddInIDtoDiskLocMap( 𝐼𝐷 𝐺 , 𝐴 𝐺 ) 
+
+> 10:
+
+return 𝐼𝐷 𝑋  
+
+> 11:
+
+procedure DeleteBatch( 𝐼𝐷 ) 
+
+> 12:
+
+𝐴 ← LookupLocations (𝐼𝐷 ) 
+
+> 13:
+
+ValidateDeletes( 𝐴 ) 
+
+> 14:
+
+(𝐺, 𝐴 𝐺 ) ← GroupDeletesByList (𝐼𝐷, 𝐴 ) 
+
+> 15:
+
+for each touched list ℓ ∈ 𝐺 in parallel do  
+
+> 16:
+
+𝑃 [ℓ] ← PlanSwapWithLast (ℓ, 𝐺 [ℓ])  
+
+> 17:
+
+MovePackedRecordsInMem( ℓ, 𝑃 ) 
+
+> 18:
+
+MoveRecordsOnDisk( ℓ, 𝑃 ) 
+
+> 19:
+
+UpdateMovedLocAndMarkTombstones( 𝑃 )5), and enters a parallel for loop (Line 6–8). Each parallel iteration processes a touched list, appending the inserted RecastQ codes to the in-memory IVF list, and appending the inserted vector records to the list file on disk. Finally, the IDs and the disk locations of the inserted vectors are added into the ID-to-disk-location map. For deletions, given a set of vector IDs to delete, Recast retrieves their disk locations from the ID-to-disk-location map on disk (Line 12), and ensures that the disk locations are valid (i.e., not tomb-stones) (Line 13). Then, it groups the resulting locations by the relevant lists (Line 14), and enters a parallel for loop (Line 15–18). Each parallel iteration processes a touched list. For a list contain-ing 𝑁 𝑙 vectors, if there are 𝑑 𝑙 deletions, the list size after deletion is 𝑁 ′ 
+
+> 𝑙
+
+= 𝑁 𝑙 − 𝑑 𝑙 . PlanSwapWithLast considers the deleted slots in slot [0, 𝑁 ′ 
+
+> 𝑙
+
+) as target holes, and regards the entries in [𝑁 ′ 
+
+> 𝑙
+
+, 𝑁 𝑙 )
+
+that are not deleted as source entries. It pairs the source entries with the target holes. Subsequently, MovePackedRecordsInMem and MoveRecordsOnDisk overwrite the target holes with source entries, and truncate the list. Note that for the in-memory IVF list, overwriting an entry involves unpacking the packed code block, updating the entry, and re-packing the code block. Finally, Recast updates the ID-to-disk-location map. For a moved vector, the vector ID remains unchanged, while the disk location is updated. For a deleted vector, the disk location is marked as a special tombstone value. Note that the in-memory IVF lists do not contain any invalid tombstones, and thus there is no tombstone test or invalid-record branch in ANNS query processing. 
+
+Cost Analysis. For a batch of 𝑁 𝑖𝑛𝑠 inserts, Recast writes 𝑂 ( 𝑁 𝑖𝑛𝑠  
+
+> 𝑛 𝐵
+
+)
+
+pages to the list files and 𝑂 ( 8𝑁 𝑖𝑛𝑠  
+
+> 𝐵
+
+) pages to the ID-to-disk-location map. Therefore, the total amount of disk I/Os is 𝑂 (( 1 
+
+> 𝑛 𝐵
+
++ 8 
+
+> 𝐵
+
+)𝑁 𝑖𝑛𝑠 ).Moreover, the computation cost is 𝑂 (𝑁 𝑖𝑛𝑠 · 𝑛𝑙𝑖𝑠𝑡 · 𝐷 ) since the most computation intensive step, AssignLists, computes the distances of 𝑛𝑙𝑖𝑠𝑡 centroids for each inserted vector. For a batch of 𝑁 𝑑𝑒𝑙 deletes, Recast accesses 2 𝑁 𝑑𝑒𝑙 pages to the list files and 2 𝑁 𝑑𝑒𝑙 pages in the ID-to-disk-location map in the worst case, where each deleted vector record resides in its own page, and 
+
+𝑁 𝑑𝑒𝑙 source entries are moved. Hence, the total I/O cost is 𝑂 (4𝑁 𝑑𝑒𝑙 ).Moreover, the computation cost is 𝑂 (𝑁 𝑑𝑒𝑙 ).
+
+## 4 QUERY-AWARE UNCERTAINTY-GUIDED CANDIDATE SELECTION 
+
+After overviewing Recast architecture and algorithms, we delve into the Quic refinement policy in this section. 
+
+Definition 4.1 (Uncertainty interval) . Let 𝑑 = 𝑑 (q, x) be the true distance between the query q and vector x, and ˆ𝑑 be the estimated distance. Given a constant 𝑧 > 0, the uncertainty interval of the distance is [𝐿, 𝑈 ], where 𝐿 = ˆ𝑑 − 𝑧𝜏 , 𝑈 = ˆ𝑑 + 𝑧𝜏 , and 𝜏 is the vector-specific uncertainty scale. Our RecastQ encoding provides both a deterministic and a prob-abilistic uncertainty interval (cf. Section 5.1). The deterministic interval is distribution-free, but its bound is quite loose. The prob-abilistic interval reduces the deterministic bound by a factor of √𝐷 .Then, Quic selects refinement candidates as follows. 
+
+Quic policy. Let 𝑆 be the set of vectors in all probed IVF lists. Suppose for 𝑥 𝑖 ∈ 𝑆 , the uncertainty interval is [𝐿 𝑖 , 𝑈 𝑖 ]. Let 
+
+𝜃 𝐾 = 𝐾 -th-smallest {𝑈 𝑖 : 𝑥 𝑖 ∈ 𝑆 }. (1) The refinement candidate set is 
+
+𝐶 (𝑆 ) = {𝑥 𝑖 ∈ 𝑆 : 𝐿 𝑖 ≤ 𝜃 𝐾 }. (2) 
+
+## 4.1 Quality of Refinement Candidates 
+
+Within the set 𝑆 of vectors in the probed IVF lists, an ideal pol-icy would keep all the true top-𝐾 neighbors in 𝑆 as refinement candidates. (Note that candidate selection policy obviously cannot recover a true neighbor missed by IVF list selection.) In the follow-ing, we would like to understand how well Quic preserves true neighbors as refinement candidates. 
+
+Theorem 4.2 (Quic quality under deterministic intervals) . If 𝑑 𝑖 ∈[𝐿 𝑖 , 𝑈 𝑖 ] for every 𝑥 𝑖 ∈ 𝑆 , then 𝐶 (𝑆 ) retains all top-𝐾 neighbors in 𝑆 .
+
+Proof. For an excluded x𝑖 , 𝑑 𝑖 ≥ 𝐿 𝑖 > 𝜃 𝐾 . However, there exists at least 𝐾 vectors x𝑗 1 , ..., x𝑗 𝐾 s.t. 𝑑 𝑗 𝑘 ≤ 𝑈 𝑗 𝑘 ≤ 𝜃 𝐾 . Thus, x𝑖 cannot be a top-𝐾 neighbor. □
+
+For the probabilistic uncertainty interval, we introduce the fol-lowing result with a number of assumptions for simplifying the anal-ysis. (Please see the detailed derivation in Appendix A.) First, con-ditioned on the true distances, the normalized distance-estimation errors are independent standard Gaussian variables. Second, the different vectors share a common uncertainty scale 𝜏 . Finally, the upper bounds of all intervals are evenly spaced. The space between two subsequent upper bounds is denoted Δ.
+
+Theorem 4.3 (Quic quality under probabilistic intervals) . Under the above assumptions, for 𝑧 > 0,
+
+E[𝑅 ref @𝐾 ] ≥ exp 
+
+ √2𝜏  
+
+> Δ
+
+𝐼 (√2𝑧 )
+
+
+
+. (3) 
+
+> 5
+
+where 𝐼 (𝑎 ) = ∫ ∞ 
+
+> 𝑎
+
+ln Φ(𝑥 ) 𝑑𝑥 , and Φ(𝑥 ) is the CDF of the standard Gaussian distribution. 
+
+The theorem provides a lower bound for the expected recall in the refinement stage (within the set 𝑆 of vectors in the probed IVF lists). For illustration, for SIFT100M, using the empirical mean ratio   
+
+> E[𝜏 ]
+> E[Δ]
+
+= 20 .316 as a plug-in approximation to 𝜏  
+
+> Δ
+
+, Eq. 3 gives 0 .9803 at 𝑧 = 2. While the assumptions are very simplified, this result illustrates the quality of the probabilistic uncertainty interval to some extent. 
+
+Theorem 4.4 (Number of refinement candidates) . Under the above assumptions, the number of refinement candidates is 𝐾 + ⌊ 2𝑧𝜏  
+
+> Δ
+
+⌋.
+
+Proof. A vector xi is selected as a candidate iff. 𝐿 𝑖 ≤ 𝜃 𝐾 . Under the above assumptions, 𝑈 𝑖 = 𝐿 𝑖 + 2𝑧𝜏 . Hence, 𝑈 𝑖 ≤ 𝜃 𝐾 + 2𝑧𝜏 . There are 𝐾 vectors with upper bounds up to 𝜃 𝐾 , and ⌊ 2𝑧𝜏  
+
+> Δ
+
+⌋ selected vectors, whose upper bounds in (𝜃 𝐾 , 𝜃 𝐾 + 2𝑧𝜏 ]. □
+
+We see that the number of refinement candidates increases with 𝑧 
+
+and 𝜏 , and decreases with Δ. First, larger 𝑧 makes the selection more conservative. Second, smaller quantization errors lead to lower 
+
+𝜏 and fewer candidates to refine. Finally, smaller Δ means more vectors with similar distances, which makes the query intrinsically harder and requires refining more candidates. 
+
+## 4.2 QUIC Computation 
+
+Computing 𝜃 𝐾 . During the FastScan of packed codes in the probed IVF lists, a size-𝐾 max heap maintains the globally smallest 𝐾 up-per bounds observed so far. The heap maximum gives the current 
+
+𝑐𝑢𝑟𝜃 𝐾 , which is monotonically non-increasing after initialization. For each SIMD batch, Recast compares all upper bounds against 
+
+𝑐𝑢𝑟𝜃 𝐾 to filter out any upper bound that is greater than or equal to 
+
+𝑐𝑢𝑟𝜃 𝐾 for reducing heap operations. The remaining upper bounds are processed serially: each is rechecked against the latest heap maximum and, if still eligible, inserted with an 𝑂 (log 𝐾 ) heap up-date. The same heap is used across all probed IVF lists, ensuring that the bound is computed globally. 
+
+Selecting Refinement Candidates. After obtaining global 𝜃 𝐾 , Re-cast compares the lower bounds to select the refinement candidates. To safeguard against unhealthy growth of per-query workspace, the implementation includes a 2,000-entry transient shortlist of candidates for a query. It is almost never activated under the evalu-ated configurations and has no measurable effect on the reported Recall–QPS frontiers. 
+
+## 5 RECASTQ ENCODING 
+
+The RecastQ encoding process is as follows: (1) Let c be a reference center. (For example, let c = 1
+
+> 𝑁
+
+Í𝑁 𝑖 =1 xi, for vectors x1, ..., xN. c will not change upon index updates.) Let T
+
+be an orthogonal transformation. (2) To encode vector x, RecastQ computes xc = x − c, 𝑟 = ∥xc ∥,and u = xc 
+
+> 𝑟
+
+, which is the normalized vector. (3) RecastQ encodes Tu using 𝑀 code groups with bit-gain-aware uneven grouping (cf. Section 5.3). (4) Three metadata bytes, i.e., norm , scale , and error , are stored with the main code to facilitate decode processing. Let y′ be the decoded vector from the main code. ˆu = T⊤ y′  
+
+> ∥y′∥
+
+is an estimation of u. Let the residual e = u − ˆu. Then, norm records 
+
+𝑟 , scale records 𝑟   
+
+> ∥y′∥
+
+, and error records ∥e∥ (cf. Section 5.2). Given a query q, the distance to vector x is estimated as follows: (1) Let qc = q − c, and q′ 
+
+> c
+
+= Tq c.(2) RecastQ obtains the decoded vector y′, and estimates 𝑟 , 𝑟   
+
+> ∥y′∥
+
+,and ∥e∥ from the three metadata bytes. (3) The squared L2 distance is computed as follows: ˆ𝑑 (q, x) = ∥qc ∥2 + 𝑟 2 − 2 𝑟 
+
+∥y′ ∥ ⟨q′
+
+> c
+
+, y′⟩. (4) We use squared L2 distance in the analysis; other supported distance metrics are discussed in Section 5.1, “Other metrics”. (4) Given a parameter 𝑧 > 0, RecastQ further computes the uncer-tainty interval as [ ˆ𝑑 (q, x) − 𝑧𝜏 (q, x), ˆ𝑑 (q, x) + 𝑧𝜏 (q, x)] , where 
+
+𝜏 (q, x) = 1√𝐷 2𝑟 ∥qc ∥∥ e∥ is the uncertainty scale (cf. Section 5.1). 
+
+## 5.1 Uncertainty Interval 
+
+Lemma 5.1 (Distance residual) . The distance estimation satisfies 
+
+𝑑 (q, x) − ˆ𝑑 (q, x) = −2𝑟 ⟨qc, e⟩. (5) Proof. We have 𝑑 (q, x) = ∥qc − xc ∥2 = ∥qc − 𝑟 u∥2. Since 
+
+⟨q′
+
+> c
+
+, y′  
+
+> ∥y′∥
+
+⟩ = ⟨Tq c, y′  
+
+> ∥y′∥
+
+⟩ = ⟨qc, T⊤ y′  
+
+> ∥y′∥
+
+⟩ = ⟨qc, ˆu⟩, ˆ𝑑 (q, x) = ∥qc ∥2 +
+
+𝑟 2 − 2𝑟 ⟨qc, ˆu⟩. Subtracting the two equations gives Eq. 5. □
+
+Then, the Cauchy–Schwarz inequality immediately gives the distribution-free bound |𝑑 (q, x) − ˆ𝑑 (q, x)| ≤ 2𝑟 ∥qc ∥∥ e∥. However, this bound assumes the worst-case scenario, and can be too loose for the selective refinement purpose. Therefore, we derive a proba-bilistic uncertainty bound under the following assumption. 
+
+Assumption 5.2 (Directional isotropy) . Suppose 𝑟 > 0, ∥qc ∥ > 0, and ∥e∥ > 0. The normalized residual e 
+
+> ∥e∥
+
+is uniformly distributed on the 𝐷 -dimensional unit hyper-sphere S𝐷 −1.Note that this is a high-dimensional analytical model, not nec-essarily a property imposed by the encoding. If 𝑟 = 0, ∥qc ∥ = 0, or ∥e∥ = 0, the residual in Lemma 5.1 is 0. Then, the estimated distance is accurate. 
+
+Lemma 5.3 (Spherical projection law) . Under Assumption 5.2, let 
+
+𝛾 = ⟨ qc  
+
+> ∥qc∥
+
+, e 
+
+> ∥e∥
+
+⟩. The probability density function of 𝛾 is 
+
+𝑓 𝐷 (𝑡 ) = Γ (𝐷 /2)√𝜋 Γ ( ( 𝐷 −1)/ 2) (1 − 𝑡 2) (𝐷 −3)/ 2, −1 < 𝑡 < 1, (6) 
+
+or equivalently, 𝛾 2 ∼ Beta (1/2, (𝐷 − 1)/ 2). Moreover, 
+
+E(𝛾 ) = 0, Var (𝛾 ) = 1 
+
+> 𝐷
+
+, √𝐷 · 𝛾 𝐷 →∞ 
+
+−−−−→ N ( 0, 1). (7) Proof. 𝛾 is the projection of e 
+
+> ∥e∥
+
+in the direction of qc  
+
+> ∥qc∥
+
+. Hence, 
+
+𝛾 can be viewed as one coordinate of a uniform point on S𝐷 −1.Then, Eq. 6, its Beta representation, and its moments follow from the spherical-coordinate law [10]. The normalized coordinate con-verges to a standard Gaussian in high dimensions [10, 13]. □
+
+Theorem 5.4 (RecastQ uncertainty interval) . Under Assumption 5.2, let 𝜏 (q, x) = 1√𝐷 2𝑟 ∥qc ∥∥ e∥. Then, as 𝐷 increases to infinity, 
+
+𝑑 (q, x) − ˆ𝑑 (q, x)
+
+𝜏 (q, x) = −√𝐷𝛾 𝐷 →∞ 
+
+−−−−→ N ( 0, 1), (8) 
+
+> 6
+
+Pr {| 𝑑 (q, x) − ˆ𝑑 (q, x)| ≤ 𝑧𝜏 (q, x)} 𝐷 →∞ 
+
+−−−−→ 2Φ(𝑧 ) − 1. (9) Proof. For Eq. 8, the left hand side= −2𝑟 ⟨qc,e⟩√𝐷    
+
+> 2𝑟 ∥qc∥ ∥ e∥
+
+= −√𝐷𝛾 . Then, Eq. 8 follows from Lemma 5.3, and Eq. 9 results from the standard Gaussian distribution. □
+
+Based on Theorem 5.4, the true distance is within the uncertainty interval [ ˆ𝑑 (q, x) − 𝑧𝜏 (q, x), ˆ𝑑 (q, x) + 𝑧𝜏 (q, x)] with approximate probability 2 Φ(𝑧 ) − 1. The parameter 𝑧 controls the interval size. Our experiments in Table 2 empirically test the setting of 𝑧 (cf. Section 7.4). The uncertainty interval covers 68.16–68.71% cases at 
+
+𝑧 = 1, and 95.43–95.85% cases at 𝑧 = 2. These are close to the 68.27% and 95.45% probabilities in the standard Gaussian 1.
+
+Other metrics. For inner-product and cosine search, we disable reference centering because subtracting a reference vector changes both measures. We support inner product through negative simi-larity with uncertainty scale 1√𝐷 𝑟 ∥q∥∥ e∥. For cosine distance (1 −
+
+cos (q, x)), we use 1√𝐷 ∥e∥ as the uncertainty scale. 
+
+## 5.2 Three Metadata Bytes 
+
+RecastQ represents each of norm , scale , and error in one byte. For 
+
+error , since it is in [0, 2], RecastQ stores ⌈ 𝑒𝑟𝑟𝑜𝑟  
+
+> 2
+
+255 ⌉. For norm and 
+
+scale , 255 is reserved as an overflow sentinel. If a vector’s norm or 
+
+scale falls outside the representable metadata range, RecastQ stores the overflow sentinel. For such cases, the uncertainty interval is treated as unbounded, which satisfies the 𝜃 𝐾 bound, and therefore the corresponding vector record is always refined. In this way, we ensure that the metadata saturation cannot erroneously exclude a vector. For non-sentinel cases, the normal distance and interval computation are performed. 
+
+## 5.3 Bit-Gain-Aware Uneven Grouping 
+
+PQ performs even grouping: every dimension group contains the same number of (e.g., 2) dimensions. Since a group is encoded with a fixed number of (e.g., 4) code bits, even grouping treats each dimension equally in essence. However, different dimensions can have significantly different data distributions. We propose uneven grouping in RecastQ to capture the dif-ference across dimensions. The basic idea is to (1) partition the dimensions (for vectors in the transformed space) into uneven groups, which can contain different numbers of dimensions, and (2) keep the fixed number of code bits (i.e., 4 bits) per group. The benefits of uneven grouping are as follows. First, the number of code bits per dimension is lower for groups with larger number of dimensions. This reflects the data variance across dimensions, thereby improving the encoding quality and decreasing the error 
+
+∥e∥. Second, lower errors result in narrower uncertainty intervals, leading to smaller number of refinement candidates and better query throughput. Finally, the resulting code still follows the fixed 4-bit group size, which is compatible to Faiss PQ4 FastScan, and amenable to SIMD acceleration. Next, we answer the question how to assign dimensions to groups. Let us consider the benefit of assigning an extra code bit to a dimension. Let D𝑗 (𝑏 ) denote the expected quantization distortion 
+
+> 1While confirming the usefulness of our computed uncertainty interval, the results are not sufficient to establish the residual isotropy assumption across candidates.
+
+Algorithm 3 Bit-gain-aware uneven grouping. 
+
+Require: vectors 𝑋 ∈ R𝑁 ×𝐷 , number of 4-bit groups 𝑀  
+
+> 1:
+
+𝑏𝑢𝑑𝑔𝑒𝑡 [𝑔 ] ← 4 and 𝐺 [𝑔 ] ← ∅ for group 𝑔 = 1,... 𝑀  
+
+> 2:
+
+compute 𝜎 𝑗 of 𝑋 for dimension 𝑗 = 1, ..., 𝐷  
+
+> 3:
+
+choose 𝜆 s.t. 𝑏 [ 𝑗 ] ← max (0, log 2 𝜎 𝑗 − 𝜆 ) and Í𝑗 𝑏 [ 𝑗 ] = 4𝑀  
+
+> 4:
+
+sort the dimensions in the descending order of 𝑏 [ 𝑗 ] 
+
+> 5:
+
+for i = 1 to 𝐷 do  
+
+> 6:
+
+𝑗 ← the dimension with the 𝑖 -th largest demand  
+
+> 7:
+
+𝑔 ∗ ← argmax 𝑏𝑢𝑑𝑔𝑒𝑡 [𝑔 ] 
+
+> 8:
+
+assign dimension 𝑗 to group 𝑔 ∗ 
+
+> 9:
+
+𝑏𝑢𝑑𝑔𝑒𝑡 [𝑔 ∗] ← 𝑏𝑢𝑑𝑔𝑒𝑡 [𝑔 ∗] − 𝑏 [ 𝑗 ], 𝐺 [𝑔 ∗] ← 𝐺 [𝑔 ∗] ∪ { 𝑗 } 
+
+> 10:
+
+return 𝐺 
+
+of a dimension 𝑗 under a budget of 𝑏 code bits. According to the quantization literature [21], D𝑗 (𝑏 ) = 𝜅𝜎 2 
+
+> 𝑗
+
+2−2𝑏 , where 𝜎 2 
+
+> 𝑗
+
+is the vari-ance of dimension 𝑗 . Then, the reduction of distortion by adding an extra bit, which is the marginal gain, is G𝑗 (𝑏 ) = D𝑗 (𝑏 )−D 𝑗 (𝑏 +1) = 
+
+> 34
+
+D𝑗 (𝑏 ). In the ideal case, if we continuously assign the next bit to the dimension with the largest marginal gain, the resulting distor-tion is the same across all dimensions. Suppose the total number of code bits is 4 𝑀 , which is determined by the specified memory budget. Hence, we have 𝑏 𝑗 = max (0, log 2 𝜎 𝑗 − 𝜆 ) and Í𝑗 𝑏 𝑗 = 4𝑀 ,where 𝜆 is a constant chosen to satisfy the bit budget. That is, the number of code bits of a dimension is proportional to the logarithm of the standard deviation log 2 𝜎 𝑗 . For dimensions whose log 2 𝜎 𝑗 ≤ 𝜆 ,no bit is assigned. From the above analysis, 𝑏 𝑗 can be viewed as the demand of dimension 𝑗 . Each of the 𝑀 code group has a code budget of 4 bits. We design a greedy algorithm to assign dimensions to groups as shown in Algorithm 3. The algorithm initializes group budgets and dimension demands (Line 1–3). Then, it sorts the dimensions (Line 4) and assigns the dimensions one by one in the descending order of the demand (Line 5–9). For each dimension, the group with the largest remaining budget is chosen to accommodate the dimension (Line 7), and the group’s budget is adjusted accordingly (Line 9). Finally, the algorithm returns the group assignment. 
+
+## 6 MEMORY-SIDE OPTIMIZATIONS 
+
+Previously, in Section 3, we have described how Recast uses the compressed coarse quantizer to accelerate the distance computation of list centroids for IVF list selection. In this section, we focus on the optimization of RecastQ code scanning in the probed IVF lists. 
+
+Why exact-float accumulation. Faiss FastScan normally quan-tizes the LUT entries in uint8. This is effective for approximate ranking, but introduces an additional numerical residual. For a row 𝑚 (𝑚 = 1, ..., 𝑀 ), let 𝑇 𝑚 [𝑐 𝑚 ] be the exact float32 entry selected from the LUT, and c𝑇 𝑚 [𝑐 𝑚 ] be the reconstructed value from the uint8 quantization. Then, the additional residual is 
+
+𝛿 LUT =∑︁ 
+
+> 𝑚
+
+(c𝑇 𝑚 [𝑐 𝑚 ] − 𝑇 𝑚 [𝑐 𝑚 ]) , |𝛿 LUT | ≤ ∑︁ 
+
+> 𝑚
+
+𝜖 𝑚 , (10) where 𝜖 𝑚 bounds the quantization error of row 𝑚 . 𝛿 LUT contributes to ⟨q′
+
+> c
+
+, y′⟩ in Eq. 4. The squared-L2 estimate scales this inner product by − 2𝑟   
+
+> ∥y′∥
+
+, incurring an additional error up to 2𝑟  
+
+> ∥y′∥
+
+Í𝑚 𝜖 𝑚 . Ignoring the residual would make the uncertainty interval inconsistent with 
+
+> 7
+
+Algorithm 4 AVX-512 exact-float RecastQ block FastScan. 
+
+Require: 32-vector packed block 𝐵 ; the lookup table in float32, LUT 𝑇 [𝑀 ] [ 16 ]; an even number of groups 𝑀 
+
+Ensure: Unquantized lookup sums of 32 vectors 𝐷 [0 . . . 31 ] 
+
+> 1:
+
+𝐴 lo , 𝐴 hi ← ZeroZmm , ZeroZmm  
+
+> 2:
+
+for 𝑚 ← 0, 2, . . . , 𝑀 − 2 do  
+
+> 3:
+
+𝑝 ← 𝐵 + 32 ∗ 𝑚 /2 
+
+> 4:
+
+𝑋 0, 𝑋 1 ← Vmovdq (𝑝 ), Vmovdq (𝑝 + 16 ) 
+
+> 5:
+
+(𝑄 lo 0 , 𝑄 lo 1 ) ← Vpand (( 𝑋 0, 𝑋 1), 0x0f ) 
+
+> 6:
+
+(𝐻 0, 𝐻 1) ← Vpsrlw (( 𝑋 0, 𝑋 1), 4) 
+
+> 7:
+
+(𝑄 hi 0 , 𝑄 hi 1 ) ← Vpand (( 𝐻 0, 𝐻 1), 0x0f ) 
+
+> 8:
+
+𝐿 0, 𝐿 1 ← Vmovups (𝑇 [𝑚, :]) , Vmovups (𝑇 [𝑚 + 1, :])  
+
+> 9:
+
+𝐴 lo ← LookupAdd (𝐴 lo , 𝑄 lo 0 , 𝐿 0) 
+
+> 10:
+
+𝐴 lo ← LookupAdd (𝐴 lo , 𝑄 lo 1 , 𝐿 1) 
+
+> 11:
+
+𝐴 hi ← LookupAdd (𝐴 hi , 𝑄 hi 0 , 𝐿 0) 
+
+> 12:
+
+𝐴 hi ← LookupAdd (𝐴 hi , 𝑄 hi 1 , 𝐿 1) 
+
+> 13:
+
+𝜋 ← [ 0, 2, 4, . . . , 14 , 1, 3, 5, . . . , 15 ] 
+
+> 14:
+
+𝐷 [0 . . . 15 ] ← Vpermps (𝜋, 𝐴 lo ) 
+
+> 15:
+
+𝐷 [16 . . . 31 ] ← Vpermps (𝜋, 𝐴 hi ) 
+
+> 16:
+
+return 𝐷 
+
+the distance, but covering it entails wider intervals and degraded refinement performance. To avoid this problem, Recast uses the original float32 values in the LUT. Our experiments in Figure 7(a) confirms the practical effect of this design decision: exact-float accumulation reaches the same recall with fewer refinement candidates compared to uint8 accumulation (cf. Section 7.4). 
+
+Why SIMD is necessary. While having the desired numerical accuracy, the scalar exact-float computation extracts one code and performs one float32 LUT lookup for every code group of every scanned encoded vector. Our experiments in Figure 7(b) shows that scalar LUT lookup dominates the query time. Therefore, we develop an exact-float kernel that exploits the AVX-512 SIMD operations to accelerate the exact-float computation. 
+
+AVX-512 exact-float FastScan. For the packed RecastQ code block, we follow the layout of the Faiss PQ4 FastScan. Specifically, the layout requires the number of code groups 𝑀 to be an even number. Then, for every pair of (𝑚, 𝑚 + 1) code groups, the packed block contributes 32 bytes, storing 4-bit code words for 32 vectors in the two code groups. The first and second 16 bytes encode sub-quantizers 𝑚 and 𝑚 + 1, respectively. Within each byte, the lower 4-bit nibble belongs to vectors 0–15 and the higher 4-bit nibble to vectors 16–31. Within either 16-vector half, the lanes are stored in the order of [0, 8, 1, 9, . . . , 7, 15 ].For the float32-based LUT, an LUT row stores 16 values, which correspond to the 16 centroids of a 4-bit code group. Hence, a row takes 64B, which fits into a 512-bit ZMM register. Then, inside 
+
+LookupAdd , we use the SIMD permutation D=VPERMPS(I, L) to perform an entire 16-way lookup inside the ZMM register 𝐿 , where 
+
+𝐷 [ 𝑗 ] receives 𝐿 [𝐼 [ 𝑗 ]] . For example, if 𝐿 contains the 𝑇 𝑚 row in the LUT, indices [3, 10 , 1, . . . ] obtain [𝑇 𝑚 [3],𝑇 𝑚 [10 ],𝑇 𝑚 [1], . . . ].Algorithm 4 lists the SIMD-accelerated exact-float FastScan pro-cedure. It first initializes two 512-bit ZMM registers (i.e., 𝐴 lo and 
+
+𝐴 hi ) as the accumulators (Line 1), then enters the main for-loop to process 𝑀 code groups (Line 2–12). Each for-loop iteration pro-cesses a pair of (𝑚, 𝑚 + 1) code groups. It obtains the starting address (Line 3), and loads the first and second 16 bytes into two 128-bit XMM registers (i.e., 𝑋 0 and 𝑋 1) corresponding to group 𝑚 
+
+and 𝑚 + 1, respectively (Line 4). After that, the procedure uses bit-wise AND and right-shift operations to obtain the lower and higher nibbles (Line 5–7), loads the two LUT rows (Line 8), and looks up and accumulates the LUT values to 𝐴 lo and 𝐴 hi (Line 9–12). Here, 
+
+𝐿𝑜𝑜𝑘𝑢𝑝𝐴𝑑𝑑 (𝐴, 𝑄, 𝐿 ) widens the 16 bytes in 𝑄 to 16 32-bit indices with 𝑉 𝑃𝑀𝑂𝑉 𝑍𝑋 𝐵𝐷 , performs 16 register lookups with 𝑉 𝑃𝐸𝑅𝑀𝑃𝑆 ,and accumulates the retrieved values with 𝑉 𝐴𝐷𝐷𝑃𝑆 . Finally, the procedure shuffles and returns the decoded values for the 32 vectors in the packed block (Line 13–16). 
+
+Metadata bytes and SIMD-based Quic computation. For each 32-vector code block, RecastQ stores three 32-byte arrays for the encoded norm , scale , and error . During the RecastQ FastScan, the metadata bytes are processed 16 vectors at a time. For each 16 vectors, a 16-byte array is loaded into a 128-bit XMM register. Then, each 8-bit code is widened to 32 bits and decoded in a 512-bit ZMM register. After that, the estimated distance ˆ𝑑 and uncertainty interval [𝐿, 𝑈 ] are computed in SIMD. Given the computed [𝐿, 𝑈 ], Quic uses a masked SIMD compar-ison to reject upper bounds above 𝑐𝑢𝑟𝜃 𝐾 . The remaining upper bounds are inserted to the heap. Quic performs a second SIMD comparison to filter vectors with lower bounds above 𝑐𝑢𝑟𝜃 𝐾 . For the surviving candidate vectors, Quic appends their estimated dis-tances, lower and upper bounds, and computed in-list offsets to a buffer. After the RecastQ FastScan, Quic obtains the global 𝜃 𝐾 ,and re-compares the lower bounds of vectors in the buffer against 
+
+𝜃 𝐾 to obtain the final refinement candidates. In summary, the SIMD-accelerated procedure fuses metadata decoding, reconstruction of ˆ𝑑 and [𝐿, 𝑈 ], global-bound update, and refinement candidate selection, while avoiding the materialization cost of per-vector uncertainty intervals for most vectors. 
+
+## 7 EVALUATION 
+
+In this section, we perform extensive experiments to compare Re-cast with state-of-the-art storage-optimized ANNS systems. We first describe the experimental setup in Section 7.1. Then, we study the static query performance and the index performance under dynamic updates in Section 7.2–7.3, and the effectiveness of refine-ment, storage footprint, and scalability in Section 7.4–7.6. 
+
+## 7.1 Experimental Setup 
+
+Hardware and common protocol. The server is equipped with two 36-core Intel Xeon Platinum 8360Y processors (2.4GHz, 3.5GHz Turbo), 1 TiB DDR4 memory, and Intel NVMe SSDs. It runs CentOS 7.9 and supports AVX-512. All systems are compiled with GCC 9.3.1 and -O3 flag. Unless stated otherwise, all systems run 10,000 queries with 72 workers pinned to distinct physical cores. Each worker is-sues 4-KiB-aligned I/Os to the same SSD with the O_DIRECT setting and QD=8. We fix the CPU frequency at 2.4 GHz and monitor 
+
+Bzy_MHz ; no AVX-512 frequency reduction is observed. 
+
+Data sets and metrics. Storage experiments use the 100M variants of SIFT, DEEP, and SPACEV [7, 27, 36], whose dimensionalities are 128, 96, and 100, respectively; encoding experiments use their 1M 
+
+> 805000 10000 15000 20000
+> QPS
+
+SIFT100M 
+
+> 02500 5000 7500
+
+DEEP100M 
+
+> 05000 10000 15000
+
+SPACEV100M                
+
+> .90 .92 .94 .96 .98 1
+> Recall@10
+> 0100 200 300 400 500
+> Pages/query
+> .90 .92 .94 .96 .98 1
+> Recall@10
+> 0500 1000 1500 2000
+> .90 .92 .94 .96 .98 1
+> Recall@10
+> 0250 500 750 1000
+
+DiskANN Starling OdinANN SPANN SPFresh Recast Figure 3: Static top-10 query performance. 
+
+variants. The distance metric is squared L2 in all results. We report Recall@ 𝐾 , QPS, refined vectors, the number of read requests, and/or unique 4-KiB storage pages as performance metrics. Fixed-recall values are interpolated from adjacent measured Pareto points; there is no extrapolation. 
+
+Systems and fairness. We compare Recast with DiskANN [42], Starling [44], OdinANN [23], SPANN [11], and SPFresh [47]. For each system, we tune its parameters to optimize the query per-formance. DiskANN uses 𝑅 = 64, build 𝐿 = 100, no node cache, and beamwidth 8. Starling uses page search with 𝑢𝑠𝑒 _𝑟𝑎𝑡𝑖𝑜 =0.3 and beamwidth 8. Its disk-graph (𝑅, 𝐿 ), and PQ bytes/vector are 
+
+(64 , 128 , 19 ), (31 , 128 , 8), and (64 , 128 , 12 ) on SIFT100M, DEEP100M, and SPACEV100M, respectively. Its navigation graph uses (𝑅 𝑚 , 𝐿 𝑚 , 𝛼 ) =
+
+(32 , 128 , 1.2); the navigation sample rates are 0.25%, 0.1%, and 0.1%. Among the settings, 𝐿 , 𝐿 𝑚 , and 𝛼 follow the public configuration, 
+
+𝑢𝑠𝑒 _𝑟𝑎𝑡𝑖𝑜 and the 8 passes follow the paper’s recommended settings, while we tune the rest of the settings. SPANN uses ratios 0.10, 0.026, and 0.09 on SIFT100M, DEEP100M, and SPACEV100M, respectively. SPFresh uses ratios 0.065, 0.020, and 0.080 on the three data sets, respectively, with a 256-MiB RocksDB cache. OdinANN uses the of-ficial PipeANN 0.1.1 implementation with 𝑅 = 96, build 𝐿 = 128, no in-memory graph, and pipeline width 8. Its (𝐵, PQ bytes/vector ) set-tings are (2.25 , 21 ) on SIFT100M and (1.785 , 16 ) on both DEEP100M and SPACEV100M. Recast uses 100K IVF lists, with RecastQ 
+
+𝑀 = 60, 𝑀 = 44, and 𝑀 = 44 on SIFT100M, DEEP100M, and SPACEV100M, respectively. Moreover, for each 100M data set of dimension 𝐷 , we set the memory budget to be 𝐷 /40 GiB (3.2 GiB for SIFT100M, 2.4 GiB for DEEP100M, and 2.5 GiB for SPACEV100M). Both in-memory index and configured caches count toward this budget. The memory footprint is measured as the increase of the process’s memory before and after loading the index. To reduce the configuration effort, we allow some compared systems to exceed this budget. For DEEP, Starling and SPANN each exceed the budget by ∼63 MiB. For SPACEV, SPANN and SPFresh exceed the budget by 824 and 336 MiB, respectively. Furthermore, we compare RecastQ with three representative quantization encodings, i.e., PQ, OPQ, and RabitQ. PQ and OPQ use the Faiss implementation [14]. RaBitQ uses RaBitQ-Library [20] and its native reranking rule in the papers [16, 17]. 
+
+## 7.2 Static Query Performance 
+
+Figure 3 reports top-10 static query performance. Each column in the figure corresponds to a data set. The upper row reports the measured Recall–QPS frontier, while the lower row reports the number of 4-KiB disk page accesses per query. We see that Recast achieves the best performance across all data sets. At Recall@10=0.99, Recast achieves 1.56–2.01 × the QPS of the strongest baseline with the same memory budget, while reading 1.73–4.10 × fewer pages. This suggests that the high-recall throughput of Recast comes from the reduction of the number of I/Os. Moreover, as the recall increases, the number of I/Os of Recast grows only slightly. Higher recalls typically require larger 
+
+nprobe , i.e., probing more IVF lists, while our RecastQ and Quic policy effectively filter out unnecessary exact-vector refinement. Posting list based solutions incur much higher number of disk I/Os at high recalls because of retrieving whole selected postings, resulting in less competitive query performance. In contrast, graph-based solutions issue fewer I/Os and are generally more competitive than posting list based systems in the experiments. Interestingly, DiskANN out-performs Starling in some cases. Compared to DiskANN, Starling allocates part of its memory budget to the navigation graph and the mapping structures. As a result, the PQ code length is reduced. This pressure is the strongest on DEEP100M because DEEP100M contains float32 vectors compared to the uint8 vectors in SIFT100M and SPACEV100M. Starling has to use 8B PQ codes, incurring significant accuracy degradation of the PQ-based distance estimation. (Note that this is a memory-budget-dependent trade-off, not an inherent claim that Starling is weaker than DiskANN.) 
+
+## 7.3 Maintenance Efficiency and Update Stability 
+
+We start from the static 100M indexes, and perform 50 rounds of updates. Each round deletes 1M vectors and inserts 1M new vectors, preserving a total 100M active vectors. As shown in Figure 4, after cumulative updates have replaced 0%, 1%, 5%, 10%, 20%, 30%, and 50%    
+
+> 90 1 5 10 20 30 50
+
+Update (%) 
+
+> 02500 5000 7500
+> QPS at Recall@10=.99  95.9% retained 68.4% retained 74.4% retained
+
+SIFT100M    
+
+> 0 1 5 10 20 30 50
+
+Update (%) 
+
+> 0400 800 1200
+> 93.1% retained 64.7% retained 73.4% retained
+
+SPACEV100M    
+
+> 0 1 5 10 20 30 50
+
+Update (%)    
+
+> 0150 300
+> Storage footprint(GiB)
+> +2.3% growth
+> 0 1 5 10 20 30 50
+
+Update (%)    
+
+> 0200 400 600
+> +0.9% growth
+> 0 1 5 10 20 30 50
+
+Update (%)  
+
+> 080 160 240
+> +2.8% growth
+> 2100 2900 97.3% retained
+
+DEEP100M    
+
+> 0 1 5 10 20 30 50
+
+Update (%)      
+
+> 050 100 150
+> 68.5% retained 75.5% retained
+> 500 1500 110 20 30 40 50
+
+Update round      
+
+> 040 80 120
+> Time (s)  600 1800 110 20 30 40 50
+
+Update round      
+
+> 040 80 120 1500 7000 110 20 30 40 50
+
+Update round 
+
+> 0100 200 300
+
+Recast SPFresh OdinANN Figure 4: Query performance, update performance, and storage footprint with updates. 
+
+of the corpus, we report the top-10 query throughput at recall=0.99 in the top row, and the storage footprint in the bottom. For the update performance, we report the time for completing the each 1M delete+1M insert round in the middle row. From the figure, we see that Recast retains 93.1–97.3% of its round-0 QPS after replacing half of each measured corpus. Its up-date rounds take an average 13.6–14.0 seconds, while its storage footprint grows by only 0.9–2.8%. Moreover, compared to SPFresh, Recast lowers the average update latency by 3.3–20.7 ×; compared to OdinANN, it lowers the average by 36.1–210.5 ×. OdinANN re-tains 73.4–75.5% of its initial QPS after 50% corpus replacement, and SPFresh retains 64.7–68.5%. Furthermore, there are non-monotonic points and latency spikes in the results of SPFresh and OdinANN. They often coincide with the compaction or merging activities. For OdinANN, its active-plus-standby storage work set grows by 204.9–234.2% across the three datasets and oscillates as merged versions replace old ones. In comparison, Recast shows robust performance because Recast does not perform background tasks for index maintenance. 
+
+## 7.4 Refinement Effectiveness 
+
+Figure 5 studies the effectiveness of the encoding methods and refinement policies. In the left sub-figures, we compare RecastQ with PQ, OPQ, and RabitQ. Both PQ and OPQ use the fixed-𝑅 policy. In the right sub-figures, we use Quic to enhance both PQ and OPQ, and compare the baseline PQ/OPQ and the enhanced PQ/OPQ. All methods probe the same IVF lists. We set nprobe to 62/78/245 for SIFT/DEEP/SPACEV, giving unencoded coarse Recall@10 of 0.99524/0.99500/0.99007. The vertical dashed line in each sub-figure marks this ideal recall ceiling. From the left sub-figures, we see that RecastQ is the overall best encoding method across all data sets. At matched encoding sizes, RecastQ refines 3.4–7.9 × and 1.5–2.5 × fewer number of vectors than 1-bit RaBitQ at 28 bytes/vector and 2-bit RaBitQ near 52 bytes/vector, respectively. The 2-bit RaBitQ is the best performing encoding among the baseline methods. RaBitQ’s reported sizes include its required dimension padding and auxiliary factors. For SPACEV1M, RaBitQ-1bit is absent because all of its measured points at Recall@10 ≥0.90 exceed the Y-axis limit of 200 refinements/query. From the right sub-figures, we see that applying Quic to PQ/OPQ leads to improved performance. (Solid curves are the baseline meth-ods, while dashed curves correspond to the enhanced methods.) The improvement is especially pronounced for SPACEV. This confirms the benefit of Quic compared to the fixed-𝑅 policy. Figure 6 shows the impact of encoding size on the number of refined vectors for RecastQ at different recalls. We see that as the code size increases, the number of refined vectors quickly decreases. At Recall@10=0.99, the plotted code-size ranges reduce refinement demand by 3.3 × on SIFT1M and 4.2 × on DEEP1M. This is because larger code leads to more accurate estimation of the distance and the uncertainty intervals. 
+
+Float32 vs. uint8 accumulation. Figure 7a compares the refine-ment performance for uint8 and float32 accumulation designs. We see that that the float32 accumulation achieves a stronger Recall– refinement frontier compared to uint8 accumulation. This motivates us to use float32 values in the LUT.      
+
+> 10 050 100 150 200
+> Refined/query
+> 050 100 150 200
+> Refined/query
+> .90 .92 .94 .96 .98 1
+
+Recall@10      
+
+> 050 100 150 200
+> Refined/query
+> .90 .92 .94 .96 .98 1
+
+Recall@10      
+
+> *DEEP1M uses the largest feasible Recast setting ( M= 96), yielding 51 B; 52 B would require M= 98 > D.
+
+Code comparison PQ/OPQ with QUIC                
+
+> SIFT1M Base: 32 B |+QUIC: 35 B |RBQ/Recast: 1-bit 28/28 B, 2-bit 52/52 B DEEP1M Base: 24 B |+QUIC: 27 B |RBQ/Recast: 1-bit 28/28 B, 2-bit 52/51 B *
+> SPACEV1M Base: 25 B |+QUIC: 28 B |RBQ/Recast: 1-bit 28/28 B, 2-bit 52/52 B
+> PQ RaBitQ-1bit RaBitQ-2bit OPQ Recast@RBQ-1bit Recast@RBQ-2bit Recast-base PQ + QUIC OPQ + QUIC
+
+Figure 5: Effectiveness of RecastQ and Quic policy. 15 19 23 27 31 35 040 80 120 160 200 SIFT1M 
+
+13 17 21 25 0150 300 450 600 DEEP1M 
+
+Encoding size (Bytes/vector) Refined vectors/query 
+
+Recall=0.90 Recall=0.95 Recall=0.98 Recall=0.99 
+
+Figure 6: Impact of code size on refinement performance. 
+
+Figure 7b reports the breakdown of the execution cost at Re-call@10=0.99. For the scalar float32 design, RecastQ scan domi-nates the query time. Hence, we exploit SIMD acceleration to reduce the computation cost. The resulting AVX-512 based design takes 6.0 ms/query, compared with 6.8 ms for uint8 and 134.5 ms for scalar float32, a 22.4 × speedup over the scalar path. Interestingly, the uint8 SIMD design in Faiss takes slightly longer time than our float32 SIMD design. This is because the uint8 SIMD design needs to perform an extra decoding step for the uint8 codes in LUT. 
+
+Quic with and without SIMD. Figure 10 uses the same SIFT100M single-worker, QD=8 operating point as Figure 7b. The time is also broken down in the same fashion as Figure 7b. From Figure 10, we see that enabling Quic ’s SIMD pipeline reduces the green Quic stage from 6.42 to 1.42 ms/query (i.e., a 4.52 × improvement) and the total time from 11.86 to 5.96 ms/query (i.e., a 1.99 × improvement). In this experiment, the recall, refine-ment candidate count, and the number of I/O page accesses remain .90 .92 .94 .96 .98 1
+
+Recall@10 
+
+040 80 120 160 200 
+
+> Refined vectors/query
+> AVX-512 float LUT uint8 LUT
+
+(a) Recall–refinement frontier. 132 
+
+> List selection RecastQ Scan QUIC I/O (QD=8)
+
+Scalar float32 AVX-512 float32 uint8 0246 
+
+> Latency (ms/query)
+
+(b) Query-time breakdown. 
+
+Figure 7: LUT accuracy and execution cost. Table 2: Interval calibration and metadata overflow. Data set Coverage 
+
+𝑧 = 1 (%) Coverage 
+
+𝑧 = 2 (%) Metadata overflow (%) 
+
+SIFT1M 68.16 95.43 0.0012 DEEP1M 68.71 95.85 0.0004 SPACEV1M 68.37 95.67 0.0001 
+
+Table 3: Storage footprint on 100M-vector data sets (GiB). System SIFT100M DEEP100M SPACEV100M 
+
+DiskANN 38.147 63.578 34.679 Starling 38.147 47.684 36.597 OdinANN 54.496 76.294 47.684 SPANN 85.717 234.613 60.187 SPFresh 89.277 178.553 63.696 Recast 13.236 39.064 13.083 
+
+unchanged. Therefore, the performance gain clearly comes from the accelerated in-memory execution. 
+
+Quality of uncertainty interval. Table 2 verifies the coverage of the uncertainty intervals for the three data sets. We see that the uncertainty intervals cover 68.16–68.71% and 95.43–95.85% of the true distances at 𝑧 = 1 and 𝑧 = 2, respectively. This is quite close to the Gaussian based estimation, which is 68.27% and 95.45% at 𝑧 = 1and 𝑧 = 2, respectively 2.Table 2 also shows the percentage of vectors with overflowed 
+
+norm or scale . We see that metadata overflow remains below 0.002%, showing that quantized uncertainty information rarely invokes the conservative overflow path. 
+
+## 7.5 Storage Footprint 
+
+Table 3 reports query-required storage data, excluding structures al-ready counted in the common in-memory index budget. We see that Recast has the lowest storage footprint for every data set, using 1.22–2.88 × less storage space than the system with the next lowest storage footprint. (We construct the 100M-vector indexes of Recast in 14.1–21.5 minutes using multiple GPUs to perform the K-means clustering and parallel CPU threads to produce the IVF lists. Here, the build time is mentioned to provide context for understanding Recast rather than for an equal-hardware comparison.) 
+
+> 2Note that these results empirically corroborate the probabilistic uncertainty intervals under Assumption 5.2. However, they are not sufficient to confirm the assumption. Nor do they test independence across candidates.
+> 11 116 32 48 64
+
+Threads 
+
+05000 10000 15000 
+
+> QPS
+
+Recall@10=.95 
+
+> 116 32 48 64
+
+Threads 
+
+Recall@10=.99     
+
+> DiskANN Starling SPANN SPFresh Recast
+
+Figure 8: Static query scalability on SIFT100M. 116 32 48 72 
+
+Threads   
+
+> 020K 40K 60K
+> Update vectors/s  Recast SPFresh OdinANN
+
+Figure 9: Update scalability (SIFT100M). QUIC without SIMD QUIC with SIMD 
+
+> 0510 15
+> Latency (ms/query)
+> List selection RecastQ Scan QUIC I/O (QD=8)
+
+Figure 10: QUIC with and without SIMD. 
+
+## 7.6 Query and Update Scalability 
+
+We study the scalability of the storage-optimized ANNS solutions in this subsection. We vary the number of query worker threads from 1 to 72. Figure 8 shows the QPS at recall=0.95 and at recall=0.99 while varying the number of query workers. We use the same fixed-recall configurations and physical-core protocol at every worker count. We see that as the number of workers increases from 1 to 72, Recast scales QPS by 49.3 × at Recall@10=.95 and 45.6 × at .99. At 72 workers it exceeds the strongest baseline by 1.39–1.71 × across the two recall targets. Graph traversal remains competitive at low concurrency, while Recast ’s in-memory selection and independent exact-vector reads provide the stronger high-concurrency scaling. Figure 9 reports the update throughput by varying the number of threads. We start from the same 100M-vector index, then perform the same round of 1M deletes and 1M new inserts for every worker count. We see that Recast scales the update throughput by 26.6 ×
+
+from 1 to 72 workers and reaches 74,434 delete+insert pairs/s. At 72 workers, it is 3.1–37.3 × faster than SPFresh and OdinANN. Note that all results include the work required before the updated index can serve queries. 
+
+## 8 RELATED WORK 
+
+We have studied previous storage-optimized ANNS systems in Section 2. Since Recast builds an in-memory index that stores RecastQ encodings, we discuss the related work on in-memory ANNS indexes and quantization encodings in this section. 
+
+In-memory ANNS indexes. In-memory ANN spans tree and hashing methods such as KD-tree, ball tree, VP-tree, FLANN, and LSH variants [2, 8, 9, 29, 33, 37, 48]; proximity graphs such as HNSW and NSG [15, 26, 34, 38, 43]; and cluster-based indexes such as IVF, IMI, ScaNN, and BLISS [6, 24, 25, 41]. Clustered layouts support contiguous scans that combine naturally with quantization and SIMD execution. Recast uses an IVF-compatible in-memory organization rather than introducing a new coarse-search index; its focus is deciding from compact scan results which exact vectors must subsequently be accessed from storage. 
+
+Quantization encoding and reranking. Compact vector repre-sentations include dimension-wise schemes such as VA-File [45], ITQ [19], and LVQ [1]; additive-codebook methods such as AQ [5] and LSQ [35]; and product methods such as product quantization (PQ) [28] and optimized product quantization (OPQ) [18]. PQ and OPQ encode vectors into short Cartesian-product codes and sup-port asymmetric distance computation. PQ Fast Scan [3], Quicker ADC [4], and related kernels reorganize codes and lookup tables for SIMD execution. These methods primarily optimize approximate ranking, reconstruction, or scan throughput. RecastQ reuses a PQ4 execution substrate but stores the magnitude and directional-error information needed for refinement candidate selection. RaBitQ [17] and Extended RaBitQ [16] combine randomized quantization with bounded distance estimators and lower-bound-guided reranking. They are the closest encoding-level baselines to RecastQ. We use the reference library and native reranking rule rather than replacing it with Recast’s selector. Recast differs in co-designing the uncertainty information, the global Top-𝐾 selec-tor, page planning, and mutable external-store architecture as one system. 
+
+## 9 CONCLUSION 
+
+In conclusion, we have introduced a refinement-centered paradigm for storage-optimized ANNS systems. We have proposed and stud-ied Recast as a concrete design of this paradigm. It enjoys a simple storage layout with low footprint and easy update support, and exploits a compact in-memory IVF index with the RecastQ encod-ings and the Quic policy for efficient query processing. We believe that our proposed solution provides a promising answer to the central design question, achieving high query throughput without sacrificing the recall and index maintenance performance. 
+
+## REFERENCES                               
+
+> [1] Cecilia Aguerrebere, Ishwar Singh Bhati, Mark Hildebrand, Mariano Tepper, and Theodore Willke. 2023. Similarity Search in the Blink of an Eye with Compressed Indices. Proceedings of the VLDB Endowment 16, 11 (2023), 3433–3446. [2] Alexandr Andoni and Piotr Indyk. 2008. Near-optimal hashing algorithms for approximate nearest neighbor in high dimensions. Commun. ACM 51, 1 (2008), 117–122. [3] Fabien André, Anne-Marie Kermarrec, and Nicolas Le Scouarnec. 2015. Cache locality is not enough: high-performance nearest neighbor search with product quantization fast scan. Proceedings of the VLDB Endowment 9, 4 (2015), 288–299. [4] Fabien André, Anne-Marie Kermarrec, and Nicolas Le Scouarnec. 2021. Quicker adc: Unlocking the hidden potential of product quantization with simd. IEEE transactions on pattern analysis and machine intelligence 43, 5 (2021), 1666–1677. [5] Artem Babenko and Victor Lempitsky. 2014. Additive quantization for extreme vector compression. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition . 931–938. [6] Artem Babenko and Victor Lempitsky. 2015. The inverted multi-index. IEEE transactions on pattern analysis and machine intelligence 37, 6 (2015), 1247–1260. [7] Artem Babenko and Victor Lempitsky. 2016. Efficient indexing of billion-scale datasets of deep descriptors. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition . 2055–2063. [8] Mayank Bawa, Tyson Condie, and Prasanna Ganesan. 2005. LSH forest: self-tuning indexes for similarity search. In Proceedings of the 14th international conference on World Wide Web . 651–660. [9] Jon Louis Bentley. 1975. Multidimensional binary search trees used for associative searching. Commun. ACM 18, 9 (1975), 509–517. [10] Tony Cai, Jianqing Fan, and Tiefeng Jiang. 2013. Distributions of Angles in Random Packing on Spheres. Journal of Machine Learning Research 14, 57 (2013), 1837–1864. https://jmlr.org/papers/v14/cai13a.html [11] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li, Mao Yang, and Jingdong Wang. 2021. SPANN: Highly-efficient Billion-scale
+> 12
+
+Approximate Nearest Neighborhood Search. Advances in Neural Information Processing Systems 34 (2021), 5199–5212. [12] Yangshen Deng, Zhengxin You, Long Xiang, Qilong Li, Peiqi Yuan, Zhaoyang Hong, Yitao Zheng, Wanting Li, Runzhong Li, Haotian Liu, Kyriakos Mouratidis, Man Lung Yiu, Huan Li, Qiaomu Shen, Rui Mao, and Bo Tang. 2025. AlayaDB: The Data Foundation for Efficient and Effective Long-context LLM Inference. In 
+
+Companion of the 2025 International Conference on Management of Data . ACM, New York, NY, USA, 364–377. https://doi.org/10.1145/3722212.3724428 [13] Persi Diaconis and David Freedman. 1987. A Dozen de Finetti-Style Results in Search of a Theory. Annales de l’Institut Henri Poincaré, Probabilités et Statistiques 
+
+23, S2 (1987), 397–423. https://numdam.org/item/AIHPB_1987__23_S2_397_0/ [14] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Herve Jégou. 2024. The Faiss library. (2024). arXiv:2401.08281 [cs.LG] [15] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast Approximate Nearest Neighbor Search With The Navigating Spreading-out Graph. Proceedings of the VLDB Endowment 12, 5 (2019), 461–474. [16] Jianyang Gao, Yutong Gou, Yuexuan Xu, Yongyi Yang, Cheng Long, and Raymond Chi-Wing Wong. 2025. Practical and Asymptotically Optimal Quantization of High-Dimensional Vectors in Euclidean Space for Approximate Nearest Neighbor Search. Proceedings of the ACM on Management of Data 3, 3 (2025), 1–26. https: //doi.org/10.1145/3725413 [17] Jianyang Gao and Cheng Long. 2024. RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search. Proceedings of the ACM on Management of Data 2, 3 (2024), 1–27. [18] Tiezheng Ge, Kaiming He, Qifa Ke, and Jian Sun. 2013. Optimized Product Quantization for Approximate Nearest Neighbor Search. In Proceedings of the 2013 IEEE Conference on Computer Vision and Pattern Recognition . 2946–2953. [19] Yunchao Gong, Svetlana Lazebnik, Albert Gordo, and Florent Perronnin. 2013. Iterative quantization: A procrustean approach to learning binary codes for large-scale image retrieval. IEEE transactions on pattern analysis and machine intelligence 35, 12 (2013), 2916–2929. [20] Yutong Gou, Jianyang Gao, Yuexuan Xu, Jifan Shi, and Zhonghao Yang. 2026. 
+
+The RaBitQ Library . https://github.com/VectorDB-NTU/RaBitQ-Library [21] Robert M. Gray and David L. Neuhoff. 1998. Quantization. IEEE Transactions on Information Theory 44, 6 (1998), 2325–2383. https://doi.org/10.1109/18.720541 [22] Hao Guo and Youyou Lu. 2025. Achieving Low-Latency Graph-Based Vector Search via Aligning Best-First Search Algorithm with SSD. In 19th USENIX Symposium on Operating Systems Design and Implementation (OSDI 25) . USENIX Association, Boston, MA, 171–186. https://www.usenix.org/conference/osdi25/ presentation/guo [23] Hao Guo and Youyou Lu. 2026. OdinANN: Direct Insert for Consistently Stable Performance in Billion-Scale Graph-Based Vector Search. In 24th USENIX Confer-ence on File and Storage Technologies (FAST 26) . USENIX Association, Santa Clara, CA, 133–147. https://www.usenix.org/conference/fast26/presentation/guo [24] Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern, and Sanjiv Kumar. 2020. Accelerating large-scale inference with anisotropic vector quantization. In Proceedings of the 37th International Conference on Machine Learning (Proceedings of Machine Learning Research) , Hal Daumé III and Aarti Singh (Eds.), Vol. 119. PMLR, 3887–3896. https://proceedings.mlr.press/v119/ guo20h.html [25] Gaurav Gupta, Tharun Medini, Anshumali Shrivastava, and Alexander J Smola. 2022. Bliss: A billion scale index using iterative re-partitioning. In Proceedings of the 28th ACM SIGKDD Conference on Knowledge Discovery and Data Mining .486–495. [26] Ben Harwood and Tom Drummond. 2016. Fanng: Fast approximate nearest neighbour graphs. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition . 5713–5722. [27] Herve Jegou and Laurent Amsaleg. 2010. Datasets for approximate nearest neigh-bor search . http://corpus-texmex.irisa.fr [28] Herve Jegou, Matthijs Douze, and Cordelia Schmid. 2011. Product quantization for nearest neighbor search. IEEE transactions on pattern analysis and machine intelligence 33, 1 (2011), 117–128. [29] Bastian Leibe, Krystian Mikolajczyk, and Bernt Schiele. 2006. Efficient clustering and matching for object class recognition.. In BMVC . 789–798. [30] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rock-täschel, et al. 2020. Retrieval-augmented generation for knowledge-intensive nlp tasks. Advances in Neural Information Processing Systems 33 (2020), 9459–9474. [31] Di Liu, Meng Chen, Baotong Lu, Huiqiang Jiang, Zhenhua Han, Qianxi Zhang, Qi Chen, Chengruidong Zhang, Bailu Ding, Kai Zhang, Chen Chen, Fan Yang, Yuqing Yang, and Lili Qiu. 2025. RetrievalAttention: Accelerating Long-Context LLM Inference via Vector Retrieval. In Advances in Neural Information Processing Systems , D. Belgrave, C. Zhang, H. Lin, R. Pascanu, P. Koniusz, M. Ghassemi, and N. Chen (Eds.), Vol. 38, Main Conference. Curran Associates, Inc., 54358–54385. https://doi.org/10.52202/085713-1816 [32] Ying Liu, Dengsheng Zhang, Guojun Lu, and Wei-Ying Ma. 2007. A survey of content-based image retrieval with high-level semantics. Pattern recognition 40, 1 (2007), 262–282. [33] Qin Lv, William Josephson, Zhe Wang, Moses Charikar, and Kai Li. 2007. Multi-probe LSH: efficient indexing for high-dimensional similarity search. In Proceed-ings of the 33rd international conference on Very large data bases . 950–961. [34] Yu A Malkov and Dmitry A Yashunin. 2020. Efficient and robust approximate nearest neighbor search using hierarchical navigable small world graphs. IEEE transactions on pattern analysis and machine intelligence 42, 4 (2020), 824–836. [35] Julieta Martinez, Joris Clement, Holger H Hoos, and James J Little. 2016. Re-visiting additive quantization. In Computer Vision–ECCV 2016: 14th European Conference, Amsterdam, The Netherlands, October 11-14, 2016, Proceedings, Part II 14 . Springer, 137–153. [36] Microsoft Research. 2021. SPACEV1B: A Billion-Scale Vector Dataset for Text Descriptors . https://github.com/microsoft/SPTAG/tree/main/datasets/SPACEV1B [37] Marius Muja and David G Lowe. 2014. Scalable nearest neighbor algorithms for high dimensional data. IEEE transactions on pattern analysis and machine intelligence 36, 11 (2014), 2227–2240. [38] Yun Peng, Byron Choi, Tsz Nam Chan, Jianye Yang, and Jianliang Xu. 2023. Efficient approximate nearest neighbor search in multi-dimensional databases. 
+
+Proceedings of the ACM on Management of Data 1, 1 (2023), 1–27. [39] J Ben Schafer, Dan Frankowski, Jon Herlocker, and Shilad Sen. 2007. Collaborative filtering recommender systems. In The adaptive web: methods and strategies of web personalization , Peter Brusilovsky, Alfred Kobsa, and Wolfgang Nejdl (Eds.). Lecture Notes in Computer Science, Vol. 4321. Springer Berlin Heidelberg, 291– 324. https://doi.org/10.1007/978-3-540-72079-9_9 [40] Aditi Singh, Suhas Jayaram Subramanya, Ravishankar Krishnaswamy, and Har-sha Vardhan Simhadri. 2021. FreshDiskANN: A Fast and Accurate Graph-Based ANN Index for Streaming Similarity Search. arXiv preprint arXiv:2105.09613 
+
+(2021). https://arxiv.org/abs/2105.09613 [41] Josef Sivic and Andrew Zisserman. 2003. Video Google: A text retrieval approach to object matching in videos. In Proceedings of the Ninth IEEE International Conference on Computer Vision , Vol. 2. IEEE, 1470–1477. https://doi.org/10.1109/ ICCV.2003.1238663 [42] Suhas Jayaram Subramanya, Devvrit, Rohan Kadekodi, Ravishankar Kr-ishaswamy, and Harsha Vardhan Simhadri. 2019. DiskANN: fast accurate billion-point nearest neighbor search on a single node. In Proceedings of the 33rd Inter-national Conference on Neural Information Processing Systems . 13766–13776. [43] Godfried T Toussaint. 1980. The relative neighbourhood graph of a finite planar set. Pattern recognition 12, 4 (1980), 261–268. [44] Mengzhao Wang, Weizhi Xu, Xiaomeng Yi, Songlin Wu, Zhangyang Peng, Xi-angyu Ke, Yunjun Gao, Xiaoliang Xu, Rentong Guo, and Charles Xie. 2024. Starling: An I/O-Efficient Disk-Resident Graph Index Framework for High-Dimensional Vector Similarity Search on Data Segment. Proceedings of the ACM on Management of Data 2, 1 (2024), 1–27. [45] Roger Weber, Hans-Jörg Schek, and Stephen Blott. 1998. A quantitative analysis and performance study for similarity-search methods in high-dimensional spaces. In VLDB , Vol. 98. 194–205. [46] Haike Xu, Magdalen Dobson Manohar, Philip A. Bernstein, Badrish Chan-dramouli, Richard Wen, and Harsha Vardhan Simhadri. 2025. In-Place Updates of a Graph Index for Streaming Approximate Nearest Neighbor Search. arXiv preprint arXiv:2502.13826 (2025). https://doi.org/10.48550/arXiv.2502.13826 [47] Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li, Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, and Mao Yang. 2023. SPFresh: Incremental In-Place Update for Billion-Scale Vector Search. In Proceedings of the 29th Symposium on Operating Systems Principles . ACM, 545–561. https: //doi.org/10.1145/3600006.3613166 [48] Peter N Yianilos. 1993. Data structures and algorithms for nearest neighbor search in general metric spaces. In Proceedings of the fourth annual ACM-SIAM symposium on Discrete algorithms . 311–321. [49] Peiqi Yin, Xiao Yan, Qihui Zhou, Hui Li, Xiaolu Li, Meiling Wang, Lin Zhang, Xin Yao, and James Cheng. 2026. GPS: Revisiting the Data Layout for Disk-based High-Dimensional Vector Search. Proceedings of the ACM on Management of Data 4, 3 (2026), 1–29. https://doi.org/10.1145/3802069 [50] Ziyang Yue, Bolong Zheng, Ling Xu, Kanru Xu, Shuhao Zhang, Yajuan Du, Yunjun Gao, Xiaofang Zhou, and Christian S. Jensen. 2025. Select Edges Wisely: Monotonic Path Aware Graph Layout Optimization for Disk-based ANN Search. 
+
+Proceedings of the VLDB Endowment 18, 11 (2025), 4337–4349. https://doi.org/10. 14778/3749646.3749697 
+
+> 13
+
+## A PROOFS FOR UNCERTAINTY-GUIDED CANDIDATE SELECTION 
+
+Fix a query and its scanned set 𝑆 = {𝑥 1, . . . , 𝑥 𝑛 }, with 𝑛 ≥ 𝐾 , true distances 𝑑 1 ≤ · · · ≤ 𝑑 𝑛 , and fixed tie-breaking. Define 𝑅 ref @𝐾 =
+
+𝐾 −1 Í𝐾 𝑗 =1 1{𝐿 𝑗 ≤ 𝜃 𝐾 }. Expectations are conditional on the true distances and scales. The results concern the uncapped selector in Eq. 2, not coarse-list misses or additional candidate-cap truncation. We distinguish the true-distance spacing needed for the recall bound from the endpoint spacing used for counts. 
+
+## A.1 Retention and a Gaussian Product Bound 
+
+Let 𝑁 𝑗 = Í𝑖 ≠𝑗 1{𝑈 𝑖 < 𝐿 𝑗 }. Since 𝑈 𝑗 ≥ 𝐿 𝑗 , candidate 𝑗 is retained ex-actly when 𝑁 𝑗 ≤ 𝐾 − 1. If all intervals contain the true distances, an excluded candidate has 𝑑 𝑗 ≥ 𝐿 𝑗 > 𝜃 𝐾 , whereas at least 𝐾 candidates have 𝑑 𝑖 ≤ 𝑈 𝑖 ≤ 𝜃 𝐾 . This proves Theorem 4.2, including ties. For the probabilistic result, assume 𝜏 𝑖 > 0 and ˆ𝑑 𝑖 = 𝑑 𝑖 + 𝜏 𝑖 𝑍 𝑖 , 𝑍 𝑖 iid 
+
+∼ N ( 0, 1). (11) Independence across candidates is an additional modeling assump-tion; it does not follow from Gaussian marginal errors. 
+
+Proposition A.1 (Candidate-dependent recall bound) . Under Eq. 11, 
+
+E[𝑅 ref @𝐾 ] ≥ 1
+
+𝐾 
+
+> 𝐾
+
+∑︁ 
+
+> 𝑗 =1
+> 𝑛
+
+Ö
+
+> 𝑙 =𝐾 +1
+
+Φ©«
+
+𝑑 𝑙 − 𝑑 𝑗 + 𝑧 (𝜏 𝑙 + 𝜏 𝑗 )√︃ 
+
+𝜏 2 
+
+> 𝑙
+
++ 𝜏 2
+
+> 𝑗
+
+ª®®¬
+
+. (12) Proof. For 𝑗 ≤ 𝐾 , the event 𝐴 𝑗 = Ñ𝑙 >𝐾 {𝑈 𝑙 ≥ 𝐿 𝑗 } implies retention: only the other 𝐾 − 1 true neighbors can contribute to 𝑁 𝑗 .Conditional independence given 𝑍 𝑗 = 𝑡 gives 
+
+𝑔 𝑗𝑙 (𝑡 ) = Pr (𝑈 𝑙 ≥ 𝐿 𝑗 | 𝑍 𝑗 = 𝑡 )
+
+= Φ
+
+ 𝑑 𝑙 − 𝑑 𝑗 + 𝑧 (𝜏 𝑙 + 𝜏 𝑗 ) − 𝜏 𝑗 𝑡 𝜏 𝑙 
+
+
+
+, (13) Pr (𝐴 𝑗 ) = E
+
+"Ö 
+
+> 𝑙 >𝐾
+
+𝑔 𝑗𝑙 (𝑍 𝑗 )
+
+#
+
+. (14) These factors are nonnegative and nonincreasing. For any such 𝑓 , 𝑔 
+
+and independent copies 𝑇 ,𝑇 ′,2 Cov (𝑓 (𝑇 ), 𝑔 (𝑇 )) = E[( 𝑓 (𝑇 ) − 𝑓 (𝑇 ′))( 𝑔 (𝑇 ) − 𝑔 (𝑇 ′))] ≥ 0. (15) Products preserve this monotonicity, so induction yields Pr (𝐴 𝑗 ) ≥ 
+
+Î𝑙 >𝐾 Pr (𝑈 𝑙 ≥ 𝐿 𝑗 ). Since 𝜏 𝑙 𝑍 𝑙 − 𝜏 𝑗 𝑍 𝑗 has Gaussian variance 𝜏 2 
+
+> 𝑙
+
++ 𝜏 2 
+
+> 𝑗
+
+,each marginal equals the corresponding Φ(·) factor in Eq. 12. Aver-aging over 𝑗 ≤ 𝐾 proves the result. This association argument is necessary: crossings share 𝑍 𝑗 and are not unconditionally indepen-dent. □
+
+## A.2 Integral Bound and Spacing Conditions 
+
+Set 𝜏 𝑖 = 𝜏 > 0. Since 𝑑 𝑗 ≤ 𝑑 𝐾 for 𝑗 ≤ 𝐾 , Proposition A.1 gives 
+
+E[𝑅 ref @𝐾 ] ≥ 
+
+> 𝑛 −𝐾
+
+Ö
+
+> ℎ=1
+
+Φ
+
+ 𝑑 𝐾 +ℎ − 𝑑 𝐾 
+
+√2𝜏 + √2𝑧 
+
+
+
+. (16) Assume the true-distance gap condition 𝑑 𝐾 +ℎ − 𝑑 𝐾 ≥ ℎΔ𝑑 , where 
+
+Δ𝑑 > 0. Let 𝑎 = √2𝑧 , 𝑏 = Δ𝑑 /( √2𝜏 ), and 𝑓 (𝑡 ) = ln Φ(𝑎 + 𝑏𝑡 ).Because 𝑓 is negative and increasing, right-endpoint Riemann sums imply ln E[𝑅 ref @𝐾 ] ≥ 
+
+> 𝑛 −𝐾
+
+∑︁ 
+
+> ℎ=1
+
+𝑓 (ℎ) ≥ 
+
+∫ 𝑛 −𝐾 
+
+> 0
+
+𝑓 (𝑡 ) 𝑑𝑡 
+
+≥
+
+∫ ∞
+
+> 0
+
+𝑓 (𝑡 ) 𝑑𝑡 =
+
+√2𝜏 
+
+Δ𝑑 
+
+𝐼 (√2𝑧 ). (17) The integral converges because − ln Φ(𝑥 ) ≤ 2(1 − Φ(𝑥 )) for 𝑥 ≥ 0and the Gaussian tail is integrable. Exponentiation establishes the expression in Theorem 4.3 with Δ = Δ𝑑 . For 𝑛 = 𝐾 , the empty product is one and every scanned vector is retained. 
+
+Distinguishing the two spacing models. The preceding proof requires true-distance spacing Δ𝑑 , not random upper-endpoint spac-ing Δ𝑈 . Independent nondegenerate Gaussian errors do not pre-serve uniform spacing and cannot simultaneously produce deter-ministic uniformly spaced endpoints. Thus the recall expression is not established by endpoint spacing alone; the main text’s recall and count models must be read separately. For the count model of Theorem 4.4, suppose the sorted upper endpoints have spacing Δ𝑈 > 0 and a common scale 𝜏 . Retention is equivalent to 𝑈 𝑖 ≤ 𝑈 (𝐾 ) + 2𝑧𝜏 , so 
+
+|𝐶 (𝑆 )| = min {𝑛, 𝐾 + ⌊ 2𝑧𝜏 /Δ𝑈 ⌋} . (18) The main text’s count applies before this expression reaches 𝑛 .Likewise, substituting empirical mean scales and gaps is illustrative, not a guarantee: an observed endpoint gap is not a verified lower bound on true-distance gaps. The example 𝜏 /Δ = 20 .316, 𝑧 = 2yields approximately 0 .9803 within the model, without establishing its assumptions for every query.

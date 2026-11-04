@@ -1,0 +1,510 @@
+Title: OctEx: Billion-Scale Vector Search by Precomputed Lattice Neighbor Lists on GPUs
+
+URL Source: https://arxiv.org/pdf/2611.02556v1
+
+Published Time: Tue, 03 Nov 2026 04:54:01 GMT
+
+Number of Pages: 15
+
+Markdown Content:
+# OctEx: Billion-Scale Vector Search by Precomputed Lattice Neighbor Lists on GPUs 
+
+## Dongfang Zhao (dzhao@uw.edu) 
+
+## https://github.com/hpdic/octex 
+
+## Abstract 
+
+Approximate nearest-neighbor search on GPUs serves retrieval-augmented generation, recommendation, and dedu-plication over datasets of up to billions of vectors. The fastest GPU indexes at high recall, such as CAGRA, walk proximity graphs in chained rounds, each of which waits for the dis-tances of the previous one. High recall therefore costs many dependent rounds per query. Our insight is to spend the HBM of the GPUs on precomputed neighbor lists, so that a query reads its candidates in one parallel step instead of a chain of rounds. This paper turns the above insight into a GPU vec-tor search system, namely OctEx, which holds hundreds of randomly projected copies of the dataset in GPU memory. Every copy rounds its vectors to the nearest points of a reg-ular grid whose cells are nearly round and stores for every populated cell the list of vectors nearest to its center. A query reads the lists of its cells in all copies at once and then, in a fixed number of waves, the precomputed neighbor lists of its best hits. OctEx ranks the union of all hits by an int8 sketch before one exact rerank. OctEx runs the whole search of a batch as CUDA graphs over all GPUs of a server and places every part of its index in HBM or host memory by its access frequency. On four H100 GPUs at recall 0.95 to 0.995, OctEx outperforms CAGRA by 2.0 × to 46.4 × on seven datasets of up to one hundred million vectors, and by 1.46 × to 2.05 ×
+
+on the one billion vectors of Deep1B and SIFT1B, whose indexes it builds in 44 to 47 minutes. OctEx also outperforms GGNN, PathWeaver, FlowANN, and the cuVS inverted file indexes IVF-PQ and IVF-RaBitQ by 5.4 × to 343 ×.
+
+## 1 Introduction 
+
+Retrieval-augmented generation (RAG) [44], dense passage retrieval such as DPR [40] and ColBERT [41], and the dedupli-cation of training data such as SemDeDup [1] require approx-imate nearest-neighbor (ANN) search at high recall, because every missed neighbor removes a relevant passage or keeps a duplicate. These applications search datasets of hundreds of millions to billions of embeddings, for instance the Deep1B benchmark [9] and the billion-scale challenge [61]. A modern GPU server holds several hundred gigabytes of HBM and tens of thousands of cores. The natural target for such a server is a search that turns this memory and this parallelism into throughput at high recall. Existing GPU indexes follow two designs, of which prox-imity graphs pay for recall with a chain of dependent rounds and inverted file (IVF) indexes pay with scans of whole in-verted lists. Proximity-graph indexes such as CAGRA [53], GGNN [25], SONG [72], and BANG [64] adapt CPU graphs such as HNSW [47], NSG [19], and DiskANN [34] to the GPU. Each of their iterations expands the best unvisited ver-tices, which depend on the distances of the previous iteration. A query thus advances through a chain of rounds whose length grows with the recall target. IVF indexes such as IVF-PQ in Faiss [37] and cuVS [50] and the recent IVF-RaBitQ [60] avoid the chain, as a query probes a fixed number of inverted lists in one pass. However, IVF indexes scan every com-pressed code of every probed list, which keeps their through-put on four H100 GPUs one to two orders of magnitude below CAGRA in our measurements. Figure 1(a) quantifies the re-sulting cost on Deep1B, where CAGRA on four H100 GPUs falls from 156k queries per second (QPS) at recall 0.992 to 87k at recall 0.995 as each further 0.003 of recall needs a longer chain of rounds. On the same GPUs, IVF-RaBitQ re-mains below 28k QPS. Breaking the chain requires candidates that do not depend on an earlier round. Precomputed lists of nearest vectors pro-vide such candidates: a query that finds the list stored for its own position reads its neighbors in one step. Lists keyed by positions in the original space are, however, infeasible in hundreds of dimensions, because a ball around the query in-tersects almost every partition of the space before it reaches the tenth neighbor [11]. The lists must therefore be keyed by cells of low-dimensional projections and computed at build time, since an expansion at query time would reintroduce the chain. Our insight is to precompute the nearest vectors per lattice 1arXiv:2611.02556v1 [cs.DC] 2 Nov 2026 0.95 0.99 0.995     
+
+> Recall@10
+> 0200 400 600 800
+> Throughput (kQPS)
+> (a) Deep1B
+> OctEx CAGRA IVF-RaBitQ
+> SIFT GIST DINOv2 MARCO D-10M D-100M S-100M D-1B S-1B 12510 20 50
+> QPS over CAGRA
+> 5.6 11.0 4.1 5.9 2.8 2.0 2.8 1.5 1.5 6.3 14.2 12.8 32.6 3.5 2.3 2.6 1.9 1.5
+> (b) Speedup over CAGRA
+> recall ≥0.95 recall ≥0.99
+
+Figure 1: OctEx against baselines on four H100 GPUs. cell and per random projection, so that a query reads them in parallel. This paper turns the above insight into a GPU vector search system, namely OctEx (Octa Explosion), which spends the HBM of the GPUs on these lists. OctEx projects the dataset into hundreds of random copies and rounds every block of eight projected coordinates to the nearest point of the E8 lattice [14], a regular grid whose cells are the roundest known in eight dimensions. For every populated cell, OctEx stores the list of the vectors nearest to its center. At search time, a query decodes its own cell in every copy and reads the stored lists of these cells. The best hits become start points, whose precomputed neighbor lists the search reads in a fixed number of waves. Finally, OctEx ranks the union of all hits by an int8 sketch of every vector before it returns the top k by one exact rerank in half precision. We implement OctEx for one server with four H100 GPUs, on which OctEx outperforms proximity-graph baselines (CA-GRA [53], GGNN [25], FlowANN [71], and PathWeaver [42]) and inverted file indexes (cuVS IVF-PQ [37, 50] and IVF-RaBitQ [60]) on nine datasets from one million to one billion vectors. Figure 1(b) presents the speedup over CAGRA across all nine datasets, which shows three results. First, the speedup of OctEx over CAGRA grows with the recall target, because OctEx keeps a fixed number of dependent steps while CA-GRA needs a longer candidate list and more rounds per query. For example, on the MS MARCO passage embeddings that retrieval-augmented generation searches, the gain over CA-GRA grows from 5.9 × at recall 0.95 to 32.6 × at recall 0.99. On ImageNet DINOv2, OctEx reaches recall 0.998, which CAGRA does not reach. Second, the gain holds on high-dimensional vectors, with 11.0 × and 14.2 × on GIST1M and 4.1 × and 12.8 × on DINOv2 at recall 0.95 and 0.99. Third, on the one billion vectors of Deep1B and SIFT1B, OctEx keeps the rows that every wave reads in HBM and moves only the half-precision vectors of the final rerank to host memory. There, OctEx outperforms CAGRA by 1.46 × to 2.05 × and cuVS IVF-RaBitQ by 20.2 × to 38.9 ×.In summary, this work makes the following contributions: • We propose an ANN search by stored ripples, which replaces the chained rounds of graph walks with precom-puted lists of nearest vectors at two kinds of sources. A query reads the ripples of its lattice fragments in hun-dreds of random projections in one parallel step. It then reads the neighbor rows of its best hits, with reverse edges, in a fixed number of waves (§3). • We implement OctEx as an open-source CUDA C++ module of cuVS [50], which builds the index of one billion vectors in 44 to 47 minutes by sorting instead of searching and runs the search of a batch as CUDA graphs over all GPUs of a server in one process. The release replaces the search calls of cuVS and Faiss in one line of Python (§4). • We evaluate OctEx on nine datasets of up to one bil-lion vectors against CAGRA, GGNN, FlowANN, Path-Weaver, cuVS IVF-PQ, and IVF-RaBitQ on four H100 GPUs. OctEx outperforms CAGRA on every dataset at recall 0.95 to 0.995 and the other GPU graph systems GGNN, FlowANN, and PathWeaver by 5.4 × to 27.9 ×.Against the inverted file indexes cuVS IVF-PQ and IVF-RaBitQ, the gain reaches 7.0 × to 343 ×. At 100 to 1,000 queries per batch, OctEx answers a batch 2.2 × to 6.0 ×
+
+faster than CAGRA on Deep100M and Deep1B. On one A100 of the previous generation, OctEx outperforms CAGRA on five datasets by 1.14 × to 16.3 × (§5). 
+
+## 2 Background and Motivation 2.1 GPU Vector Search 
+
+The first GPU index family connects every vector to a few dozen neighbors in a proximity graph, in which a query starts from entry vertices and repeatedly expands the closest un-visited ones. CAGRA [53] builds a fixed-degree graph for the GPU and searches it with one thread block per query, which makes it the standard GPU baseline in cuVS [50]. Other GPU graph indexes such as GGNN [25], SONG [72], and BANG [64] follow the same expansion loop with differ-ent graphs and memory layouts. For billion-scale datasets, FlowANN [71] extends CAGRA with a tiered graph that keeps part of the graph in host memory of one GPU server. The second family, inverted file (IVF) indexes, clusters the dataset and scans the inverted lists of the clusters nearest to a query. The IVF-PQ index of Faiss [37] and cuVS [50] com-presses every vector by product quantization [39], whereas IVF-RaBitQ [60] replaces the codes by RaBitQ [22] with an error bound per distance. Inverted multi-indexes [8] and opti-mized product quantization [23] refine the coarse quantizer and the codes. In all of these indexes, a query reads every code of every probed cluster before an exact refinement of its candidates, which makes its cost grow with the cluster size rather than with the number of true neighbors. 22.2 Chained Rounds of Graph Search 
+
+The expansion loop of a graph search is a chain of dependent rounds, because the vertices that one round expands are the best results of the previous round. Although CAGRA com-putes the distances of all neighbors of the expanded vertices of one round in parallel, the next round can start only after a sort of the candidate list [53]. A higher recall target needs a longer candidate list and more rounds per query, while the GPU threads of a block wait at the end of every round for the slowest distance. Figure 1(a) shows the consequence on Deep1B, where the throughput of CAGRA falls by 2.1 × from recall 0.989 to 0.995. The chain also limits the use of the memory of the server. A graph of one billion vertices with degree 32 occupies 119 GiB beside 179 GiB of half-precision vectors, which fills 298 GiB of the 372 GiB of HBM of four H100 GPUs with one copy of the CAGRA index. Additional memory cannot shorten the chain, as every round still depends on the last. In contrast, a search whose steps are independent could spend the memory on precomputed results and finish in a constant number of parallel steps per query. 
+
+## 2.3 Search by Precomputed Lists 
+
+A search with a constant number of steps needs candidates that do not depend on an earlier round. Precomputed lists of nearest vectors provide them, as long as a query finds its list by a computation on the query alone. A space partition gives such a computation, in which the query decodes its own cell and reads the list stored for that cell. Because the volume of a ball in hundreds of dimensions concentrates near its surface [11], the partition must be built in random low-dimensional projections. Random projections preserve distances in a few dozen dimensions up to a small dis-tortion [38]. Within each projection, a lattice quantizer such as 
+
+E8 partitions the space into cells of nearly spherical shape [14]. Formally, the E8 lattice consists of points in R8 whose coordi-nates are either all integers or all half-integers and sum to an even integer: E8 = {x ∈ Z8 ∪ (Z + 12 )8 | ∑8 
+
+> i=1
+
+xi ∈ 2Z} [14]. Its Voronoi cells center the densest packing of equal balls in eight dimensions [14, 65]. The vectors that share the cell of the query in a projection are therefore mostly near the query. Earlier CPU and disk indexes such as C2LSH [21], QALSH [31], and SuCo [70] enumerate the cell members of each random projection at query time and count them on the CPU. Their candidates are the members of the cells of a query, whose number varies from query to query and from cell to cell, whereas GPUs require fixed-shape parallel searches. 
+
+## 2.4 Technical Challenges 
+
+Turning precomputed lists into a GPU search raises the fol-lowing technical challenges: • Most cells that queries fall into are empty at fine spacing, as a product of multiple E8 blocks has far more cells than a dataset has vectors. The lists must hence belong to cells that hold data and be found without a search for nearby cells at query time. Fragments at several spacings, each populated one with a stored fragment ripple, meet both conditions (§§3.2 and 3.3). • Part of the neighbors lie outside every cell of the query, a share that grows with the dataset, and must be reached without a chain of dependent rounds. Waves over neigh-bor rows, ranked by an int8 sketch, reach them in a fixed number of steps (§§3.4 and 3.5). • The lists of all copies overlap and differ in length, so their union needs deduplication and ranking with few kernel launches per wave. Fixed-shape CUDA graphs and fused merge kernels provide both (§§4.1 and 4.2). • At one billion vectors, the projected copies, ranking sketches, neighbor lists, and raw vectors together ex-ceed aggregate GPU HBM, while host memory serves random vector lookups at a small fraction of HBM band-width, and the lists of hundreds of copies threaten to make the build slow. OctEx places every part of its in-dex in HBM or host memory by its access frequency (§§4.3 and 4.4) and builds all fragment ripples of a bil-lion vectors in minutes by sorting the members of every fragment (§4.5). 
+
+## 3 Design 3.1 System Overview 
+
+OctEx indexes a dataset X ⊂ RD through C copies . Copy c
+
+maps every vector x by its own random projection, scaled by a 
+
+spacing f , to a point y of R8b, where b is a small integer such as 4 (Section 3.2 gives the map). The 8 b coordinates of y split into b blocks of eight. Each block rounds to its nearest point of the lattice E8. We call the resulting tuple (p1, . . . , pb) ∈ Eb
+
+> 8
+
+the fragment of x in copy c at spacing f . It identifies the cell of Eb 
+
+> 8
+
+, a product of b Voronoi cells of E8, that contains y. Two vectors share a fragment exactly when all b of their blocks round to the same lattice points. A fragment is populated 
+
+when at least one vector of X has it. Its center is the point 
+
+(p1, . . . , pb) of R8b.OctEx precomputes the near neighbors of two kinds of points as stored ripples. The stored ripple of a source point is the list of the vectors of X nearest to it, sorted by distance. A 
+
+fragment ripple has the center of a populated fragment as its source and measures distances in the projection of the copy. A query reads it through its own fragment in that copy. A vector ripple has a vector of X as its source and measures distances in RD. A query reads it through a vector that its search has already found. A search reads the fragment ripples of a query 3query (blue star) fragment of the query (purple hexagon) fragment center (purple cross) fragment ripple (purple dots) vector ripples (dashed orange circles) start points (orange rings) neighbors found by the waves (orange dots) Figure 2: The first round and the waves of one query. once, in its first round. Every later round is a wave , in which each start point of the query reads its own vector ripple. The start points are the best candidates of the query so far. Both kinds of ripples are lists of vector identifiers that one GPU kernel gathers, which makes a search one read of fragment ripples followed by a few waves. A search of OctEx has four parameters r, S, W , and R,which the following steps define. Figure 2 follows one query through one of these copies. OctEx runs the same steps in all 
+
+C copies at once and for a whole batch of queries: 1. Project. One matrix multiplication maps the batch into the C copies. In each copy, the query (blue star) falls into its fragment (purple hexagon) at several cell sizes, of which it uses the smallest one that has a stored list. 2. Read the stored ripple. The query reads the first r en-tries of the fragment ripple of its fragment (purple dots), where the read depth r is a search parameter. These en-tries are the r vectors nearest to the fragment center (purple cross). The lists of all C copies form the can-didate pool of the query, from which a hash removes duplicates. 3. Rank by sketch. OctEx stores for every vector an int8 
+
+sketch of its first principal coordinates and ranks the pool by sketch distance, without reading any full vector. The sketch distance of an entry is the distance between its sketch and the same principal coordinates of the query. The S entries with the smallest sketch distances become the start points (orange rings), where S is a search pa-rameter. 4. Waves. In each wave, every start point reads its own vector ripple, which lists its nearest vectors in the full space (dashed orange circles). The waves thereby find neighbors outside the pool (orange dots). Vectors that the pool already holds keep their purple color inside the circles. The search ranks the new entries by sketch distance. The S best entries whose rows no earlier wave has read become the start points of the next wave. The search runs a fixed number W of waves. 5. Rerank. Sketch distances are approximate: the sketch keeps only the first principal coordinates of a vector in eight bits. After the last wave, OctEx therefore reads the full half-precision vectors of the R entries with the smallest sketch distances, where the rerank depth R is a search parameter. It then computes their exact distances to the query and returns the k nearest of them. Since R is a few dozen to a few hundred entries against thousands in the pool, the full vectors are read rarely enough to stay in host memory when they exceed HBM. Steps 1 to 3 form one parallel step, after which each wave adds one. A search thus waits for an earlier result W times, where W is a small constant, typically 1 to 6, that does not grow with the candidate pool. A graph walk instead waits once per round, for a number of rounds that grows with its candidate list and thus with the recall target (Section 2.2). The index that OctEx builds for a dataset X consists of four parts: the keys and fragment ripples of the C copies, the sketch rows, the vector ripples, and the half-precision vectors of X.A part that every query reads many times at random positions must stay in HBM, which serves random rows two orders of magnitude faster than host memory. A query reads r entries of one fragment ripple in each of the C copies, which makes 
+
+Cr entries per query. The keys and fragment ripples of a copy therefore stay in the HBM of the GPU that owns the copy. A query also reads one sketch row for every distinct entry of its candidate pool. Each of the W waves reads the vector ripples of S start points, which makes W S rows per query. For the same reason, the sketch rows and the vector ripples stay in HBM, split by rows over all GPUs when one GPU cannot hold them. We also call the vector ripples the neighbor rows. In contrast, the final rerank reads only R half-precision vectors per query. When the dataset exceeds the HBM of the GPUs, the half-precision vectors consequently live in host memory. 
+
+## 3.2 Lattice Fragments in Projected Copies 
+
+Each copy of the dataset projects every vector x ∈ RD into 8b dimensions and partitions the projection into products of 
+
+E8 cells. Specifically, copy c draws a random orthonormal projection Uc from the top principal subspace of the data and a uniform random shift tc and maps x to y = ( U⊤ 
+
+> c
+
+(x −
+
+μ) + tc)/ f , where μ denotes the data mean and f the spacing in units of the projected standard deviation. The projection 
+
+y splits into b blocks of eight coordinates, each of which decodes to its nearest point of E8 by the decoder of Conway and Sloane [13], which solves a special case of closest-point 4search in lattices [3]. The b decoded points form the fragment of x in copy c at spacing f , as Section 3.1 defines it. The spacing controls the size of a fragment and with it the distance up to which vectors share the fragment of the query. A fine spacing gives small fragments that separate near from far vectors sharply but leave most queries in fragments without data. A coarse spacing gives fragments that almost always hold data but mix near and far vectors. To obtain both, OctEx decodes every vector at L spacings f1 < · · · < fL, from which a query uses the finest spacing whose fragment holds a stored list. The probability that a vector shares the fragment of the query decreases with their projected distance. Because the shift of a copy is uniform, the query falls at a uniform position within its own cell. A vector then shares the fragment of the query with the probability that this position stays inside the cell after a move by their projected difference, which is the share of the cell that overlaps its own translate by this difference. The cell of a lattice is convex, so this overlap can only shrink as the difference grows in any direction [14]. The b blocks of a fragment have independent shifts, which multiplies their probabilities. A fragment therefore holds near vectors with higher proba-bility than far vectors. Every copy draws its own rotation and shift, which makes the events of different copies independent. Over C copies, the probability thus turns into an expected number of hits, which makes the union over copies contain the nearest vectors with a probability that rises with C.
+
+## 3.3 Stored Ripples 
+
+Because the fragment of a query holds no data in most copies at fine spacing, OctEx stores for every populated fragment the list of vectors nearest to its center, its fragment ripple. For each copy, spacing, and fragment that at least pmin vectors fall into, the build computes the list of the l vectors nearest to the center of the fragment in the projection of the copy, sorted by distance. A query that falls into a stored fragment reads the first r ≤ l entries of its list. A query whose fragment is not stored at the finest spacing instead moves to the next coarser spacing, where fragments hold more data. The stored list approximates the list of the vectors nearest to the query, given that the query lies near the center of its fragment. The approximation weakens as the offset ε of the query from the center grows. Let τr denote the projected distance of the r-th entry of the list to the center. By the triangle inequality, a vector whose projected distance to the query is below τr − ε lies closer to the center than τr, so that the first r entries contain every such vector and cover this radius in full. The reach τr − ε of a list depends on the spacing and the list length, while the pruning threshold pmin sets its memory. The offset ε is at most the covering radius of the fragment, which is the largest distance from a point of its cell to its center. For a product of b cells of E8, this radius is √b, since the covering radius of E8 is 1 [14]. Before the division by the spacing 
+
+f , the offset in the projection is thus at most f √b, which a finer spacing reduces. A longer list instead increases τr.The pruning threshold costs little coverage, since a fragment that holds few vectors also receives few queries when the queries follow the data distribution. As a result, dropping such a fragment below pmin moves only those queries to the next spacing, at a small loss of recall. 
+
+## 3.4 Waves over Neighbor Rows 
+
+OctEx reaches the neighbors that the first round misses by waves, each of which adds one dependent step. The first round of stored ripples finds most of the nearest neighbors but misses those that fall into other fragments in almost every copy. The vector ripples of Section 3.1 serve this purpose: the neighbor row of every vector lists its nearest vectors in the full space. In each wave, the S best entries found so far read their neighbor rows. Since a wave reads S rows in parallel and depends only on the ranking of the previous wave, a search with W waves has W + 1 dependent steps in total, however long its candidate pool. A neighbor row that lists only the nearest neighbors of its owner misses vectors whose own neighbors are near the owner but which no near vector lists. OctEx therefore builds each row from k f forward neighbors, up to kr reverse entries, and the remaining forward neighbors, where a reverse entry of 
+
+u is a vector v that lists u among its first ks forward neighbors. Reverse entries give every vector a path back from the vectors that consider it near, along which a wave reaches every vector from the start points near it. From one hundred million vectors on, OctEx builds the neighbor rows by its own search, while smaller datasets use exact rows. The first version of the rows comes from the first round alone, with every base vector as a query and the vector itself removed. Each later version runs the full search with waves over the reverse rows of the previous version, which raises the quality of the rows with each refinement. 
+
+## 3.5 Ranking without Full Vectors 
+
+OctEx ranks the union of a query by an int8 sketch: exact distances for its thousands of distinct entries would read thou-sands of full vectors per query. The sketch stores for every vector its first principal coordinates in eight bits with one scale per coordinate. Each sketch distance reads one row of 64 to 128 bytes. The exact rerank thus needs only a few dozen entries whenever the sketch ranks the true neighbors among its best entries. The best S entries by sketch distance become the start points. Only the best R entries after the last wave receive exact half-precision distances, or in every wave when the vectors fit in HBM. 5Algorithm 1 Search of one query q in OctEx. 
+
+Require: copies 1 .. C, spacings f1 < · · · < fL, read depth r
+
+Require: start points S, waves W , rerank depth R
+
+Ensure: the approximate k nearest neighbors of q 
+
+> 1:
+
+U ← /0 
+
+> 2:
+
+for c = 1.. C in parallel do  
+
+> 3:
+
+j ← the finest spacing whose fragment of q is stored  
+
+> 4:
+
+U ← U∪ the first r entries of the list of that fragment  
+
+> 5:
+
+end for  
+
+> 6:
+
+T ← the S entries of U nearest to q by sketch distance  
+
+> 7:
+
+for w = 1.. W do  
+
+> 8:
+
+U ← S 
+
+> s∈T
+
+the neighbor row of s, in parallel  
+
+> 9:
+
+T ← the S unread entries of T ∪ U nearest by sketch distance  
+
+> 10:
+
+end for  
+
+> 11:
+
+return the exact top k among the best R of T
+
+The separation of ranking from exact distances determines where the index can live. The sketch rows are read for every distinct entry and must stay in HBM. In contrast, the full vectors are read R times per query and can live in host memory. Algorithm 1 summarizes the search of one query with both kinds of ripples and both rankings. 
+
+Time and space complexity. A query of Algorithm 1 per-forms O(Cr +W SL t ) memory reads and sketch distances and 
+
+O(R) exact distances in W + 1 dependent steps, where Lt de-notes the length of a neighbor row. Specifically, the first round reads Cr list entries and computes at most Cr sketch distances per query; similarly, each wave reads S rows of length Lt and computes at most SL t sketch distances. The index stores, per copy, l identifiers for each of its stored fragments together with their keys; in addition, the shared part stores one sketch row and one neighbor row of Lt identifiers per vector. The deduplication hash set of a query holds at most max (Cr , SL t )
+
+entries in any round. 
+
+## 4 Implementation 
+
+The implementation of OctEx consists of 11,425 lines of code. At its core, a CUDA C++ library of 5,452 lines forms the module cuvs::neighbors::octex of cuVS [50]. Its search path takes 2,716 lines with 10 CUDA kernels and covers the loading of an index onto the GPUs and the search of a batch of queries. The builder takes another 2,736 lines with 16 kernels and computes the copies, the fragment ripples, the sketch, and the neighbor rows on the GPUs, with the radix sort of CUB for the fragment ripples of billion-vector datasets and the merges, and the IVF-Flat index of cuVS for the ripples of smaller ones. The C and Python interfaces take 701 and 1,322 lines. Unit tests take 1,421 lines. Command-line tools, examples, and further tests take the remaining 2,529 lines. The source code of OctEx is available on GitHub 1. The Python package is published on PyPI as octex 2. The release offers five interfaces: • C++: build , load , and search in the style of cuVS, with queries in host or device memory. • C: cuvsOctexBuild , cuvsOctexLoad , and 
+
+cuvsOctexSearch on DLPack tensors, following the C API of cuVS. • Python: octex.build , octex.load , and 
+
+Index.search on NumPy, CuPy, or PyTorch arrays, or any array with DLPack or the CUDA array interface, without copies. • Drop-ins: from octex import cuvs as cagra for the CAGRA calls of cuVS and from octex import faiss for the GPU index calls of Faiss, each replacing one import in existing code. • Command line: octex_build and octex_bench ,which build indexes and run the measurements of Section 5. 
+
+## 4.1 One CUDA Graph per Batch 
+
+OctEx captures the search of a batch on each GPU as CUDA graphs [51], one for the first round and one for the exchange of start points and all waves. Every kernel of the graph has a fixed shape: the projection is one matrix multiplication over all copies; similarly, the decoding, gather, and rerank kernels assign a fixed number of threads to every query. Queries that need fewer entries than the maximum skip work inside the kernels instead of changing the launch shape, which spares the host any synchronization inside a search. Every step is a CUDA kernel or a cuBLAS call in C++, with no framework in the search path. Every per-query structure inside the graph takes a size that follows from the maximum number of entries of the query. The deduplication of a union uses an open-addressing hash set in the shared memory of the block [6]. Such a set is one fixed array, in which an entry that finds its slot taken moves on to the next free slot. Its size is the next power of two above 1.5 times the maximum number of entries of the query, at most 32,768 slots. The gather kernel inserts the list entries of a query into this set and splits them evenly over the threads of the block by a prefix sum of the list lengths. One lane per 16 sketch coordinates of each new entry then computes its sketch distance. Similarly, the kernel that keeps the S start points sorts the next power of two above S + R keys of distance and identifier by a bitonic network [10], instead of a fixed size of 1,024 keys. The exact rerank selects the R best entries by 
+
+> 1https://github.com/hpdic/octex
+> 2https://pypi.org/project/octex
+
+6a radix selection over their sketch distances and reads their half-precision rows. The graphs keep every GPU busy through a batch. In a trace of one batch of 10,000 queries on Deep1B over four H100 GPUs, the kernels of the graphs leave each GPU idle for at most 0.06 ms in total, against 0.17 to 0.25 ms when the host launches every kernel. The four GPUs finish the batch within 0.2 ms of each other. 
+
+## 4.2 Fused Merge Kernels 
+
+Two fused kernels merge the start points of a query and select those of the next wave, each in one thread block per query. The merge kernel radix-selects the S sketch-nearest of the new entries of a query in one thread block and then sorts their keys of distance and identifier together with the kept start points by a bitonic network in shared memory. Because the same identifier always carries the same sketch distance, a repeated identifier becomes an equal key and collapses during the sort. The selection kernel inserts the identifiers that earlier waves expanded into a hash set in shared memory and takes the first 
+
+S kept entries, in order, that the set does not contain. Both kernels return the same start points as a merge by sorting, up to the order among equal sketch distances. Since each kernel keeps its intermediate keys in shared memory, a wave issues one launch for the merge and one for the selection per batch. The merge also removes the duplicates that the start points of successive waves would otherwise carry into the next wave. 
+
+## 4.3 Multi-GPU Execution in One Process 
+
+OctEx drives all G GPUs of a server from one host thread in one process. Each GPU holds a 1 /G share of the copies and answers every query of the batch with them, which runs the first round of each query on all GPUs at once. A peer-gather kernel inside the CUDA graph then merges the start points of each query from the other GPUs over NVLink, after which each GPU runs the waves for 1 /G of the queries. With CUDA events ordering the two graphs of all GPUs without host barriers, the host issues the whole batch in one pass over the GPUs. The wave graph of each GPU starts only after the first-round graphs of all GPUs have recorded their events, which keeps the exchange of start points out of the critical path of the host. Small datasets can instead replicate the whole index on every GPU, which then answers its own share of the queries without exchange. OctEx splits the sketch rows and the neighbor rows by rows over the G GPUs and reads them through peer pointers. The half-precision vectors are split in the same way when they would otherwise crowd out copies. Every kernel receives an array of device pointers to the row ranges of each split part. A row can live on the local HBM, on the HBM of a peer GPU, Phase fragment ripples wave 1 wave 2 3 4 rerank       
+
+> 50% 100%
+> SM
+> 20% 40%
+> HBM
+> 40% 80%
+> NVLink
+> 0510 15 20 25 30
+> Time in one batch on one GPU (ms)
+> 8% 16%
+> PCIe
+
+Figure 3: GPU utilization in one Deep1B batch by phase. or in host memory, since the unified address space of CUDA gives all three memories pointers of the same form. 
+
+## 4.4 Tiered Placement by Access Frequency 
+
+OctEx places every part of its index by how often a query reads it. The first round reads Cr list entries per query. Ev-ery wave reads the sketch rows and the neighbor rows of thousands of entries at random positions. These parts stay in HBM, which serves random reads of short rows two orders of magnitude faster than host memory over PCIe. When the copies, sketch rows, and neighbor rows do not fit together, OctEx shrinks them instead of moving any of them to the host. The sketch kernels accept any width that is a multiple of 16 and leave the extra lanes of the last group idle. Each copy can also keep only the first entries of every list, which are the nearest to the center of the fragment. The final rerank reads only R half-precision vectors per query and is the only step that reads host memory. When these vectors do not fit into the HBM that the other parts leave, OctEx keeps them in host memory. It allocates them as anonymous memory and fills them from the file in sequential chunks, without a mapping of the file. With this placement, PCIe carries only the final rerank, and every round before it stays on the HBM and NVLink of the GPUs. To verify this split, we sample the hardware counters of the four H100 GPUs at 20 kHz over 30 batches of 10,000 queries on Deep1B with 512 start points and four waves. Figure 3 plots the raw samples of one batch on one GPU. Through the fragment ripples and all four waves, the SMs stay busy and the GPU reads the sketch rows and neighbor rows of its peers over NVLink at up to 65% of its bandwidth. PCIe stays at most 1% busy in these phases. The final rerank alone reads host memory, for 3.5 ms of the 33-ms batch at up to 13% of the PCIe bandwidth. HBM serves the short random rows at about 18% of its read bandwidth, as these reads wait on latency rather than bandwidth. 7Table 1: Index configuration of OctEx per dataset.                                                                    
+
+> SIFT GIST DINOv2 MARCO D-10M D-100M S-100M D-1B S-1B Copies C200 400 600 256 320 272 224 256 256 List length l32 64 32 64 64 64 64 16 16 Min. fragment pmin 1122210 10 100 100 Sketch width 64 128 128 128 64 64 64 96 96 Row length Lt64 64 64 64 64 64 64 32 32 Reverse edges ––✓✓✓✓✓✓✓
+> Neighbor rows exact exact exact exact exact search search search search
+
+## 4.5 Fast Build by Sorting and Sketch Ranking 
+
+The build of a billion-vector index spends its time on two nearest-neighbor problems: the fragment ripples of hundreds of copies and the neighbor row of every vector. Both grow with the dataset, the first also with the number of copies. Oc-tEx solves the first by sorting instead of searching and the second by ranking without full vectors, and it hides the I/O of the build behind the GPU work. The fragment ripples need no search over the dataset. The pass that hashes the vectors of a copy also computes the projected distance of every vector to the center of its fragment. A radix sort by this distance, followed by a stable radix sort by fragment key, orders the members of every fragment by distance, and each stored fragment keeps its first l members as its ripple. A copy thus costs one streaming pass over the dataset and two sorts per spacing. At one billion vectors, every stored fragment holds at least pmin = 100 members, many more than the l = 16 entries of a ripple. Smaller datasets hold few vectors per fragment and instead search their ripples with the IVF-Flat index of cuVS [50]. At one billion vectors, the neighbor rows come from two passes of the search of OctEx over all base vectors: the first round alone, then two waves over the rows of the first pass (§3.4). Both passes rank by sketch distance only and skip the final rerank, so that they read no half-precision vectors from host memory. The builder loads the index once for both passes and replaces only the neighbor rows between them. It writes the lists and the sketch in a background thread while the passes run and page-locks the dataset in place instead of copying it into new pinned memory. 
+
+## 5 Evaluation 5.1 Experimental Setup 
+
+Datasets. We evaluate on nine datasets of image descrip-tors, image embeddings, and text embeddings, from one mil-lion to one billion vectors of 96 to 960 dimensions. SIFT1M (SIFT) [36, 45] holds one million 128-dimensional SIFT de-scriptors with 10,000 queries. GIST1M (GIST) [7, 52] holds one million 960-dimensional GIST descriptors from ANN-Table 2: Baselines and their placement on the four GPUs.                                        
+
+> System Placement SIFT GIST DINOv2 MARCO D-10M D-100M S-100M D-1B S-1B
+> Graph indexes
+> CAGRA [53] full; 8 shards at 1B ✓✓✓✓✓✓✓✓✓
+> GGNN [25] 4 shards; full, ×4✓✓✓✓✓
+> FlowANN [71] one GPU, ×4✓✓
+> PathWeaver [42] 4 shards, end to end ✓✓
+> Inverted file indexes
+> IVF-PQ [39, 50] full per GPU ✓✓✓✓✓✓
+> IVF-RaBitQ [60] full; 8 shards at 1B ✓✓✓✓✓✓
+
+Benchmarks with 1,000 queries. DINOv2-1.28M (DINOv2) holds the normalized 768-dimensional DINOv2 [54] embed-dings of the 1.28 million ImageNet training images [57], with 10,000 validation images as queries. MS MARCO (MARCO) [49] holds the 8.8 million passages and the 6,980 labeled dev queries of its passage-ranking task as normal-ized 768-dimensional embeddings of the Sentence-BERT [56] model msmarco-distilbert-cos-v5 [58], with ground truth from a single-precision screen of 128 candidates and a double-precision rerank. Deep10M, Deep100M, and Deep1B (D-10M, D-100M, D-1B) hold the first ten million, the first one hundred million, and all one billion 96-dimensional vectors of Deep1B [9] with its 10,000 queries, with exact ground truth for the two prefixes. SIFT100M and SIFT1B (S-100M, S-1B) hold the first one hundred million and all one billion SIFT descriptors of BIGANN [36] with its 10,000 queries and public ground truth. 
+
+Configurations of OctEx. All datasets share one lattice configuration: b = 4 blocks of E8 over the top 64 principal co-ordinates and five spacings from 2.0 to 5.0 projected standard deviations. Table 1 lists the parts of the index that scale with the dataset. The read depth, the start points, and the waves vary along the frontier of each dataset. The two billion-vector indexes come from the build of Section 4.5 and rerank R = 32 entries at the end, while smaller datasets rerank 128 to 256 entries exactly per wave. 
+
+Baselines. We compare OctEx with four GPU graph sys-tems and two inverted file indexes, each swept over its own parameters. Table 2 lists the baselines from top to bottom with their placement on the four GPUs. CAGRA [53] in cuVS [50] 26.10 sweeps graph degrees 32 to 96 (32 at one billion vec-tors), internal top-k sizes 32 to 1,024, and search widths 1 to 4, in single and half precision. GGNN [25] runs with the default parameters of its authors, sharded over the four GPUs and with the full index on one GPU, credited with ideal 4 ×
+
+scaling. FlowANN [71] runs on one GPU with the scripts, set-tings, and GDRCopy driver of its authors, credited with ideal 4× scaling, up to one hundred million vectors, as its graph 80.9 0.99 0.999 10 2
+
+> 10 3
+> 10 4
+> Throughput (kQPS)
+
+SIFT1M   
+
+> 0.9 0.97 0.99 10 1
+> 10 2
+> 10 3
+
+GIST1M   
+
+> 0.9 0.97 0.99 10 2
+> 10 3
+
+DINOv2-1.28M   
+
+> 0.9 0.97 0.99 10 1
+> 10 2
+> 10 3
+
+MS MARCO   
+
+> 0.9 0.97 0.99
+> Recall@10
+> 10 2
+> 10 3
+> Throughput (kQPS)
+
+Deep10M   
+
+> 0.9 0.97 0.99
+> Recall@10
+> 10 1
+> 10 2
+> 10 3
+
+Deep100M   
+
+> 0.9 0.99 0.999
+> Recall@10
+> 10 1
+> 10 2
+> 10 3
+
+SIFT100M  
+
+> 0.95 0.98 0.995
+> Recall@10
+> 0200 400 600 800
+
+SIFT1B       
+
+> OctEx CAGRA FlowANN GGNN PathWeaver IVF-PQ IVF-RaBitQ
+
+Figure 4: Recall and throughput on four H100 GPUs (Pareto frontiers, median QPS, recall axis in nines). build on Deep1B processes only 6.7k vectors per second. PathWeaver [42] runs its own preprocessing and multi-GPU search with one shard per GPU and is timed end to end, since its own timer starts after the first and most expensive round. IVF-PQ [39, 50] in cuVS sweeps 16 to 256 probes over 2,048 lists at one million and 16,384 lists at one hundred million vectors with a refinement ratio of 4. IVF-RaBitQ [60] in cuVS sweeps 4 and 7 bits and refinement ratios 2 to 8 over 4,096 to 65,536 lists, followed by our exact GPU rerank. 
+
+Metrics. We report throughput in QPS over the full query set in batches and recall at 10, which counts the fraction of the true ten nearest neighbors among the ten returned. Throughput is the median over five timed repetitions after a warm-up, for OctEx and for every baseline. The median matters for CAGRA at one billion vectors, whose best repetition exceeds its median by up to 1.7 ×, whereas the best and the median of OctEx differ by at most 4.5%. For each system, we sweep its configurations and report the Pareto frontier of recall and throughput. A speedup at a recall target compares the best throughput of each system at or above that target. A range of speedups over CAGRA spans the targets 0.95, 0.97, 0.98, 0.99, and 0.995 that both systems reach. 
+
+Platform. All measurements outside Section 5.6 run on one server, on all four of its GPUs unless Table 2 notes one. The server holds four NVIDIA H100 GPUs with 93 GiB of HBM each, connected all to all by NVLink, Intel Xeon Platinum 8468 processors with 192 hardware threads, and 960 GB of DRAM, with CUDA 12.6 and cuVS 26.10. Its datasets and indexes reside on a network-attached block device that reads and writes about 0.8 GB/s per stream and reads 6.7 GB/s with eight streams in parallel. Section 5.6 uses a second server with one whole NVIDIA A100 80GB PCIe GPU, two AMD EPYC 7763 processors with 256 threads, and 512 GB of DRAM. 
+
+## 5.2 Recall–Throughput Trade-off 
+
+We compare OctEx with the baselines over the full recall range on all nine datasets, to test whether a fixed number of parallel steps turns HBM into throughput at high recall. Each Pareto frontier credits every system with its best configuration of Tables 2 and 1 at each recall. Figures 4 and 1(a) show that OctEx leads every baseline at every recall that both reach, on all nine datasets. Up to one hundred million vectors, it outperforms CAGRA by 2.0 × to 46.4 × from recall 0.95 to 0.995. Over the other GPU graph systems and the inverted file indexes, the gain reaches 5.4 ×
+
+to 27.9 × and 7.0 × to 343 ×. The gain grows with the recall target, for instance from 5.9 × at recall 0.95 to 46.4 × at 0.995 on MS MARCO, where CAGRA quadruples its candidate list to rise from recall 0.987 to 0.996. It narrows with the size of 932 48 64 
+
+> Read depth (2 waves)
+> 012
+> Missed neighbors (%)
+
+(a) Reverse edges 
+
+> OctEx no reverse edges
+> SIFT D-100M D-1B 0.00 0.25 0.50 0.75 1.00
+> Relative throughput
+
+(b) Search kernels  
+
+> OctEx no CUDA graph no fused merge
+> 0.96 0.99
+> Recall@10
+> 100 300 1000
+> Throughput (kQPS)
+> CAGRA
+
+(c) Start points 
+
+> start points 192 256 320 384 512 640 768 896 1024
+> 0.93 0.96 0.99
+> Recall@10
+> 2.0 2.5 3.0 3.5
+> Throughput (MQPS)  64 128 192 272 64 272
+
+(d) Copies 
+
+> 1 wave 2 waves
+> SIFT GIST DINOv2 D-10M D-100M D-1B 025 50 75 100
+> Batch time (%)
+
+(e) Batch time 
+
+> fi rst round waves other
+
+Figure 5: Reverse edges, system optimizations, start points, copies, and the batch time by phase. the dataset, to 2.0 × to 2.5 × on Deep100M, as a larger dataset needs more copies and waves to reach the same neighbors. Figure 1(a) shows the same comparison at one billion vectors, where the index of OctEx spans the HBM of all four GPUs and the host memory. There, OctEx still outperforms CAGRA by 1.48 × to 2.05 × and IVF-RaBitQ by 20.2 × to 26.7 ×. On SIFT1B in Figure 4, the gain over CAGRA is 1.46 × to 1.85 ×
+
+and reaches 2.38 × at recall 0.998, against 20.8 × to 38.9 ×
+
+over IVF-RaBitQ. The gain of OctEx is thus largest at high recall, where graph search needs its longest chains of rounds. 
+
+## 5.3 Ablation and Sensitivity 
+
+We ablate two design choices of OctEx, the reverse edges of the neighbor rows and the system optimizations of the search, and vary the two parameters that set its reach, the start points and the copies. Each panel of Figure 5 varies one of them on the largest dataset at which it matters. Both design choices pay off: the reverse edges halve the missed neighbors at a small cost, and the fused merge kernels and the CUDA graphs raise the throughput on every dataset. Figure 5(a) ablates the reverse edges of the neighbor rows on Deep100M with two waves. A row without reverse edges lists only the nearest vectors of its owner, whereas a row of Oc-tEx of the same length also lists vectors that count the owner among their own nearest. The reverse edges cut the missed neighbors from 2.2% to 0.9% at read depth 32 and by more than half at every read depth, while the throughput drops by only 2.6% to 3.7%. Figure 5(b) ablates the two search kernel optimizations one at a time and reports the throughput relative to the full search at the same recall. Without the fused merge kernels, which select the start points in shared memory, the merge must sort all candidates in global memory. The through-put then falls to 23% on SIFT1M, 37% on Deep100M, and 65% on Deep1B. Without CUDA graphs, the host launches every kernel and synchronizes between the first round and the waves, which costs 9% on SIFT1M, whose batches take only 1.4 ms, and at most 2.3% on the larger datasets. The start points, the copies, and the waves set the reach of OctEx, and at one billion vectors the waves take most of its time. Figure 5(c) varies the start points on Deep1B, each line from three to five waves. Every further increase extends the frontier toward higher recall. With the waves fixed at five, tuning only the start points loses at most 1.9% of throughput against the best configuration at every recall target from 0.97 to 0.995, which makes them the main tuning parameter of a loaded index. Figure 5(d) varies the copies on Deep100M and shows that copies and waves can replace each other: 64 copies with two waves reach both higher recall and higher throughput than one wave over 192 copies. Figure 5(e) splits the batch time by phase. The waves, which include the final rerank, take 12% to 48% of it up to one hundred million vectors but 88% on Deep1B. As a result, the cost of a wave decides the throughput at one billion vectors. 
+
+## 5.4 Robustness to Resource Limits 
+
+We test whether the gains of OctEx hold when its index ex-ceeds the HBM, when fewer GPUs are available, and when batches shrink. The first two panels of Figure 6 cover the memory tiers of Deep1B, and the last three cover GPU scal-ing, a single GPU, and the batch size. At one billion vectors, OctEx stays fast as long as every row that a wave reads stays in HBM. Figure 6(a) shows the memory of one GPU at one billion vectors. Each GPU holds a quarter of the copies, sketch rows, and neighbor rows together with its search buffers in 80.2 of its 93 GiB, while the 179 GiB of half-precision vectors stay in host memory for the final rerank. Lists of 32 entries do not fit 256 copies next to these rows; at 128 copies, keeping only their first 16 entries cuts the list memory from 93.8 to 53.8 GiB at a recall loss of 0.0012. Figure 6(b) moves the neighbor rows to host memory as well. 10 one GPU 020 40 60 80 100 
+
+> GiB
+> sketch 22.4 copies 26.9 rows 29.8 bu ff ers 1.1 HBM capacity
+
+(a) HBM, D-1B 
+
+> 128 256 512
+> Start points
+> 0500 1000
+> Throughput (kQPS)
+
+(b) Rows, D-1B   
+
+> in host in HBM
+> 124
+> GPUs
+> 0246810
+> Throughput (MQPS)  OctEx CAGRA
+
+(c) GPUs, SIFT  
+
+> 0.95 0.99
+> Recall@10
+> 10 2
+> 10 3
+> Throughput (kQPS)  OctEx FlowANN
+
+(d) 1 GPU, D-100M   
+
+> 100 1k 10k
+> Batch size
+> 0.3 1310 30 100 300
+> Latency (ms)
+
+(e) Batch latency 
+
+> OctEx 100M CAGRA 100M OctEx 1B CAGRA 1B
+
+Figure 6: Placement at one billion vectors, the neighbor-row tier, GPU scaling, one GPU against FlowANN, and batch latency. D-1B S-1B 020 40 60   
+
+> Build time (min)
+> 12 17 44 47
+
+(a) Build on 4 H100  
+
+> CAGRA OctEx: lists OctEx: rows, pass 1 OctEx: rows, pass 2 OctEx: other
+> D-1B S-1B 0200 400 600
+> Memory (GiB)
+
+(b) Loaded index 
+
+> HBM capacity copies sketch, rows host vectors
+
+Figure 7: Build time and memory at one billion vectors. The throughput then falls by 2.6 × to 3.9 ×, as GPU reads of random rows from host memory reach only 40 million rows per second per GPU against 5.4 billion from HBM. OctEx keeps its gains with fewer GPUs and with smaller batches. Figure 6(c) scales SIFT1M from one to four GPUs, each with the full index and a share of the queries. The throughput of OctEx grows by 3.4 × to 9.50 million QPS at recall 0.991, against 1.8 × for CAGRA, since every GPU of OctEx runs the CUDA graphs of a batch without host synchro-nization. Figure 6(d) compares OctEx with FlowANN on one H100 with Deep100M, the single-GPU setting of FlowANN, where OctEx outperforms it by 12.8 × to 27.9 × from recall 0.95 to 0.98. Figure 6(e) shrinks the batch from 10,000 to 100 queries near recall 0.99. On Deep100M, the batch time of Oc-tEx falls from 6.4 to 0.60 ms, as a batch runs a fixed number of parallel steps, whereas that of CAGRA falls only from 12.3 to 3.4 ms. On Deep1B, the gain of OctEx consequently grows from 1.6 × at 10,000 queries per batch to 3.4 × at 100 queries. 
+
+## 5.5 Build Time and Memory Footprint 
+
+OctEx buys its throughput with precomputation: hundreds of copies whose lists are computed at build time and held in HBM. We measure this cost at one billion vectors, in the time to build the index and in the memory that the loaded index occupies. Both costs decide which datasets suit OctEx, SIFT GIST DINOv2 MARCO D-10M 12510 20      
+
+> QPS over CAGRA  recall 0.95 0.97 0.98 0.99 0.995
+
+Figure 8: Speedup over CAGRA on one A100 by recall target. namely those that are indexed once and queried often. Figure 7(a) shows that a billion-vector index of OctEx takes less than an hour to build on four H100 GPUs, each of which builds a quarter of the copies without communication. OctEx builds Deep1B in 44 minutes and SIFT1B in 47 minutes, against 12 and 17 minutes for the eight shards of CAGRA. The fragment ripples of the 256 copies take 12 and 14 minutes, one streaming pass over the dataset per copy. The two passes of the neighbor rows together take another 28 minutes, as each of them searches all one billion base vectors. Reading the dataset and computing the sketch take the remaining minutes, while the index files are written during the passes. Figure 7(b) shows that memory rather than build time bounds the index of OctEx at one billion vectors. On Deep1B, the sketch rows and the neighbor rows hold 66% of the 316 GiB in HBM, against 34% for the 256 copies with lists of 16 entries. Deep1B and SIFT1B add 179 and 238 GiB of half-precision vectors in host memory, which only the final rerank reads. The HBM of the server thus bounds the index, which is why both datasets keep only 16 entries per list (Figure 6(a)). 
+
+## 5.6 Portability to Other GPU Platforms 
+
+We repeat the comparison with CAGRA on the whole A100 of the previous generation. OctEx keeps its configurations with as many copies as one GPU holds, while CAGRA sweeps degrees 32 to 96 with internal top-k sizes up to 1,024. With 80 GB of HBM on one GPU, OctEx loads all 200 copies of 11 SIFT1M and all 600 of DINOv2-1.28M, but only 112 of the 400 copies of GIST1M, 69 of the 256 of MS MARCO, and 87 of the 320 of Deep10M. Both systems run the same CUDA 12.6 and cuVS 26.10 as on the H100 server. Figure 8 shows that OctEx outperforms CAGRA on all five datasets at every recall target from 0.95 to 0.995, by 1.14 × to 2.40 × on SIFT1M, 5.62 × to 7.89 × on GIST1M, 1.81 × to 14.4 × on DINOv2-1.28M, 4.20 × to 16.3 × on MS MARCO, and 1.19 × to 2.08 × on Deep10M. As on the H100, the gains are largest on high-dimensional vectors and at the highest recall targets. Loaded with only 8 to 32 of its copies, which take 1.7 × to 3.1 × the memory of CAGRA, OctEx still outperforms CAGRA on MS MARCO by 2.1 × at recall 0.95, 4.7 × at recall 0.98, and 6.3 × at recall 0.99. 
+
+## 6 Related Work 
+
+Graph and inverted file indexes. Proximity-graph indexes such as HNSW [47], NSG [19], and DiskANN [34] expand the best unvisited vertices of a query round by round. CA-GRA [53], GGNN [25], SONG [72], and BANG [64] run this loop on GPUs. FlowANN [71] tiers a CAGRA graph across GPU and host memory, whereas PathWeaver [42] pipelines a sharded CAGRA search across GPUs. PipeANN [26] aligns the same loop with SSD reads. Their graphs are neighbor ta-bles refined in the spirit of NN-Descent [17], with the reverse links that HNSW [47] and NSG [19] add for connectivity. In-verted file indexes in Faiss [18,37] and cuVS [50] instead scan the codes of the probed lists, compressed by product quanti-zation [23, 39], inverted multi-indexes [8], or RaBitQ [22, 60]. Milvus [66], Manu [27], Starling [67], FusionANNS [63], and Helmsman [32] distribute or tier such indexes across ma-chines, memory, and storage. SPANN [12] and SOAR [62] spend memory on recall by assigning a vector to several lists, but every query still scans the lists that it probes. OctEx reads the same kind of neighbor table as a graph walk and spends memory as SPANN and SOAR do, yet it expands all start points of a query at once in a fixed number of waves and reads precomputed lists instead of scanning partitions. 
+
+Random projections. Locality-sensitive hashing [4, 15, 33] and its multi-probe variants [46] hash vectors into the cells of random projections, where Jégou et al. [35] use the E8 lattice as the quantizer. C2LSH [21] and QALSH [31] count colli-sions over one-dimensional projections, as SuCo [70] does over subspaces. GPU implementations [55, 69] accelerate the bucket lookups of such indexes. All of them store which vectors fall into each bucket and return the members of the buckets of a query, whose number varies with the population of each bucket. OctEx keeps the random projections and the 
+
+E8 quantizer of these indexes [35] but reads a fixed number of entries per copy, which gives every query the same work on the GPU. 
+
+Approximate Voronoi diagrams. The approximate Voronoi diagrams of Har-Peled [29] and Arya et al. [5] store an answer per cell of a partition, so that a query reads the answer of its own cell instead of searching. Their number of cells, however, grows exponentially with the dimension. OctEx stores such answers only in low-dimensional projec-tions: for every populated fragment, the list of its nearest vectors, which reaches beyond the fragment by the radius of Section 3.3. Its waves then reach the neighbors that no copy holds, which no stored answer per cell provides. 
+
+Scheduling irregular search on GPUs. Irregular graph workloads face the same imbalance as a query whose lists differ in length. Hong et al. [30] assign whole adjacency lists to warps, whereas Merrill et al. [48], Davidson et al. [16], and Gunrock [68] spread the lists of a frontier evenly over the threads by prefix sums and searches, in the manner of merge path [24]. The gather kernel of OctEx follows the second ap-proach for the lists of a query. Selecting the best candidates is a second recurring step, which Faiss performs by warp-level k-selection [37] and Dr. Top-k by delegate-centric selection [20]. The fused merge kernels of OctEx instead build on GPU hash tables [6], radix sorting [2, 59], and bitonic networks [10], which also remove duplicate candidates. Persistent-thread designs [28] keep one kernel resident and schedule the work inside it. Nimble [43] schedules the kernels of deep learn-ing models ahead of time to cut their launch overhead. With fixed kernel shapes, OctEx goes further and replays the whole search of a batch as CUDA graphs [51], whereas persistent kernels and per-query launches decide their work at run time. 
+
+## 7 Conclusion 
+
+In this paper, we present OctEx, a GPU index that reaches high recall in a fixed number of parallel steps. Our design is inspired by the observation that a query’s nearest neighbors are often found in the same fragments of a lattice, which we exploit by storing the nearest vectors of every fragment as ripples. OctEx replaces the search rounds with stored ripples: a query reads the precomputed lists of its lattice fragments in hundreds of random projections at once and then the neighbor rows of its best hits in a few waves. We open-source OctEx as a CUDA module that builds the index of one billion vectors in 44 to 47 minutes, runs each batch as CUDA graphs over all GPUs, and moves only the vectors of the final rerank to host memory; moreover, we provide Python and C interfaces and drop-in replacements for Faiss and cuVS to facilitate its integration into existing systems. We evaluate OctEx on nine datasets of up to one billion vectors, where it outperforms the state-of-the-art GPU graph systems and inverted file indexes at every recall from 0.95 to 0.995, by up to 46.4 × over CAGRA and by 5.4 × to 343 × over the other baselines. 12 References 
+
+[1] ABBAS , A., T IRUMALA , K., S IMIG , D., G ANGULI , S., AND MOR -
+
+> COS
+
+, A. S. SemDeDup: Data-efficient learning at web-scale through semantic deduplication. arXiv preprint arXiv:2303.09540 (2023). [2] ADINETS , A., AND MERRILL , D. Onesweep: A Faster Least Signif-icant Digit Radix Sort for GPUs. arXiv preprint arXiv:2206.01784 
+
+(2022). [3] AGRELL , E., E RIKSSON , T., V ARDY , A., AND ZEGER , K. Closest Point Search in Lattices. IEEE Transactions on Information Theory 48 ,8 (aug 2002), 2201–2214. [4] ANDONI , A., AND INDYK , P. Near-Optimal Hashing Algorithms for Approximate Nearest Neighbor in High Dimensions. Communications of the ACM 51 , 1 (2008), 117–122. [5] ARYA , S., M ALAMATOS , T., AND MOUNT , D. M. Space-Time Trade-offs for Approximate Nearest Neighbor Searching. Journal of the ACM 57 , 1 (2009), 1:1–1:54. [6] ASHKIANI , S., F ARACH -C OLTON , M., AND OWENS , J. D. A Dy-namic Hash Table for the GPU. In 2018 IEEE International Parallel and Distributed Processing Symposium (IPDPS) (2018), pp. 419–429. [7] AUMÜLLER , M., B ERNHARDSSON , E., AND FAITHFULL , A. ANN-Benchmarks: A benchmarking tool for approximate nearest neighbor algorithms. Information Systems 87 (2020), 101374. [8] BABENKO , A., AND LEMPITSKY , V. The inverted multi-index. In 
+
+2012 IEEE Conference on Computer Vision and Pattern Recognition 
+
+(2012), pp. 3069–3076. [9] BABENKO , A., AND LEMPITSKY , V. Efficient Indexing of Billion-Scale Datasets of Deep Descriptors. In Proceedings of the IEEE Con-ference on Computer Vision and Pattern Recognition (CVPR) (2016), pp. 2055–2063. [10] BATCHER , K. E. Sorting Networks and Their Applications. In Proceed-ings of the AFIPS Spring Joint Computer Conference (1968), pp. 307– 314. [11] BEYER , K., G OLDSTEIN , J., R AMAKRISHNAN , R., AND SHAFT , U. When Is “Nearest Neighbor” Meaningful? In Database Theory – ICDT’99 (1999), vol. 1540 of Lecture Notes in Computer Science ,pp. 217–235. [12] CHEN , Q., Z HAO , B., W ANG , H., L I, M., L IU , C., L I, Z., Y ANG , M.,  
+
+> AND
+
+WANG , J. SPANN: Highly-efficient Billion-scale Approximate Nearest Neighborhood Search. In Advances in Neural Information Processing Systems (NeurIPS) (2021), vol. 34, pp. 5199–5212. [13] CONWAY , J. H., AND SLOANE , N. J. A. Fast Quantizing and Decoding Algorithms for Lattice Quantizers and Codes. IEEE Transactions on Information Theory 28 , 2 (mar 1982), 227–232. [14] CONWAY , J. H., AND SLOANE , N. J. A. Sphere Packings, Lattices and Groups , 3rd ed., vol. 290 of Grundlehren der mathematischen Wissenschaften . Springer, New York, 1999. [15] DATAR , M., I MMORLICA , N., I NDYK , P., AND MIRROKNI , V. S. Locality-Sensitive Hashing Scheme Based on p-Stable Distributions. In Proceedings of the Twentieth Annual Symposium on Computational Geometry (SoCG) (2004), pp. 253–262. [16] DAVIDSON , A., B AXTER , S., G ARLAND , M., AND OWENS , J. D. Work-Efficient Parallel GPU Methods for Single-Source Shortest Paths. In Proceedings of the IEEE 28th International Parallel and Distributed Processing Symposium (IPDPS) (2014), pp. 349–359. [17] DONG , W., C HARIKAR , M., AND LI, K. Efficient k-Nearest Neighbor Graph Construction for Generic Similarity Measures. In Proceedings of the 20th International Conference on World Wide Web (WWW) (2011), pp. 577–586. [18] DOUZE , M., G UZHVA , A., D ENG , C., J OHNSON , J., S ZILVASY , G., MAZARÉ , P.-E., L OMELI , M., H OSSEINI , L., AND JÉGOU , H. The Faiss Library. IEEE Transactions on Big Data 12 , 2 (2026), 346–361. [19] FU, C., X IANG , C., W ANG , C., AND CAI , D. Fast Approximate Nearest Neighbor Search with the Navigating Spreading-out Graph. 
+
+Proceedings of the VLDB Endowment 12 , 5 (2019), 461–474. [20] GAIHRE , A., Z HENG , D., W EITZE , S., L I, L., S ONG , S. L., D ING , C., LI, X. S., AND LIU , H. Dr. Top-k: Delegate-Centric Top-k on GPUs. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (SC) (2021), pp. 1–13. [21] GAN , J., F ENG , J., F ANG , Q., AND NG, W. Locality-Sensitive Hashing Scheme Based on Dynamic Collision Counting. In Proceedings of the 2012 ACM SIGMOD International Conference on Management of Data (SIGMOD) (may 2012), ACM, pp. 541–552. [22] GAO , J., AND LONG , C. RaBitQ: Quantizing High-Dimensional Vec-tors with a Theoretical Error Bound for Approximate Nearest Neighbor Search. Proceedings of the ACM on Management of Data 2 , 3 (2024), 167:1–167:27. [23] GE, T., H E, K., K E, Q., AND SUN , J. Optimized Product Quantization for Approximate Nearest Neighbor Search. In IEEE Conference on Computer Vision and Pattern Recognition (CVPR) (2013), pp. 2946– 2953. [24] GREEN , O., M CCOLL , R., AND BADER , D. A. GPU Merge Path: A GPU Merging Algorithm. In Proceedings of the 26th ACM Interna-tional Conference on Supercomputing (ICS) (2012), pp. 331–340. [25] GROH , F., R UPPERT , L., W IESCHOLLEK , P., AND LENSCH , H. P. A. GGNN: Graph-Based GPU Nearest Neighbor Search. IEEE Transac-tions on Big Data 9 , 1 (2023), 267–279. [26] GUO , H., AND LU, Y. Achieving Low-Latency Graph-Based Vector Search via Aligning Best-First Search Algorithm with SSD. In 19th USENIX Symposium on Operating Systems Design and Implementation (OSDI 25) (Boston, MA, jul 2025), USENIX Association, pp. 171–186. [27] GUO , R., L UAN , X., X IANG , L., Y AN , X., Y I, X., L UO , J., C HENG ,Q., X U, W., L UO , J., L IU , F., C AO , Z., Q IAO , Y., W ANG , T., T ANG ,B., AND XIE , C. Manu: A Cloud Native Vector Database Management System. Proceedings of the VLDB Endowment 15 , 12 (2022), 3548– 3561. [28] GUPTA , K., S TUART , J. A., AND OWENS , J. D. A Study of Persistent Threads Style GPU Programming for GPGPU Workloads. In Innovative Parallel Computing (InPar) (2012), pp. 1–14. [29] HAR -P ELED , S. A Replacement for Voronoi Diagrams of Near Linear Size. In Proceedings of the 42nd IEEE Symposium on Foundations of Computer Science (FOCS) (2001), pp. 94–103. [30] HONG , S., K IM , S. K., O GUNTEBI , T., AND OLUKOTUN , K. Accel-erating CUDA Graph Algorithms at Maximum Warp. In Proceedings of the 16th ACM Symposium on Principles and Practice of Parallel Programming (PPoPP) (2011), pp. 267–276. [31] HUANG , Q., F ENG , J., Z HANG , Y., F ANG , Q., AND NG, W. Query-Aware Locality-Sensitive Hashing for Approximate Nearest Neighbor Search. Proceedings of the VLDB Endowment 9 , 1 (sep 2015), 1–12. [32] HUANG , Y., M A, B., S UN , Y., S HI , Y., C HEN , X., Z HONG , X., W ANG ,Z., H U, Y., X U, E., AND WENG , C. The Clustering Strikes Back: Building Cost-Effective and High-Performance ANNS at Scale with Helmsman. In 20th USENIX Symposium on Operating Systems De-sign and Implementation (OSDI 26) (Seattle, WA, jul 2026), USENIX Association, pp. 1623–1639. [33] INDYK , P., AND MOTWANI , R. Approximate Nearest Neighbors: Towards Removing the Curse of Dimensionality. In Proceedings of the 30th Annual ACM Symposium on Theory of Computing (STOC) (1998), pp. 604–613. [34] JAYARAM SUBRAMANYA , S., D EVVRIT , K ADEKODI , R., K RISH -
+
+> NASWAMY
+
+, R., AND SIMHADRI , H. V. DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node. In Advances in Neural Information Processing Systems (NeurIPS) (2019), vol. 32. 
+
+13 [35] JÉGOU , H., A MSALEG , L., S CHMID , C., AND GROS , P. Query Adap-tative Locality Sensitive Hashing. In Proceedings of the IEEE In-ternational Conference on Acoustics, Speech and Signal Processing (ICASSP) (mar 2008), pp. 825–828. [36] JEGOU , H., T AVENARD , R., D OUZE , M., AND AMSALEG , L. Search-ing in one billion vectors: Re-rank with source coding. In 2011 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP) (2011), pp. 861–864. [37] JOHNSON , J., D OUZE , M., AND JÉGOU , H. Billion-Scale Similarity Search with GPUs. IEEE Transactions on Big Data 7 , 3 (2019), 535– 547. [38] JOHNSON , W. B., AND LINDENSTRAUSS , J. Extensions of Lipschitz mappings into a Hilbert space. Contemporary Mathematics 26 (1984), 189–206. [39] JÉGOU , H., D OUZE , M., AND SCHMID , C. Product Quantization for Nearest Neighbor Search. IEEE Transactions on Pattern Analysis and Machine Intelligence 33 , 1 (2011), 117–128. [40] KARPUKHIN , V., O ˘GUZ , B., M IN , S., L EWIS , P., W U, L., E DUNOV ,S., C HEN , D., AND TAU YIH , W. Dense Passage Retrieval for Open-Domain Question Answering. In Proceedings of the 2020 Confer-ence on Empirical Methods in Natural Language Processing (EMNLP) 
+
+(2020), pp. 6769–6781. [41] KHATTAB , O., AND ZAHARIA , M. ColBERT: Efficient and Effec-tive Passage Search via Contextualized Late Interaction over BERT. In Proceedings of the 43rd International ACM SIGIR Conference on Research and Development in Information Retrieval (2020), pp. 39–48. [42] KIM , S., P ARK , S., N OH , S. U., H ONG , J., K WON , T., L IM , H., AND 
+
+LEE , J. PathWeaver: A High-Throughput Multi-GPU System for Graph-Based Approximate Nearest Neighbor Search. In 2025 USENIX Annual Technical Conference (USENIX ATC 25) (2025), pp. 1501– 1517. [43] KWON , W., Y U, G.-I., J EONG , E., AND CHUN , B.-G. Nimble: Lightweight and Parallel GPU Task Scheduling for Deep Learning. In 
+
+Advances in Neural Information Processing Systems (NeurIPS) (2020), vol. 33, pp. 8343–8354. [44] LEWIS , P., P EREZ , E., P IKTUS , A., P ETRONI , F., K ARPUKHIN ,V., G OYAL , N., K ÜTTLER , H., L EWIS , M., TAU YIH , W., R OCK -
+
+> TÄSCHEL
+
+, T., R IEDEL , S., AND KIELA , D. Retrieval-Augmented Gen-eration for Knowledge-Intensive NLP Tasks. In Advances in Neural Information Processing Systems (NeurIPS) (2020), vol. 33, pp. 9459– 9474. [45] LOWE , D. G. Distinctive Image Features from Scale-Invariant Key-points. International Journal of Computer Vision 60 , 2 (2004), 91–110. [46] LV, Q., J OSEPHSON , W., W ANG , Z., C HARIKAR , M., AND LI, K. Multi-Probe LSH: Efficient Indexing for High-Dimensional Similarity Search. In Proceedings of the 33rd International Conference on Very Large Data Bases (VLDB) (2007), pp. 950–961. [47] MALKOV , Y. A., AND YASHUNIN , D. A. Efficient and Robust Approx-imate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs. IEEE Transactions on Pattern Analysis and Machine Intelligence 42 , 4 (2020), 824–836. [48] MERRILL , D., G ARLAND , M., AND GRIMSHAW , A. Scalable GPU Graph Traversal. In Proceedings of the 17th ACM SIGPLAN Sympo-sium on Principles and Practice of Parallel Programming (PPoPP) 
+
+(2012), pp. 117–128. [49] NGUYEN , T., R OSENBERG , M., S ONG , X., G AO , J., T IWARY , S., MAJUMDER , R., AND DENG , L. MS MARCO: A Human Generated MAchine Reading COmprehension Dataset. In Proceedings of the Workshop on Cognitive Computation: Integrating Neural and Symbolic Approaches, co-located with NeurIPS 2016 (2016), vol. 1773 of CEUR Workshop Proceedings , p. Paper 9. [50] NVIDIA. cuVS: Vector Search and Clustering on the GPU, 2026. Version 26.10. [51] NVIDIA C ORPORATION . CUDA C++ Programming Guide: CUDA Graphs, 2025. [52] OLIVA , A., AND TORRALBA , A. Modeling the Shape of the Scene: A Holistic Representation of the Spatial Envelope. International Journal of Computer Vision 42 , 3 (2001), 145–175. [53] OOTOMO , H., N ARUSE , A., N OLET , C., W ANG , R., F EHER , T., AND 
+
+WANG , Y. CAGRA: Highly Parallel Graph Construction and Approxi-mate Nearest Neighbor Search for GPUs. In 2024 IEEE 40th Interna-tional Conference on Data Engineering (ICDE) (2024), pp. 4236–4247. [54] OQUAB , M., D ARCET , T., M OUTAKANNI , T., V O, H., S ZAFRANIEC ,M., K HALIDOV , V., F ERNANDEZ , P., H AZIZA , D., M ASSA , F., E L-NOUBY , A., A SSRAN , M., B ALLAS , N., G ALUBA , W., H OWES , R., HUANG , P.-Y., L I, S.-W., M ISRA , I., R ABBAT , M., S HARMA , V., SYNNAEVE , G., X U, H., J EGOU , H., M AIRAL , J., L ABATUT , P., JOULIN , A., AND BOJANOWSKI , P. DINOv2: Learning Robust Vi-sual Features without Supervision. Transactions on Machine Learning Research (2024). [55] PAN , J., AND MANOCHA , D. Fast GPU-Based Locality Sensitive Hashing for k-Nearest Neighbor Computation. In Proceedings of the 19th ACM SIGSPATIAL International Conference on Advances in Geo-graphic Information Systems (GIS) (2011), pp. 211–220. [56] REIMERS , N., AND GUREVYCH , I. Sentence-BERT: Sentence Em-beddings using Siamese BERT-Networks. In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP) (2019), pp. 3982–3992. [57] RUSSAKOVSKY , O., D ENG , J., S U, H., K RAUSE , J., S ATHEESH , S., MA, S., H UANG , Z., K ARPATHY , A., K HOSLA , A., B ERNSTEIN , M., BERG , A. C., AND FEI -F EI , L. ImageNet Large Scale Visual Recog-nition Challenge. International Journal of Computer Vision 115 , 3 (2015), 211–252. [58] SANH , V., D EBUT , L., C HAUMOND , J., AND WOLF , T. DistilBERT, a distilled version of BERT: smaller, faster, cheaper and lighter. arXiv preprint arXiv:1910.01108 (2019). [59] SATISH , N., H ARRIS , M., AND GARLAND , M. Designing Efficient Sorting Algorithms for Manycore GPUs. In 2009 IEEE International Symposium on Parallel & Distributed Processing (2009), pp. 1–10. [60] SHI , J., G AO , J., X IA , J., F EHÉR , T. B., AND LONG , C. GPU-Native Approximate Nearest Neighbor Search with IVF-RaBitQ: Fast Index Build and Search. Proceedings of the VLDB Endowment 19 , 11 (2026), 3454–3467. [61] SIMHADRI , H. V., W ILLIAMS , G., A UMÜLLER , M., D OUZE , M., BABENKO , A., B ARANCHUK , D., C HEN , Q., H OSSEINI , L., K RISH -
+
+> NASWAMY
+
+, R., S RINIVASA , G., J AYARAM SUBRAMANYA , S., AND 
+
+WANG , J. Results of the NeurIPS’21 Challenge on Billion-Scale Ap-proximate Nearest Neighbor Search. In Proceedings of the NeurIPS 2021 Competitions and Demonstrations Track (2022), vol. 176 of Pro-ceedings of Machine Learning Research , PMLR, pp. 177–189. [62] SUN , P., S IMCHA , D., D OPSON , D., G UO , R., AND KUMAR , S. SOAR: Improved Indexing for Approximate Nearest Neighbor Search. In Advances in Neural Information Processing Systems (NeurIPS) 
+
+(2023), vol. 36, pp. 3189–3204. [63] TIAN , B., L IU , H., T ANG , Y., X IAO , S., D UAN , Z., L IAO , X., J IN , H., ZHANG , X., Z HU , J., AND ZHANG , Y. Towards High-throughput and Low-latency Billion-scale Vector Search via CPU/GPU Collaborative Filtering and Re-ranking. In 23rd USENIX Conference on File and Storage Technologies (FAST 25) (2025), pp. 171–185. [64] VENKATASUBBA , K., K HAN , S., S INGH , S., S IMHADRI , H. V., AND 
+
+VEDURADA , J. BANG: Billion-Scale Approximate Nearest Neighbour Search Using a Single GPU. IEEE Transactions on Big Data 11 , 6 (2025), 3142–3157. [65] VIAZOVSKA , M. S. The Sphere Packing Problem in Dimension 8. 
+
+Annals of Mathematics 185 , 3 (2017), 991–1015. 
+
+14 [66] WANG , J., Y I, X., G UO , R., J IN , H., X U, P., L I, S., W ANG , X., G UO ,X., L I, C., X U, X., Y U, K., Y UAN , Y., Z OU , Y., L ONG , J., C AI , Y., LI, Z., Z HANG , Z., M O, Y., G U, J., J IANG , R., W EI , Y., AND XIE ,C. Milvus: A Purpose-Built Vector Data Management System. In 
+
+Proceedings of the 2021 ACM SIGMOD International Conference on Management of Data (2021), pp. 2614–2627. [67] WANG , M., X U, W., Y I, X., W U, S., P ENG , Z., K E, X., G AO , Y., XU, X., G UO , R., AND XIE , C. Starling: An I/O-Efficient Disk-Resident Graph Index Framework for High-Dimensional Vector Simi-larity Search on Data Segment. Proceedings of the ACM on Manage-ment of Data 2 , 1 (2024), 42:1–42:27. [68] WANG , Y., D AVIDSON , A., P AN , Y., W U, Y., R IFFEL , A., AND 
+
+OWENS , J. D. Gunrock: A High-Performance Graph Processing Li-brary on the GPU. ACM SIGPLAN Notices 50 , 8 (2015), 265–266. [69] WANG , Y., S HRIVASTAVA , A., W ANG , J., AND RYU , J. Randomized Algorithms Accelerated over CPU-GPU for Ultra-High Dimensional Similarity Search. In Proceedings of the 2018 International Conference on Management of Data (SIGMOD) (2018), pp. 889–903. [70] WEI , J., L EE , X., L IAO , Z., P ALPANAS , T., AND PENG , B. Subspace Collision: An Efficient and Accurate Framework for High-dimensional Approximate Nearest Neighbor Search. Proceedings of the ACM on Management of Data (SIGMOD) 3 , 1 (feb 2025), 1–29. [71] ZHAO , H., H E, J., Z ENG , J., D ONG , M., AND DU, D. Disentangling Graph Dependencies for Efficient Billion-Scale GPU Vector Search. In 20th USENIX Symposium on Operating Systems Design and Imple-mentation (OSDI 26) (2026), pp. 1563–1584. [72] ZHAO , W., T AN , S., AND LI, P. SONG: Approximate Nearest Neigh-bor Search on GPU. In 2020 IEEE 36th International Conference on Data Engineering (ICDE) (2020), pp. 1033–1044. 
+
+15
