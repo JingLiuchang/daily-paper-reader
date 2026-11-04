@@ -51,12 +51,12 @@
       <span class="dpr-home-dashboard-kicker">2026-11-03</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 35 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 33 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>3 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>19</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>16</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>18</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>15</dd></div>
   </dl>
   <p class="dpr-home-dashboard-body">最近更新：2026-11-04 01:08:46 UTC<br>状态：成功</p>
 </section>
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今天完成日报：共收录35篇，精读19篇、速读16篇。最值得看的是两篇9.0分的精读：ACTIVE用动态帕累托前沿做双向量查询统一索引，另一篇讲邻近图索引的无损压缩，以加速近似最近邻搜索。普通读者可先看这两篇精读，再按需翻看KITE、O2N2等8.0分速读。</p>
+<p>合并同一论文的不同版本后，共 33 篇，精读 18 篇、速读 15 篇。历史文章链接与阅读记录保留。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +78,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">19 篇</strong>
+    <strong class="dpr-home-dashboard-count">18 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
 <ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="ACTIVE: A Dynamic Pareto-Frontier-Based Unified Index for Dual-Vector Query">ACTIVE: A Dynamic Pareto-Frontier-Based Unified Index for Dual-Vector Query</span></li><li><span class="dpr-home-dashboard-paper-title" title="Lossless Compression of Proximity Graph Indexes for Efficient Approximate Nearest Neighbors Search">Lossless Compression of Proximity Graph Indexes for Efficient Approximate Nearest Neighbors Search</span></li><li><span class="dpr-home-dashboard-paper-title" title="Fast Approximate Line Nearest Neighbor Search">Fast Approximate Line Nearest Neighbor Search</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>8</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>6</strong></span><span class="dpr-home-dashboard-tag">vector-db <strong>4</strong></span><span class="dpr-home-dashboard-tag">vq-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>7</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>6</strong></span><span class="dpr-home-dashboard-tag">vector-db <strong>4</strong></span><span class="dpr-home-dashboard-tag">vq-ann <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +91,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">16 篇</strong>
+    <strong class="dpr-home-dashboard-count">15 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
 <ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="KITE: Retrieval as a Decision Procedure for Long-Term Conversational Memory">KITE: Retrieval as a Decision Procedure for Long-Term Conversational Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="O2N2: Efficient Doubly Oblivious Approximate Nearest Neighbor Search">O2N2: Efficient Doubly Oblivious Approximate Nearest Neighbor Search</span></li><li><span class="dpr-home-dashboard-paper-title" title="Read the Route: Attention-Steered Hypergraph Retrieval for Multi-hop RAG">Read the Route: Attention-Steered Hypergraph Retrieval for Multi-hop RAG</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>13</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>2</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>12</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>2</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 </div>
 
