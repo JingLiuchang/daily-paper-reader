@@ -1,0 +1,1431 @@
+Title: Turbocharging PiPNN for Proximity and k-NN Graph Building
+
+URL Source: https://arxiv.org/pdf/2611.05690v1
+
+Published Time: Thu, 05 Nov 2026 01:30:07 GMT
+
+Number of Pages: 27
+
+Markdown Content:
+# Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+## Tobias Rubel 
+
+UMD College Park, USA trubel@umd.edu 
+
+## Richard Wen 
+
+UMD College Park, USA rwen1@umd.edu 
+
+## Guy Blelloch 
+
+CMU and Google Research Pittsburgh, USA blelloch@cs.cmu.edu 
+
+## Laxman Dhulipala 
+
+UMD and Google Research College Park, USA laxman@umd.edu 
+
+## Lars Gottesbüren 
+
+Google Research Zürich, Switzerland gottesbueren@google.com 
+
+## Jakub Łącki 
+
+Google Research New York City, USA jlacki@google.com 
+
+## Vahab Mirrokni 
+
+Google Research New York City, USA mirrokni@google.com 
+
+Abstract 
+
+Graph-based Approximate Nearest Neighbor Search (ANNS) in-dexes such as HNSW and Vamana deliver state-of-the-art query performance at the cost of large indexing times. The recently in-troduced PiPNN method drastically accelerated index construction by way of a partitioning-based algorithm which leverages efficient dense matrix multiplication and top-k aggregation kernels. In this paper, we unlock the full potential of PiPNN’s hardware-friendly algorithm design. We introduce PiPNN II, which optimizes multiple steps of the PiPNN recipe, giving up to 8 × speedups for graph-based ANNS index construction. In addition, we present GPiPNN, a GPU implementation of PiPNN, which builds compa-rable ANNS indices up to 43 .7× faster than Jasper and up to 50 ×
+
+faster than CAGRA. We also extend PiPNN II and GPiPNN to com-pute high-quality 𝑘 -nearest-neighbor ( 𝑘 -NN) graphs directly, which unlocks massive speedups over methods used in many existing sys-tems for clustering, anomaly detection, and more. For 10-NN graph building at 90% recall, we obtain up to a 13 × speedup on CPUs and 6.6× on GPUs as compared to the prior best methods. PiPNN II can build a billion-scale 10-NN graph in under 16 minutes. Common to both PiPNN II and GPiPNN is the use of quantization 
+
+to reduce memory traffic and leverage fast low-precision matrix operations. Top-𝐾 emerges as a new bottleneck, which we optimize by specializing the code to the specific 𝐾 , as well as fusing with the matrix kernel to avoid materializing the distance matrix to memory. For CPUs, we demonstrate further performance improvements by leveraging our matrix kernels in the RobustPrune procedure originally proposed in Vamana and used in PiPNN. On GPUs, we flatten recursive partitioning into segmented batches, use one fused top-𝐾 abstraction for partitioning and leaf scoring, and prune with already-witnessed direct edges rather than a new candidate-to-candidate scoring pass. 
+
+1 Introduction 
+
+Vector embeddings power modern search, recommendation, entity resolution, and retrieval-augmented generation systems [22, 36, 37, 45, 55, 65, 69]. These systems rely on approximate nearest-neighbor search (ANNS) because exact search is prohibitively expensive and small errors are tolerable. Graph-based indexes such as HNSW, Vamana (DiskANN), and NSG have become the standard for high-recall, low-latency ANNS [17, 30, 40]. Unfortunately, their excellent query performance has come at the cost of slow index construc-tion: building a high-quality search graph (also termed “proximity OpenAI DataComp WikiCohere MS-Arctic                     
+
+> 020 40 60 80
+> Build-time speedup
+> 78 55 77 58 9.5 7.8 12 11 11 9.2 8.8 5.6 1.0 1.0 1.0 1.0
+> CPU: speedup over Vamana-F32
+> Wiki-Qwen OpenAI DBpedia-3072 DEEP-10M
+> 010 20 30 40 50
+> 18 27 21 50 1.4 1.3 0.47 13 1.0 1.0 1.0 1.0
+> GPU: speedup over CAGRA
+> PiPNN II PiPNN Vamana-Q Vamana-F32 gPiPNN Jasper CAGRA
+
+Figure 1: Index-build speedup of PiPNN II and GPiPNN over well-optimized baselines. Left: CPU speedup of PiPNN II over unquantized Vamana. Right: GPU speedup of GPiPNN over CAGRA. 
+
+graph”) over a large dataset has historically required many hours or even days of compute on powerful multi-core machines [41]. Fast index construction is not merely a convenience: build time is often a major factor in the total cost of the system. Indexes must be rebuilt as data drifts, parameters need to be tuned across datasets, and ANNS appears as an inner loop in fundamental tasks including accelerated 𝑘 -means [60], hierarchical clustering [12, 67], minimum spanning trees, and single-linkage clustering [1, 3, 5, 7]. Small modifications to graph-index construction also yield high-quality 𝑘 -NN graphs [8], a primitive that we directly target in this paper. An indexing method that takes hours or days is simply unusable in many modern workflows. The recently introduced Pick-in-Partitions Nearest Neighbors (PiPNN) method significantly speeds up high-quality index con-struction by replacing build-time graph search with regular partition-local scoring work [56]. It recursively partitions the input vectors into small overlapping collections (termed “leaves”), generates candidate edges through batched all-pairs distance com-parisons and top-𝐾 aggregation inside each leaf, and streams those candidates through an online history-independent pruning procedure (HashPrune) to retain sparsity. The bulk of PiPNN’s construction is comprised of all-to-all comparisons over small, cache-resident sets of vectors; an operation far more amenable to modern hardware than the irregular pointer-chasing of incremen-tal graph construction [17, 30, 40]. The payoff of this approach is that the existing version of PiPNN is up to 11 .6× faster than arXiv:2611.05690v1 [cs.DB] 3 Nov 2026 Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 
+
+the ParlayANN implementation of Vamana on CPU and produces indexes with equivalent QPS-recall performance [56]. Despite these significant improvements in build times, the first version of PiPNN fails to leverage modern hardware to its full potential. For instance, it keeps vectors in full-precision float32 form to perform GEMM (General Matrix Multiply) and materializes the full distance matrices to memory to perform per-row top-𝑘 
+
+reduction. In this paper we significantly optimize the entire ap-proach from first principles. We start by leveraging quantization 
+
+to replace the full-precision vectors with compact integer codes that are cheaper to compare [14, 27, 32, 35, 41, 61]. Quantizing the vectors not only speeds up memory accesses, but it also enables low-precision multiply-accumulate instructions. Decoding cost may seem concerning at first glance, but is easily amortized over many distance computations. Lastly, we fuse the GEMM kernel with top-k reduction in register, to avoid materializing an 𝑀 × 𝑁 distance ma-trix to memory. While fused distance computation and in-register 
+
+𝑘 -selection are established in GPU similarity search [14, 32], our contribution is a family of compressed-domain kernels specialized to PiPNN’s leader-assignment and leaf-processing shapes and in-stantiated across CPUs and GPUs. The aforementioned opportunity and challenge carries over to hardware acceleration using GPUs. Compared to existing GPU ANNS systems [42, 50] which struggle to leverage the full potential of the hardware due to relying on either beam search or iterative refinement on graphs, PiPNN’s batched many-to-many structure is an ideal fit for tensor cores. However, implementing PiPNN on GPUs presents non-trivial challenges: PiPNN’s recursive partition-ing produces irregularly-sized subproblems whose control flow is not handled well by the GPU scheduler and must be flattened into uniform passes; the vectors needed for each local comparison are scattered in device memory and must be gathered into dense batches; and the HashPrune reservoirs for each point must be maintained without the use of locks. 
+
+In this paper we realize the full potential of PiPNN by carefully restructuring PiPNN’s construction pipeline around fused quantized batched top-𝐾 kernels . We instantiate this de-sign on both shared memory CPU systems ( PiPNN II 1) as well as GPUs ( GPiPNN ), thus cashing in on the promise for hardware-accelerated ANNS builds within the PiPNN framework. Our results show that our GEMM kernels take full advantage of the hardware: the CPU score-and-select kernels run near instruction through-put roofline, whereas the corresponding GPU kernels are memory bound for high-dimensional vectors typical of modern embeddings. On GPUs, PiPNN flattens the recursion used in PiPNN’s par-titioning routines by refactoring them as radix sorts over leader-assignment keys. In addition, it processes multiple collections of points in a single kernel using a segmented top-𝐾 primitive, which ameliorates workload imbalances. Finally, it avoids a costly final prune, by way of a novel DirectEdgePrune over the cached dis-tances in the HashPrune structure. Our extensive experimental study establishes PiPNN II and GPiPNN as the new state of the art for proximity-graph index construction on CPUs and GPUs, delivering large speedups over the strongest prior methods while preserving high-recall query 
+
+> 1Pronounced “Pippin the second”.
+
+performance. On CPUs, PiPNN II builds indexes up to 8× faster than PiPNN and substantially outperforms all prior graph-based ANNS builders on the datasets we evaluate. On GPUs, GPiPNN achieves speedups of up to 43 .7× over Jasper and 50 × over CA-GRA across a diverse benchmark of text, image, and text-to-image datasets, while matching or exceeding their query throughput at high recall. On CPU, we show that our new methods enable the construction of billion-point graph indexes on a single machine in under 10 minutes, as opposed to hours for prior best methods. Beyond proximity-graph construction, we show that the same methods produce high-quality 𝑘 -NN graphs (a connection between partitioning-based construction and 𝑘 -NN graphs also briefly noted in prior work [25]), making PiPNN II and GPiPNN state-of-the-art for 𝑘 -NN graph construction as well. At recall10@10 ≥ 0.9, PiPNN II is up to 13 × faster than the best prior CPU 𝑘 -NN builder (Vamana-Q), and GPiPNN is up to 6.6× faster than the best prior GPU 𝑘 -NN builder (cuvs NN-Descent). In summary, the main contributions of this paper are: (1) Highly optimized quantized GEMM fused with top-𝐾 kernels .(2) PiPNN II, a shared-memory CPU implementation lever-aging quantization and our new fused kernels to achieve state-of-the-art index construction and 𝑘 -NN graph build-ing performance. (3) GPiPNN, a GPU implementation of the same method which redesigns the PiPNN framework for excellent performance on modern accelerators. (4) An extensive experimental evaluation spanning twelve datasets across text, image, and text-to-image modalities at scales up to one billion points (one hundred million on GPU), including direct 𝑘 -NN graph construction results, that establishes PiPNN II and GPiPNN as state of the art for fast high-quality ANNS index construction on modern CPUs and GPUs. 
+
+2 Preliminaries and Prior Work 
+
+Approximate Nearest Neighbor Search (ANNS). Let X ⊆ R𝑑 be a collection of 𝑛 vectors and let 𝑑 (· , ·) denote a dissimilarity measure on R𝑑 (e.g. Euclidean distance or the negative of an inner product). Definition 1. (𝑘 -nearest neighbor search) Given a query 𝑞 ∈ R𝑑 ,the 𝑘 -nearest neighbor set of 𝑞 in X is the set K ⊆ X of size 𝑘 ≤ |X| 
+
+containing the 𝑘 points of smallest dissimilarity to 𝑞 :
+
+∀𝑝 ∈ K , ∀𝑝 ′ ∈ X \ K , 𝑑 (𝑞, 𝑝 ) ≤ 𝑑 (𝑞, 𝑝 ′).
+
+We assume K is unique. In ANNS, the goal is to return a set K′
+
+that approximates K as efficiently as possible. Definition 2. (𝑘 @𝑘 ′ recall) Let K be the exact 𝑘 -nearest neighbor set of query 𝑞 and let K′ ⊆ X be a returned set of size 𝑘 ′. The 𝑘 @𝑘 ′
+
+recall of K′ is | K∩K ′ || K | .
+
+We focus on 10@10 recall and use recall to denote this quantity; the recall of a query set 𝑄 is the mean recall over all queries in 𝑄 .
+
+Graph-based ANNS. Graph-based ANNS methods build a sparse 
+
+proximity graph over the points, with outgoing edges to a small set of nearby neighbors. The graph need not exactly equal the 𝑘 -NN graph; it must only be navigable enough that a local search can locate the nearest neighbors. HNSW and Vamana are canonical Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+examples, both constructed via greedy graph traversal [30, 40]. A long line of work has refined proximity-graph constructions [13, 15– 17, 28, 29, 39, 43, 46, 64, 66, 70], developed parallel or disk-resident variants [35, 41, 59], accelerated query-time search [10, 20, 26], and ported graph indexes to GPUs [34, 42, 50]. 
+
+Beam search. The standard graph-query procedure is beam search. It maintains a beam 𝐵 of the 𝐿 best points seen so far; at each step it expands the best unvisited point in 𝐵 , inserting its neighbors into 
+
+𝐵 and truncating back to size 𝐿 . The search terminates when every point in 𝐵 has been expanded, and the final beam is returned or used as candidates for reranking (see code in Appendix A, Algorithm 5). 
+
+The “search bottleneck”. Prior to the introduction of PiPNN, the highest-quality graph indexes were built by searching during con-struction : HNSW and Vamana insert points incrementally, travers-ing the partial index to find candidate neighbors for each point, then pruning for sparsity [30, 40]. This produces excellent graphs but creates a search bottleneck : beam search is rife with random mem-ory accesses and cache misses, so traversal dominates construction time. PiPNN’s partitioning approach breaks altogether from prior solutions which used distance-comparison-skipping heuristics and cheap graph-initialization. It builds indexes up to 11 .6× faster than the efficient ParlayANN implementation of Vamana [41]. 
+
+2.1 Quantization 
+
+Quantization is a lossy compression technique that maps high-precision vectors to a smaller, discrete set of representative points. Broadly speaking, three types of quantization methods are widely-used in the ANNS literature: scalar uniform quantization, which independently maps each vector coordinate to an 𝑋 -bit integer; product quantization, which partitions a vector into subvectors and performs lookups in learned codebooks [23, 31]; and rotation-based quantizers, which apply a random rotation and leverage distributional properties of the rotated vectors, including RaBitQ [18, 19, 21], DRIVE/EDEN [6, 62, 63], and TurboQuant [68]. In this paper, we consider two quantization methods: RSQ8 (rotated scalar quantization with 8 bits per coordinate) and TQ4 , a 4-bit variant of TurboQuant, which we outline next. 
+
+TurboQuant. TurboQuant is a scalar quantizer with non-uniform codebook. It first applies a random rotation and then quantizes each post-rotation coordinate independently with a scalar Lloyd– Max codebook trained against the post-rotation marginal [68]. This achieves near-optimal distortion across bit widths and dimensions, but the resulting inner-product estimator is biased because the MSE-optimal codebook is not matched to the inner-product ob-jective. The original TurboQuant addresses this with a two-stage estimator that applies a 1-bit JL quantizer to the residual to recover an unbiased dot product. 
+
+TurboQuant variant. We adopt TurboQuant’s rotation-plus-scalar-quantizer structure but replace the QJL residual with an extra codebook bit and a per-vector rescaling factor 𝜎 . We first normalize the vector before quantization, so to get the correct dot product, 
+
+𝜎 is the ratio of the original norm to the quantized norm. The estimator multiplies the dot product from the decoded vectors by the two scaling factors 𝜎 𝑞 and 𝜎 𝑑 (for the query and database vectors, respectively). The rotation is done with a Fast Walsh–Hadamard Transform composed with a small random orthogonal matrix, so encoding runs in 𝑂 (𝑑 log 𝑑 ) and is data-oblivious. Post-rotation quantization is done by independently mapping each coordinate to its nearest codebook entry. With TQ-4 we use an int8 version of the codebook scaled to [− 127 , 127 ]. For further details, we refer to the original paper. For the remainder of this paper, the important part is that we can quickly decode vectors from 4-bit to int8 with a 16-entry codebook, in-register using the vpshufb shuffle instruction. A goal of this paper is to develop fast kernels in which the distance computation relies on an integer inner product plus a small per-vector correction. Related quantizers such as RaBitQ, DRIVE, EDEN, [6, 62, 63] all fit this template and could be used instead. We use the TurboQuant variant because it has fast encoding time, and after decoding, maps cleanly onto integer dot-product instructions on CPUs (VNNI) and GPUs (WGMMA); any quantization fitting the template plugs into the same kernels. 
+
+3 PiPNN 
+
+PiPNN ( Pick-in-Partitions Nearest Neighbors , KDD’26) is a recent graph construction algorithm designed to circumvent the build-side search bottleneck of most existing graph-based construction methods [56]. Instead of performing expensive global beam searches to find neighbors, PiPNN localizes the search by partitioning the dataset and generating graph edges within each partition. Alg. 1 gives high-level pseudocode for PiPNN [56], which proceeds in three phases: 
+
+(1) Partition. We build an overlapping partition B = {𝑏 1, . . . , 𝑏 𝑡 }
+
+of X via recursive randomized ball carving until each leaf cluster 
+
+𝑏 𝑖 satisfies 𝐶 𝑚𝑖𝑛 ≤ | 𝑏 𝑖 | ≤ 𝐶 𝑚𝑎𝑥 .
+
+(2) Pick. For each leaf, we compute the within-leaf 𝑘 -NN graph for a very small 𝑘 = 2 and bi-direct it. Because points participate in multiple overlapping leaves, they accumulate a diverse set of candidate edges overall, despite the small local 𝑘 .
+
+(3) Prune. Candidates from different leaves are streamed into a per-point reservoir of size ℓ𝑚𝑎𝑥 using HashPrune to ensure direc-tional diversity, followed by a final RobustPrune pass for sparsifi-cation. 
+
+Algorithm 1: PiPNN 
+
+Input: X a collection of points with dissimilarity measure, 
+
+𝐵𝑃 a collection of hyper-parameters 
+
+Output: 𝐺 = (𝑉 , 𝐸 ) a graph over X 
+
+> 1
+
+G ← (X , ∅) ; 
+
+> 2
+
+B ← Partition( X, 𝐵𝑃 ); 
+
+> 3
+
+for 𝑏 𝑖 ∈ B do in parallel  
+
+> 4
+
+new _edges ← Pick( 𝑏 𝑖 , 𝐵𝑃 ); 
+
+> 5
+
+G. Prune_And_Add_Edges( new _edges ); 
+
+> 6
+
+for 𝑥 ∈ X do in parallel  
+
+> 7
+
+PruneNode( 𝑥 ); 
+
+> 8
+
+return 𝐺 ;Accelerating PiPNN is the primary goal of this paper. In total there are four pieces that dominate the runtime: AssignLeaders 
+
+during Partition, ProcessLeafTop2 during Pick, HashPrune, and 
+
+RobustPrune . The main cost in the first two is many-to-many top-𝑘 
+
+computations over small collections of vectors. Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 
+
+The AssignLeaders Kernel. PiPNN partitions via Randomized Ball Carving (RBC) : given a subproblem P ⊆ X , RBC samples a subset of P𝑠𝑎𝑚𝑝 · |P | points as leaders . Each point in P is assigned to its 𝐹 nearest leaders. This multi-assignment creates the overlap between subproblems. To control the growth of subproblems, 𝐹 
+
+decays geometrically per level (typically from 10 down to 3, and finally 1). RBC recurses on any subproblem exceeding size 𝐶 𝑚𝑎𝑥 .The dominant cost of partitioning is the distance comparisons to score each point against all leaders and retain the top 𝐹 leaders (AssignLeaders kernel). 
+
+The ProcessLeafTop2 Kernel. Within each leaf 𝑏 𝑖 , we compute all |𝑏 𝑖 |2 pairwise distances and extract the top-2 neighbors per point. Each point participates in multiple leaves (typically 30), so a small per-leaf 𝑘 = 2 is sufficient to deliver a diverse set of candidate neigh-bors [56]. Because each pairwise comparison can symmetrically update the top-2 of both endpoints, bi-directing these edges yields on average 4 candidates per point per leaf. ProcessLeafTop2 is typically the bottleneck in PiPNN. 
+
+HashPrune. HashPrune is an online procedure that pre-filters the set of candidate edges generated for each index point. For each point 𝑝 , the goal is to keep neighbors that are spread out in different directions. To achieve this, for each point 𝑝 we maintain a reservoir 
+
+𝑀 𝑝 of capacity ℓ𝑚𝑎𝑥 indexed by an 𝑚 -bit hash. For a candidate 𝑐 ,we define its hash ℎ𝑝 (𝑐 ) = É𝑚 𝑖 =1 1[H 𝑖 · ( 𝑐 − 𝑝 ) ≥ 0] for 𝑚 random hyperplanes H𝑖 , where É denotes the concatenation of bits to form an 𝑚 -bit signature. Mathematically, this projects the direction of the residual vector 𝑐 − 𝑝 onto 𝑚 hyperplanes, partitioning the space around 𝑝 into 2 𝑚 angular cones (sectors). Two candidates 𝑐, 𝑐 ′
+
+fall into the same cone (collide) with probability (1 − 𝜃 /𝜋 )𝑚 , where 
+
+𝜃 is the angle between 𝑐 −𝑝 and 𝑐 ′ −𝑝 . The reservoir 𝑀 𝑝 retains only the single nearest candidate that falls into each cone. Crucially, the final state of the reservoir depends only on the set of candidates and not their arrival order. The PiPNN graph is deterministic, despite streaming candidates in parallel. Pseudocode is in Sec. B. 
+
+RobustPrune. RobustPrune selects a sparse out-neighbor set from a candidate list via a greedy occlusion rule [30]: it repeatedly picks the nearest remaining candidate 𝑝 ∗, adds it as a neighbor, then discards any candidate 𝑝 ′ satisfying 𝛼 · 𝑑 (𝑝 ∗, 𝑝 ′) ≤ 𝑑 (𝑝, 𝑝 ′)—meaning 𝑝 ∗ already “occludes” 𝑝 ′ from 𝑝 . The parameter 𝛼 ≥ 1controls pruning aggressiveness; larger 𝛼 retains more edges and yields denser, more navigable graphs. PiPNN applies a Robust-Prune pass over each reservoir to impose the DiskANN 𝛼 -rule. Because each reservoir is already small ( ≤ ℓ𝑚𝑎𝑥 entries), this pass is relatively cheap compared to graph-based builders that invoke RobustPrune on much larger candidate lists [56]. 
+
+Building 𝑘 -NN Graphs with PiPNN. A by-product of the par-titioning phase is that each point already accumulates a pool of nearby candidates within its leaves, which we can use to produce a 
+
+𝑘 -NN graph directly. Many prior graph-based approaches to build-ing 𝑘 -NN graphs take a build-then-search approach: they first con-struct a full navigable index over X and then issue a beam-search query for each base point, doubling the work and making the query pass dominant. In this paper, we study using PiPNN to retain the top-𝑘 neighbors per point directly from its leaves and skip the search pass entirely. We show in Sec. 6 that this strategy matches the recall of build-and-search at a fraction of the cost, and surpasses NN-Descent which is the most popular method for direct 𝑘 -NN construction. 
+
+4 Quantized and Fused Top-𝐾 CPU Kernels 
+
+The primary bottleneck of PiPNN is computing distances between query points and data points during top-𝑘 assignments (either leaders during partitioning, or leafmates during leaf processing). Naively, this could be done by materializing a large distance ma-trix, which is costly due to writing and subsequently re-reading to post-process the distances, e.g., reducing to the top-𝐾 neighbors. To eliminate this bottleneck, PiPNN II fuses the distance compu-tation with the downstream reduction. Registers with computed distances for a subset of the neighbors in the distance matrix are im-mediately consumed instead of being written out to an explicit dis-tance matrix. In this section we describe the matrix-multiplication structure (Sec. 4.1), then the reduction kernels for partitioning (Sec. 4.2), and finally leaf processing (Sec. 4.3). 
+
+4.1 Vectorized Quantized MatMul Structure 
+
+Overview. In this subsection we describe our core matrix mul-tiplication primitive. Before diving into the technical details, we give a high level overview. Our goal is to enable PiPNN II to work directly over the quantized data. The inputs to the kernel are TQ coordinates, which we decode on-the-fly with an i8 codebook. The loop structure of the matrix multiplication iterates over queries in the outer loop, database points in the middle loop and reduces on dimensionality in the inner loop to obtain the dot product between query and database point. For efficiency, we use SIMD vector instructions to compute par-tial dot products. A SIMD vector register consists of multiple lanes ,where each lane corresponds to one data item, e.g., a 512-bit AVX register holds 16 i32 lanes which can be processed in parallel with a single instruction. The performance driver of our code is a dot-product instruction from VNNI (Vector Neural Network Instruc-tions) which requires us to make some adaptations to the data layout. We give a detailed description of our approach next. 
+
+The Dot Product Instruction. We leverage the 𝑢 8 × 𝑖 8 quad dot product instruction vpdpbusd (AVX-512 VNNI). For concreteness, the instruction computes: 
+
+∀𝑖 ∈ [ 16 ] : acc [𝑖 ] + =
+
+> 3
+
+∑︁ 
+
+> 𝑗 =0
+
+𝑎 [4𝑖 + 𝑗 ] · 𝑏 [4𝑖 + 𝑗 ]
+
+where 𝑎 [𝑘 ] ∈ u8, 𝑏 [𝑘 ] ∈ i8, acc [𝑖 ] ∈ i32, and 𝑖 iterates over the 16 lanes in a 512-bit register. Given two 64-byte registers of u8 
+
+and i8 , it computes 16 parallel 4-dimensional dot products in a single instruction. We use Highway’s SumOfMulQuadAccumulate 
+
+function, which uses vpdpbusd when available and emulates it via widen + pairwise-add instructions ( vpmaddubsw ) on earlier targets (AVX2) [24]. We note that unfortunately there is no equivalent i8 × i8 instruction. 
+
+Multiplying Signed Bytes. Because the vpdpbusd instruction only supports multiplying unsigned bytes ( u8 ) by signed bytes ( i8 ), we cannot directly multiply the signed codes for both the query and data points. We resolve this by shifting database codes by +128 to make them unsigned, multiplying unsigned codes by signed codes, then subtracting the error from the accumulated inner products. Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+Specifically, let ˜ 𝑎 𝑖 be the original signed database byte, 𝑏 𝑖 be the signed query byte, and 𝑎 𝑖 = ˜𝑎 𝑖 + 128 ∈ [ 0, 255 ] be the shifted unsigned database byte. We recover the true signed inner product 
+
+Í ˜𝑎 𝑖 · 𝑏 𝑖 by evaluating Í 𝑎 𝑖 · 𝑏 𝑖 − 128 Í 𝑏 𝑖 .
+
+Data Layout for Vectorization. The quad instruction computes 16 independent 4-dimensional dot products, one per i32 lane, so scoring 16 database points at once requires each lane to hold a different point. A row-major layout stores each point’s coordinates contiguously, which spreads a single point across the lanes rather than 16 distinct points, forcing a costly horizontal reduction per point and one point per instruction. We instead interleave the database into contiguous blocks called panels : a panel groups 𝐿 = 16 database points and a panel tile stores one 4-dimension (quad) coordinate group from each, so 64 consecutive bytes hold the same 4 dimensions across all 16 points (Fig. 2). A panel tile is then scored against a broadcasted query quad in a single instruction, yielding 16 partial dot products, one per lane. 
+
+Loop Structure. We want to perform the inner reduce on the dimensions so that we materialize a finalized dot product after the loop. Hence, we do not have to spill partial dot products to memory before down-stream consumption in the top-𝐾 aggregation. This motivates our loop structure to process queries in the outer loop, database points in the middle, and dimensions in the inner loop, as shown in Algorithm 2. We omit cache tiling as it slightly hurts performance: the inputs are small enough to remain L2-resident. Note that the pseudocode shows the process for computing neg-ative dot products as the distance. When we use L2 distance, we precompute the squared norms of the datapoints to compute L2 from dot product. 
+
+Unrolling. Unrolling over 𝑀 𝑞 = 6 queries at a time amortizes the cost of streaming over the database points repeatedly and exposes instruction-level parallelism; we found 𝑀 𝑞 = 6 to perform best. Unrolling over multiple panels at a time (we found four to perform best) amortizes the cost of loading and broadcasting the 4 query dimensions: because all four panels share the same broadcast of four query bytes, one broadcast instruction serves four vpdpbusd 
+
+instructions instead of one. In the inner loop we thus perform 4 × 𝑀 𝑞 = 24 vpdpbusd instructions per iteration. For simplicity, unrolling is not shown in Alg. 2. The kernels described next share this GEMM core but differ in the epilogue: Sec. 4.2 fuses an asymmetric top-𝐾 reduction, while Sec. 4.3 exploits score symmetry to halve the work. The same GEMM core is reused for the final RobustPrune pass, evaluated in Sec. 6.3. 
+
+4.2 AssignLeaders Kernels 
+
+During each level of partitioning, each point must be assigned to its nearest leader(s)—a batched nearest-neighbor query that the 
+
+AssignLeaders step performs as an asymmetric GEMM with per-query top-𝐾 filtering. The database side (the leaders) is small, so we can pretranspose the leaders once and amortize the cost over many queries. Moreover we can simply parallelize over cache-sized chunks of queries and call the single-threaded GEMM kernel. We inherit the fanout recipe from PiPNN: the number of leaders each point is assigned to is 𝐹 = 10 on the first level, 3 on the second, and 1 on deeper levels. This enables us to specialize the top-𝐾 
+
+aggregation to these specific values. 
+
+Algorithm 2: Simplified Fused GEMM Loop 
+
+Input: Queries Q, Transposed Panels P, Scaling factors 
+
+𝜎 𝑞 , 𝜎 𝑑 
+
+Output: Fused update to Top-𝐾 state  
+
+> 1
+
+for 𝑞 = 0 to 𝑁 𝑞 − 1 do  
+
+> 2
+
+qvec ← Q [ 𝑞 ]; 
+
+> 3
+
+qbias ← Í𝑘 128 · qvec [𝑘 ]; 
+
+> 4
+
+for 𝑝 = 0 to ⌈𝑁 𝑑 /𝐿 ⌉ − 1 do  
+
+> 5
+
+acc ← 0𝐿  
+
+> 6
+
+for 𝑡 = 0 to ⌈𝑑 /4⌉ − 1 do // Reduce dimensions in 4-byte blocks  
+
+> 7
+
+a ← Load SIMD (P [ 𝑝 ] [ 𝑡 ])  
+
+> 8
+
+qv ← Broadcast (qvec [4𝑡 . . . 4𝑡 + 3])  
+
+> 9
+
+acc += SumOfMulQuadAccumulate (a, qv) 
+
+> 10
+
+acc ← acc − Broadcast (qbias ) // u8 bias correction  
+
+> 11
+
+acc ← ConvertToFloat32 (acc ) ⊙ (− 𝝈 𝑑 ) · 𝜎 𝑞 [𝑞 ]
+
+UpdateTopK (state [𝑞 ], acc , panel_indices (𝑝 ))                               
+
+> 31 -18 -644 𝑥 0
+> ...
+> -44 31 18 -18 𝑥 15 159 110 122 172 · · · 84 159 146 110
+> 𝑥 0𝑥 15
+> +128 bias, interleave
+> 𝐿 pts one 𝑊 =64 byte load
+> 51-32𝑞 1
+> 𝑞 2
+> ...
+> 51-32· · · 51-32
+> broadcast
+> 𝑞 ’s 4B,
+> 𝑀𝑞 =6
+> 𝑞 replicated in every lane
+
+vpdpbusd : per lane 𝑗 , 𝑥 𝑗 ·𝑞 (4 ×u8 · 4×i8 → i32 )                                       
+
+> quad 0:𝑎 =[159 ,110 ,122 ,172 ],𝑏 =[5,1,-3,2]
+> Í
+> 𝑘 𝑎 𝑘 𝑏 𝑘 =883 ;˜𝑎 =𝑎 −128 =[31 ,-18 ,-6,44 ]
+> 883 =243
+> |{z} Í
+> 𝑘 ˜𝑎 𝑘 𝑏 𝑘
+> +640
+> |{z}
+> 128 Í
+> 𝑘 𝑏 𝑘
+> →subtract 128 𝑆𝑞
+> i32 output 𝐴 𝑗 =⟨𝑥 𝑗 , 𝑞 ⟩
+> 243 · · · -279
+> 𝑥 0𝑥 15
+> →rescale, top-𝐾
+> 1Transpose to u8 quads 2Broadcast 4 query bytes 3Fused VNNI score →top-𝐾
+
+Figure 2: 16 quads in a panel of the CPU GEMM kernel (AVX-512, 𝐿 = 16 ). 1 The database side is first decoded from Tur-boQuant to u8 using i8 + 128 codebook, then transposed to a 
+
+4𝑥 16 u8 tile. 2 The query side stays row-major and decoded to i8; the matching 4-byte word of one query is broadcast 
+
+into all 𝐿 lanes, then recast to 𝑖 8. 3 One vpdpbusd multiplies the two tiles lane by lane, folding 4 𝐿 byte products into 𝐿 i32 
+
+lanes. After processing all dimensions, lane 0 recovers the true signed dot product 243 for datapoint 0 from the unsigned-by-signed value 883 via the 128 𝑆 𝑞 byte-sum correction (lane 
+
+15 gives −279 ); the epilogue then rescales by 𝜎 𝑞 and 𝜎 𝑑 .
+
+Top-1 ArgMin. For 𝐾 = 1, we use a vector-of-indices approach to ArgMin, which operates in a single pass over the scores of a query without spilling to memory. A score accumulator holds the scores of one query for 𝐿 database points in its lanes. We track the per-lane minimum score and database index in registers. Given the score accumulator for the next panel, we compare lane-wise to Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 
+
+obtain a mask and blend (IfThenElse) the new scores and indices into the running tracker. After all panels, we perform a horizontal reduction across lanes to obtain the actual minimum. 
+
+Displacement sort ( 𝐾 ∈ { 3, 10 }). For 𝐾 = 3 and 𝐾 = 10 we gen-eralize the ArgMin approach to a displacement sort (Alg. 3). The key idea is to track the top-𝐾 per lane independently, deferring the expensive horizontal merge until all panels are processed; this is faster than vectorized QuickSelect for small 𝐾 . We maintain a displacement register d, initialized with the incoming scores. In each of 𝐾 iterations, a lane-wise comparison of d with the current top-𝑖 entry produces a mask, where 𝑖 is the current iteration. Four conditional blends per iteration swap scores and indices between the tracker and the displacement register. If the incoming score beats the 𝑖 -th best, the displaced entry is carried in d into itera-tion 𝑖 +1, where it may in turn displace the (𝑖 +1)-th best. After 𝐾 
+
+iterations, d holds the element that was pushed out of the top-𝐾 .With query unrolling, this still fits in registers for 𝐾 = 3, but for 
+
+𝐾 = 10 the tracker state spills to L1; this is acceptable since the L1 round-trip is negligible relative to the GEMM work and 𝐾 = 10 is called for 𝑛 queries, whereas 𝐾 = 3 is called for 10 𝑛 queries. After the loop over all panels, each of the 𝐾 tracker registers holds 𝐿 independent per-lane candidates. We dump the 𝐾 ·𝐿 scores to a stack buffer and resolve to a per-query top-𝐾 with scalar insertion sort. The scalar work is minimal compared to the GEMM and SIMD top-𝐾 work. 
+
+Algorithm 3: SIMD Displacement Sort Insertion 
+
+Input: Score vector d ∈ R𝐿 
+
+Index vector didx ∈ N𝐿 
+
+Data: Tracker score registers s𝑖 ∈ R𝐿 for 𝑖 ∈ { 0, . . . , 𝐾 − 1}
+
+(updated in place) Tracker index registers i𝑖 ∈ N𝐿 for 𝑖 ∈ { 0, . . . , 𝐾 − 1}
+
+(updated in place)  
+
+> 1
+
+for 𝑖 = 0 to 𝐾 − 1 do  
+
+> 2
+
+mask ← d < s𝑖 // per-lane comparison  
+
+> 3
+
+snew ← IfThenElse (mask , d, s𝑖 ) 
+
+> 4
+
+inew ← IfThenElse (mask , didx , i𝑖 ) 
+
+> 5
+
+d ← IfThenElse (mask , s𝑖 , d) 
+
+> 6
+
+didx ← IfThenElse (mask , i𝑖 , didx ) 
+
+> 7
+
+s𝑖 ← snew  
+
+> 8
+
+i𝑖 ← inew 
+
+4.3 The Leaf Kernel 
+
+The leaf processing step computes a self-join: every point in a leaf serves as both query and database entry, and the kernel finds the top-2 nearest neighbors for each point. Because the similarity relation is symmetric, computing both 𝑑 (𝑖, 𝑗 ) and 𝑑 ( 𝑗, 𝑖 ) is redundant. To halve the distance computations, we restrict our GEMM to the lower triangle of the score matrix and update the top-2 trackers of both points symmetrically. Concretely, for a query batch of 𝑀 𝑞 
+
+consecutive points starting at index 𝑞 0, the kernel only sweeps panels 𝑝 < ⌈( 𝑞 0 + 𝑀 𝑞 )/ 𝐿 ⌉. For each computed score 𝑠 (𝑖, 𝑗 ), we scatter updates to the top-2 states of both query 𝑖 and database point 𝑗 .Let s ∈ R𝐿 denote the vector of rescaled distances between query 𝑞 and the 𝐿 database points in panel 𝑝 , occupying positions 
+
+𝑏, 𝑏 +1, . . . , 𝑏 +𝐿 −1 where 𝑏 = 𝑝 · 𝐿 . We process s in three stages. 
+
+Masking. To enforce the lower-triangular computation and ex-clude out-of-bounds entries, we set s[ℓ] ← +∞ for every lane ℓ
+
+satisfying 𝑏 + ℓ ≥ 𝑞 (eliminating self-distances and pairs already accounted for when 𝑏 + ℓ served as a query) or 𝑏 + ℓ ≥ 𝑛 (padding lanes beyond the point set). After masking, each finite entry s[ℓ]
+
+corresponds to a unique unordered pair {𝑞, 𝑏 +ℓ } with 𝑏 + ℓ < 𝑞 .
+
+Symmetric scatter. We exploit the symmetry 𝑑 (𝑞, 𝑝 ) = 𝑑 (𝑝, 𝑞 ) by updating two independent top-2 trackers with the same score vector. The query-side tracker 𝑇 𝑞 stores scores in registers s0, s1 ∈ R𝐿 and their database-point indices in i0, i1 ∈ N𝐿 ; it tracks the two smallest scores for query 𝑞 and resides entirely in SIMD registers through-out the panel loop, incurring no memory traffic. The database-side tracker 𝑇 𝑑 [𝑏..𝑏 +𝐿 −1] maintains the analogous state for the 𝐿 data-base points in panel 𝑝 . As it is shared across query batches, it is loaded from memory once per panel, updated in-register by all 𝑀 𝑞 
+
+queries in the current batch, and stored back once the batch com-pletes. The unrolling optimization for GEMM benefits the memory traffic here as well. Both trackers are updated via the branchless two-comparison cascade described next. Note that 𝑇 𝑑 uses one lane per database point, updated with the same query id, whereas 𝑇 𝑞 
+
+uses 𝐿 lanes for one query point updated with 𝐿 database points. 
+
+Lane-parallel top-2 insertion. Given the tracker registers s0, s1
+
+and i0, i1 for the running top-2, and an incoming score vector s and index vector idx , the insertion proceeds independently per lane. We first compute two Boolean masks: mask 0 ← s < s0 (indicating new global bests) and mask 1 ← ¬ mask 0 ∧ ( s < s1) (indicating new second-bests). The second-best registers are updated first: if the incoming score beats the current best ( mask 0), the old best is demoted to second; if it beats only the second-best ( mask 1), it replaces the second directly: 
+
+s1 ← IfThenElse (mask 0, s0, IfThenElse (mask 1, s, s1)) , (1) 
+
+i1 ← IfThenElse (mask 0, i0, IfThenElse (mask 1, idx , i1)) ,
+
+followed by the first-best registers: 
+
+s0 ← IfThenElse (mask 0, s, s0), (2) 
+
+i0 ← IfThenElse (mask 0, idx , i0).
+
+Note that eq. (1) must precede eq. (2): when mask 0 is true, the old s0 must be demoted into s1 before being overwritten. All four assignments are branchless IfThenElse blend operations executing in parallel across all lanes without cross-lane communication. Note that this uses six blend instructions: two less than the generic top-2. 
+
+Cross-lane reduction. After the final panel, the 𝐿 lanes of 𝑇 𝑞 hold 
+
+𝐿 independent top-2 pairs. We extract all 2 𝐿 score–index candidates and move them into the database-side tracker using scalar top-2 insertion. The database-side tracker serves as the output. 
+
+5 Accelerating PiPNN on GPUs 
+
+Overview. GPUs are highly effective on tasks where many threads can operate on dense data with regular, contiguous memory access patterns. They provide high throughput for tiled matrix products, bulk copies, reductions, and global sorts. On the other hand, they Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+do poorly on workloads of widely varying size, on recursive calls, and on lock-heavy data structures. As on the CPU, the dominant cost for our GPU implementation of PiPNN II ought to be top-𝐾 computation. GPUs can perform bulk top-𝐾 very efficiently, but the rest of the work performed in PiPNN II — recursive partitioning, HashPrune reservoirs with locks, and the final RobustPrune — are difficult to implement performantly. 
+
+GPU background. GPUs are built from many streaming multi-processors (SMs), the general-purpose cores that run threads. Each SM has a register file (64K 32-bit registers on the H100 we use). It also has a small shared-memory scratchpad, shared by a group of cooperating threads, that we use to stage data that is read fre-quently. For matrix multiplication, the SM provides tensor cores ,units that multiply and accumulate a small tile in a single instruc-tion. Two asynchronous copy engines move data into shared memory without occupying the SM’s compute units so that copies overlap with computation: cp.async performs ordinary per-thread copies from global memory, whereas the Tensor Memory Accelerator ( TMA )copies a whole tile characterized by a copy descriptor containing the base address, shape, stride, and swizzle to be performed. Software groups threads at three levels: a warp is 32 threads that execute in lockstep, the GPU analogue of a SIMD register; a warpgroup is four warps (128 threads) that together issue one tensor-core instruction, 
+
+wgmma ; and a thread block is one or more warps scheduled onto a single SM, sharing its registers and shared memory. We call threads operating within a warp lanes .With this in mind, we change a number of PiPNN’s algorithmic and implementation details to map it onto the GPU. (1) We flatten the recursion into a fixed number of assignment-and-sort rounds (Sec. 5.1). (2) We regularize bucket sizes during partitioning and leaf building into fixed-size work units called score tiles (Sec. 5.2). Each scores a group of queries against a block of database points and maps one-to-one onto a thread block. (3) We compute every distance through a single top-𝐾 primi-tive that scores directly over the vectors without ever ma-terializing a score matrix (Sec. 5.3). This is segmented , in the sense that it is one kernel that computes a top-𝐾 over many independent subproblems of varying size at once. (4) We replace the lock-based HashPrune with sort-and-merge accumulation (Sec. 5.4). This requires a transient buffer bounded by the per-batch slab cap rather than by the full candidate set (Sec. E.9). (5) We replace RobustPrune with a relaxation, Direct-EdgePrune, that reuses already-witnessed distances rather than recomputing them (Sec. 5.5). While DirectEdgePrune produces denser graphs than RobustPrune (Tab. 7), we find that this does not affect index quality. 
+
+5.1 Flattening Recursion 
+
+PiPNN partitions points by recursively assigning each point to one or more leader points. Because recursion is a poor fit for GPUs, we replace the explicit recursion with a fixed number of assignment passes. In each pass, we assign points to their nearest leaders within a given subproblem, then sort by the induced keys. This gives us the same partitioning structure without explicit recursion. More formally, we first sample top-level leaders, assign every point to its 𝑓 0 nearest leaders, then sort the memberships by leader so that each top-level bucket is a contiguous run. Second, within each top-level bucket, we sample bucket-local sub-leaders, assign each member to its 𝑓 1 nearest sub-leaders, and sort again to expose the second-level buckets as contiguous runs. We set the GPiPNN fanout to 𝑓 0 = 8 at the top level and 𝑓 1 = 4 at the second, so each point appears in up to 𝑓 0 · 𝑓 1 = 32 leaf memberships, comparable to the roughly 30 in PiPNN II (Sec. 4.2). Each round costs a device-wide sort. Additional assign-then-sort rounds are possible, but two were adequate to achieve high recall. Fig. 9 reports the effect of recursion depth on index quality. 
+
+5.2 Regularizing Bucket Sizes 
+
+Flattening eliminates recursion from GPiPNN but does not address skew in subproblem sizes: some top-level buckets are large, some second-level buckets exceed the maximum leaf size, and some leaves are nearly empty. Because a GPU runs thousands of thread blocks concurrently and a launch completes only when its slowest block finishes, a kernel whose per-block work tracks this long tail would let a few oversized buckets dominate the launch while many near-empty leaves leave their SMs idle, so utilization collapses toward the worst-case bucket rather than the average. We reshape the un-even buckets into nearly-uniformly-sized leaves, which we process within fixed-size score tiles (Sec. 5.3). 
+
+Reshaping buckets. We reshape both the partitioning buckets and the final leaves the same way. We radix-sort points by bucket id, run-length-encode to recover each bucket’s size, then split over-sized buckets and merge undersized ones to a target size ( ≈ 1024), mirroring the leaf-balancing step of PiPNN [56]. Because the sizes are normalized, one fixed-tile kernel handles every leaf, so we never specialize or relaunch per bucket size. We score each leaf as one segment and launch the leaf kernel on batches of these segments, which keeps the tensor cores occupied and amortizes launch over-head. 
+
+5.3 A Single Fused Segmented Top-𝐾 Primitive 
+
+Overview. We serve every batched top-𝐾 with one primitive that scores over the decoded i8 codes and keeps the top-𝐾 entirely in registers. RSQ8 codes are already i8 and used as-is, while TQ4’s packed 4-bit codes are expanded once through a 16-entry codebook into i8 , so the kernel sees a uniform i8 representation for both (Sec. E.3). We describe that kernel here. 
+
+The tensor-core instruction. We use the warpgroup matrix-multiply instruction wgmma on Hopper tensor cores. Recall that a warpgroup (128 threads) issues one wgmma cooperatively. On the 
+
+i8 codes of a quantized dataset, a single wgmma instruction operates on a tile of 𝑀 = 64 query rows, 𝑁 = 128 database-point columns, and contraction width 𝑊 = 32 bytes, computing 
+
+𝐶 [𝑚, 𝑛 ] + = 
+
+> 𝑊 −1
+
+∑︁  
+
+> 𝑟 =0
+
+𝐴 [𝑚, 𝑟 ] · 𝐵 [𝑟, 𝑛 ], 0 ≤ 𝑚 < 𝑀, 0 ≤ 𝑛 < 𝑁 , 
+
+i.e. multiplying an 𝑀 × 𝑊 tile of query bytes by a 𝑊 × 𝑁 tile of data bytes and accumulating an 𝑀 × 𝑁 block of i32 results. The instruction fixes 𝑀 = 64, while the 𝑁 = 128 width is our tiling choice. The accumulator lives in registers distributed across the Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 
+
+warpgroup. Each lane owns a fixed set of (𝑚, 𝑛 ) cells, and the four lanes that own one output row sit at consecutive lanes of a warp. 
+
+Launch interface. At each launch we pass to the segmented top-𝐾 
+
+kernel the decoded base vectors of the dataset, the per-vector scales 
+
+𝜎 and squared norms, a single dense slab holding the database-point rows of every segment in the launch, and the list of segment descriptors. A descriptor is the tuple (Q 𝑖 , 𝑟 𝑖 , 𝑐 𝑖 , 𝑜 𝑖 ) consisting of the global ids Q𝑖 of its query rows, the first row 𝑟 𝑖 and count 𝑐 𝑖 of its database-point window inside the slab, and the output offset 
+
+𝑜 𝑖 at which we write its top-𝐾 results. Packing all database-point rows into one slab allows faster TMA tile copies from global to shared memory. Because that descriptor covers the whole slab, each segment accesses its rows by offset, and we never rebuild a descriptor per leaf. 
+
+Score tiles. We expand the segment sizes on the host into a list of 
+
+score tiles . A tile 𝑇 = (𝑖, 𝑚 0) pairs segment 𝑖 with a block of 𝑀 = 64 query rows starting at 𝑚 0. A multi-warpgroup variant doubles this to 𝑀 = 128 (Sec. E.4). Each thread block executes one tile: a single warpgroup of 128 threads issues the wgmma s, each computing 64 × 128 × 32 multiply-accumulates over one 32-byte stripe. Because the tile size is fixed, work is assigned to thread blocks statically and evenly, no matter how segment sizes are distributed. A segment is one independent scoring subproblem: a set of queries scored against a contiguous window of database points. A single launch scores many segments at once—one per leaf—for a batch of leaves sized to fill the slab, which is thousands of leaves per launch. 
+
+Fused scoring loop. Each thread block sweeps its segment’s database-point window in tiles of 𝑁 = 128 rows. Within a tile we reduce over the vector dimension 𝑑 in 𝑊 = 32-byte stripes :we stage the next stripe of database-point bytes (and, at high di-mension, query bytes) into shared memory while the tensor cores multiply the current one, keeping a single wgmma group in flight so copies and math overlap. We move bytes into shared memory with asynchronous copies ( cp.async ) or with the TMA engine, neither of which ties up the warps’ registers; we use TMA for the database-point slab in our warp-specialized pipeline and cp.async otherwise (Sec. E.4). When the database-point tile is exhausted, the warpgroup drains the accumulator and runs the epilogue. We never write the 
+
+𝑀 × 𝑁 score block to global memory. Each finished dot product is consumed in registers by the top-𝐾 reduction, as shown in Alg. 4. 
+
+Register top-𝐾 and merge. Our register top-𝐾 mirrors the CPU displacement sort (Sec. 4.2): each lane runs a private top-𝐾 tourna-ment in registers, and we defer the cross-lane merge to the very end. We keep each lane’s running top-𝐾 for a query row in reg-isters, sorted so the best candidate sits in slot 0 and the 𝐾 -th in slot 𝐾 − 1 (pseudocode in Alg. 7). To insert a candidate we first compare it against slot 𝐾 − 1, which rejects anything worse than the current 𝐾 -th best. Otherwise an unrolled compare-swap chain shifts it into place, carrying the displaced entry off the end. Reg-isters cannot be indexed by a value computed at run time, so the top-𝐾 array must live at compile-time-constant slots. If any access were data-dependent, the compiler would spill the array to local memory —slower per-thread storage backed by global memory. In our measurements that spill moved the bottleneck off the matrix product and onto the epilogue, so we fully unroll the insertion to keep every slot access constant. Once the database-point window is 
+
+Algorithm 4: Segmented fused top-𝐾 scoring 
+
+Input: Tile 𝑇 = (𝑖, 𝑚 0); segments/slab; scales/norms; 𝐾 
+
+Output: Per-query sorted top-𝐾 (distance, id) 
+
+Data: 𝑀 ∈ { 64 , 128 }; 𝑁 = 128; 𝑊 = 32 bytes  
+
+> 1
+
+seg ← segment 𝑖 ; 𝑄 ← seg .Q [ 𝑚 0 : 𝑚 0 + 𝑀 ) 
+
+> 2
+
+initialize a register top-𝐾 list for each owned query row  
+
+> 3
+
+stage all 𝑊 -byte stripes of 𝑄 into shared memory  
+
+> 4
+
+for 𝑛 0 = 0 to seg .count in steps of 𝑁 do  
+
+> 5
+
+𝑁 valid ← min (𝑁 , seg .count − 𝑛 0) 
+
+> 6
+
+stage database-point ids, scales, and squared norms for rows [𝑛 0, 𝑛 0 + 𝑁 valid ); pad the remaining tile entries  
+
+> 7
+
+C ← 0 // 𝑀 × 𝑁 accumulators  
+
+> 8
+
+for each stripe 𝑟 do // 𝑊 -byte stripes  
+
+> 9
+
+stage 𝑆 [𝑛 0 : 𝑛 0 + 𝑁 valid , 𝑟 ] into an 𝑁 -row shared-memory tile and pad the remainder  
+
+> 10
+
+C += wgmma (𝑄 [:, 𝑟 ], 𝑆 tile [:, 𝑟 ]) // one in flight  
+
+> 11
+
+for each accumulator cell (𝑚, 𝑛 ) owned by this lane with 
+
+𝑛 < 𝑁 valid do  
+
+> 12
+
+𝑠 ← 𝜎 𝑞 [𝑚 ] 𝜎 𝑑 [𝑛 ] C[𝑚, 𝑛 ] 
+
+> 13
+
+if the metric is squared L2 then  
+
+> 14
+
+score ← ∥ 𝑞 𝑚 ∥2 + ∥ 𝑝 𝑛 ∥2 − 2𝑠  
+
+> 15
+
+else  
+
+> 16
+
+score ← − 𝑠 // MIPS as argmin  
+
+> 17
+
+if id (𝑛 ) ≠ id (𝑚 ) then insert (score , id (𝑛 )) into row 
+
+𝑚 ’s top-𝐾  
+
+> 18
+
+merge the four owner lanes of each row with a shuffle butterfly  
+
+> 19
+
+write each row’s 𝐾 results in sorted order consumed, the four lanes that own one output row hold four inde-pendent top-𝐾 lists, and we merge them with a two-step butterfly: a warp shuffle exchanges each lane’s 𝐾 entries with its partner across lane masks 1 and 2, and we insert the partner’s entries into the local list. The base lane then writes the 𝐾 results in sorted or-der. A leaf is scored as a self-join, so its score block is symmetric. We nonetheless compute it in full, because the tensor cores need dense rectangular tiles and both edge directions are emitted for accumulation regardless. 
+
+Modes and precision. A single kernel family—not a separate kernel per precision—serves every configuration. We run it in two interchangeable pipeline modes—a single-warpgroup mode and a warp-specialized mode that splits loads from compute—and the same kernel serves the quantized i8 builds (TQ4 and RSQ8) and the unquantized fp16/tf32 configurations we evaluate as a supplement (Sec. E.3). We provide more details in Sec. E.3 and E.4, and report kernel measurements in Tab. 8 and 9. 
+
+5.4 From Online HashPrune to Sort-and-Merge 
+
+Recall that HashPrune keeps, for each point, a bounded reservoir of nearby candidates with diverse residual directions. On the CPU we implement it by simply protecting the structure using a lock. Unfortunately on GPU this leads to significantly worse contention Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+and thus degrades performance meaningfully. We therefore replace the synchronized update with a sort. This sort-and-merge runs once per batch of leaves during leaf scoring, and each batch’s candidates merge into a global HashPrune datastructure that the final prune sparsifies into the graph. For every candidate neighbor we emit two fixed-size records, one per direction, each carrying a short sketch of the residual direction from source to target, and we radix-sort the records by owner row and distance. The sort operates on a transient buffer of two records per candidate edge, bounded by a memory parameter (the per-batch slab cap, ≈ 6 GB in our runs) and reused across batches—it does not grow with the full candidate set. After the sort, every owner’s candidates are contiguous, so we update each row’s bounded accumulator in a single sequential pass with no concurrent writes: we de-duplicate repeated targets. For colliding hashes, we keep the nearer candidate. We describe the sketch construction and record layout in more detail in Sec. E.9. 
+
+5.5 Pruning Without Candidate Recompute 
+
+ANN builds need a final sparsification step after candidate accumu-lation. Exact RobustPrune tests whether an accepted neighbor 𝑝 ∗
+
+occludes a candidate 𝑝 ′ for source 𝑝 . This test needs the distance 
+
+𝑑 (𝑝 ∗, 𝑝 ′). Recomputing such distances for every row would add a new irregular candidate-to-candidate scoring stage. We instead use an approximation we call DirectEdgePrune. When we prune the neighbors of point 𝑝 , we check whether the accepted neighbor 𝑝 ∗ already has 𝑝 ′ in its own neighbor-list. If that edge exists then we use the stored distance as the witnessed value for 𝑑 (𝑝 ∗, 𝑝 ′) and apply the usual 𝛼 -prune test; if the edge was not witnessed then we proceed to the next neighbor. All rows consult a read-only snapshot of the completed candidate accumulator. Each row writes its accepted neighbors to separate scratch storage; after all pruning decisions finish, a second pass compacts these outputs into the final graph. This relaxation of RobustPrune has one-sided error: it can miss a domination that exact RobustPrune would have found, because the needed candidate pair may be absent from the accumulator. It never prunes an edge that would have been retained by Robust-Prune. The effect on degree and query quality is measured in Tab. 7: DirectEdgePrune yields denser graphs of quality comparable to those produced by a final RobustPrune. 
+
+6 Experimental Evaluation 
+
+Our experiments are organized around three goals: (1) quantify-ing the speedups we achieve for index building and 𝑘 -NN graph construction (Sec. 6.1 and 6.2), (2) demonstrating that the quantiza-tion and algorithmic changes employed by PiPNN II and GPiPNN preserve high index quality (Sec. 6.2 and 6.3), and (3) explaining which components in the implementations are responsible for the observed speedups (Sec. 6.3 and 6.4). In particular, we find that: (1) On CPU, PiPNN II is the fastest method for both the ANNS-index and 𝑘 -NN tasks: on average for ANNS-index build it beats the strongest quantized Vamana baseline by 5.9 × and unquantized Vamana by 40.7 ×. For 𝑘 -NN building it beats quantized Vamana by 10.3 × and PyNNDescent by 5.9 × at equivalent recall (Sec. 6.1). (2) On GPU, GPiPNN is also the fastest method: on the ANNS-index task it beats Jasper by 8.1 × on average ( 13.3 × with quantization) and unquantized CAGRA by 16 × (27 × with quantization). On the 𝑘 -NN task it beats Jasper, NN-Descent, CAGRA, and IVF-PQ8 by geometric means of 7.1 ×, 2.9 ×,
+
+9.8 ×, and 49.8 × respectively (Sec. 6.2). (3) Using quantization in the build keeps query performance essentially unchanged: PiPNN-TQ and PiPNN-RSQ8 match PiPNN-FP32’s QPS at any given recall within geometric-mean ratios of 0.98 and 0.99 (Sec. 6.3). (4) We trace the speedups to our highly-optimized kernels: we show that our leaf-2-NN kernel achieves a 12.4 × speedup over PiPNN’s prior approach. It runs at near-peak instruc-tion throughput on CPU, and it is bandwidth-bound at high dimension on GPU, reaching 82–95% of memory through-put at 𝑑 ≥ 1536 (Sec. 6.3 and 6.4). 
+
+Machines. We use a Google Cloud c4-highmem-288 (288 vC-PUs, 2.2 TB DRAM, Intel Granite Rapids) for billion-point datasets, and a c3-highmem-192 (192 vCPUs, 1.5 TB DRAM, Intel Sapphire Rapids) for smaller datasets. For GPU measurements we use an 
+
+a3-highgpu-1g instance: one NVIDIA H100 80 GB HBM3 SXM5 (cc 9.0, 132 SMs, 3.35 TB/s HBM3) on a 26-vCPU Sapphire Rapids host with 234 GB DDR5, CUDA 12 with driver 580. GPiPNN is com-piled for Hopper SM90a and run as a single-H100 builder. Datasets that exceed the 80 GB device memory are reported on CPU only. 
+
+“High-quality” indexes. We measure quality in terms of query throughput and recall. Specifically, we consider an index high-quality when its QPS-vs-recall curve is comparable to that of an unquantized ParlayANN-Vamana graph. The first version of PiPNN was shown to produce high-quality indexes, and we show in this paper that it continues to do so for quantized points. 
+
+CPU Methods. Our primary baseline is Vamana [30] as imple-mented in the ParlayANN library [41]. To the best of our knowl-edge, this is the most performant shared-memory graph-based ANNS index publicly available. We restrict our comparison to Va-mana because previous work [56] already showed that it builds indexes faster and of equivalent or better quality than HCNNG [46], HNSW [40], MIRAGE [64], and FastKCNA [66]. We also consider an unpublished version of ParlayANN’s Va-mana [51] that uses 8-bit scalar quantization (SQ8) for distance computations and reranks a smaller set with float precision. For dimensionalities > 512 it further uses a filtering technique based on precomputed Johnson-Lindenstrauss (JL) sketches [33] that further speeds up beam search. Quantization and filtering offers signifi-cantly faster builds and queries than unquantized Vamana while producing indexes of identical quality. Hence, we use this version when computing QPS-vs-recall curves on CPUs. For 𝑘 -NN graph construction, we additionally compare with a parallel implemen-tation of NN-descent PyNNDescent [43] also in the ParlayANN library [41] that uses SQ8. The per-dataset build parameter config-urations for CPU methods are detailed in Sec. G (Tab. 16 and 17). 
+
+GPU Methods. We compare GPiPNN against the two leading GPU-native graph ANNS systems: CAGRA [50] and Jasper [42]. The original CAGRA paper only considered FP16 coordinates, but the library implementation supports generating the initial 𝑘 -NN graph via product quantization (PQ) coupled with IVF, which we Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 
+
+Table 1: Summary of datasets used in our experiments.                                                                                            
+
+> Name Type Dim Size QDType Dist. Src.
+> DBpedia1536 Text 1536 999k 1k f32 L2 [52] DBpedia3072 Text 3072 999k 1k f32 L2 [53] DataCompDr T2I 1536 12.78M 1k bf16 L2 [2] MSMARCO-Arctic Text 1024 113.52M 10k f32 MIPS [11, 44] MSMARCO Text 768 101.07M 9376 f32 IP [57] Wiki-Cohere Text 768 35M 5k f32 IP [54] OpenAI-ArXiv Text 1536 2.32M 20k f32 L2 [47] wiki-all Text 768 88M 10k f32 MIPS [49] Wiki-Qwen-500K Text 4096 500k 100k float MIPS [38] DEEP Image 96 1B 10k f32 L2 [4] MS-Turing Text 100 1B 100k f32 L2 [58] Text2Image T2I 200 1B 100k f32 MIPS [58]
+
+evaluate here (to our knowledge) for the first time. Unquantized CAGRA does not run on unnormalized MIPS datasets, as the NN-descent implementation is specialized to L2. cuVS [48] supports MIPS graphs for CAGRA only through its IVF-PQ build path, not the NN-Descent build path that unquantized CAGRA uses. 
+
+Jasper [42] ports Vamana to GPU, leverages RaBitQ quantiza-tion [18] for search, and optimizes the greedy search kernel for latency hiding. We use Jasper ’s query code for our index quality studies (Fig. 5 and Fig. 12). This permits us to assess the quality of the indexes without the confounding issue of query performance. It was previously shown that Jasper’s query routines are at least as good as CAGRA’s [42]. The per-dataset build parameter configura-tions for GPU methods are detailed in Sec. F (Tab. 13 and 14). 
+
+Datasets. We evaluate on a diverse suite of datasets summarized in Tab. 1: three billion-scale datasets (DEEP [4], MS-Turing [58], Text2Image [58]) and two hundred-million-scale text datasets (MS-MARCO [57] and MSMARCO-Arctic [11, 44]) obtained through the BigANN Benchmarks framework [57, 58]; Wiki-Qwen-500K (4096-d) embeddings [38]; two DBpedia datasets at 1536-d and 3072-d [52, 53]; the 12.78M image–text DataCompDr embeddings [2]; and Wiki-Cohere [54], OpenAI-ArXiv [47], and wiki-all [49]. We use a subset of these for our GPU experiments, the full collection can be seen in Tab. 4. For DEEP and MS-Turing we use both 10M and 100M slices; for Text2Image, DataCompDr, Wiki-Cohere, and MSMARCO we use 10M slices, and for MSMARCO-Arctic a 1M slice, as the GPU baselines (Jasper, CAGRA) do not complete at full scale on a single 80 GB H100. 
+
+6.1 Speedup Results on CPU 
+
+ANNS Index Build. We build PiPNN and Vamana indexes and subsequently query them under varying beam size to measure the throughput vs recall tradeoff. Representative QPS-recall curves on two datasets are shown in Fig. 3; for the full set of results over all 12 datasets, refer to Fig. 10 in the appendix. The methods have similar query performance across the datasets. The index build times are shown in Sec. 6.1 and also included in the legends of each plot. Quantization speeds up Vamana construction by 3-15 × and PiPNN by 2-8 ×, while showing no impact on index quality. The effects on Vamana are more pronounced on high dimensional datasets due to JL. However, even with these speedups, full precision PiPNN remains faster to build on most datasets. PiPNN II is up to 8×
+
+faster than PiPNN. Against quantized and unquantized Vamana, its geometric-mean speedups are 5.9 × and 40.7 ×, respectively. 0.90 0.92 0.94 0.96 0.98 1.00      
+
+> Recall
+> 10 4
+> 10 5
+> QPS
+> wiki-all
+> Vamana-FP32 (3.3h) Vamana-JL+SQ8 (24.9m) PiPNN-FP32 (14.9m) PiPNN-RSQ8 (3.0m) PiPNN-TQ4 (2.4m)
+> 0.90 0.92 0.94 0.96 0.98 1.00
+> Recall
+> 10 5
+> OpenAI-ArXiv
+> Vamana-FP32 (5.7m) Vamana-JL+SQ8 (30.9s) PiPNN-FP32 (36.1s) PiPNN-RSQ8 (5.6s) PiPNN-TQ4 (4.3s)
+
+Figure 3: Index Quality (CPU). QPS vs. recall on two represen-tative datasets, with per-method build times in the legends. PiPNN-FP32, PiPNN-TQ4, and PiPNN-RSQ8 trace nearly iden-tical curves; the full set of twelve datasets is in Fig. 10 (Sec. C). 
+
+𝑘 -NN Graph Build. To build a 𝑘 -NN graph with Vamana we build an ANNS index and then perform a 𝑘 -NN query for each point. While PiPNN could use the same approach, we find the neighbors of a point directly from its leaves [25]. We also include PyNNDescent, which is designed for direct 𝑘 -NN graph construction. 0.80 0.85 0.90 0.95 1.00       
+
+> Recall
+> 10 2
+> 10 3
+> 10 4
+> Build time (s)
+> wiki-all-88M
+> 0.80 0.85 0.90 0.95 1.00
+> Recall
+> 10 1
+> 10 2
+> OpenAI-ArXiv-2M
+> Vamana-JL+SQ8 pyNNDescent PiPNN
+
+Figure 4: 𝑘 -NN graph build time vs. recall on two representa-tive datasets, zoomed to recall in [0.8, 1.0]. Results on the full set of datasets are shown in Fig. 11 (Sec. C). 
+
+From a large parameter sweep, we select the fastest builds spanning different recall levels, forming a Pareto frontier for each method. Fig. 4 shows two representative datasets; the full set is in Fig. 11 (Sec. C). All three methods are able to produce 𝑘 -NN graphs of reasonably-high recall. However, thanks to PiPNN II’s low construction time combined with its ability to avoid mate-rializing a complete index, it is able to build 4-10 × faster than PyNNDescent and 5-20 × faster than Vamana for graphs of equiva-lent recall (geometric means 5.9 × over PyNNDescent, and 10.3 ×
+
+over quantized Vamana). Sec. 6.1 reports absolute build times for both tasks across our CPU datasets, alongside the unquantized baselines. PyNNDescent is omitted from the billion-scale datasets and MSMARCO because it exceeded the available memory. 
+
+6.2 Speedup Results on GPU 
+
+ANNS Index Build. In Tab. 3 we report ANNS index build time for GPiPNN-RSQ8 and FP16, as well as Jasper and CAGRA. GPiPNN is fastest on every dataset. Taking the geometric mean, GPiPNN-RSQ8 builds 13.3 × faster than Jasper and 27 × faster than CAGRA. The largest single-dataset gaps are 43 .7× over Jasper (DBpedia-3072) and 50 × over CAGRA (DEEP-10M). Without quan-tization, GPiPNN-FP16 is on average 8 .1× faster than JASPER and 16 .3× faster than CAGRA. Full per-dataset build times are reported Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+Table 2: CPU build times (seconds). Left: ANNS index build, best high-recall configuration of each method (QPS-vs-recall curves appear in Fig. 10). Right: 𝑘 -NN graph build, fastest swept configuration achieving recall ≥ 0.9. Each half is col-ored independently: per-row fastest method bolded and cells shaded by log-slowdown vs the row min (green = fastest, red = slowest); “–” indicates method did not achieve recall cutoff. VF32 is unquantized Vamana; VQ is Vamana with quantiza-tion and optional filtering; NNDQ is PyNNDescent with SQ8.                                                                                              
+
+> ANNS index 𝑘 -NN @ R ≥0.9
+> Dataset PiPNN II PiPNN VF32 VQ PiPNN II VQ NNDQ Wiki-Qwen-500K 3.6 18 117 8.0 2.4 32 12 DBP1536 1.9 15 122 9.3 1.7 37 13 DBP3072 4.7 28 228 15 4.2 57 19 OpenAI 4.4 36 342 31 4.2 61 32 DataComp 35 245 1918 208 58 506 421 WikiCohere 56 352 4317 491 212 5303 1442 WikiAll 146 892 11780 1492 576 3137 1903 MSMARCO 175 1107 13510 1743 1015 9751 –MS-Arctic 249 1298 14440 2568 230 2157 1599 DEEP 564 1484 8178 3142 1605 6251 –MS-Turing 567 1480 5719 2772 1051 4630 –Text2Image 730 2027 8605 3784 935 12108 –
+
+Table 3: GPU build times (s): ANNS index ( left ) and fastest 
+
+𝑘 -NN graph at recall ≥ 0.9 ( right ); build-then-search includes self-search. RSQ8/FP16: quantized/unquantized GPiPNN modes; NN-Desc: NN-Descent. Coloring follows Sec. 6.1; full results in Tab. 4 and 5.                                                                                                             
+
+> ANNS index 𝑘 -NN @ R ≥0.9
+> Dataset RSQ8 FP16 Jasper CAGRA RSQ8 FP16 NN-Desc Jasper DEEP-10M 2.32 2.57 8.78 115 4.43 4.65 29.1 10.8 MS-Turing-10M 2.64 2.88 18.1 116 15.9 16.3 32.3 19.1 DBP1536 0.57 1.08 11.9 11.1 1.84 2.24 4.78 11.3 DBP3072 0.90 1.99 39.4 18.5 3.00 4.00 6.40 21.8 Wiki-Qwen-500K 0.61 1.30 7.81 10.9 2.38 3.11 3.60 13.1 OpenAI 1.29 2.66 26.0 34.6 2.46 3.55 12.7 24.4 WikiAll-1M 0.44 0.64 2.17 –1.78 2.03 4.03 4.60 WikiAll-10M 3.53 6.78 32.2 –8.50 11.3 39.2 82.6 MS-MARCO-10M 3.50 6.58 88.3 –30.1 37.0 39.4 410 DataComp-10M 6.08 –79.3 –15.7 ––129 WikiCohere-10M 3.59 6.70 64.5 –31.1 38.7 49.4 217 Text2Image-10M 2.39 2.96 90.2 –5.00 5.47 31.1 106 MS-Arctic-1M 0.55 0.81 3.75 –0.96 1.19 4.45 39.0
+
+in Tab. 4. On the unnormalized MIPS datasets, we omit results for unquantized CAGRA, since it does not support MIPS as mentioned before. In the appendix, we show additional results with a variant that builds the index through IVF-PQ that does support it. Build speed does not come at the cost of query quality. Fig. 5 plots GPiPNN’s query throughput against recall for a low-dimensional (𝑑 =96, DEEP-10M) and a high-dimensional ( 𝑑 =3072, DBpedia-3072) dataset. Across the recall range, GPiPNN’s QPS is equal or higher than that of Jasper and the CAGRA variants. The same conclusion holds on the full benchmark set, shown in Fig. 12. 
+
+𝑘 -NN Graph Build. Next, we evaluate 𝑘 -NN graph building. We consider additional methods from cuVS, namely NN-Descent and IVF-PQ. For each method and dataset, we sweep a variety of build-time parameters and retain the fastest configuration whose resulting 0.900 0.925 0.950 0.975 1.000 10 5    
+
+> 10 6
+> DEEP-10M
+> 0.900 0.925 0.950 0.975 1.000 10 5
+> DBpedia-3072
+> Recall GPU QPS
+> gPiPNN-TQ4 gPiPNN-RSQ8 JASPER CAGRA CAGRA-FP16 CAGRA-PQ4 CAGRA-PQ8
+
+Figure 5: GPU QPS vs. recall for DEEP-10M ( 𝑑 =96 ) and DBpedia-3072 ( 𝑑 =3072 ); all datasets in Fig. 12. 
+
+graph achieves recall ≥ 0.9 (Tab. 3); the full per-method, per-dataset build parameters and software versions are given in Sec. F. Entries where no configuration meets the recall target are marked “–”. For GPiPNN-RSQ8 and cuVS NN-Descent we show the direct 𝑘 -NN graph build time; for Jasper, IVF-PQ, and CAGRA it is the index-build time plus the time to query all 𝑛 points against the built index. GPiPNN-RSQ8 is the fastest-building method on all thirteen 
+
+datasets, including MS-MARCO-10M (MIPS, 𝑑 =768), where it builds in 30.1 s against 39.4 s for the next-fastest NN-Descent. Aggregated as a geometric mean, GPiPNN-RSQ8 is 7.12 × faster than Jasper, 
+
+2.91 × faster than NN-Descent, 9.84 × faster than CAGRA, and 
+
+49.80 × faster than IVF-PQ8. CAGRA and IVF-PQ8 are reported in the full comparison in Tab. 5. CAGRA’s ANNs construction works only on Euclidean data. 
+
+6.3 CPU Ablations 
+
+Leaf 2-NN kernel. We evaluate the leaf 2-NN kernel described in Sec. 4.3 on a single core of an Icelake CPU by scoring a leaf of 800 points gathered from a dataset of 1M 768-dimensional points. Fig. 6 divides runtime into three components: prepare , the dot-product 
+
+GEMM , and top-2 filtering . Prepare covers work done before the inner loop runs: decoding and packing the database vectors into the transposed panel layout, and zero-initializing the top-2 trackers. The original PiPNN [56], which scores the leaf with Eigen’s float32 GEMM and extracts top-2 with Highway’s VQSort, runs in 12 .90 ms. Our final optimized kernel runs in 1 .04 ms, a 12 .4× improvement. We walk through the optimizations in Fig. 6 in order. As we apply each optimization, the dominant cost increasingly shifts to the top-2 filtering step, until SIMD Scatter addresses that bottle-neck. TQ Flat replaces the float32 GEMM with an int8 dot prod-uct using vpdpbusd over the baseline’s data layout (rows=points, columns=dimensions). Processing 4 times more elements per SIMD instruction yields a 1 .92 × speedup over the baseline. The block-transposed panel layout ( TQ Transposed ) regresses against TQ Flat 
+
+prior to query unrolling. Query Unrolling subsequently allows the transposed layout to come out ahead of flat by enabling better instruction-level parallelism. Transpose furthermore unlocks Panel Unrolling , which yields another 1 .58 × improvement by keeping the query broadcasts in registers across four database panels. 
+
+Lower Triangle roughly halves the GEMM work (1 .96 ×), exposing filtering as the new bottleneck at 58% of the total time. Vectorizing Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 0 2 4 6 8 10 12 14    
+
+> Time (ms) (lower is better)
+> + SIMD Scatter + Lower Triangle + Panel Unrolling + Query Unrolling TQ Transposed TQ Flat + Query Unrolling TQ Flat Eigen FP32 + VQSort
+> 69% 34% 46% 65% 90% 71% 81% 83% 58% 46% 28% 9% 27% 18% 14%
+> 475 GMAC/s 223 GMAC/s 160 GMAC/s 102 GMAC/s 46 GMAC/s 97 GMAC/s 73 GMAC/s 38 GMAC/s
+> Prepare GEMM Filtering Other
+
+Figure 6: ProcessLeafTop2 ablation: runtime breakdown and effective throughput across cumulative optimizations. Throughput counts 𝑛 2𝑑 operations although Lower Triangle 
+
+computes 1.96 × fewer. OpenAI Datacomp-DR Deep-100M Wiki-Cohere       
+
+> 0.00.51.01.52.02.53.03.5
+> Slowdown vs. fastest
+> 1.33 8.29 24.02 13.51 0.74 5.06 8.49 8.44 0.70 4.91 7.31 7.95
+> Naive TQ (vectorized) Distmat (panel-based) Fused (panel-based)
+
+Figure 7: RobustPrune implementations absolute time in seconds (annotated above bar) and slowdown vs. fastest. 
+
+the scatter ( SIMD Scatter , described in Sec. 4.3) is the largest single jump, 2 .1×, and shrinks filtering back to roughly 10%. In a standalone benchmark we were able to sustain 342 GMAC/s when issuing vpdpbusd from registers (279 with memory loads). The GEMM part of our kernel runs at 475 0.69 ·1.96 = 351 GMAC/s, where 0 .69 is the fraction of time spent in GEMM. This indicates that the GEMM runs at peak performance. This also matches the theoretical expectation of 332 .8 GMAC/s on a 2 .6 GHz base clock core leveraging two execution ports, if we account for turboboost. 
+
+Pruning kernel. Recall that PiPNN II uses the RobustPrune pro-cedure from DiskANN [30]. With the leaf and partitioning kernels accelerated, RobustPrune becomes a non-negligible part of the run-time. We compare three implementations which differ in how they compute distances between RobustPrune candidates. The baseline “Naive TQ (vectorized)” computes the distances between a candidate and all prior survivors using one-to-many TurboQuant. “Distmat (panel-based)” precomputes the full 𝐶 × 𝐶 candidate–candidate distance matrix in a single GEMM pass using the techniques from Sec. 4.1, then prunes using those distances. Note that this approach is not able to exit early when a candidate gets pruned. “Fused (panel-based)” is a variant where we store only survivors and the next query batch (size 6) in the panel layout. We then compute distances from the next query batch against the survivors and itself. After pruning, we copy over the survivors from this batch. Compared to Distmat, this eliminates redundant work by only comparing with pruned candidates in the same query batch. Compared to the naive version, however, a query still does not exit early if pruned. As can be seen in Fig. 7, both panel-based strategies provide significant speedup over the Naive method (DistMat gets a 2 .1×
+
+improvement on average over Naive). Additionally, leveraging the Fused version gives a 1 .08 × improvement over Distmat. 
+
+6.4 GPU Ablations 
+
+Fig. 8 in Appendix E.7 shows per-stage and per-kernel runtime breakdowns on GPU. Leaf processing dominates the runtime on GPU as well, though less than on CPU. We perform a Speed of Light (SOL) analysis to identify the % of system utilization with respect to the theoretical hardware peak. 
+
+Leaf 2-NN kernel. The performance bottleneck of the kernel on the H100 GPU shifts depending on the vector dimension. At higher dimensions ( 𝑑 ≥ 1536, e.g., openai-2M and dbpedia-3072), data streaming for candidate comparisons saturates the L2 cache band-width. Unified memory throughput reaches 82–95%, indicating that L2 is the limiting tier rather than DRAM, which remains at 37–52%. Meanwhile, the SM pipelines hold steady at 46–49%, falling below Nsight Compute’s (NCU) 60% threshold for a compute-bound state. For intermediate dimensions ( 𝑑 = 768, e.g., wiki-all-10M), neither the compute nor memory pipelines saturate: the SM sits at 50% and the memory hierarchy at 41%. Here, NCU attributes the perfor-mance gap to latency rather than throughput. The kernel achieves only 26–28% occupancy, tightly constrained by its 28% theoretical limit due to high shared-memory pressure and an allocation of 96 registers per thread. This occupancy limitation persists at the lowest dimensions ( 𝑑 = 96, e.g., deep-10M; Tab. 9). The working set resides entirely within cache which drops DRAM traffic to 4% and leaves the kernel strictly occupancy-bound. 
+
+Index Quality. Fig. 5 shows QPS vs recall on a low- and a high-dimensional dataset. Across the recall range GPiPNN’s curves sit on or above those of Jasper and CAGRA, and the same holds on the full benchmark set (Fig. 12). Using DirectEdgePrune produces 30–58% denser graphs, since the method does not prune some edges that RobustPrune would. Still, index quality is comparable between the two pruning methods (Tab. 7). DirectEdgePrune cuts GPU build time by up to 1 .4×
+
+on the high-dimensional datasets. While DirectEdgePrune could increase memory footprint, the maximum degree between the two pruning methods is identical, so in the Jasper query implementation there is no difference in terms of allocated memory. 
+
+7 Discussion & Conclusion 
+
+PiPNN introduced a fast, hardware-friendly route to high-quality proximity-graph construction, but its original implementation left substantial performance on the table. In this paper we fully realize PiPNN’s potential by accelerating the GEMM and top-𝐾 steps, via quantization, fusing GEMM with per-query top-𝐾 selection into a single in-register pass, as well as vectorizing and tailoring the Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+top-𝐾 selection to the specific 𝐾 . Instantiating this design on shared-memory CPUs as PiPNN II and on GPUs as GPiPNN yields large speedups over the strongest prior state-of-the-art methods on both platforms while preserving equivalent query performance. In future work we plan to scale beyond a single machine and port the design to other accelerators. PiPNN’s structure is well-suited to the distributed setting: partitioning creates independent sub-problems, leaves can be processed independently, and HashPrune merges candidate sets without coordinating on global state. 
+
+References 
+
+[1] Alexandr Andoni and Hengjie Zhang. 2023. Sub-quadratic (1+ 𝜖 )-approximate Euclidean Spanners, with Applications. In 2023 IEEE 64th Annual Symposium on Foundations of Computer Science (FOCS) . IEEE, 98–112. [2] Apple. 2024. DataCompDR-12M-bf16. https://huggingface.co/datasets/apple/ DataCompDR-12M-bf16. [3] Amir Azarmehr, Soheil Behnezhad, Rajesh Jayaram, Jakub Łącki, Vahab Mirrokni, and Peilin Zhong. 2025. Massively parallel minimum spanning tree in general metric spaces. In Proceedings of the 2025 Annual ACM-SIAM Symposium on Discrete Algorithms (SODA) . SIAM, 143–174. [4] Artem Babenko and Victor Lempitsky. 2016. Efficient indexing of billion-scale datasets of deep descriptors. In Proceedings of the IEEE conference on computer vision and pattern recognition . 2055–2063. [5] MohammadHossein Bateni, Soheil Behnezhad, Mahsa Derakhshan, Moham-madTaghi Hajiaghayi, Raimondas Kiveris, Silvio Lattanzi, and Vahab Mirrokni. 2017. Affinity clustering: Hierarchical clustering at scale. Advances in Neural Information Processing Systems 30 (2017). [6] Ran Ben-Basat, Yaniv Ben-Itzhak, Gal Mendelson, Michael Mitzenmacher, Amit Portnoy, and Shay Vargaftik. 2026. A Note on TurboQuant and the Earlier DRIVE/EDEN Line of Work. arXiv preprint arXiv:2604.18555 (2026). [7] Lorenzo Beretta, Vincent Cohen-Addad, Rajesh Jayaram, and Erik Waingarten. 2025. Approximating High-Dimensional Earth Mover’s Distance as Fast as Closest Pair. arXiv preprint arXiv:2508.06774 (2025). [8] CJ Carey, Jonathan Halcrow, Rajesh Jayaram, Vahab Mirrokni, Warren Schudy, and Peilin Zhong. 2022. Stars: Tera-Scale Graph Building for Clustering and Learning. Advances in Neural Information Processing Systems 35 (2022), 21470– 21481. [9] Moses Charikar. 2002. Similarity estimation techniques from rounding algo-rithms. In Proceedings on 34th Annual ACM Symposium on Theory of Computing, May 19-21, 2002, Montréal, Québec, Canada . ACM, 380–388. [10] Patrick H. Chen, Wei-Cheng Chang, Jyun-Yu Jiang, Hsiang-Fu Yu, Inderjit S. Dhillon, and Cho-Jui Hsieh. 2023. FINGER: Fast inference for graph-based approximate nearest neighbor search. In Proceedings of the ACM Web Conference (WWW) . 3225–3235. https://doi.org/10.1145/3543507.3583318 [11] Nick Craswell, Bhaskar Mitra, Emine Yilmaz, Daniel Campos, and Ellen M. Voorhees. 2021. Overview of the TREC 2020 Deep Learning Track. In TREC .[12] Laxman Dhulipala, Jakub Łącki, Jason Lee, and Vahab Mirrokni. 2023. Terahac: Hierarchical agglomerative clustering of trillion-edge graphs. Proceedings of the ACM on Management of Data 1, 3 (2023), 1–27. [13] Wei Dong, Moses Charikar, and Kai Li. 2011. Efficient k-nearest neighbor graph construction for generic similarity measures. In Proceedings of the 20th Interna-tional Conference on World Wide Web (WWW) . 577–586. https://doi.org/10.1145/ 1963405.1963487 [14] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. 2024. The Faiss library. (2024). arXiv:2401.08281 [cs.LG] [15] Cong Fu and Deng Cai. 2016. EFANNA: An extremely fast approximate nearest neighbor search algorithm based on kNN graph. arXiv preprint arXiv:1609.07228 
+
+(2016). [16] Cong Fu, Changxu Wang, and Deng Cai. 2021. High dimensional similarity search with satellite system graph: Efficiency, scalability, and unindexed query compatibility. IEEE Transactions on Pattern Analysis and Machine Intelligence 44, 8 (2021), 4139–4150. [17] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast Approximate Nearest Neighbor Search With The Navigating Spreading-out Graph. Proceedings of the VLDB Endowment 12, 5 (2019), 461–474. https://doi.org/10.14778/3303753. 3303754 [18] Jianyang Gao, Yutong Gou, Yuexuan Xu, Jifan Shi, Zhonghao Yang, and Cheng Long. 2025. The RaBitQ Library. In The 1st Workshop on Vector Databases (VecDB), co-located with ICML 2025 . https://openreview.net/forum?id=OeZHhOsFir [19] Jianyang Gao, Yutong Gou, Yuexuan Xu, Yongyi Yang, Cheng Long, and Raymond Chi-Wing Wong. 2025. Practical and Asymptotically Optimal Quantization of High-Dimensional Vectors in Euclidean Space for Approximate Nearest Neighbor Search. In Proceedings of the ACM on Management of Data (SIGMOD) .[20] Jianyang Gao and Cheng Long. 2023. High-dimensional approximate nearest neighbor search: with reliable and efficient distance comparison operations. 
+
+Proceedings of the ACM on Management of Data (PACMMOD) 1, 2, Article 137 (2023), 27 pages. https://doi.org/10.1145/3589282 [21] Jianyang Gao and Cheng Long. 2024. Rabitq: Quantizing high-dimensional vectors with a theoretical error bound for approximate nearest neighbor search. 
+
+Proceedings of the ACM on Management of Data 2, 3 (2024), 1–27. [22] Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia, Jinliu Pan, Yuxi Bi, Yixin Dai, Jiawei Sun, Haofen Wang, and Haofen Wang. 2023. Retrieval-augmented generation for large language models: A survey. arXiv preprint arXiv:2312.10997 
+
+(2023). [23] Tiezheng Ge, Kaiming He, Qifa Ke, and Jian Sun. 2013. Optimized product quantization. IEEE transactions on pattern analysis and machine intelligence 36, 4 (2013), 744–755. [24] Google. 2026. Highway: Performance-portable SIMD. https://github.com/ google/highway [25] Lars Gottesbüren, Laxman Dhulipala, Rajesh Jayaram, and Jakub Lacki. 2025. Unleashing Graph Partitioning for Large-Scale Nearest Neighbor Search. Proc. VLDB Endow. 18, 6 (2025), 1649–1662. [26] Yutong Gou, Jianyang Gao, Yuexuan Xu, and Cheng Long. 2025. SymphonyQG: Towards Symphonious Integration of Quantization and Graph for Approximate Nearest Neighbor Search. In Proceedings of the ACM on Management of Data (SIGMOD) .[27] Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern, and Sanjiv Kumar. 2020. Accelerating Large-Scale Inference with Anisotropic Vector Quantization. In International Conference on Machine Learning . https: //arxiv.org/abs/1908.10396 [28] Ben Harwood and Tom Drummond. 2016. FANNG: Fast approximate nearest neighbour graphs. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR) . 5713–5722. [29] Masajiro Iwasaki and Daisuke Miyazaki. 2018. Optimization of indexing based on k-nearest neighbor graph for proximity search in high-dimensional data. arXiv preprint arXiv:1810.07355 (2018). [30] Suhas Jayaram Subramanya, Fnu Devvrit, Harsha Vardhan Simhadri, Ravishankar Krishnawamy, and Rohan Kadekodi. 2019. Diskann: Fast accurate billion-point nearest neighbor search on a single node. Advances in neural information pro-cessing Systems 32 (2019). [31] Herve Jegou, Matthijs Douze, and Cordelia Schmid. 2010. Product quantization for nearest neighbor search. IEEE transactions on pattern analysis and machine intelligence 33, 1 (2010), 117–128. [32] Jeff Johnson, Matthijs Douze, and Hervé Jégou. 2019. Billion-scale similarity search with GPUs. IEEE Transactions on Big Data 7, 3 (2019), 535–547. [33] William B. Johnson and Joram Lindenstrauss. 1984. Extensions of Lipschitz mappings into a Hilbert space. Contemp. Math. 26 (1984), 189–206. [34] Saim Khan, Somesh Singh, Harsha Vardhan Simhadri, Jyothi Vedurada, et al. 2024. Bang: Billion-scale approximate nearest neighbor search using a single gpu. arXiv preprint arXiv:2401.11324 (2024). [35] Ravishankar Krishnaswamy, Magdalen Dobson Manohar, and Harsha Vardhan Simhadri. 2024. The DiskANN library: Graph-Based Indices for Fast, Fresh and Filtered Vector Search. IEEE Data Eng. Bull. (2024). [36] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rock-täschel, et al. 2020. Retrieval-augmented generation for knowledge-intensive nlp tasks. Advances in Neural Information Processing Systems 33 (2020), 9459–9474. [37] Yuliang Li, Jinfeng Li, Yoshihiko Suhara, AnHai Doan, and Wang-Chiew Tan. 2020. Deep entity matching with pre-trained language models. Proc. VLDB Endow. 14, 1 (2020), 50–60. [38] Maknee. 2024. wikipedia_qwen_8b. https://huggingface.co/datasets/maknee/ wikipedia_qwen_8b. [39] Yury Malkov, Alexander Ponomarenko, Andrey Logvinov, and Vladimir Krylov. 2014. Approximate nearest neighbor algorithm based on navigable small world graphs. Information Systems 45 (2014), 61–68. [40] Yu A Malkov and Dmitry A Yashunin. 2018. Efficient and robust approximate nearest neighbor search using hierarchical navigable small world graphs. IEEE transactions on pattern analysis and machine intelligence 42, 4 (2018), 824–836. [41] Magdalen Dobson Manohar, Zheqi Shen, Guy Blelloch, Laxman Dhulipala, Yan Gu, Harsha Vardhan Simhadri, and Yihan Sun. 2024. Parlayann: Scalable and deterministic parallel graph-based approximate nearest neighbor search algo-rithms. In Proceedings of the 29th ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming . 270–285. [42] Hunter McCoy, Zikun Wang, and Prashant Pandey. 2026. Jasper: ANNS Quantized for Speed, Built for Change on GPU. arXiv preprint arXiv:2601.07048 (2026). [43] Leland McInnes. 2020. PyNNDescent for Fast Approximate Nearest Neighbors. Webpage. Retrieved December 15, 2022 from https://pynndescent.readthedocs. io/en/latest/ [44] Luke Merrick, Danmei Xu, Gaurav Nuti, and Daniel Campos. 2024. Arctic-Embed: Scalable, Efficient, and Accurate Text Embedding Models. (2024). arXiv:2405.05374 Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 
+
+[45] Bhaskar Mitra, Nick Craswell, et al. 2018. An introduction to neural information retrieval. Foundations and Trends® in Information Retrieval 13, 1 (2018), 1–126. [46] Javier Vargas Munoz, Marcos A Gonçalves, Zanoni Dias, and Ricardo da S Torres. 2019. Hierarchical clustering-based graphs for large scale approximate nearest neighbor search. Pattern Recognition 96 (2019), 106970. [47] Arvind Neelakantan, Tao Xu, Raul Puri, Alec Radford, Jesse Michael Han, Jerry Tworek, Qiming Yuan, Nikolas Tezak, Jong Wook Kim, Chris Hallacy, et al. 2022. Text and code embeddings by contrastive pre-training. arXiv preprint arXiv:2201.10005 (2022). [48] NVIDIA RAPIDS. 2024. cuVS: GPU-accelerated Vector Search and Clustering. https://github.com/rapidsai/cuvs. [49] NVIDIA RAPIDS. 2024. wiki-all: a vector-search benchmark dataset. https: //data.rapids.ai/raft/datasets/. [50] Hiroyuki Ootomo, Akira Naruse, Corey Nolet, Ray Wang, Tamas Feher, and Yong Wang. 2024. Cagra: Highly parallel graph construction and approximate nearest neighbor search for gpus. In 2024 IEEE 40th International Conference on Data Engineering (ICDE) . IEEE, 4236–4247. [51] ParlayANN contributors. 2024. ParlayANN: A library of algorithms for approxi-mate nearest neighbor search. https://github.com/cmuparlay/ParlayANN. [52] Qdrant. 2024. dbpedia-entities-openai3-text-embedding-3-large-1536-1M. https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M. [53] Qdrant. 2024. dbpedia-entities-openai3-text-embedding-3-large-3072-1M. https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-3072-1M. [54] Nils Reimers. 2022. Cohere/wikipedia-22-12-en-embeddings. https://huggingface. co/datasets/Cohere/wikipedia-22-12-en-embeddings. [55] Deepjyoti Roy and Mala Dutta. 2022. A systematic review and research perspec-tive on recommender systems. Journal of Big Data 9, 1 (2022), 59. [56] Tobias Rubel, Richard Wen, Laxman Dhulipala, Lars Gottesbüren, Rajesh Jayaram, and Jakub Łącki. 2026. PiPNN: Ultra-Scalable Graph-Based Nearest Neighbor Indexing. arXiv preprint arXiv:2602.21247 (2026). [57] Harsha Vardhan Simhadri, Martin Aumüller, Amir Ingber, Matthijs Douze, George Williams, Magdalen Dobson Manohar, Dmitry Baranchuk, Edo Liberty, Frank Liu, Ben Landrum, et al. 2024. Results of the Big ANN: NeurIPS’23 compe-tition. arXiv preprint arXiv:2409.17424 (2024). [58] Harsha Vardhan Simhadri, George Williams, Martin Aumüller, Matthijs Douze, Artem Babenko, Dmitry Baranchuk, Qi Chen, Lucas Hosseini, Ravishankar Krish-naswamny, Gopal Srinivasa, et al. 2022. Results of the NeurIPS’21 challenge on billion-scale approximate nearest neighbor search. In NeurIPS 2021 Competitions and Demonstrations Track . PMLR, 177–189. [59] Aditi Singh, Suhas Jayaram Subramanya, Ravishankar Krishnaswamy, and Har-sha Vardhan Simhadri. 2021. Freshdiskann: A fast and accurate graph-based ann index for streaming similarity search. arXiv preprint arXiv:2105.09613 (2021). [60] Jack Spalding-Jamieson, Eliot Wong Robson, and Da Wei Zheng. 2025. Scalable k-Means Clustering for Large k via Seeded Approximate Nearest-Neighbor Search. 
+
+arXiv preprint arXiv:2502.06163 (2025). [61] Philip Sun, David Simcha, Dave Dopson, Ruiqi Guo, and Sanjiv Kumar. 2023. SOAR: Improved Indexing for Approximate Nearest Neighbor Search. In Neural Information Processing Systems . https://arxiv.org/abs/2404.00774 [62] Shay Vargaftik, Ran Ben-Basat, Amit Portnoy, Gal Mendelson, Yaniv Ben-Itzhak, and Michael Mitzenmacher. 2021. DRIVE: One-bit distributed mean estimation. In Advances in Neural Information Processing Systems (NeurIPS) .[63] Shay Vargaftik, Ran Ben-Basat, Amit Portnoy, Gal Mendelson, Yaniv Ben-Itzhak, and Michael Mitzenmacher. 2022. EDEN: Communication-efficient and robust distributed mean estimation for federated learning. In International Conference on Machine Learning (ICML) .[64] Sairaj Voruganti and M. Tamer Özsu. 2025. MIRAGE-ANNS: Mixed Approach Graph-based Indexing for Approximate Nearest Neighbor Search. Proc. ACM Manag. Data 3, 3, Article 188 (June 2025), 27 pages. https://doi.org/10.1145/ 3725325 [65] Lee Xiong, Chenyan Xiong, Ye Li, Kwok-Fung Tang, Jialin Liu, Paul N. Bennett, Junaid Ahmed, and Arnold Overwijk. 2021. Approximate Nearest Neighbor Neg-ative Contrastive Learning for Dense Text Retrieval. In International Conference on Learning Representations, ICLR .[66] Shuo Yang, Jiadong Xie, Yingfan Liu, Jeffrey Xu Yu, Xiyue Gao, Qianru Wang, Yanguo Peng, and Jiangtao Cui. 2024. Revisiting the index construction of proximity graph-based approximate nearest neighbor search. arXiv preprint arXiv:2410.01231 (2024). [67] Shangdi Yu, Joshua Engels, Yihao Huang, and Julian Shun. 2025. Pecann: Paral-lel efficient clustering with graph-based approximate nearest neighbor search. In 2025 Proceedings of the Conference on Applied and Computational Discrete Algorithms (ACDA) . SIAM, 1–17. [68] Amir Zandieh, Majid Daliri, Majid Hadian, and Vahab Mirrokni. 2025. Tur-boquant: Online vector quantization with near-optimal distortion rate. arXiv preprint arXiv:2504.19874 (2025). [69] Alexandros Zeakis, George Papadakis, Dimitrios Skoutas, and Manolis Koubarakis. 2023. Pre-Trained Embeddings for Entity Resolution: An Experi-mental Analysis. Proc. VLDB Endow. 16, 9 (2023), 2225–2238. [70] Xi Zhao, Yao Tian, Kai Huang, Bolong Zheng, and Xiaofang Zhou. 2023. Towards efficient index construction and approximate nearest neighbor search in high-dimensional spaces. Proceedings of the VLDB Endowment 16, 8 (2023), 1979–1991. Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+A Beam Search Pseudocode 
+
+For completeness, we provide pseudocode for the standard beam-search graph-query procedure described in Section 2. Given a navi-gation graph over points X, a beam search is a greedy search with intermediate storage (called the beam). Given a source node 𝑠 in the graph and a query point 𝑞 , a beam search with beam width 𝐿 
+
+works as follows. We maintain two sets: a set 𝐵 containing up to 𝐿 
+
+encountered points that are closest to 𝑞 (often called the “beam”), and the set 𝑉 of all points visited. Visiting a point 𝑝 ∈ 𝐵 \ 𝑉 adds all its unseen neighbors to the beam, then adds 𝑝 to the visited set. The algorithm begins by initializing the beam with only the source 
+
+𝑠 and an empty visited set. We then visit the unvisited node in the beam closest to 𝑞 , repeating until every node in the beam has been visited. Because the distance of the points in the beam to the target decreases monotonically, this process converges, at which point we return the final state of the beam. 
+
+Algorithm 5: BeamSearch 
+
+Input: 𝐺 = (X , 𝐸 ) a graph over X, 𝑠 ∈ X an entry point, 𝑞 aquery point, and 𝐿 ∈ N a beam width 
+
+Output: 𝐵 ⊆ X containing the 𝐿 closest points to 𝑞 
+
+encountered during the search  
+
+> 1
+
+𝐵 ← { 𝑠 }; 
+
+> 2
+
+𝑉 ← ∅ ; 
+
+> 3
+
+while 𝐵 \ 𝑉 ≠ ∅ do  
+
+> 4
+
+𝑝 ← argmin 𝑢 ∈𝐵 \𝑉 𝑑 (𝑢, 𝑞 ); 
+
+> 5
+
+𝐵 ← 𝐵 ∪ Neighbors( 𝑝 ); 
+
+> 6
+
+𝑉 ← 𝑉 ∪ { 𝑝 }; 
+
+> 7
+
+if |𝐵 | > 𝐿 then  
+
+> 8
+
+𝐵 ← the 𝐿 points in 𝐵 with smallest distance to 𝑞 ; 
+
+> 9
+
+return 𝐵 ;
+
+B HashPrune Pseudocode 
+
+Here we document and give pseudocode for the HashPrune on-line pruning procedure used by PiPNN (Sec. 3). The algorithm is reproduced verbatim from [56]. 
+
+Motivation. Pruning ensures that each vertex connects to neigh-bors in many different directions, so that greedy search can route quickly from any point to any other. HashPrune achieves this with locality-sensitive hashing (LSH) [9]: it discards candidate edges that are directionally similar to edges already kept. Working with relatively low dimensional hashes ( ≈ 12) also lets the procedure operate on low-dimensional sketches rather than full vectors, so pruning avoids fetching high-dimensional data. 
+
+Residualized hashing. HashPrune draws a fixed set of random hyperplanes through the origin. For each point 𝑝 it derives an individualized hash ℎ𝑝 that hashes the residual 𝑐 − 𝑝 of a candidate 
+
+𝑐 : the 𝑖 -th bit records which side of the 𝑖 -th hyperplane the residual falls on. Two candidates collide under ℎ𝑝 with probability (1 −
+
+𝜃 /𝜋 )𝑚 , where 𝜃 is the angle between 𝑐 − 𝑝 and 𝑐 ′ − 𝑝 and 𝑚 is the number of hyperplanes [9]. Hashing the residual thus draws probabilistic cones centered on 𝑝 , and the number of hyperplanes controls how finely those cones partition direction space. 
+
+Insertion. To prune the candidate stream V for a point 𝑝 , Hash-Prune maintains a reservoir 𝑀 of size at most ℓ𝑚𝑎𝑥 keyed by hash value. For each candidate 𝑐 it computes ℎ𝑝 (𝑐 ). If the bucket is al-ready occupied, it keeps whichever of the two candidates lies closer to 𝑝 . Otherwise it inserts 𝑐 , and when the reservoir is full it evicts the candidate farthest from 𝑝 . The reservoir therefore retains the nearest point in each cone while never exceeding ℓ𝑚𝑎𝑥 entries, which bounds memory up front and lets it be allocated in a single contiguous block rather than grown dynamically. 
+
+History independence. The final reservoir depends only on the candidate set, not on the order candidates arrive in: dropping the size limit leaves exactly the nearest point in each bucket, and the size limit only ever evicts the farthest retained candidate. History independence lets candidates be merged in arbitrary order, partition by partition, without fragmenting the graph, and makes PiPNN’s partitioning-based construction deterministic. 
+
+Algorithm 6: HashPrune 
+
+Input: V a stream of candidate points, fitted with dissimilarity measure ∥· , ·∥ , point 𝑝 , size limit 
+
+ℓ𝑚𝑎𝑥 ∈ N
+
+Output: A set 𝐶 ⊆ V of size at most min (|V | , ℓ 𝑚𝑎𝑥 ) 
+
+> 1
+
+𝑀 ← an empty key-value store mapping hashes to points;  
+
+> 2
+
+for 𝑐 ∈ V do  
+
+> 3
+
+if 𝑀 .HasKey( ℎ𝑝 (𝑐 )) then  
+
+> 4
+
+if ∥𝑝, 𝑐 ∥ < ∥𝑝, 𝑀 .Get( ℎ𝑝 (𝑐 ))∥ then  
+
+> 5
+
+𝑀 .Set( ℎ𝑝 (𝑐 ), 𝑐 ); 
+
+> 6
+
+else  
+
+> 7
+
+if |𝑀 | < ℓ𝑚𝑎𝑥 then  
+
+> 8
+
+𝑀 .Set( ℎ𝑝 (𝑐 ), 𝑐 ); 
+
+> 9
+
+else  
+
+> 10
+
+𝑧 = argmax 𝑦 ∈𝑀 ∥𝑝, 𝑦 ∥; 
+
+> 11
+
+if ∥𝑝, 𝑐 ∥ < ∥𝑝, 𝑧 ∥ then  
+
+> 12
+
+𝑀 .Remove( ℎ𝑝 (𝑧 )); 
+
+> 13
+
+𝑀 .Set( ℎ𝑝 (𝑐 ), 𝑐 ); 
+
+> 14
+
+return 𝑀 .Values() ;
+
+C Additional Experiments 
+
+This appendix presents the full per-dataset query-throughput and 
+
+𝑘 -NN-graph recall results, together with supporting ablations, for the datasets listed in Tab. 1. For datasets that we report at multiple scales (DEEP, MS-Turing, Text2Image, MSMARCO), we show the largest slice. 
+
+D Full GPU Build-Time Tables 
+
+For completeness, Tab. 4 and 5 report the GPU build-time com-parisons of Sec. 6.2 across the full set of GPiPNN and baseline variants—adding GPiPNN-TQ4, the fp16/tf32 unquantized modes, the four CAGRA variants, and NN-Descent-FP16. The table in the main part (Tab. 3) contains a subset of these configurations. The build parameters behind these tables, the tuning protocol, and the software environment are reported in Sec. F. Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 
+
+Table 4: Full GPU ANNS-index native build times (s) across all GPiPNN modes (TQ4/RSQ8, unquantized FP16/TF32) and CAGRA variants; cf. the headline Tab. 3. Colored as in Sec. 6.1. “–” marks a run that did not complete or exceeded the 80 GB H100 budget; the unquantized FP16/TF32 modes carry a 2–4× larger decoded-row footprint and so miss the largest cells (TF32 at 100M, and both on DataCompDr-10M), and plain CAGRA runs only on the L2 datasets (its cuVS NN-Descent build is L2-only). The 100M-scale rows (DEEP-100M, MS-Turing-100M) are shown for completeness but excluded from the main-text tables and the aggregate speedups of Tab. 6; the CAGRA DEEP-100M outlier is discussed in Sec. D.                                                                                                                                                   
+
+> gPiPNN JASPER CAGRA Dataset gPiPNN-TQ4 gPiPNN-RSQ8 gPiPNN-FP16 gPiPNN-TF32 JASPER CAGRA CAGRA-FP16 CAGRA-PQ4 CAGRA-PQ8 DEEP-10M 2.31 2.32 2.57 2.73 8.78 115 192 298 266 MS-Turing-10M 2.63 2.64 2.88 3.07 18.1 116 124 176 193 DEEP-100M 19.4 19.6 22.3 –105 3940 5391 3706 3907 MS-Turing-100M 20.1 20.3 23.2 –166 ––––DBpedia-1536 0.54 0.57 1.08 1.62 11.9 11.1 11.3 45.9 51.8 DBpedia-3072 0.86 0.90 1.99 3.03 39.4 18.5 18.2 97.9 124 Wiki-Qwen-500K 0.57 0.61 1.30 1.96 7.81 10.9 10.6 64.9 73.4 OpenAI-2M 1.22 1.29 2.66 4.12 26.0 34.6 34.6 133 149 Wiki-all-1M 0.39 0.44 0.64 0.91 2.17 ––26.9 29.4 Wiki-all-10M 3.41 3.53 6.78 11.0 32.2 ––381 456 MS-MARCO-10M 3.38 3.50 6.58 10.5 88.3 ––370 446 DataCompDr-10M 5.81 6.08 ––79.3 ––625 790 Wiki-Cohere-10M 3.41 3.59 6.70 10.8 64.5 ––345 415 Text2Image-10M 2.35 2.39 2.96 3.47 90.2 ––231 250 MS-Arctic-1M 0.46 0.55 0.81 1.18 3.75 ––34.2 37.6
+
+Table 5: Full 𝑘 -NN-graph native build times (s), fastest configuration of each method reaching graph-fidelity recall ≥ 0.9; cf. the headline Tab. 3. GPiPNN is shown in TQ4/RSQ8 plus unquantized FP16/TF32 supplement modes; IVF-PQ4 is omitted (it met the floor on no dataset). Colored as in Sec. 6.1. “–” marks cells where no configuration met the floor, the build ran out of memory, or the metric is unsupported. The 4-bit TQ4 mode is too lossy to reach 0.9 on the harder cells, while the FP16/TF32 modes clear the floor wherever they fit; cuVS CAGRA (NN-Descent build) is L2-only, so it is absent on the MIPS datasets.                                                                                                                                   
+
+> gPiPNN JASPER NN-Descent IVF-PQ CAGRA Dataset gPiPNN-TQ4 gPiPNN-RSQ8 gPiPNN-FP16 gPiPNN-TF32 JASPER NN-Descent NN-Descent-FP16 IVF-PQ8 CAGRA DEEP-10M –4.43 4.65 4.84 10.8 29.1 30.0 49.9 106 MS-Turing-10M –15.9 16.3 17.4 19.1 32.3 30.3 –106 DBpedia-1536 1.81 1.84 2.24 2.92 11.3 4.78 4.78 64.1 14.9 DBpedia-3072 2.94 3.00 4.00 5.52 21.8 6.40 6.41 143 23.3 Wiki-Qwen-500K 2.35 2.38 3.11 4.29 13.1 3.60 3.60 93.5 14.6 OpenAI-2M 6.15 2.46 3.55 4.89 24.4 12.7 12.7 186 36.6 Wiki-all-1M 1.77 1.78 2.03 2.46 4.60 4.03 4.02 40.1 –Wiki-all-10M 27.0 8.50 11.3 15.7 82.6 39.2 39.5 1721 –MS-MARCO-10M –30.1 37.0 51.9 410 39.4 39.5 ––DataCompDr-10M 50.6 15.7 ––129 ––––Wiki-Cohere-10M –31.1 38.7 54.8 217 49.4 49.5 3127 –Text2Image-10M –5.00 5.47 5.95 106 31.1 31.1 ––MS-Arctic-1M 0.90 0.96 1.19 1.51 39.0 4.45 4.45 70.9 –
+
+Aggregate speedups. Tab. 6 summarizes the per-dataset build times of Tab. 3 as the geometric-mean and maximum build-time speedup of GPiPNN-RSQ8 over each GPU baseline, taken over the datasets that baseline completes. On proximity-graph (ANNS index) construction GPiPNN-RSQ8 is the fastest builder on every dataset, a geometric-mean 13 .3× over Jasper and 27 × over unquantized CAGRA, peaking at 43 .7× (DBpedia-3072) and 50 × (DEEP-10M). On 
+
+𝑘 -NN-graph construction it is a geometric-mean 7 .12 ×, 2 .91 ×, and 9.84 × faster than Jasper, NN-Descent, and CAGRA respectively, and is the fastest builder on every cell. These ANNS-index aggre-gates are taken over the ≤10M-scale datasets; the two 100M-scale rows of Tab. 4 are excluded, for the reason discussed next. 
+
+The 100M-scale CAGRA build is an outlier. Tab. 4 also reports the two 100M-scale datasets (DEEP-100M, MS-Turing-100M). We exclude these from the aggregate speedups above and from the main-text tables because the CAGRA DEEP-100M build is anoma-lous. At 3940 s it is ≈ 4.7× slower than the 825 .6 s that Jasper report for CAGRA on the same dataset and graph degree [42]—measured Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+Table 6: Build-time speedup of GPiPNN-RSQ8 over each GPU baseline, reported as the geometric mean and maximum over the datasets that baseline completes (computed from Tab. 3 and the full Tab. 5); 𝑛 is the number of such datasets. The ANNS-index rows exclude the two 100M-scale datasets, whose CAGRA build is an outlier (see Sec. D).                         
+
+> Build Baseline 𝑛 Geo. mean Max ANNS index Jasper 13 13 .3×43 .7×
+> ANNS index CAGRA 627 ×50 ×
+> 𝑘 -NN graph Jasper 13 7.12 ×40 .7×
+> 𝑘 -NN graph NN-Descent 12 2.91 ×6.56 ×
+> 𝑘 -NN graph CAGRA 69.84 ×23 .8×
+
+there on a slower A100. We reproduced the figure (3868 s on our H100) and traced it to the cuVS 25.04 large-scale CAGRA graph-build path rather than to an intrinsic property of the dataset: it is insensitive to memory-pool, device-residency, and batching set-tings. GPiPNN itself builds both 100M graphs in ≈ 20 s (5 .4× and 8.2× faster than Jasper on DEEP-100M and MS-Turing-100M, re-spectively), so its scaling is unaffected; we omit the 100M cells from the headline averages only to avoid reporting speedups against an unreliable CAGRA baseline. 
+
+Table 7: GPU final prune: direct-edge reuse vs. candidate-distance recompute (GPiPNN-TQ4, Sec. 5.5). Average out-degree of the built graph and the area under the GPU QPS-vs-recall curve above recall 0.9 (AUC >0.9, in 10 3 QPS ·recall; higher is better). Both modes use the identical build recipe and HashPrune pass and differ only in the final pruning rule. The direct-edge rule yields 30 –58% denser graphs of com-parable quality in the high recall regime. 
+
+avg. out-degree AUC >0.9 (×10 3)Dataset recomp. direct recomp. direct DEEP-10M ( L2, 𝑑 =96 ) 28.7 37.3 167.8 182.5 Wiki-all-10M ( IP, 𝑑 =768 ) 17.6 27.7 20.4 20.1 OpenAI-2M ( L2, 𝑑 =1536 ) 21.4 30.6 9.0 9.1 DBpedia ( L2, 𝑑 =3072 ) 18.6 27.6 9.0 10.4 
+
+E GPiPNN Kernel Details 
+
+This appendix collects implementation detail deferred from Sec. 5. 
+
+E.1 Flattened routing keys 
+
+Sec. 5.1 flattens PiPNN’s recursion into two scoring assignment passes joined by radix sorts. The current implementation has no third assignment or refinement pass: after the second-level assign-ments, oversized second-level buckets are split by the bin-packing walk described below. 
+
+Pass 1: top-level leaders. Every point scores against the sampled top-level leader set and keeps its 𝑓 0 best leaders (default 𝑓 0 = 8). The kernel emits 𝑓 0𝑛 pairs (𝐿, 𝑝 ) with key 𝐿 , and a radix sort makes each top-level bucket a contiguous run. The point array is also permuted by each point’s best top-level leader; all later graph work uses this permuted row space until the final export remap. 
+
+Pass 2: sub-leaders. Inside each top-level bucket, the host sam-ples a bucket-local sub-leader candidate set. Each bucket member scores against only that bucket’s sub-leaders and keeps its 𝑓 1 best (default 𝑓 1 = 4). The pass emits (𝑠, 𝑝 ) pairs keyed by the group-local sub-leader label 𝑠 ; sorting and run-length encoding these keys ex-poses the second-level buckets. With the default fanout, a point can therefore appear in up to 𝑓 0 𝑓 1 = 32 leaf memberships. 
+
+Bin packing. The second-level buckets are then packed into leaf-sized work units. This step does not introduce new leaders or new geometric assignments. It only splits oversized buckets and merges small adjacent buckets within the same parent range so the leaf scorer sees regular batch sizes. The implementation uses a count/assign/broadcast walk over the sorted bucket runs: first count the bins each parent range will produce, then assign compact leaf ids to runs, then broadcast those ids back to the membership array. The broadcast keys are monotone, so no second post-pack sort is needed. Sub-leader sampling is keyed by the global top-level bucket id, so changing the number of streamed leader groups changes memory use but not the sampled partition. 
+
+E.2 Partitioning-pass operand staging 
+
+As is discussed in Sec. 5.1, the assignment passes are expressed as segmented top-𝐾 scoring. Here we provide more details on how the slabs of segments work. 
+
+Top-level leader slab. The top-level pass samples 𝐿 0 leaders (auto-tuned up to 4096) and gathers those rows once into a dense leader slab. The single segment then scores all points against that slab and emits 𝑓 0 synthetic leader labels per point. The synthetic labels avoid self-skip behavior in the shared scoring primitive, since a sampled leader must be allowed to assign to itself. 
+
+Sub-leader slabs. For each streamed range of top-level buckets, the host samples sub-leaders inside each bucket and resolves them to permuted row ids. All sub-leaders for the group are gathered into one dense slab, and the launch contains one score segment per nonempty top-level bucket. Each segment points to its bucket’s contiguous sub-leader slice with an offset and count. This lets one scoring launch handle buckets with different candidate counts while keeping the operand layout dense. 
+
+E.3 Decoded rows across precisions 
+
+The host-side TurboQuant encoder stores TQ4 and RSQ8 in their packed code formats, but the GPU pipeline expands them before the assignment and leaf scoring stages. TQ4 is decoded through its 16-entry codebook into signed INT8 rows, RSQ8 is copied into the same signed-byte decoded layout, and padding beyond the true dimension is zeroed in the decoded domain. The segmented top-𝐾 
+
+primitive therefore sees the same decoded INT8 row contract for both TQ modes. The unquantized supplement uses the same decoded-base inter-face. The loader reads float32 rows, normalizes each row to unit length, records the original norm, and the device decode converts the normalized base to fp16 or tf32 rows. The scoring primitive then switches operand traits while the surrounding gather, accu-mulation, canonicalization, pruning, and export stages remain the Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 
+
+same. The TQ paths are validated by bitwise-equality tests against a reference decode; the unquantized fp16 and tf32 supplement paths, which are not bit-exact, are validated by recall-threshold tests. 
+
+E.4 Scoring pipeline modes 
+
+The segmented top-𝐾 primitive of Sec. 5.3 runs in two pipeline modes behind one interface. In the unified mode a single warpgroup performs both the copies and the matrix products, synchronizing on shared memory once per stripe; we use it for small segments, where it is the simplest and fastest path. In the warp-specialized mode a dedicated producer warp issues the TMA and gather copies while the consumer warpgroups compute, so loads and matrix products run on separate warps. The two modes produce identical results. In either mode two consumer warpgroups can share a thread block to score a 128-row query tile ( 𝑀 = 128) against one shared-memory ring of database-point rows, so each row is loaded once and reused across both 64-row halves. We use this variant for the small-𝐾 builds (𝐾 ≤ 4). We stage the query operands into shared memory once and reuse them when a 64-row query tile fits—up to 768 bytes of decoded operand per row—and stream them alongside the database points above that width. The same kernel serves the quantized i8 
+
+builds and the unquantized fp16/tf32 modes, which differ only in the operand type and accumulator (Sec. E.3). 
+
+E.5 Register top-𝐾 epilogue 
+
+The scoring epilogue of Sec. 5.3 keeps each query row’s top-𝐾 in registers and, once the candidate sweep finishes, merges the four lanes that own a row with a butterfly shuffle (Alg. 7). 
+
+Algorithm 7: Register top-𝐾 insertion and four-lane but-terfly merge 
+
+Data: Per-lane registers d[0: 𝐾 ], i[0: 𝐾 ], sorted ascending in canonical order ( d[0] best, ties broken by smaller id) 
+
+// Insert candidate (𝑐, 𝑗 ) into the sorted top-𝐾  
+
+> 1
+
+if (𝑐, 𝑗 ) ≮ (d[𝐾 −1], i[𝐾 −1]) then return 
+
+// worse than 𝐾 -th best: one compare  
+
+> 2
+
+for 𝑠 = 0 to 𝐾 − 1 do  
+
+> 3
+
+if (𝑐, 𝑗 ) < (d[𝑠 ], i[𝑠 ]) then (𝑐, 𝑗 ) ↔ ( d[𝑠 ], i[𝑠 ]) 
+
+// Merge the four lanes that own one output row  
+
+> 4
+
+for mask ∈ { 1, 2} do  
+
+> 5
+
+(d′, i′) ← shfl_xor (d, i, mask ) // snapshot the partner first  
+
+> 6
+
+foreach (𝑐, 𝑗 ) of (d′, i′) do insert it as above 
+
+E.6 Leaf kernel across precision and dimension 
+
+Tab. 8 reports the RSQ8 leaf kernel on the high-dimensional datasets; Tab. 9 gives the full sweep across the four build precisions (RSQ8, TQ4, and the unquantized fp16/tf32 supplement) and all four datasets. Wider operands push the kernel into the memory hierarchy: at a fixed dimension the unquantized fp16/tf32 paths load 2–4 × the bytes per coordinate, so they saturate L2 ( ≈ 98% of unified memory throughput) even at 𝑑 =768, where the INT8 paths are still occupancy-bound. Dimension has the same effect: the 
+
+Table 8: Leaf 2-NN kernel SOL analysis for GPiPNN-RSQ8 (full precision sweep in Tab. 9). Columns: “ 2-NN%” is the leaf kernel’s share of the build time. “SM%”/“Mem%” are NCU compute- and memory-pipe throughput; “Occ%” is achieved occupancy ( 28% ceiling, set by 96 registers/thread and SMEM); “regime” names the binding resource.                             
+
+> Dataset ( 𝑑 )2-NN% SM% Mem% DRAM% L1% Occ% regime WikiAll-10M ( 768 )24 .1% 50 .140 .613 .940 .127 .7occupancy OpenAI ( 1536 )20 .6% 48 .781 .836 .643 .627 .6L2-bound DBP3072 ( 3072 )25 .5% 45 .694 .851 .951 .027 .7L2-bound
+
+Table 9: Leaf 2-NN kernel speed-of-light utilization across build precision and dimension (single H100, GPiPNN; columns as in Tab. 8). The fp16/tf32 rows are the unquan-tized supplement; “occupancy” marks the latency/occupancy-bound regime where neither the SM nor the memory pipe reaches 60% of peak.                                                                                                                        
+
+> Dataset ( 𝑑 )mode SM% Mem% DRAM% L1% Occ% regime WikiAll-10M ( 768 )RSQ8 50 .140 .613 .940 .127 .7occupancy WikiAll-10M ( 768 )TQ4 50 .140 .814 .040 .127 .6occupancy WikiAll-10M ( 768 )FP16 37 .398 .030 .352 .822 .4L2-bound WikiAll-10M ( 768 )TF32 30 .297 .945 .853 .622 .5L2-bound OpenAI ( 1536 )RSQ8 48 .781 .836 .643 .627 .6L2-bound OpenAI ( 1536 )TQ4 49 .078 .335 .043 .727 .6L2-bound OpenAI ( 1536 )FP16 31 .297 .643 .953 .822 .5L2-bound OpenAI ( 1536 )TF32 27 .997 .855 .856 .522 .6L2-bound DBP3072 ( 3072 )RSQ8 45 .694 .851 .951 .027 .7L2-bound DBP3072 ( 3072 )TQ4 46 .090 .450 .951 .127 .7L2-bound DBP3072 ( 3072 )FP16 27 .797 .854 .156 .422 .4L2-bound DBP3072 ( 3072 )TF32 26 .297 .264 .054 .422 .5L2-bound DEEP ( 96 )RSQ8 49 .423 .14.423 .126 .3occupancy DEEP ( 96 )TQ4 49 .423 .14.423 .126 .3occupancy DEEP ( 96 )FP16 46 .526 .17.026 .124 .9occupancy DEEP ( 96 )TF32 46 .842 .012 .431 .424 .9occupancy
+
+INT8 leaf is L2-bound at 𝑑 ≥1536 but occupancy-bound at 𝑑 ≤768. Only low-dimensional deep-10M ( 𝑑 =96) stays occupancy-bound in every precision: its working set is small enough that neither pipe saturates regardless of operand width. Achieved occupancy is 22–28% throughout, set by the kernel’s 96 registers per thread and shared-memory footprint. 
+
+E.7 All major build kernels across the speed-of-light 
+
+Tab. 8 and 9 characterize the leaf 2-NN kernel; here we apply the same speed-of-light methodology to every major build ker-nel. Tab. 10 gives the RSQ8 picture across dimension, and Tab. 11 and 12 sweep all four build precisions. The comparable-cost kernels sit in different speed-of-light regimes, so no single kernel dominates the build: 
+
+• The leaf 2-NN and sub-leader scans share the score_topk 
+
+primitive and the same regime shift—L2-bound at 𝑑 ≥ 1536, latency/occupancy-bound at 𝑑 ≤ 768—at ≈ 28% achieved oc-cupancy. 
+
+• The top-leader scan ( 𝐾 =8) is capped at ≈ 19% occupancy by register pressure: latency-bound at low dimension, reaching the L2 ceiling only at 𝑑 ≥ 1536. It is individually small and folds into the cluster stage (hence no %build entry). Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+Table 10: Per-kernel speed-of-light utilization on a single H100 (GPiPNN-RSQ8; R=64 , max_cand=64 , leaf target 1024 ,fanout 8,4; columns as in Tab. 8). “%build” is the kernel’s share of the native GPU build from –diag ; the top-leader scan is not separable from the cluster stage (“–”). The leaf and sub-leader sub-timers run on two overlapped streams, so their shares are taken against the native build and need not sum within a stage.  
+
+> Kernel Dataset (
+
+𝑑 ) %build SM% Mem% DRAM% L1% Occ% regime top-leader scan WikiAll-10M (768) – 50.3 29.5 2.5 20.6 18.7 occupancy top-leader scan OpenAI (1536) – 46.2 63.5 10.6 34.2 18.7 L2-bound top-leader scan DBP3072 (3072) – 42.0 83.3 32.6 49.5 18.6 L2-bound top-leader scan DEEP (96) – 63.1 9.6 0.6 9.6 18.7 SM-bound sub-leader scan WikiAll-10M (768) 19.0% 49.0 55.0 2.5 51.7 28.0 occupancy sub-leader scan OpenAI (1536) 15.6% 44.8 78.4 37.1 54.4 28.0 L2-bound sub-leader scan DBP3072 (3072) 7.2% 42.8 88.3 44.7 62.1 27.9 L2-bound sub-leader scan DEEP (96) 20.2% 49.1 28.6 0.9 28.5 27.7 occupancy leaf 2-NN WikiAll-10M (768) 24.1% 50.1 40.6 13.9 40.1 27.7 occupancy leaf 2-NN OpenAI (1536) 20.6% 48.7 81.8 36.6 43.6 27.6 L2-bound leaf 2-NN DBP3072 (3072) 25.5% 45.6 94.8 51.9 51.0 27.7 L2-bound leaf 2-NN DEEP (96) 15.6% 49.4 23.1 4.4 23.1 26.3 occupancy edge-hash WikiAll-10M (768) 14.7% 87.1 31.1 6.0 31.1 93.9 SM-bound edge-hash OpenAI (1536) 20.9% 88.5 29.3 5.4 29.3 94.9 SM-bound edge-hash DBP3072 (3072) 24.7% 89.2 28.4 4.4 28.3 95.6 SM-bound edge-hash DEEP (96) 5.1% 78.9 41.8 3.6 41.8 86.9 SM-bound direct-edge prune WikiAll-10M (768) 12.7% 67.9 21.1 3.2 21.1 53.6 SM-bound direct-edge prune OpenAI (1536) 7.5% 69.9 22.1 3.0 22.1 55.5 SM-bound direct-edge prune DBP3072 (3072) 3.9% 73.9 24.1 3.9 24.2 60.5 SM-bound direct-edge prune DEEP (96) 23.7% 76.1 22.4 5.3 22.4 65.4 SM-bound 
+
+• The edge-hash kernel is firmly SM-bound (87–89% of SM throughput at ≈ 95% occupancy): each warp folds a 32-lane SimHash off the operand load it already performs, with no operand re-streaming. 
+
+• The direct-edge prune is SM-bound (68–76%) and 
+
+precision- and dimension-invariant : because it reuses stored direct-edge witnesses instead of recomputing candidate distances, its utilization is identical across RSQ8/TQ4/FP16/TF32 (Tab. 12) and its share of the build shrinks as 𝑑 grows (23 .7% at 𝑑 =96 down to 3 .9% at 𝑑 =3072, as the 𝑑 -dependent score and hash kernels grow around it). The unquantized fp16/tf32 paths push the score-family kernels deeper into the L2 (wider operands, ≈ 98% unified memory through-put) but leave the SM-bound edge-hash and prune essentially un-changed. 
+
+E.8 Build component breakdown 
+
+Fig. 8 breaks the native GPU build time down by component on the four ablation datasets, both by pipeline stage and by kernel (RSQ8, 
+
+R=64 —the same configuration as Tab. 8). The dominant component 
+
+shifts with dimension : at 𝑑 =96 (deep) the direct-edge prune (24%) and the sub-leader scan (20%) are the largest kernels; at 𝑑 =3072 (dbpedia) the leaf score (25%) and edge-hash (25%) take over while the prune falls to 4%. The leaf-other and cluster-other slices collect the per-stage remainder—gather, sort, merge, emit, and the top-leader assignment—after subtracting the named sub-timers; because the leaf runs two overlapped streams these are stage wall time minus the measured sub-timers, not separately profiled kernels. 
+
+Table 11: Score-family kernels (top-leader 𝐾 =8, sub-leader 
+
+𝐾 =4) speed-of-light across the four build precisions (single H100, GPiPNN; columns as in Tab. 9). Both track the leaf: L2-bound at 𝑑 ≥ 1536 and under the wider fp16/tf32 operands, latency/occupancy-bound otherwise. 
+
+> Dataset (
+
+𝑑 ) mode SM% Mem% DRAM% L1% Occ% regime                                                                                                                                                                                                                                 
+
+> top-leader scan
+> WikiAll-10M (768) RSQ8 50.3 29.5 2.5 20.6 18.7 occupancy WikiAll-10M (768) TQ4 50.5 29.1 2.5 20.7 18.7 occupancy WikiAll-10M (768) FP16 42.7 60.5 10.2 33.5 18.7 L2-bound WikiAll-10M (768) TF32 40.0 83.5 32.4 47.5 18.7 L2-bound OpenAI (1536) RSQ8 46.2 63.5 10.6 34.2 18.7 L2-bound OpenAI (1536) TQ4 46.6 60.9 10.2 34.1 18.7 L2-bound OpenAI (1536) FP16 40.5 80.5 31.2 47.9 18.7 L2-bound OpenAI (1536) TF32 37.4 88.3 34.9 54.6 18.7 L2-bound DBP3072 (3072) RSQ8 42.0 83.3 32.6 49.5 18.6 L2-bound DBP3072 (3072) TQ4 42.0 83.2 32.5 49.6 18.6 L2-bound DBP3072 (3072) FP16 37.5 90.0 35.5 54.6 18.6 L2-bound DBP3072 (3072) TF32 35.5 92.7 37.4 56.5 18.6 L2-bound DEEP (96) RSQ8 63.1 9.6 0.6 9.6 18.7 SM-bound DEEP (96) TQ4 63.2 9.6 0.6 9.6 18.7 SM-bound DEEP (96) FP16 62.7 11.9 1.0 11.9 18.7 SM-bound DEEP (96) TF32 61.2 15.9 1.6 16.0 18.7 SM-bound
+> sub-leader scan
+> WikiAll-10M (768) RSQ8 49.0 55.0 2.5 51.7 28.0 occupancy WikiAll-10M (768) TQ4 49.1 55.0 2.5 51.7 28.0 occupancy WikiAll-10M (768) FP16 39.1 97.7 20.6 52.5 23.3 L2-bound WikiAll-10M (768) TF32 30.2 98.7 39.3 52.4 23.4 L2-bound OpenAI (1536) RSQ8 44.8 78.4 37.1 54.4 28.0 L2-bound OpenAI (1536) TQ4 44.8 78.6 37.2 54.4 28.0 L2-bound OpenAI (1536) FP16 31.2 98.2 38.9 52.5 23.3 L2-bound OpenAI (1536) TF32 27.0 98.3 40.5 56.6 23.3 L2-bound DBP3072 (3072) RSQ8 42.8 88.3 44.7 62.1 27.9 L2-bound DBP3072 (3072) TQ4 43.0 86.8 44.0 62.0 27.9 L2-bound DBP3072 (3072) FP16 28.6 96.1 38.2 55.8 23.2 L2-bound DBP3072 (3072) TF32 25.9 97.2 40.0 56.4 23.3 L2-bound DEEP (96) RSQ8 49.1 28.6 0.9 28.5 27.7 occupancy DEEP (96) TQ4 49.1 28.6 0.9 28.6 27.7 occupancy DEEP (96) FP16 39.2 17.9 1.0 17.9 23.1 occupancy DEEP (96) TF32 40.2 28.4 1.6 22.9 23.2 occupancy
+
+E.9 HashPrune sketch construction 
+
+HashPrune on GPiPNN (Sec. 5.5) sketches each edge (𝑠, 𝑡 ) by fold-ing the per-coordinate sign of the residual into a 12-bit SimHash, 
+
+ℎ(𝑠 →𝑡 ) = fold 12 
+
+ sign (𝑡 [ 𝑗 ] − 𝑠 [ 𝑗 ]) 𝑑 −1
+
+𝑗 =0 ;the reverse sketch rides the same operand load, packed into the other half of a 32-bit word. 2 One warp takes one edge and its 32 lanes coalesce the contraction-axis loads. The emit kernel writes a fixed forward and reverse candidate record for each witnessed edge. The sort key is (owner « 16 ) | dist 16 , and the payload stores the target id together with the 12-bit sketch. Thus each owner row sees candidates in distance order before the deterministic merge applies duplicate-target and same-sketch rules. Because the emit buffer holds only the current batch’s records, its size is bounded by the per-batch slab cap and does not scale with the graph. 
+
+> 2
+
+The reverse is not the bitwise complement of the forward: equal decoded coordinates contribute 0 to both directions. Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni DEEP               
+
+> d= 96 WikiAll-10M
+> d= 768 OpenAI
+> d= 1536 DBP3072
+> d= 3072 020 40 60 80 100
+> % of native build time
+> 5915 19 31 27 25 18 33 47 48 56 24 13 72.38s 3.77s 1.30s 0.92s
+
+By pipeline stage                      
+
+> remap_d2h prune canon leaf cluster decode h2d encode/setup
+> DEEP
+> d= 96 WikiAll-10M
+> d= 768 OpenAI
+> d= 1536 DBP3072
+> d= 3072 020 40 60 80 100
+> % of native build time
+> 12 13 19 22 11 810 11 20 19 16 716 24 21 25 515 21 25 12 97524 13 72.38s 3.77s 1.30s 0.92s
+
+By kernel 
+
+> prune leaf-other edge-hash leaf-score sub-leader-score cluster-other setup/IO
+
+Figure 8: Build component breakdown of GPiPNN-RSQ8 by pipeline stage (left) and by kernel (right), as a percentage of the native build time (absolute build time above each bar). Datasets are ordered by dimension. No single kernel dominates, and the bottleneck shifts from the prune and sub-leader scan at low dimension to the leaf score and edge-hash at high dimension. 
+
+E.10 Direct KNN-graph mode and build-time scaling 
+
+We also use the same pipeline to build direct KNN graphs. In KNN mode we set the leaf top-𝐾 and accumulator capacity to the re-quested 𝑘 , disable same-sketch HashPrune filtering, and dedupli-cate only repeated target ids, keeping the nearer copy. We then skip the final prune and export the canonicalized accumulator as a directed graph; this avoids the build-then-search pattern that graph-index baselines use for KNN construction (Tab. 3 and 5). For harder KNN cells we run several rounds. Round 0 creates the permuted row space; later rounds resample the top-level partition with new seeds but keep the row order fixed, so their witnesses merge into the same accumulator and export through the same id map, changing the candidate set without creating incompatible row spaces. We plan the remaining scaling choices before alloca-tion: a memory planner chooses how many top-level bucket ranges to stream and bounds the leaf and accumulation buffers, keeping output-neutral choices (such as the number of streamed ranges) separate from quality-coupled ones (such as candidate capacity). The full build-time tables are in Tab. 4 and 6. 
+
+F GPU Build Parameter Configurations 
+
+This section reports the exact per-(method, dataset) build param-eters behind the GPU build-time results (Tab. 3 to 5), how they were selected, and the software and hardware environment. All runs were driven by a single comparison harness that builds each method from source and records the invocation. GPiPNN here is the H100 port; its four modes—TQ4, RSQ8, FP16, and TF32 (CLI --tq 4 ,
+
+--tq 8 , and --unquant fp16|tf32 )—change only the score-kernel precision, so the graph-topology parameters in Tab. 13 and 14 are shared across all four modes. 
+
+F.1 Tuning protocol 
+
+For each (method, dataset) pair we ran a parameter sweep and kept a single configuration. For the ANNS index we kept the fastest build whose index is high-quality —its QPS-versus-recall curve com-parable to an unquantized ParlayANN-Vamana graph (Sec. 6)— scored by the area under that curve. For the 𝑘 -NN graph we kept the fastest build reaching graph-fidelity recall ≥ 0.9 (sampling 5,000 seeded points against the brute-force top-10); a “–” in Tab. 5 marks a method ×dataset cell where no swept configuration cleared the floor. The swept ranges were: GPiPNN 𝛼 ∈ { 0.90 , . . . , 1.20 }, leaf size 
+
+∈ { 512 , 1024 , 2048 , 4096 }, prune degree 𝑅 and prune-candidate cap 
+
+∈ { 32 , 64 }, and, for 𝑘 -NN, leaders and fanout; Jasper 𝛼 (same grid), 
+
+use_rabitq , use_reorder ; CAGRA graph degree ∈ { 32 , 48 , 64 }
+
+and intermediate degree ∈ { 64 , 128 , 192 }. Methods otherwise run at library defaults. The 𝛼 default is distance-aware (0 .9 for MIPS, 1 .1for L2) for both GPiPNN and Jasper; RaBitQ was not used during queries for any method. 
+
+F.2 ANNS-index build parameters 
+
+GPiPNN always builds with GPU HashPrune and the direct-edge final prune, both enabled by default. Tab. 13 lists the tuned param-eters per dataset: GPiPNN angular slack 𝛼 , prune degree 𝑅 , and leaf size 𝐶 (prune-candidate cap pc =64, reduced to 32 at 100M to fit the accumulators); Jasper degree 𝑅 , 𝛼 , and reorder flag ( 𝐿 cap =64, 
+
+mbr =0.02 throughout, 0 .004 at 100M to avoid an illegal access at 219 nodes); and CAGRA graph / intermediate degree. Unquantized CAGRA and CAGRA-FP16 build the initial graph with NN-Descent (L2 only) and therefore do not run on the MIPS sets (Wiki-all, MS-MARCO, MSMARCO-Arctic, Wiki-Cohere, Text2Image) except for Wiki-Qwen-500K, which is L2-normalized; only CAGRA-PQ4/PQ8 (IVF-PQ path) do, sharing the listed degrees and differing only in PQ bit-width. On the L2 DataCompDr-10M set the unquantized Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+Table 12: Support kernels (edge-hash, direct-edge prune) speed-of-light across the four build precisions. Both are SM-bound; the prune is precision-invariant because it reuses stored witnesses rather than reloading operands.                                                                                                                                                                                                                                        
+
+> Dataset ( 𝑑 )mode SM% Mem% DRAM% L1% Occ% regime
+> edge-hash
+> WikiAll-10M (768) RSQ8 87.1 31.1 6.0 31.1 93.9 SM-bound WikiAll-10M (768) TQ4 87.1 31.1 6.2 31.1 93.8 SM-bound WikiAll-10M (768) FP16 75.4 33.6 15.6 33.6 93.0 SM-bound WikiAll-10M (768) TF32 78.4 50.6 37.3 35.0 92.4 SM-bound OpenAI (1536) RSQ8 88.5 29.3 5.4 29.3 94.9 SM-bound OpenAI (1536) TQ4 88.5 29.3 5.4 29.3 95.0 SM-bound OpenAI (1536) FP16 78.8 36.2 15.3 32.0 94.5 SM-bound OpenAI (1536) TF32 82.4 57.9 39.0 33.5 94.1 SM-bound DBP3072 (3072) RSQ8 89.2 28.4 4.4 28.3 95.6 SM-bound DBP3072 (3072) TQ4 89.2 28.2 4.4 28.3 95.7 SM-bound DBP3072 (3072) FP16 80.8 37.2 14.8 31.2 95.3 SM-bound DBP3072 (3072) TF32 84.2 62.0 41.0 32.5 95.2 SM-bound DEEP (96) RSQ8 78.9 41.8 3.6 41.8 86.9 SM-bound DEEP (96) TQ4 78.8 41.8 3.6 41.8 87.0 SM-bound DEEP (96) FP16 71.8 41.6 5.4 41.6 85.6 SM-bound DEEP (96) TF32 70.7 41.3 11.0 41.3 85.3 SM-bound
+> direct-edge prune
+> WikiAll-10M (768) RSQ8 67.9 21.1 3.2 21.1 53.6 SM-bound WikiAll-10M (768) TQ4 67.9 21.1 3.2 21.1 53.7 SM-bound WikiAll-10M (768) FP16 67.9 21.1 3.2 21.1 53.6 SM-bound WikiAll-10M (768) TF32 67.8 21.1 3.2 21.1 53.6 SM-bound OpenAI (1536) RSQ8 69.9 22.1 3.0 22.1 55.5 SM-bound OpenAI (1536) TQ4 70.2 22.1 3.0 22.1 55.7 SM-bound OpenAI (1536) FP16 70.0 22.1 3.0 22.1 55.5 SM-bound OpenAI (1536) TF32 70.0 22.1 3.0 22.1 55.5 SM-bound DBP3072 (3072) RSQ8 73.9 24.1 3.9 24.2 60.5 SM-bound DBP3072 (3072) TQ4 74.0 24.1 3.9 24.2 60.5 SM-bound DBP3072 (3072) FP16 73.9 24.1 3.9 24.2 60.5 SM-bound DBP3072 (3072) TF32 73.9 24.1 3.9 24.2 60.5 SM-bound DEEP (96) RSQ8 76.1 22.4 5.3 22.4 65.4 SM-bound DEEP (96) TQ4 76.3 22.4 5.4 22.5 65.8 SM-bound DEEP (96) FP16 76.2 22.4 5.3 22.4 65.4 SM-bound DEEP (96) TF32 76.2 22.4 5.2 22.4 65.4 SM-bound
+
+CAGRA build did not complete. GPiPNN-TF32 exceeds the 80 GB budget at 100M, and both GPiPNN-FP16 and TF32 exceed it on DataCompDr-10M (10 7×1536). 
+
+F.3 𝑘 -NN-graph build parameters 
+
+Tab. 14 lists the 𝑘 -NN build parameters ( 𝐾 =10). GPiPNN (published as RSQ8) is set by leaders, leaf size 𝐶 , fanout (𝑓 0, 𝑓 1), and rounds. TQ4 is too lossy to reach the recall floor on DEEP-10M, MS-Turing-10M, MS-MARCO-10M, Wiki-Cohere-10M, and Text2Image-10M. For some datasets it requires significantly higher fanout than RSQ8 and is thus slower . FP16/TF32 exceed the 80 GB budget on DataCompDr-10M. Jasper uses 𝑅 =64, 𝐿 cap =64, mbr =0.02, RaBitQ and reorder off, with 𝛼 and beam size as shown. NN-Descent (and its FP16 variant) is set by intermediate degree / iterations; IVF-PQ8 by probe count 
+
+𝑛 𝑝 (list count and PQ dimension auto); cuVS CAGRA uses graph / intermediate degree 32 /128 on every dataset. At 100M (DEEP, MS-Turing; not in Tab. 5) GPiPNN scales leaders to 4096, with leaf 2048 /4096 and fanout (8, 8)/( 8, 10 ) respectively. 
+
+F.4 Software and hardware 
+
+Tab. 15 gives the full version manifest abbreviated in Sec. 6. GPiPNN is compiled for Hopper SM90a with fused multiply-add disabled (-fmad=false device, -ffp-contract=off host) for determinis-tic builds. All builds run on a single H100, device-resident where the dataset fits the 80 GB budget; the DEEP-100M CAGRA outlier (Tab. 4) stems from the cuVS 25.04 large-scale host-input build path. 
+
+G CPU Build Parameter Configurations 
+
+This section reports the per-(method, dataset) build parameters behind the CPU results: the build times in Sec. 6.1 and the QPS-vs-recall curves in Fig. 10. PiPNN appears in three modes (TQ4, RSQ8, and FP32) that differ only in build precision. They share the build parameters below, so its columns cover all three, but the differing precision yields different graphs; all three are queried identically. For the ANNS index we fixed the graph degree 𝑅 =64 and build beam 𝐿 =128 and tuned the slack 𝛼 per dataset (Sec. G.1). For the 
+
+𝑘 -NN graph we swept the per-method knobs of Tab. 17 and kept the fastest build reaching recall ≥ 0.9. 
+
+G.1 ANNS-index build parameters 
+
+Tab. 16 lists the tuned parameters per dataset. The parameter 𝛼 
+
+is the only knob that was varied for both methods, as it directly controls the density of the produced graph. 
+
+Tuning 𝛼 . For each dataset we set PiPNN’s 𝛼 so that its graph’s average degree falls within ±2 of the Vamana’s average degree. We note that varying 𝛼 does not meaningfully change the construction time for PiPNN II, and this tuning was done to produce an apples-to-apples comparison between the quality of the graphs produced by the two methods (Fig. 10). 
+
+G.2 𝑘 -NN-graph build parameters 
+
+Tab. 17 lists the retained 𝑘 -NN configuration per method: the fastest swept build reaching recall ≥ 0.9. PyNNDescent is omitted on MS-MARCO, DEEP, MS-Turing, and Text2Image since it runs out of memory. Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 
+
+Table 13: Per-dataset ANNS-index build parameters (cf. Tab. 4). 𝑅 : degree; 𝐶 : leaf size; reord.: Jasper reorder; deg./inter.: CAGRA graph / intermediate degree. 
+
+GPiPNN (all modes) Jasper CAGRA Dataset 𝛼 𝑅 𝐶 𝑅 𝛼 reord. deg. inter. DEEP-10M 1.1 64 512 64 1.05 Y 64 128 MS-Turing-10M 1.1 64 512 64 1.1 Y 64 128 DEEP-100M 1.1 32 512 64 1.05 Y 64 128 MS-Turing-100M 1.1 32 512 64 1.1 Y 64 128 DBpedia-1536 1.0 32 512 32 1.05 Y 32 128 DBpedia-3072 1.0 32 512 32 1.1 N 32 192 Wiki-Qwen-500K 0.95 32 512 32 1.0 Y 32 192 OpenAI-2M 1.05 64 1024 64 1.1 Y 32 192 Wiki-all-1M 0.95 32 512 32 1.0 Y 32 128 Wiki-all-10M 0.95 32 512 32 0.95 Y 32 128 MS-MARCO-10M 0.9 32 512 32 0.9 Y 32 128 DataCompDr-10M 1.05 32 1024 32 1.1 Y 32 192 Wiki-Cohere-10M 0.95 32 512 32 0.95 Y 32 128 Text2Image-10M 0.9 64 512 64 0.9 Y 64 128 MS-Arctic-1M 0.9 32 512 32 0.9 Y 32 128 
+
+Table 14: Per-dataset 𝑘 -NN-graph build parameters (cf. Tab. 5). Values are the swept configuration retained per method; “–” in Tab. 5 marks cells where no configuration reached recall ≥ 0.9. deg./iter.: NN-Descent intermediate degree / iterations. 
+
+GPiPNN (all modes) Jasper NN-Descent IVF-PQ8 Dataset leaders 𝐶 (𝑓 0, 𝑓 1 ) rounds 𝛼 beam deg./iter. 𝑛 𝑝 
+
+DEEP-10M 512 1024 (8,4) 1 0.95 64 64/15 32 MS-Turing-10M 512 4096 (8,10) 1 1.05 64 48/15 64 DBpedia-1536 512 512 (8,8) 1 0.95 128 48/20 32 DBpedia-3072 512 512 (8,8) 1 0.95 128 48/30 32 Wiki-Qwen-500K 512 512 (8,10) 1 0.95 128 48/30 32 OpenAI-2M 512 512 (8,4) 1 0.95 128 48/15 32 Wiki-all-1M 512 2048 (8,10) 1 1.0 64 48/15 32 Wiki-all-10M 512 2048 (8,4) 1 0.95 64 48/15 64 MS-MARCO-10M 512 2048 (8,4) 4 0.9 128 48/15 64 DataCompDr-10M 512 4096 (8,4) 1 1.05 128 – –Wiki-Cohere-10M 512 2048 (8,4) 4 0.95 128 48/20 128 Text2Image-10M 512 1024 (8,4) 1 0.9 64 48/20 –MS-Arctic-1M 512 4096 (8,4) 1 0.9 512 48/20 32 
+
+Table 15: Software and hardware environment for the GPU experiments. 
+
+Component Version GPU NVIDIA H100 80 GB HBM3 SXM5 (cc 9.0) Host / instance GCP a3-highgpu-1g , 26-vCPU Sapphire Rapids, 234 GB DDR5 GPU driver 580.126.09 CUDA toolkit 12.9 (compiled sm_80/89/90; run as SM90a) OS Ubuntu 24.04.4 LTS GPiPNN libs CuTe/CUTLASS 3.7.0, RaBitQ, Eigen 3.4.0, Abseil 20250512.0, mimalloc 2.2.2 Compiler gcc/g++ 13, C++17, CMake ≥ 3.15 Jasper git 1f03773 (CUDA ≥ 12.1, cc > 8.0) cuVS / RAFT / RMM 25.04 (cuvs-bench 25.04, Python 3.12) Harness Python 3.10, NumPy ≥ 1.24 Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 
+
+Table 16: Per-dataset CPU ANNS-index build parameters (cf. Sec. 6.1 and Fig. 10). 𝑅 : graph degree; 𝐶 : PiPNN leaf/cluster size; 
+
+𝐿 : Vamana build beam. PiPNN runs a single cluster tree ( nc =1) with LSH table size 𝑇 =96 (dropped to 64 on the billion-scale sets in FP32 mode to fit memory); its TQ4, RSQ8, and FP32 modes differ only in build precision and so produce different graphs from these shared parameters, all queried identically. Vamana quant.: SQ8 is 8-bit scalar quantization, JL+SQ8 adds a Johnson-Lindenstrauss filter; the unquantized VF32 baseline uses the same 𝑅 , 𝐿 , and 𝛼 .
+
+PiPNN (all modes) Vamana Dataset 𝛼 𝑅 𝐶 𝑅 𝐿 𝛼 quant. Wiki-Qwen-500K 0.75 64 1024 64 128 1.0 JL+SQ8 DBP1536 1.25 64 1024 64 128 1.0 JL+SQ8 DBP3072 1.25 64 1024 64 128 1.0 JL+SQ8 OpenAI 1.25 64 1024 64 128 1.04 JL+SQ8 DataComp 1.25 64 1024 64 128 1.1 JL+SQ8 WikiCohere 0.98 64 1024 64 128 0.99 JL+SQ8 WikiAll 0.9 64 1024 64 128 0.93 JL+SQ8 MSMARCO 0.985 64 1024 64 128 1.0 JL+SQ8 MS-Arctic 0.95 64 1024 64 128 0.95 JL+SQ8 DEEP 1.15 64 1024 64 128 1.025 SQ8 MS-Turing 1.07 64 1024 64 128 1.01 SQ8 Text2Image 0.95 64 1024 64 128 1.0 SQ8 
+
+Table 17: Per-dataset CPU 𝑘 -NN-graph build parameters: the fastest swept configuration reaching recall ≥ 0.9 (the configurations timed in the right half of Sec. 6.1). PiPNN is set by its leaf fanout scheme and cluster count nc at fixed leaf size 𝐶 =1024 , per-leaf top-10 , heap size 𝑘 =20 , and TQ8 scoring. Vamana sweeps 𝑅 (build beam 𝐿 =2𝑅 ) and is read out at query beam 𝑄 , with SQ8 or JL+SQ8 as in Tab. 16. PyNNDescent runs one fixed configuration ( 𝑅 =40 , nc =5, leaf 100 , 𝛿 =0.02 , SQ8). “–” marks where PyNNDescent 
+
+exceeded memory (MSMARCO and the billion-scale sets). 
+
+PiPNN Vamana PyNNDescent 
+
+Dataset fanout nc 𝑅 𝑄 𝑅 nc 
+
+Wiki-Qwen-500K (10,1) 2 16 225 40 5DBP1536 (10,1) 2 32 12 40 5DBP3072 (10,1) 3 16 500 40 5OpenAI (10,1) 2 16 160 40 5DataComp (10,2,1) 2 32 120 40 5WikiCohere (10,3,1) 3 64 500 40 5WikiAll (10,3,1) 3 32 300 40 5MSMARCO (10,3,1) 5 64 160 – –MS-Arctic (10,2,1) 1 32 34 40 5DEEP (10,3,1) 3 64 30 – –MS-Turing (10,3,1) 2 32 140 – –Text2Image (10,2,1) 2 32 200 – –Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 
+
+Figure 9: Effect of maximum recursion depth on PiPNN index quality. On four different datasets, increasing recursion depth cap beyond 3 has little to no impact on query performance. Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 5
+
+> QPS
+
+Vamana-FP32 (122.2 s) Vamana-JL+SQ8 (9.3 s) PiPNN-FP32 (14.8 s) PiPNN-RSQ8 (2.5 s) PiPNN-TQ4 (1.9 s) 
+
+(a) DBpedia1536 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 5
+
+2 × 10 4
+
+3 × 10 4
+
+4 × 10 4
+
+6 × 10 4
+
+> QPS
+
+Vamana-FP32 (227.6 s) Vamana-JL+SQ8 (15.4 s) PiPNN-FP32 (28.2 s) PiPNN-RSQ8 (5.5 s) PiPNN-TQ4 (4.7 s) (b) DBpedia3072 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 4
+
+10 5
+
+> QPS
+
+Vamana-FP32 (1918.0 s) Vamana-JL+SQ8 (207.8 s) PiPNN-FP32 (244.7 s) PiPNN-RSQ8 (44.3 s) PiPNN-TQ4 (35.2 s) (c) DataCompDr 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 4
+
+10 5
+
+> QPS
+
+Vamana-FP32 (13510.0 s) Vamana-JL+SQ8 (1743.0 s) PiPNN-FP32 (1107.0 s) PiPNN-RSQ8 (226.4 s) PiPNN-TQ4 (175.0 s) 
+
+(d) MSMARCO 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 5
+
+> QPS
+
+Vamana-FP32 (14440.0 s) Vamana-JL+SQ8 (1766.0 s) PiPNN-FP32 (1302.0 s) PiPNN-RSQ8 (269.4 s) PiPNN-TQ4 (224.3 s) (e) MSMARCO-Arctic 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 4
+
+10 5
+
+> QPS
+
+Vamana-FP32 (4317.0 s) Vamana-JL+SQ8 (491.0 s) PiPNN-FP32 (352.2 s) PiPNN-RSQ8 (69.6 s) PiPNN-TQ4 (55.9 s) (f) Wiki-Cohere 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 5
+
+> QPS
+
+Vamana-FP32 (341.5 s) Vamana-JL+SQ8 (30.9 s) PiPNN-FP32 (36.1 s) PiPNN-RSQ8 (5.6 s) PiPNN-TQ4 (4.3 s) 
+
+(g) OpenAI-ArXiv 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 4
+
+10 5
+
+> QPS
+
+Vamana-FP32 (11780.0 s) Vamana-JL+SQ8 (1492.0 s) PiPNN-FP32 (891.8 s) PiPNN-RSQ8 (180.7 s) PiPNN-TQ4 (145.5 s) (h) wiki-all 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 5
+
+> QPS
+
+Vamana-FP32 (117.0 s) Vamana-JL+SQ8 (8.0 s) PiPNN-FP32 (18.4 s) PiPNN-RSQ8 (4.1 s) PiPNN-TQ4 (3.6 s) (i) Wiki-Qwen-500K 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 5
+
+10 6
+
+> QPS
+
+Vamana-FP32 (8178.0 s) Vamana-SQ8 (3142.0 s) PiPNN-FP32 (1484.0 s) PiPNN-RSQ8 (689.3 s) PiPNN-TQ4 (564.4 s) 
+
+(j) DEEP-1B 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 5
+
+10 6
+
+> QPS
+
+Vamana-FP32 (5719.0 s) Vamana-SQ8 (2772.0 s) PiPNN-FP32 (1480.0 s) PiPNN-RSQ8 (734.2 s) PiPNN-TQ4 (567.2 s) (k) MS-Turing-1B 0.800 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000 
+
+Recall 
+
+10 5
+
+> QPS
+
+Vamana-FP32 (8605.0 s) Vamana-SQ8 (3784.0 s) PiPNN-FP32 (2027.0 s) PiPNN-RSQ8 (935.1 s) PiPNN-TQ4 (730.2 s) (l) Text2Image-1B 
+
+Figure 10: Index Quality (CPU). QPS vs. recall on all datasets from Tab. 1, with per-method build times in the legends. PiPNN-FP32, PiPNN-TQ4, and PiPNN-RSQ8 trace nearly identical curves. Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 010 20 30 40 50 60 70 80 Build Time (s) 
+
+Vamana-JL+SQ8 PipNN pyNNDescent 
+
+(a) DBpedia-1536 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 020 40 60 80 100 120 140 Build Time (s) 
+
+Vamana-JL+SQ8 PipNN pyNNDescent (b) DBpedia-3072 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 010 20 30 40 50 60 Build Time (s) 
+
+Vamana-JL+SQ8 PipNN pyNNDescent (c) Wiki-Qwen-500K 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 020 40 60 80 100 120 140 160 Build Time (s) 
+
+Vamana-JL+SQ8 PipNN pyNNDescent 
+
+(d) OpenAI-2M 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 01000 2000 3000 4000 5000 Build Time (s) 
+
+Vamana-JL+SQ8 PipNN pyNNDescent (e) MSMARCO-Arctic-114M 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 0200 400 600 800 1000 Build Time (s) 
+
+Vamana-JL+SQ8 PipNN pyNNDescent (f) DataCompDR-12M 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 01000 2000 3000 4000 5000 6000 7000 Build Time (s) 
+
+Vamana-JL+SQ8 PipNN pyNNDescent 
+
+(g) Wiki-Cohere-35M 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 02000 4000 6000 8000 10000 12000 14000 Build Time (s) 
+
+Vamana-JL+SQ8 PipNN pyNNDescent (h) Wiki-all-88M 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 05000 10000 15000 20000 25000 Build Time (s) 
+
+Vamana-JL+SQ8 PipNN pyNNDescent (i) MSMARCO-101M 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 05000 10000 15000 20000 25000 30000 Build Time (s) 
+
+Vamana-SQ8 
+
+(j) Deep-1B 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 05000 10000 15000 20000 25000 Build Time (s) 
+
+Vamana-SQ8 PipNN (k) MSTuring-1B 0.70 0.75 0.80 0.85 0.90 0.95 1.00 Recall 05000 10000 15000 20000 25000 30000 35000 40000 Build Time (s) 
+
+Vamana-SQ8 PipNN (l) Text2Image-1B 
+
+Figure 11: Full set of 𝑘 -NN-graph recall vs. build time results on CPUs. We note that the optimized version of pyNNDescent in ParlayANN runs out of memory on MSMARCO-101M, Deep-1B, MSTuring-1B, and Text2Image-1B. Turbocharging PiPNN for Proximity and 𝑘 -NN Graph Building 10 5
+
+> 10 6
+
+DEEP-10M 
+
+> 10 5
+> 10 6
+
+MS-Turing-10M 
+
+> 10 5
+
+DBpedia-1536 
+
+> 10 5
+
+DBpedia-3072 
+
+> 10 4
+> 10 5
+
+Wiki-Qwen-500K 
+
+> 10 5
+
+OpenAI-2M 
+
+> 10 5
+> 10 6
+
+Wiki-all-1M 
+
+> 10 5
+
+Wiki-all-10M 
+
+> 10 5
+
+DataCompDr-10M 
+
+> 10 5
+
+Wiki-Cohere-10M 
+
+> 10 5
+> 10 6
+
+Text2Image-10M 
+
+> 10 5
+
+MS-MARCO-10M     
+
+> 0.6 0.7 0.8 0.9 1.0 10 5
+
+MS-Arctic-1M 
+
+Recall GPU QPS 
+
+> gPiPNN-TQ4 gPiPNN-RSQ8 gPiPNN-FP16 JASPER CAGRA CAGRA-FP16 CAGRA-PQ4 CAGRA-PQ8
+
+Figure 12: Full GPU query throughput vs. recall grid for all thirteen datasets (top-right is best); the body (Fig. 5) shows the DEEP-10M and DBpedia-3072 panels. Queries use Jasper’s GPU search kernel. The DataCompDr-10M, Wiki-Cohere-10M, Text2Image-10M, and MS-MARCO-10M panels use ground truth computed for the 10M crops, and the MS-Arctic-1M panel ground truth for the 1M slice; on the unnormalized MIPS sets only the CAGRA-PQ (IVF-PQ) variant is available.

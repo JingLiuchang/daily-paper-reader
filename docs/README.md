@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-03</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-05</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 33 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 16 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
-    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>3 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>18</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>15</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>12</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-04 01:08:46 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-05 04:09:15 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,9 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>合并同一论文的不同版本后，共 33 篇，精读 18 篇、速读 15 篇。历史文章链接与阅读记录保留。</p>
+<p>今天共扫读 16 篇论文，精读 4 篇，重点放在向量检索加速与近似最近邻搜索（ANNS）的工程化优化上，两项高分工作均获 9.0 分。</p>
+<p>最值得关注的是 Vectorium+kANNolo 的模块化高效 ANNS 方案，以及 Turbocharging PiPNN 对邻近图和 k-NN 图构建的提速，两者都直接指向大规模检索的实用性能提升。</p>
+<p>普通读者可先读这两篇精读文章的摘要与方法图，了解检索加速的整体思路；再按需浏览速读中关于 LLM 智能体长期记忆与图检索的三篇 7 分工作。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +80,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">18 篇</strong>
+    <strong class="dpr-home-dashboard-count">4 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="ACTIVE: A Dynamic Pareto-Frontier-Based Unified Index for Dual-Vector Query">ACTIVE: A Dynamic Pareto-Frontier-Based Unified Index for Dual-Vector Query</span></li><li><span class="dpr-home-dashboard-paper-title" title="Lossless Compression of Proximity Graph Indexes for Efficient Approximate Nearest Neighbors Search">Lossless Compression of Proximity Graph Indexes for Efficient Approximate Nearest Neighbors Search</span></li><li><span class="dpr-home-dashboard-paper-title" title="Fast Approximate Line Nearest Neighbor Search">Fast Approximate Line Nearest Neighbor Search</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo">Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo</span></li><li><span class="dpr-home-dashboard-paper-title" title="Turbocharging PiPNN for Proximity and $k$-NN Graph Building">Turbocharging PiPNN for Proximity and $k$-NN Graph Building</span></li><li><span class="dpr-home-dashboard-paper-title" title="Delivered, Not Used: Evaluating Agent Memory at Its Point of Use">Delivered, Not Used: Evaluating Agent Memory at Its Point of Use</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>7</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>6</strong></span><span class="dpr-home-dashboard-tag">vector-db <strong>4</strong></span><span class="dpr-home-dashboard-tag">vq-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>2</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +93,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">15 篇</strong>
+    <strong class="dpr-home-dashboard-count">12 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="KITE: Retrieval as a Decision Procedure for Long-Term Conversational Memory">KITE: Retrieval as a Decision Procedure for Long-Term Conversational Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="O2N2: Efficient Doubly Oblivious Approximate Nearest Neighbor Search">O2N2: Efficient Doubly Oblivious Approximate Nearest Neighbor Search</span></li><li><span class="dpr-home-dashboard-paper-title" title="Read the Route: Attention-Steered Hypergraph Retrieval for Multi-hop RAG">Read the Route: Attention-Steered Hypergraph Retrieval for Multi-hop RAG</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="KEEPER: Learning Control-Sufficient Textual Memory for Long-Horizon LLM Agents">KEEPER: Learning Control-Sufficient Textual Memory for Long-Horizon LLM Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="EAGR: Evidence-Guided Adaptive Graph Retrieval">EAGR: Evidence-Guided Adaptive Graph Retrieval</span></li><li><span class="dpr-home-dashboard-paper-title" title="EvoMemState: Evolving Memory State for Personal Agents">EvoMemState: Evolving Memory State for Personal Agents</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>12</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>2</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>12</strong></span></div>
 </section>
 </div>
 
