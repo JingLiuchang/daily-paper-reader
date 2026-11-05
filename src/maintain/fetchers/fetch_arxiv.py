@@ -15,6 +15,7 @@ from supabase_source import (
     fetch_recent_papers,
     fetch_papers_by_date_range,
 )
+from arxiv_fetch_recovery import FetchCheckpoint, ResilientArxivClient
 try:
     from source_config import load_config_with_source_migration
 except Exception:  # pragma: no cover - 兼容 package 导入路径
@@ -293,6 +294,7 @@ def fetch_category_in_windows(
     seen_ids: set[str],
     unique_papers: dict,
     split_on_error_depth: int = 1,
+    checkpoint: FetchCheckpoint | None = None,
 ) -> datetime | None:
     """
     按时间窗口抓取单个大类。
@@ -316,31 +318,35 @@ def fetch_category_in_windows(
         )
 
         count = 0
+        window_papers = []
         try:
-            for r in client.results(search):
-                pid = r.get_short_id()
+            cached = checkpoint.get(query) if checkpoint else None
+            if cached is not None:
+                log(f'[arxiv:checkpoint] restored {category} {start_str}..{end_str}: {len(cached)} papers')
+            def fetch_papers():
+                for r in client.results(search):
+                    yield {
+                        'id': r.get_short_id(), 'source': 'arxiv',
+                        'title': r.title.replace('\n', ' '),
+                        'abstract': r.summary.replace('\n', ' '),
+                        'authors': [a.name for a in r.authors],
+                        'primary_category': r.primary_category, 'categories': r.categories,
+                        'published': str(r.published),
+                        'link': getattr(r, 'pdf_url', None) or r.entry_id,
+                    }
+            for paper_dict in cached if cached is not None else fetch_papers():
+                window_papers.append(paper_dict)
+                pid = paper_dict['id']
                 if pid in seen_ids:
                     continue
                 if pid in unique_papers:
                     continue
 
-                pdf_link = getattr(r, "pdf_url", None) or r.entry_id
-                paper_dict = {
-                    "id": pid,
-                    "source": "arxiv",
-                    "title": r.title.replace("\n", " "),
-                    "abstract": r.summary.replace("\n", " "),
-                    "authors": [a.name for a in r.authors],
-                    "primary_category": r.primary_category,
-                    "categories": r.categories,
-                    "published": str(r.published),
-                    "link": pdf_link,
-                }
                 unique_papers[pid] = paper_dict
                 count += 1
 
                 seen_ids.add(pid)
-                published_dt = r.published
+                published_dt = _parse_iso_datetime(paper_dict['published'])
                 if isinstance(published_dt, datetime):
                     if published_dt.tzinfo is None:
                         published_dt = published_dt.replace(tzinfo=timezone.utc)
@@ -351,12 +357,20 @@ def fetch_category_in_windows(
                 if count % 200 == 0:
                     log(f"   Category {category} (win {idx}/{len(windows)}): {count} papers fetched...")
 
+            if checkpoint and cached is None:
+                checkpoint.put(query, window_papers)
             log(f"   ✅ Finished {category} (win {idx}/{len(windows)}): Got {count} new papers.")
         except Exception as e:
             # 单个窗口失败不影响其他窗口/分类
             log(f"   ❌ Error fetching category {category} (win {idx}/{len(windows)}): {e}")
             # 回退：如果窗口仍然很大，尝试把该窗口再二分（仅一层，避免过度递归）
-            if split_on_error_depth > 0 and (win_end - win_start) >= timedelta(days=2):
+            status = getattr(e, 'status', None)
+            if status == 429:
+                # The page client already exhausted a bounded backoff budget.
+                # Splitting this query would only add traffic to a rate limit.
+                raise RuntimeError(f'arXiv rate limit persisted: {category} {start_str}..{end_str}; completed windows checkpointed') from e
+            can_split = status in (500, 502, 503, 504) or isinstance(e, arxiv.UnexpectedEmptyPageError)
+            if can_split and split_on_error_depth > 0 and (win_end - win_start) >= timedelta(days=2):
                 mid = win_start + (win_end - win_start) / 2
                 mid = mid.replace(second=0, microsecond=0)
                 minute = timedelta(minutes=1)
@@ -374,6 +388,7 @@ def fetch_category_in_windows(
                     seen_ids=seen_ids,
                     unique_papers=unique_papers,
                     split_on_error_depth=split_on_error_depth - 1,
+                    checkpoint=checkpoint,
                 )
                 cat_max_right = fetch_category_in_windows(
                     client=client,
@@ -382,6 +397,7 @@ def fetch_category_in_windows(
                     seen_ids=seen_ids,
                     unique_papers=unique_papers,
                     split_on_error_depth=split_on_error_depth - 1,
+                    checkpoint=checkpoint,
                 )
                 for candidate in (cat_max_left, cat_max_right):
                     if candidate and (max_published_new is None or candidate > max_published_new):
@@ -510,6 +526,15 @@ def fetch_all_domains_metadata_robust(
         start_date, window_end, source_desc = resolve_supabase_time_window(
             end_date=end_date, days=days,
         )
+    token = get_run_date_token(end_date)
+    checkpoint = FetchCheckpoint(
+        os.getenv('DPR_ARXIV_FETCH_CACHE_DIR') if ignore_seen else None,
+        ['arxiv-fetch-v1', os.getenv('GITHUB_RUN_ID') or token, days,
+         token if RANGE_TOKEN_RE.match(token) or days == 1 else 'rolling',
+         CATEGORIES_TO_FETCH, chunk_days],
+        start_date, window_end,
+    )
+    start_date, window_end = checkpoint.bounds
     windows = iter_time_windows(start_date, window_end, chunk_days=chunk_days)
     start_str = start_date.strftime("%Y%m%d%H%M")
     end_str = window_end.strftime("%Y%m%d%H%M")
@@ -523,11 +548,7 @@ def fetch_all_domains_metadata_robust(
     unique_papers = {}
     max_published_new: datetime | None = None
     
-    client = arxiv.Client(
-        page_size=200,    # 降级：从 1000 降到 200，避免单次响应过大导致 500
-        delay_seconds=3.0,
-        num_retries=5
-    )
+    client = ResilientArxivClient(log=log)
 
     # 2. 遍历分类进行抓取
     for category in CATEGORIES_TO_FETCH:
@@ -537,6 +558,7 @@ def fetch_all_domains_metadata_robust(
             windows=windows,
             seen_ids=seen_ids,
             unique_papers=unique_papers,
+            checkpoint=checkpoint,
         )
         if cat_max and (max_published_new is None or cat_max > max_published_new):
             max_published_new = cat_max
@@ -569,7 +591,8 @@ def fetch_all_domains_metadata_robust(
         save_seen_state(seen_ids, max_published_new)
     else:
         save_seen_state(seen_ids, latest_published_at)
-    save_last_crawl_at(end_date)
+    save_last_crawl_at(min(end_date, window_end))
+    checkpoint.finish()
     group_end()
 
 if __name__ == "__main__":

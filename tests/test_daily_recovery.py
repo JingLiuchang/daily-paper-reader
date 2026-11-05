@@ -122,7 +122,7 @@ def test_arxiv_failure_does_not_write_results_or_advance_state(tmp_path, monkeyp
     monkeypatch.setattr(fetcher, 'load_last_crawl_at', lambda: None)
     client = Mock()
     client.results.side_effect = RuntimeError('arXiv unavailable')
-    monkeypatch.setattr(fetcher.arxiv, 'Client', lambda **kwargs: client)
+    monkeypatch.setattr(fetcher, 'ResilientArxivClient', lambda **kwargs: client)
     save_seen, save_crawl = Mock(), Mock()
     monkeypatch.setattr(fetcher, 'save_seen_state', save_seen)
     monkeypatch.setattr(fetcher, 'save_last_crawl_at', save_crawl)

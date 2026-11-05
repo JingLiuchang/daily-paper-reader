@@ -1,0 +1,81 @@
+name: Verify arXiv metadata fetch
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Metadata window in days (1–30); no model calls or publication'
+        default: '9'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-paper-reader
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DPR_STRICT_ARXIV_FETCH: '1'
+      DPR_ARXIV_FETCH_CACHE_DIR: .local-runs/arxiv-fetch-cache
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install metadata dependencies only
+        run: python -m pip install 'arxiv<3' requests pyyaml
+      - name: Restore fetch progress
+        uses: actions/cache/restore@v5
+        with:
+          path: .local-runs/arxiv-fetch-cache
+          key: arxiv-fetch-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: arxiv-fetch-v1-${{ github.run_id }}-
+      - name: Fetch all configured arXiv categories
+        timeout-minutes: 25
+        env:
+          FETCH_DAYS: ${{ inputs.days }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          days = int(os.environ['FETCH_DAYS'])
+          if not 1 <= days <= 30:
+              raise SystemExit('days must be 1–30')
+          output = Path('.local-runs/arxiv-probe/papers.json')
+          subprocess.run([sys.executable, 'src/maintain/fetchers/fetch_arxiv.py',
+                          '--days', str(days), '--ignore-seen', '--disable-supabase-read',
+                          '--output', str(output)], check=True)
+          papers = json.loads(output.read_text())
+          dates = sorted(p['published'] for p in papers)
+          summary = {'papers': len(papers), 'unique_ids': len({p['id'] for p in papers}),
+                     'earliest': dates[0] if dates else None,
+                     'latest': dates[-1] if dates else None,
+                     'model_calls': 0, 'published': False}
+          print(json.dumps(summary, ensure_ascii=False))
+          Path('.local-runs/arxiv-probe/summary.json').write_text(json.dumps(summary, indent=2))
+          PY
+      - name: Save fetch progress even after failure
+        if: always() && hashFiles('.local-runs/arxiv-fetch-cache/**') != ''
+        uses: actions/cache/save@v5
+        with:
+          path: .local-runs/arxiv-fetch-cache
+          key: arxiv-fetch-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload verification summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: arxiv-fetch-verification
+          path: .local-runs/arxiv-probe/summary.json
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: error
