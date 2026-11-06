@@ -51,14 +51,14 @@
       <span class="dpr-home-dashboard-kicker">2026-11-05</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 16 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 22 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
-    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>2 次</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>12</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>18</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-05 04:09:15 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-06 00:10:56 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,9 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今天共扫读 16 篇论文，精读 4 篇，重点放在向量检索加速与近似最近邻搜索（ANNS）的工程化优化上，两项高分工作均获 9.0 分。</p>
-<p>最值得关注的是 Vectorium+kANNolo 的模块化高效 ANNS 方案，以及 Turbocharging PiPNN 对邻近图和 k-NN 图构建的提速，两者都直接指向大规模检索的实用性能提升。</p>
-<p>普通读者可先读这两篇精读文章的摘要与方法图，了解检索加速的整体思路；再按需浏览速读中关于 LLM 智能体长期记忆与图检索的三篇 7 分工作。</p>
+<p>今日完成22篇论文筛选（精读4篇、速读18篇），重点集中在向量检索加速与智能体记忆管理两大方向。最值得看的是两篇9.0分工作：Vectorium与kANNolo模块化高效近似最近邻检索，以及Turbocharging PiPNN的邻近与k-NN图构建优化。普通读者可先看这两篇精读掌握检索效率主线，再按需浏览智能体记忆相关的三篇速读。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -93,12 +91,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">12 篇</strong>
+    <strong class="dpr-home-dashboard-count">18 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="KEEPER: Learning Control-Sufficient Textual Memory for Long-Horizon LLM Agents">KEEPER: Learning Control-Sufficient Textual Memory for Long-Horizon LLM Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="EAGR: Evidence-Guided Adaptive Graph Retrieval">EAGR: Evidence-Guided Adaptive Graph Retrieval</span></li><li><span class="dpr-home-dashboard-paper-title" title="EvoMemState: Evolving Memory State for Personal Agents">EvoMemState: Evolving Memory State for Personal Agents</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Evolving Memory, Learning to Meta-Control: Test-Time Adaptation for Experience-augmented LLM Agents">Evolving Memory, Learning to Meta-Control: Test-Time Adaptation for Experience-augmented LLM Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Scalaris: A Scalable Enterprise Memory Architecture for Conversational AI Assistants">Scalaris: A Scalable Enterprise Memory Architecture for Conversational AI Assistants</span></li><li><span class="dpr-home-dashboard-paper-title" title="A State Change Is Local, Its Consequences Are Not: Dependency-Aware State Revision for Long-Term Agent Memory">A State Change Is Local, Its Consequences Are Not: Dependency-Aware State Revision for Long-Term Agent Memory</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>12</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>18</strong></span></div>
 </section>
 </div>
 
