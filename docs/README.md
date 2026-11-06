@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-05</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-06</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 22 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 11 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
-    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>2 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>18</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>3</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>8</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-06 00:10:56 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-06 23:56:00 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日完成22篇论文筛选（精读4篇、速读18篇），重点集中在向量检索加速与智能体记忆管理两大方向。最值得看的是两篇9.0分工作：Vectorium与kANNolo模块化高效近似最近邻检索，以及Turbocharging PiPNN的邻近与k-NN图构建优化。普通读者可先看这两篇精读掌握检索效率主线，再按需浏览智能体记忆相关的三篇速读。</p>
+<p>今日精读3篇、速读8篇，重点聚焦动态向量数据库与图式最近邻搜索的理论边界。最值得关注的是两项9.0分工作，它们分别给出动态向量库逐查询召回保证，以及球面图搜索的尖锐极限，适合关心ANN可靠性与性能上限的读者。建议先读这两篇精读，把握核心结论，再用速读里的记忆管理与RAG路由文章补充应用视角。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +78,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">4 篇</strong>
+    <strong class="dpr-home-dashboard-count">3 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo">Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo</span></li><li><span class="dpr-home-dashboard-paper-title" title="Turbocharging PiPNN for Proximity and $k$-NN Graph Building">Turbocharging PiPNN for Proximity and $k$-NN Graph Building</span></li><li><span class="dpr-home-dashboard-paper-title" title="Delivered, Not Used: Evaluating Agent Memory at Its Point of Use">Delivered, Not Used: Evaluating Agent Memory at Its Point of Use</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Per-Query Recall Guarantees for Approximate Nearest Neighbor Search in Dynamic Vector Databases">Per-Query Recall Guarantees for Approximate Nearest Neighbor Search in Dynamic Vector Databases</span></li><li><span class="dpr-home-dashboard-paper-title" title="Sharp Limits of Graph-Based Nearest Neighbor Search on the Sphere">Sharp Limits of Graph-Based Nearest Neighbor Search on the Sphere</span></li><li><span class="dpr-home-dashboard-paper-title" title="GINGER: Spicing Up Graph-Based Vector Search">GINGER: Spicing Up Graph-Based Vector Search</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>2</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">ann-graph <strong>2</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +91,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">18 篇</strong>
+    <strong class="dpr-home-dashboard-count">8 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Evolving Memory, Learning to Meta-Control: Test-Time Adaptation for Experience-augmented LLM Agents">Evolving Memory, Learning to Meta-Control: Test-Time Adaptation for Experience-augmented LLM Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Scalaris: A Scalable Enterprise Memory Architecture for Conversational AI Assistants">Scalaris: A Scalable Enterprise Memory Architecture for Conversational AI Assistants</span></li><li><span class="dpr-home-dashboard-paper-title" title="A State Change Is Local, Its Consequences Are Not: Dependency-Aware State Revision for Long-Term Agent Memory">A State Change Is Local, Its Consequences Are Not: Dependency-Aware State Revision for Long-Term Agent Memory</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Accept Changes, Reject Attacks: Robust Memory Management for LLM Agents">Accept Changes, Reject Attacks: Robust Memory Management for LLM Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Reglos: A Self-Evolving Personal Memory Agent with Recursive Self-Improvement">Reglos: A Self-Evolving Personal Memory Agent with Recursive Self-Improvement</span></li><li><span class="dpr-home-dashboard-paper-title" title="ZeroRAG: Adaptive Semantic Peer Routing for Decentralized Retrieval-Augmented Generation">ZeroRAG: Adaptive Semantic Peer Routing for Decentralized Retrieval-Augmented Generation</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>18</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">vector-db <strong>7</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 </div>
 

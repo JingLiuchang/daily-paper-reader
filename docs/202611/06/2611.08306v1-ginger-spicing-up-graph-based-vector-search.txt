@@ -1,0 +1,947 @@
+Title: GINGER: Spicing Up Graph-Based Vector Search
+
+URL Source: https://arxiv.org/pdf/2611.08306v1
+
+Published Time: Fri, 06 Nov 2026 03:35:50 GMT
+
+Number of Pages: 18
+
+Markdown Content:
+# GINGER: Spicing Up Graph-Based Vector Search 
+
+## Daniel Salwasser 
+
+Google Research & KIT Karlsruhe, Germany dsalwasser@google.com 
+
+## Lars Gottesbüren 
+
+Google Research Zürich, Switzerland gottesbueren@google.com 
+
+## Laxman Dhulipala 
+
+Google Research & UMD College Park, USA laxmand@google.com 
+
+## Jakub Łącki 
+
+Google Research New York City, USA jlacki@google.com 
+
+## Guy Blelloch 
+
+Google Research & CMU Pittsburgh, USA gblelloch@google.com 
+
+## Rajesh Jayaram 
+
+Google Research New York City, USA rkjayaram@google.com 
+
+## Tobias Rubel 
+
+Google Research & UMD College Park, USA rubelato@google.com 
+
+## Kshiteej Sheth 
+
+Google Research & EPFL Zürich, Switzerland kshiteejsheth@google.com 
+
+## Amir Zandieh 
+
+Google Research Zürich, Switzerland zandieh@google.com 
+
+## Vahab Mirrokni 
+
+Google Research New York City, USA mirrokni@google.com 
+
+## ABSTRACT 
+
+We present Ginger, a state-of-the-art open-source C++ library for graph-based approximate nearest neighbor search (ANNS). We developed Ginger at Google to push the speed and memory effi-ciency of graph search on large and high-dimensional embedding datasets. Ginger surpasses existing ANNS libraries with regards to query throughput and indexing time while matching the memory footprint of the most space-efficient competitors. Ginger builds upon recent advances in proximity graph con-struction (PiPNN) and vector quantization (TurboQuant). We in-troduce Nested TurboQuant (NTQ), a two-level quantizer which supports low precision graph navigation and high precision rerank-ing in a single code. This representation achieves near floating point precision with 2 .6× less memory. We also compress the size of our proximity graphs by up to 2 .5× without impacting query through-put. We combine graph reordering with a new lossless compression codec called AdaptiveGap, which builds upon StreamVByte. At 95% recall, Ginger speeds up query throughput by an average of 1 .8×
+
+over each dataset’s fastest competitor and by at least 2 .3× over any single library. This lead grows to 2 .9× over compact libraries on high-dimensional embeddings. 
+
+## 1 INTRODUCTION 
+
+The rapid progress in deep learning has placed Approximate Nearest Neighbor Search (ANNS) at the center of information retrieval and data analysis [31, 49, 50, 62, 72, 88, 93]. Today’s workloads are marked by a sharp increase in both the number of indexed entities and the dimensionality of the embeddings used to represent them. Proximity graphs have been shown to perform well in very high dimensions, and are thus the dominant technique for ANNS indexing whenever high recall is paramount. A proximity graph represents each entity as a vertex and connects it to nearby and further directionally diverse neighbors. Queries route through the graph via greedy beam search , which iteratively expands the closest unexplored vertices until converging to the query neighborhood. Prominent proximity-graph algorithms include HNSW [57], Va-mana (DiskANN) [41], NSG [26], and PiPNN [73, 74]. Compared to cluster-based inverted-file (IVF) indexes such as Faiss [22] and ScaNN [37, 81], proximity graphs achieve high recall with many fewer distance evaluations on modern embeddings. Still, graph indexes face three bottlenecks in practice: (1) mem-ory bandwidth at search time, (2) memory footprint to host the index, and (3) indexing time. Our prior work PiPNN [73, 74] effec-tively resolved the issue of index construction, building high-quality 1x 3x 6x 9x 12x Ginger SymphonyQG ParlayANN SVS DiskANN Faiss ScaNN Hnswlib          
+
+> QPS Speedup
+> 100% 200% 300%
+> Index Size / Raw Vectors
+> 20m 40m 60m 80m Ginger SymphonyQG ParlayANN SVS DiskANN Faiss ScaNN Hnswlib
+> Build Time (MS-MARCO)
+> 𝑛 =101M , 𝑑 =768
+
+## 1
+
+Figure 1: Query throughput relative to Hnswlib at 95% 10@10 recall (top left, higher is better) and memory footprint (graph and com-pressed vectors) relative to raw vectors (top right, lower is better) as the geometric mean across 14 datasets, alongside index construction time on MS-MARCO (bottom, lower is better). SymphonyQG and ScaNN fail on some datasets, which are excluded in their aggregate. 
+
+billion-scale indexes in 10s of minutes instead of hours. This paper addresses the other two bottlenecks: search throughput and mem-ory footprint. Moreover, we introduce the first production-grade implementation of PiPNN. To this end we present and open-source Ginger 1, an in-memory C++ library for graph-based ANNS. It was developed internally at Google to solve a variety of large-scale retrieval problems with a primary focus on efficiency. We developed Ginger from the ground up as a standalone C++ library with portable SIMD kernels written in Highway [87]. Ginger also serves as the official open-source implementation of PiPNN II [73], thus combining SOTA query speed, memory efficiency and indexing time in one package. Many industrial-grade vector search libraries exist, including Faiss [22], ScaNN [37, 81], DiskANN [41], SVS [1], and Hnswlib [58]. Given this high bar, it might be expected that there exists little room for improvement over these widely adopted and well-optimized systems. Surprisingly, we find that a combination of algorithmic improvements in vector quantization as well as careful performance engineering yields significant speedups over the prior state of the 
+
+> 1https://github.com/google/ginger 1arXiv:2611.08306v1 [cs.IR] 5 Nov 2026 Salwasser et al.
+
+art. Across all 14 benchmarks in our evaluation, Ginger is on av-erage 1 .8× faster than the fastest competitor at 95% recall (up to 2.7×). The gap is largest on high-dimensional datasets ( 𝑑 ≥ 768), where Ginger is 2 .0× faster on average. Our results come from both designing every step of our beam search implementation around reducing memory traffic as well as reducing the index footprint by way of lossless graph compression. We make the following contributions. 
+
+• Nested TurboQuant (Section 3). We introduce Nested Turbo-Quant (NTQ), an extension of TurboQuant in which a single code per vector serves both graph navigation and reranking. The beam search operates on the leading 4 bits per coordinate, which form a valid TurboQuant code [85, 92]. The remaining 𝑘 bits refine each 4-bit interval with a nested Lloyd–Max codebook, using the full code to rerank the search results. With 12 bits per coordinate, NTQ nearly matches the accuracy of 32-bit floats while using 2 .6× less memory. 
+
+• Fast graph search (Sections 3 and 4). We contribute an ex-tremely fast SIMD kernel for one-to-many scoring of the 4-bit codes. On high-dimensional embeddings, we offer two ways to further speed up the search. We either project vectors to a lower dimension with PCA, or apply a tuning-free prefilter called TurboSlice [17] to discard unpromising candidates early. 
+
+• Graph compression (Section 5). On low-dimensional datasets, the graph adjacency lists of prior libraries consume as much memory as the quantized vectors themselves. We introduce Adap-tiveGap , a lossless codec that packs small gaps into fewer than eight bits while retaining the single-shuffle SIMD decoding of StreamVByte. On the same vertex ordering, AdaptiveGap uses on average 5 .4% less graph memory (up to 7 .6%) than StreamVByte. We combine this codec with graph partitioning to assign nearby IDs to neighboring vertices. Together, these techniques shrink the graph by an average of 2 .1× (up to 2 .5×) relative to an un-compressed CSR layout without slowing down queries. 
+
+• Extensive evaluation (Section 6). We compare Ginger with seven state-of-the-art graph and IVF libraries on 14 public bench-marks with up to one billion vectors and 4096 dimensions. Gin-ger achieves the highest query throughput at 90% and 95% recall on 13 of the 14 benchmarks. At 95% recall, Ginger outperforms the fastest competitor by 2 .0× on average (up to 2 .7×) on high-dimensional data and by 1 .45 × (up to 2 .1×) on low-dimensional data. At 90% recall, the corresponding speedups are 1 .8× (up to 2.3×) and 1 .55 × (up to 2 .0×). The complete Ginger index for the billion-point Deep dataset occupies approximately 288 GB of memory with 12-bit NTQ (Figure 5). Ginger’s modular design and portable SIMD kernels make it easy to integrate state-of-the-art ANNS into new search and data management systems. Our results demonstrate that we can simul-taneously deliver state-of-the-art memory footprint, search perfor-mance, and indexing time through a mix of algorithmic improve-ments and performance engineering. 
+
+## 2 PRELIMINARIES 
+
+Let X ⊆ R𝑑 be a collection of 𝑛 vectors and let dist (· , ·) be a dissim-ilarity on R𝑑 , such as Euclidean distance or negative inner product. Definition 2.1 ( 𝑘 -nearest-neighbor search). Given a query 
+
+𝑞 ∈ R𝑑 , the 𝑘 -nearest-neighbors of 𝑞 in X is a set K ⊆ X with |K | = 𝑘 
+
+such that dist (𝑞, 𝑝 ) ≤ dist (𝑞, 𝑝 ′) for all 𝑝 ∈ K and 𝑝 ′ ∈ X \ K .
+
+Approximate Nearest Neighbors (ANNS). Given a query 𝑞 , an approximate nearest neighbors (ANNS) index returns a set K′ that approximates K. The quality is measured by the recall , |K ∩ K ′ |/ 𝑘 ,averaged over a query set. We write 𝑘 @𝑘 ′ recall when |K ′ | = 𝑘 ′ ≥ 𝑘 ,and use 10@10 recall unless stated otherwise. An index is judged by its throughput (queries per second, QPS) at a given recall, by its memory footprint, and by the time taken to construct it. 
+
+## 2.1 ANNS Indexes 
+
+Proximity Graphs and Search. A graph-based ANNS index or-ganizes vectors into a proximity graph, with a vertex for each vec-tor and directed edges connecting vectors. Neighbors are selected heuristically during graph construction based on closeness and directional diversity. Queries explore this graph using beam search (Algorithm 1). Starting from an entry vertex 𝑠 , the search maintains a beam 𝐵 of at most 𝐿 candidates and a set 𝑉 of expanded vertices. It repeatedly expands the closest vertex in 𝐵 \ 𝑉 , adds its neighbors to the beam, and retains the 𝐿 closest candidates, stopping when every vertex in the beam has been expanded. Implementations of graph search differ widely in their candidate and visited-set data structures, stopping rules, filtering, batching, and prefetching. They may also navigate using quantized vectors and rerank a larger can-didate set using full-precision vectors or more accurate codes. These choices affect memory traffic, query throughput, and recall.  
+
+> Algorithm 1: BeamSearch
+
+Input: 𝐺 = (X , 𝐸 ) a proximity graph over X, 𝑠 ∈ X an entry point, 𝑞 a query point, and 𝐿 ∈ N a beam width 
+
+Output: 𝐵 ⊆ X containing the 𝐿 closest points to 𝑞 
+
+encountered during the search  
+
+> 1
+
+𝐵 ← { 𝑠 }; 
+
+> 2
+
+𝑉 ← ∅ ; 
+
+> 3
+
+while 𝐵 \ 𝑉 ≠ ∅ do  
+
+> 4
+
+𝑝 ← arg min 𝑢 ∈𝐵 \𝑉 dist (𝑢, 𝑞 ); 
+
+> 5
+
+𝐵 ← 𝐵 ∪ Neighbors( 𝑝 ); 
+
+> 6
+
+𝑉 ← 𝑉 ∪ { 𝑝 }; 
+
+> 7
+
+if |𝐵 | > 𝐿 then  
+
+> 8
+
+𝐵 ← the 𝐿 points in 𝐵 with smallest distance to 𝑞 ; 
+
+> 9
+
+return 𝐵 ;
+
+Graph Construction. The Vamana [41] index constructs a prox-imity graph iteratively via beam-search traversals on the partial index and an 𝛼 -Relative Neighborhood Graph ( 𝛼 -RNG) pruning heuristic ( RobustPrune ). This rule enforces directional diversity and injects long-range edges, achieving shorter search paths than hierarchical structures like HNSW [57]. Many other proximity-graph construction algorithms have been proposed [21, 24–26, 38, 40, 56, 63, 86, 90, 91, 94]. In practice, Vamana and HNSW are the most widely used. However, search-driven graph construction suf-fers from a fundamental “search bottleneck” [74] requiring millions 
+
+> 2GINGER: Spicing Up Graph-Based Vector Search
+
+of random-access memory lookups and thus incurring long build times. 
+
+PiPNN (Pick-in-Partitions Nearest Neighbors) [74] speeds up in-dex construction by replacing searches during construction with a partitioning-based build paradigm. Instead of global beam searches, PiPNN recursively decomposes the dataset into overlapping clus-ters via randomized ball carving and generates candidate edges using cache-friendly many-to-many top-𝑘 kernels. This achieves an order-of-magnitude faster index construction across CPUs and accelerators while maintaining equivalent graph quality. In Gin-ger, we offer both PiPNN and Vamana index builds to give users flexibility and choice. 
+
+Inverted Indexes. Inverted-file (IVF) indexes partition vectors into clusters and store each cluster in an inverted list. A query probes a subset of the clusters and scores the vectors in their lists, often using quantized representations followed by higher-precision reranking. 
+
+Quantization. Quantization replaces floating-point vectors with compact codes representing regions of the vector space, reducing both index memory and the bytes fetched during distance evalua-tion [1, 42]. The codes must support fast scoring while preserving enough accuracy to identify the nearest neighbors. Scalar quanti-zation encodes each coordinate independently using 𝑏 bits to select one of 2 𝑏 representative values. Product quantization partitions a vector into subvectors and encodes each with an index into a learned codebook; distances are estimated by combining per-subvector ta-ble lookups [32, 42]. Rotation-based scalar quantizers first apply a shared random orthogonal transformation, then encode the trans-formed coordinates. Examples include DRIVE/EDEN [8, 84, 85], RaBitQ [27, 28, 30], and TurboQuant [92]. The representation and scoring kernel must also suit the search access pattern. Graph tra-versal scores scattered candidates, whereas IVF search scans lists of vectors. Quantization has a rich literature, and we refer readers to the excellent surveys [36, 60] for background on its foundations and applications to nearest-neighbor search. Section 3 presents our nested quantizer and SIMD scoring kernels for graph navigation and reranking. 
+
+## 2.2 Prior Libraries 
+
+We focus on a representative selection of widely used libraries and high-performance ANNS methods. Our selection emphasizes methods that are widely adopted and/or very high performance while covering graph-based and inverted-file search. 
+
+DiskANN. DiskANN [41, 46] is Microsoft’s widely used library for in-memory and SSD-backed search using the Vamana proximity graph. Its SSD-backed design enables billion-scale search on a single machine by keeping compressed vectors in memory and fetching graph neighborhoods and full-precision vectors from disk. 
+
+ParlayANN. ParlayANN [59, 66] is a highly optimized parallel graph-based ANNS library built on the ParlayLib [12] runtime. It provides deterministic implementations of proximity-graph al-gorithms, including Vamana, designed to avoid synchronization bottlenecks and scale to large datasets on shared-memory machines. 
+
+SVS. Intel’s Scalable Vector Search (SVS) [1] combines Vamana-based search with highly optimized SIMD kernels and compressed vector representations. Its LVQ codec uses per-vector scaling and scalar quantization to reduce memory traffic, while LeanVec [83] combines dimensionality reduction with quantization. 
+
+Hnswlib. Hnswlib [58] provides a lightweight, header-only C++ implementation of HNSW [57] with Python bindings and support for custom distance functions. It supports incremental index con-struction, vector updates and deletions, and multithreaded search, with configurable graph connectivity and search effort. 
+
+SymphonyQG. SymphonyQG [27, 35] combines RaBitQ quan-tization [30] with FastScan [4], storing codes on graph edges to score neighbors sequentially. Its layout aligns vertex degrees with 32-edge FastScan batches, trading increased memory usage from replicated codes for fewer random accesses during graph search. 
+
+Faiss. Faiss [22, 43] is Meta’s similarity search library, offering flat, IVF, and graph indexes with scalar and product quantization. Its widely-used CPU implementations support large-scale search, with index and compression choices that provide different tradeoffs between memory usage, query throughput, and recall. 
+
+ScaNN. ScaNN [37, 81] is an existing IVF-based similarity search li-brary developed at Google, combining partitioning with anisotropic vector quantization and optimized scoring kernels for maximum inner-product search. Its two-stage pipeline scores candidates using low-bit representations before reranking a smaller set, reducing the cost of evaluating large candidate pools. 
+
+## 3 NESTED TURBOQUANT (NTQ) 
+
+All production-grade ANNS libraries use quantization . Because distance evaluation performs only a small constant number of arith-metic operations per loaded byte, ANNS is limited by memory bandwidth. Compressing coordinates to low-precision codes re-duces both memory traffic and the memory footprint of the index. Graph beam search imposes a specific access pattern on the quan-tizer: each expansion fetches an arbitrary subset of non-contiguous points in X and scores each point by scanning across its coordinates. Unfortunately, standard PQ [32, 42], as used in IVF indexes, is ill-suited for this task because loading each of the 𝑀 subspace lookup tables is expensive relative to scoring a single point. Uniform scalar quantization methods avoid per-subspace codebooks and support fast coordinate-wise scans, but suffer higher quantization error. Recently, rotation-based quantizers [28, 30, 84, 85, 92] have become popular. They keep the fast coordinate-wise scans of uniform scalar quantizers and need no per-subspace tables, while achieving much lower quantization error. A random rotation makes every coordi-nate approximately Gaussian, so a single scalar codebook serves all coordinates. EDEN [85] and TurboQuant [92] place this codebook non-uniformly at the Lloyd–Max points of the Gaussian [52, 61], which minimizes the mean-squared error per coordinate. Graph search needs two precisions with conflicting goals. Beam search scores thousands of random candidates per query and needs a compact code that is cheap to load from memory and score. Reranking scores only the final beam, but needs the accuracy of floats to achieve very high recall. A standard recipe is therefore to navigate with aggressive quantization and then rerank the con-verged beam with floats or higher-precision codes. Storing a second code for reranking, or maintaining the float vectors, wastes signifi-cant memory. A single nested code avoids this waste, but only if 
+
+> 3Salwasser et al.
+
+nesting does not degrade the quality of the codes. We developed Nested TurboQuant (NTQ) to achieve this. 
+
+Overview of Our Approach. NTQ builds on TurboQuant [92] and EDEN [8, 85]. It takes the 4-bit Lloyd–Max codebook and splits each of its intervals into 2 𝑘 finer sub-intervals, which yields a (4 + 𝑘 )-bit code. The 4-bit prefix of every code is therefore a complete Tur-boQuant code for navigation. The full code nearly matches float accuracy for reranking. Search cost stays fixed, while the 𝑘 addi-tional bits per coordinate trade memory for reranking accuracy. We mostly focus on 10- and 12-bit codes ( 𝑘 = 6 and 8). Nesting is nearly free, because the rotation makes every coordinate approximately Gaussian, and Gaussian sources are successively refinable [23]. Both levels of NTQ are therefore close to optimal for the rotated coordinates. We make both levels fast to score by evaluating their codebooks in registers rather than memory. 
+
+The following subsections describe NTQ in detail for in-terested readers. Section 3.1 sets up the TurboQuant encoding that NTQ builds on and points out where we deviate from it. Sec-tion 3.2 introduces the nested refinement, which is the core of NTQ. Sections 3.3 and 3.4 describe fast scoring kernels for 4-bit navigation and (4 + 𝑘 )-bit reranking. All quantization and scoring kernels are implemented in portable SIMD using Highway [87]. For concreteness, we refer to AVX-512 instructions in the text. 
+
+## 3.1 Rotation and Codebook 
+
+To encode a non-zero vector 𝑥 ∈ R𝑑 , NTQ normalizes and rotates it to 𝑦 = √𝑑 𝑅 ˆ𝑥 with ˆ 𝑥 = 𝑥 /∥ 𝑥 ∥2. It then quantizes each coordinate 
+
+𝑦 𝑖 with a scalar codebook and stores a per-vector scale factor that corrects for the norm and for the shrinkage caused by quantization. 
+
+Non-Power-of-Two Rotation. Applying a dense orthogonal ma-trix 𝑅 costs 𝑂 (𝑑 2) operations per vector, which is too expensive. Therefore, we use a randomized Walsh–Hadamard transform [2, 3], which takes 𝑂 (𝑑 log 𝑑 ) operations. However, this transform is lim-ited to dimensions that are a power of two. Zero-padding 𝑑 to the next power of two as in EDEN [85] can nearly double the memory footprint and scoring work. Instead, we factor 𝑑 = 𝑟 · 2ℓ with 𝑟 odd and ℓ ≥ 0 maximal. Let 𝑆 = diag (𝜎 1, . . . , 𝜎 𝑑 ) with independent uniform random signs 
+
+𝜎 𝑖 ∈ {± 1}. We split 𝑆𝑥 into 𝑟 contiguous blocks of 2 ℓ coordinates and stack these blocks as the rows of a matrix 𝑋 ∈ R𝑟 ×2ℓ
+
+. We then define 𝑅𝑥 as the concatenation of the rows of 𝑄𝑋 𝐻 2ℓ . Here 𝐻 2ℓ ∈{± 2−ℓ/2 }2ℓ ×2ℓ
+
+is the normalized (orthonormal) Walsh–Hadamard matrix, so right-multiplication applies the Walsh–Hadamard trans-form to each block. The matrix 𝑄 is an 𝑟 × 𝑟 Haar-random orthogo-nal matrix, so left-multiplication mixes corresponding coordinates across 𝑟 blocks. Since 𝑆 , 𝐻 2ℓ , and 𝑄 are orthogonal, 𝑅 is an orthog-onal matrix. Evaluating 𝑅𝑥 takes 𝑂 (𝑑 (ℓ + 𝑟 )) operations, which is 
+
+𝑂 (𝑑 log 𝑑 ) for small constant 𝑟 (e.g., 𝑟 = 3 for common dimensions 
+
+𝑑 ∈ { 96 , 768 , 1536 , 3072 }). For these dimensions, zero-padding to the next power of two would add 33% more codes and distance scoring work. 
+
+Gaussian Lloyd–Max Codebook. Following TurboQuant [92], we quantize each rotated coordinate using a symmetric 𝑏 -bit Gaussian Lloyd–Max codebook [52, 61]. The codebook partitions R≥0 using 2𝑏 −1 positive centroids 0 < 𝑐 0 < · · · < 𝑐 2𝑏 −1 −1 separated by mid-point thresholds 𝑡 1, . . . , 𝑡 2𝑏 −1 −1. Each coordinate 𝑦 𝑖 stores its sign 0 1 2 3                   
+
+> Rotated coordinate |𝑦 𝑖 |
+> 0.0 0.1 0.2 0.3 0.4
+> Density  𝜙  (𝑧  )
+> (a) Nested (4 + 𝒌 )-Bit Intervals
+> Sub-intervals ( 𝑘 =2) 4-bit thresholds 𝑡 𝑢
+> 064 128 192 255
+> Tail sub-index 𝑣 (𝑢 =7)
+> 23456
+> Centroid  𝑐 7,𝑣
+> (b) Tail Fit (4 + 8 Bits)
+> Exact 𝑐 7,𝑣
+> 1-cubic ( 𝑀 8=1) 16-cubic ( 𝑀 8=16)
+> 1
+
+Figure 2: (a) Nested (4 + 𝑘 )-bit intervals under the rotated coordinate density 𝜙 (𝑧 ), where each positive 4-bit interval [𝑡 𝑢 , 𝑡 𝑢 +1 ) splits into 
+
+2𝑘 sub-intervals without crossing 𝑡 1, . . . , 𝑡 7. (b) On the unbounded tail interval 𝑢 = 7, a single cubic poorly fits the (4 + 8)-bit centroids 
+
+𝑐 7,𝑣 , whereas 𝑀 8 = 16 cubic segments track 𝑐 7,𝑣 closely across all 256 
+
+sub-indices. 
+
+sgn (𝑦 𝑖 ) ∈ {± 1} and the index 𝑢 𝑖 ∈ { 0, . . . , 2𝑏 −1 − 1} of the centroid nearest to |𝑦 𝑖 |, giving reconstruction ˜ 𝑦 𝑖 = sgn (𝑦 𝑖 ) 𝑐 𝑢 𝑖 . NTQ uses this codebook with 𝑏 = 4 for navigation, and Section 3.2 refines its intervals for reranking. 
+
+Norm and Shrinkage Rescaling. Inner products with quantized vectors are biased unless they are corrected. Under the standard normal density 𝜙 (𝑧 ) = (2𝜋 )−1/2𝑒 −𝑧 2/2, the 𝑏 -bit codebook incurs a per-coordinate mean-squared error 
+
+𝐷 𝑏 = E[( 𝑦 𝑖 − ˜𝑦 𝑖 )2] = 2  
+
+> 2𝑏 −1−1
+
+∑︁ 
+
+> 𝑢 =0
+
+∫ 𝑡 𝑢 +1
+
+> 𝑡 𝑢
+
+(𝑧 − 𝑐 𝑢 )2𝜙 (𝑧 ) 𝑑𝑧, 
+
+with 𝑡 0 = 0 and 𝑡 2𝑏 −1 = ∞. Because each centroid 𝑐 𝑢 is the condi-tional mean of its interval, E[( 𝑦 𝑖 − ˜𝑦 𝑖 ) ˜𝑦 𝑖 ] = 0, which gives E[𝑦 𝑖 ˜𝑦 𝑖 ] =
+
+E[ ˜𝑦 2 
+
+> 𝑖
+
+] = 1−𝐷 𝑏 . Normalizing ˜ 𝑦 to unit length therefore shrinks inner products with 𝑅 ˆ𝑥 by E[⟨ 𝑅 ˆ𝑥, ˜𝑦 ⟩]/ √︃ E[∥ ˜𝑦 ∥22] = √1 − 𝐷 𝑏 . Rotation-based quantizers correct this bias in different ways. EDEN [85] di-vides by ⟨𝑅𝑥, ˜𝑦 ⟩. TurboQuant [92] uses (𝑏 − 1)-bit Lloyd–Max quan-tization and reserves 1 bit per coordinate for a quantized Johnson– Lindenstrauss (QJL) sign sketch of the quantization residual. We store the per-vector scale factor 𝑠 𝑏 (𝑥 ) = ∥𝑥 ∥2/( √1 − 𝐷 𝑏 ∥ ˜𝑦 ∥2), so that 𝑠 𝑏 (𝑥 ) ˜𝑦 estimates 𝑅𝑥 without shrinkage bias. This costs a single float per vector and leaves all 𝑏 bits to the codebook. By orthogo-nality of 𝑅 , we then estimate ⟨𝑞, 𝑥 ⟩ = ⟨𝑅𝑞, 𝑅𝑥 ⟩ as 𝑠 𝑏 (𝑞 ) 𝑠 𝑏 (𝑥 ) ⟨ ˜𝑞, ˜𝑦 ⟩
+
+for a quantized query or 𝑠 𝑏 (𝑥 ) ⟨ 𝑅𝑞, ˜𝑦 ⟩ for an unquantized query. 
+
+## 3.2 Nested Refinement 
+
+For reranking, NTQ adds 𝑘 refinement bits per coordinate to the 4-bit code. A standard way to add such bits is two-stage resid-ual quantization, which encodes the residual 𝑦 𝑖 − ˜𝑦 𝑖 of the 4-bit reconstruction with a second codebook shared across all 4-bit in-tervals [22, 42]. However, because the conditional distribution of a rotated coordinate varies significantly between the 4-bit intervals, a shared residual codebook is suboptimal. In our experiments, resid-ual quantization achieves lower recall than the nested codebook described next (see Section 6.3). We instead split each positive 4-bit interval [𝑡 𝑢 , 𝑡 𝑢 +1) into 2 𝑘 
+
+contiguous sub-intervals with centroids 𝑐 𝑢,𝑣 for 𝑣 ∈ { 0, . . . , 2𝑘 − 1}
+
+(Figure 2a). Here 𝑢 ∈ { 0, . . . , 7}, 𝑡 0 = 0, and 𝑡 8 = ∞. The cen-troids 𝑐 𝑢, 0, . . . , 𝑐 𝑢, 2𝑘 −1 form a 2 𝑘 -entry Lloyd–Max codebook for the 
+
+> 4GINGER: Spicing Up Graph-Based Vector Search
+
+standard normal density restricted to [𝑡 𝑢 , 𝑡 𝑢 +1). Each 4-bit interval therefore gets its own refinement codebook, adapted to the shape of 𝜙 (𝑧 ) on that interval. Encoding first finds the 4-bit interval 𝑢 𝑖 
+
+of |𝑦 𝑖 | as in Section 3.1 and then the nearest centroid 𝑐 𝑢 𝑖 ,𝑣 𝑖 within that interval. Since the sub-intervals never cross the 4-bit thresh-olds, each coordinate’s (4 + 𝑘 )-bit code splits into its 4-bit code 𝑢 𝑖 
+
+and a 𝑘 -bit refinement code 𝑣 𝑖 . The (4 + 𝑘 )-bit reconstruction is ˜𝑦 (4+𝑘 ) 
+
+> 𝑖
+
+= sgn (𝑦 𝑖 ) 𝑐 𝑢 𝑖 ,𝑣 𝑖 . Its scale factor 𝑠 4+𝑘 (𝑥 ) follows Section 3.1, with the mean-squared error 𝐷 4+𝑘 summed over all 8 · 2𝑘 positive sub-intervals. 
+
+Why Nesting Is Nearly Free. Forcing the (4 + 𝑘 )-bit code to refine the 4-bit intervals could cost accuracy, because an uncon-strained (4 + 𝑘 )-bit Lloyd–Max codebook would place all of its thresholds freely. This constraint costs almost nothing, because Gaussian sources are successively refinable under mean-squared error [23]. 
+
+Storage Layout. The 4-bit codes, packed two per byte, and their per-vector scale factor form the navigation array read by beam search. The refinement codes and 𝑠 4+𝑘 (𝑥 ) form a separate array read only for reranking, so beam search loads no extra bytes. 
+
+## 3.3 Vectorized 4-Bit Scoring for Beam Search 
+
+Each coordinate of a data vector is stored as a 4-bit code for beam search, so the codebook has only 16 entries. To score candidates with fast 8-bit integer dot-product instructions, we round these 16 centroids to int8 values and quantize the query coordinates to int8 as well. Each codebook entry then occupies a single byte, so the entire codebook forms a 16-entry lookup table. We load this table into a vector register. Scoring a candidate looks up each of its 4-bit codes in this register and accumulates the products with the query coordinates. 
+
+Codes and Table Entries. For each database vector 𝑥 , coordinate 
+
+𝑖 ∈ { 0, . . . , 𝑑 − 1} packs its sign and 3-bit index 𝑢 𝑖 ∈ { 0, . . . , 7}
+
+into a 4-bit nibble 𝑛 𝑖 ∈ { 0, . . . , 15 }, which serves directly as the table index. The table holds the 16 signed centroids ±𝑐 0, . . . , ±𝑐 7
+
+quantized to int8 as ± round (127 𝑐 𝑢 /𝑐 7), so looking up 𝑛 𝑖 yields ¯𝑦 𝑖 ∈ [− 127 , 127 ]. For a query 𝑞 , we quantize the rotated coordinates to int8 as ¯ 𝑞 𝑖 = round (127 (𝑅𝑞 )𝑖 /∥ 𝑅𝑞 ∥∞) ∈ [− 127 , 127 ]. The scale factors ¯ 𝑠 4 (𝑥 ) = ∥𝑥 ∥2/( √1 − 𝐷 4 ∥ ¯𝑦 ∥2) and ¯ 𝑠 (𝑞 ) = ∥𝑞 ∥2/∥ ¯𝑞 ∥2 absorb the int8 scales, so ¯ 𝑠 (𝑞 ) ¯𝑠 4 (𝑥 ) ⟨ ¯𝑦, ¯𝑞 ⟩ estimates ⟨𝑞, 𝑥 ⟩.
+
+Shifted Table Entries. We accumulate the products with the x86 8-bit integer dot-product instruction vpdpbusd [39], which multiplies unsigned by signed bytes and accumulates into 32-bit integers. The table therefore stores the shifted unsigned entries ¯ 𝑦 𝑖 + 128 ∈{1, . . . , 255 }, while the query bytes ¯ 𝑞 𝑖 remain signed. The shift adds a query-dependent, candidate-independent bias:  
+
+> 𝑑 −1
+
+∑︁ 
+
+> 𝑖 =0
+
+( ¯𝑦 𝑖 + 128 ) ¯𝑞 𝑖 = ⟨ ¯𝑦, ¯𝑞 ⟩ + 128  
+
+> 𝑑 −1
+
+∑︁ 
+
+> 𝑖 =0
+
+¯𝑞 𝑖 . (1) We precompute this bias per query and subtract it from each candi-date’s accumulated dot product before multiplying by ¯ 𝑠 (𝑞 ) ¯𝑠 4 (𝑥 ).
+
+Table Lookups. The byte shuffle instruction pshufb performs the lookups. It replaces each index byte in {0, . . . , 15 } by the table entry at that position. With a copy of the table in each 128-bit lane, one AVX-512 shuffle performs 64 lookups. For each candidate vector, coordinate pairs (𝑛 2𝑗 , 𝑛 2𝑗 +1) are packed into the low and high nibbles of byte 𝑗 ∈ { 0, . . . , ⌈𝑑 /2⌉ − 1}. Rather than unpacking nibbles into coordinate order via cross-lane shuffles, we split ¯ 𝑞 
+
+into contiguous even coordinates ( ¯𝑞 0, ¯𝑞 2, . . . ) and odd coordinates 
+
+( ¯𝑞 1, ¯𝑞 3, . . . ). Each SIMD step loads one vector register of packed code bytes. A bitwise mask ( 0x0F ) extracts the even indices, and a 4-bit right shift followed by the same mask extracts the odd indices. Two shuffles, each performing 64 table lookups, map both index streams to ¯ 𝑦 𝑖 +128, and two vpdpbusd instructions accumulate their dot products with the even and odd query coordinates. Since each step takes only a few SIMD instructions, scoring is dominated by fetching neighbors from dispersed memory addresses. We therefore issue software prefetches several candidates ahead during neighbor-list expansion to hide DRAM latency. 
+
+## 3.4 Fast (4 + 𝑘 )-Bit Reranking 
+
+Reranking fetches the refinement codes of the top candidates. It scores each candidate against the unquantized rotated query 𝑅𝑞 as 
+
+𝑠 4+𝑘 (𝑥 ) ⟨ 𝑅𝑞, ˜𝑦 (4+𝑘 ) ⟩. Unlike the int8 table of Section 3.3, reranking computes in float precision. Refinement codebooks for small 𝑘 fit in registers, but the 10- and 12-bit codebooks have 512 or 2048 positive centroids and need memory gathers, which take roughly 80% of reranking time at 𝑑 = 4096. 
+
+Piecewise-Cubic Codebook Approximation. We therefore re-place the table with a piecewise-cubic polynomial that computes each centroid ˆ 𝑐 𝑢,𝑣 in registers from its integer index. The coeffi-cients of each piece are fit offline by least squares to the codebook centroids. On each of the seven bounded intervals ( 𝑢 ≤ 6), 𝜙 (𝑧 ) is smooth and bounded away from zero. A single cubic per interval there-fore fits all 2 𝑘 sub-centroids with small error. On the unbounded tail [𝑡 7, ∞) , 𝜙 (𝑧 ) decays rapidly and the sub-intervals grow pro-gressively wider, so a single cubic cannot fit all tail centroids (Fig-ure 2b). We split the 2 𝑘 tail sub-intervals into 𝑀 𝑘 equal segments of 𝐵 𝑘 = 2𝑘 /𝑀 𝑘 sub-intervals each. 𝑀 𝑘 must be a power of two so that 𝐵 𝑘 is one as well, which lets each SIMD lane find its segment with a shift and a mask. We choose 𝑀 6 = 8 and 𝑀 8 = 16, the largest such values for which the coefficients of all 7 + 𝑀 𝑘 segments fit in one 16-lane float register per polynomial degree for 𝑘 = 6, and in two for 𝑘 = 8. 
+
+In-Register SIMD Evaluation. A coordinate with codes (𝑢, 𝑣 )
+
+belongs to segment 𝑠 = 𝑢 with local index 𝜏 = 𝑣 if 𝑢 < 7. In the tail, it belongs to segment 𝑠 = 7+⌊ 𝑣 /𝐵 𝑘 ⌋ with 𝜏 = 𝑣 mod 𝐵 𝑘 . We evaluate 16 coordinates in parallel, and each SIMD lane computes (𝑠, 𝜏 ) with a shift and a mask. Each lane then selects its segment’s coefficients 
+
+(𝑎 𝑠, 0, . . . , 𝑎 𝑠, 3) with an in-register permutation ( vpermps for 𝑘 = 6, or two-register vpermi2ps for 𝑘 = 8). Finally, it evaluates the cubic in Horner form with three fused multiply-adds: ˆ𝑐 𝑢,𝑣 = 𝑎 𝑠, 0 + 𝜏  𝑎 𝑠, 1 + 𝜏 (𝑎 𝑠, 2 + 𝜏𝑎 𝑠, 3). (2) Replacing memory gathers with in-register permutations and fused multiply-adds roughly halves 10- and 12-bit reranking latency, with no loss in recall. 
+
+> 5Salwasser et al.
+
+## 4 SEARCH OPTIMIZATIONS 
+
+Although the basic beam search (Algorithm 1) is simple, ANN sys-tems vary significantly in the details of how the search is imple-mented. In Ginger, we build on our fast 4-bit scoring kernel (Sec-tion 3.3) with search optimizations that reduce memory traffic and the overhead of maintaining the candidate beam. 
+
+## 4.1 Search on Projected Coordinates 
+
+On high-dimensional datasets, fetching and scoring even quantized candidate vectors consumes substantial memory bandwidth. In Ginger, we reduce this cost by projecting database vectors and queries into a lower-dimensional space using Principal Compo-nent Analysis (PCA) [44]. We encode the projected vectors with 4-bit navigation codes and score them using the kernel from Sec-tion 3.3. Each candidate evaluation therefore reads and scores fewer coordinates, reducing memory traffic beyond quantization alone. The database vectors can be projected offline, whereas each in-coming query must be multiplied by the projection matrix 𝑃 before navigation begins. This matrix multiplication is itself memory-bound and competes with graph traversal for memory bandwidth when queries run in parallel across threads. To alleviate this bot-tleneck, we also quantize the rows of 𝑃 to 4 bits, reducing the data fetched during query projection. Our results show that this does not impair recall (Figure 8). 
+
+## 4.2 Candidate Prefiltering 
+
+During beam search, most scanned neighbors 𝑣 ∈ 𝑁 (𝑝 ) are not use-ful and will never enter the beam 𝐵 . On high-dimensional datasets, we can use a cheaper filter distance 𝑑 filt (𝑞, 𝑣 ) to prune unpromising candidates early and thus avoid computing the 4-bit navigation distance 𝑑 nav (𝑞, 𝑣 ). Only the neighbors with 𝑑 filt (𝑞, 𝑣 ) below a cutoff threshold are scored with 𝑑 nav .This general idea has been used in several recent systems [15, 29, 45, 53, 54, 82]. For example, ADSampling [29] uses Johnson– Lindenstrauss projections for Euclidean distance, and FINGER [15] uses angle approximation. However, prior methods rely on a specific relationship between the two distance measures so that a candi-date’s filter score can be compared against the navigation distance 
+
+𝑑 nav (𝑞, 𝑏 𝐿 ) of the furthest point 𝑏 𝐿 ∈ 𝐵 [89]. 
+
+Our Approach. We instead allow pairing arbitrary filter and nav-igation measures, such as Hamming distance and inner product. All we require is that each measure independently approximates the distance ordering relative to 𝑞 , which makes this framework flexible. This decoupling works because beam admission depends only on relative distance ordering around 𝑞 rather than calibrated distance values. Any coarse sketch whose ranking correlates with 
+
+𝑑 nav (𝑞, ·) can separate the few promising neighbors from the many that lie far behind the beam boundary. At the same time, 𝑑 filt has higher variance than 𝑑 nav and cannot replace it for graph naviga-tion, even in early hops. Navigating directly with 𝑑 filt commits the greedy traversal to its ranking errors and can steer the beam away from the query neighborhood. Using 𝑑 filt solely as a conservative gate backed by 𝑑 nav preserves the 4-bit search trajectory while skip-ping full distance evaluations on clearly unpromising neighbors. Because the two measures may not be comparable, we derive the filter cutoff from the beam using 𝑑 filt itself. Thresholding against 
+
+𝑑 filt (𝑞, 𝑏 𝐿 ) alone would be brittle, because a noisy filter can assign 
+
+𝑏 𝐿 a small distance by chance and prune candidates that beat 𝑏 𝐿 
+
+under 𝑑 nav . While the beam is filling up ( |𝐵 | < 𝐿 ), prefiltering is dis-abled. Once the beam is full (at step 𝑡 0), we compute the mean filter distance 𝜇 𝑡 over the 𝑤 furthest points at the tail of 𝐵 𝑡 = (𝑏 1, . . . , 𝑏 𝐿 )
+
+to smooth out single-point noise. We then set the cutoff 𝜏 𝑡 to the running average of 𝜇 𝑠 over all steps since 𝑡 0:
+
+𝜇 𝑡 = 1
+
+𝑤 
+
+> 𝐿
+
+∑︁ 
+
+> 𝑗 =𝐿 −𝑤 +1
+
+𝑑 filt (𝑞, 𝑏 𝑗 ), 𝜏 𝑡 = 1
+
+𝑡 − 𝑡 0 + 1
+
+> 𝑡
+
+∑︁ 
+
+> 𝑠 =𝑡 0
+
+𝜇 𝑠 . (3) If 𝑏 𝐿 did not change on step 𝑡 , we reuse 𝜇 𝑡 = 𝜇 𝑡 −1. As the beam im-proves, 𝜇 𝑡 decreases, so 𝜏 𝑡 tightens over time while staying slightly looser than 𝜇 𝑡 . We instantiate this scheme with two filters: 
+
+TurboSlice. Because the random rotation in Section 3.1 spreads a vector’s energy evenly across all rotated coordinates, any prefix of 𝑑 ts < 𝑑 rotated 4-bit coordinates acts as a low-dimensional sketch, which provides an unbiased estimator of the dot prod-uct [17]. This sketch sits at the front of the 4-bit navigation code and requires no extra vector storage. For typical prefix lengths 
+
+𝑑 ts ∈ { 128 , 256 }, the filter reads only one or two cache lines and skips loading the rest of the vector for rejected neighbors. We score the prefix with the 4-bit kernel of Section 3.3 over the first 
+
+𝑑 ts coordinates and rescale by a precomputed prefix norm factor ¯𝑠 (𝑑 ts ) 
+
+> 4
+
+(𝑥 ) = ∥𝑥 ∥2/( √1 − 𝐷 4 ∥ ¯𝑦 1: 𝑑 ts ∥2).
+
+1-Bit Sparse Johnson–Lindenstrauss (JL). ParlayANN [59] al-ready offers a filter based on JL, whose details have not been pub-lished so far, however. This filter maps each vector 𝑥 ∈ R𝑑 to a 
+
+𝑑 jl -bit sign sketch ℎ(𝑥 ) ∈ { 0, 1}𝑑 jl with bits ℎ𝑖 (𝑥 ) = 1[⟨ 𝑎 𝑖 , 𝑥 ⟩ > 0]
+
+(we usually use 𝑑 jl = 1024). We pack the sketches into 64-bit words and compare them by Hamming distance ∥ℎ(𝑞 ) ⊕ ℎ(𝑣 )∥ 1. Because our cutoff (3) only compares filter scores against other filter scores, we can use the Hamming distances directly without reconstructing angles or norms. To make projecting the query fast, it suffices to use a sparse random projection matrix 𝐴 ∈ {− 1, 0, +1}𝑑 jl ×𝑑 with only a few non-zero entries per row. While our experiments show that PCA is generally more effective than the prefilters and they do not stack well (both reduce memory traffic in a similar way), we note that the prefilters are quite useful in scenarios where we cannot work with PCA. One example is network-constrained deployments, where we do not want to send multiple sets of vectors per query over the wire. Here, taking a TurboSlice prefix does not incur additional traffic. Another example is extremely high-dimensional vectors, where the projection matrix is so large that it slows down projection. 
+
+## 4.3 Beam Management 
+
+A naive beam search maintains two priority queues for the closest unexplored vertices and the furthest points in 𝐵 . However, priority-queue operations take 𝑂 (log 𝐿 ) time and have poor cache locality. Following ParlayANN [59] and SVS [1], we instead keep 𝐵 in a single array of size at most 𝐿 sorted by distance. Each entry stores a flag indicating whether it has been explored, and we track the index of the first unexplored entry. Picking the next vertex to expand then takes 𝑂 (1) time. Because 𝐵 is sorted, the furthest element 𝑏 𝐿 sits at the end of the array and provides the distance cutoff for entering 
+
+> 6GINGER: Spicing Up Graph-Based Vector Search
+
+the beam. Inserting new points into the sorted array one at a time would take 𝑂 (𝐿 ) time per point. Instead, when expanding a vertex 
+
+𝑝 ∈ 𝐵 , we keep only the unvisited neighbors that beat 𝑏 𝐿 , sort the survivors, and merge them into 𝐵 in a single linear pass. Later in the search, most neighbors have already been visited or fail to beat 𝑏 𝐿 , so merging after every expansion scans the whole beam just to insert one or two points. Once the initial phase of the search is over, we therefore batch across consecutive expan-sions. We collect unvisited neighbors from several unexplored beam vertices, score them together, and merge the survivors into 𝐵 in a single pass. Batching also exposes a longer stream of candidates, which helps amortize startup latency (due to prefetching) in the TurboQuant scoring kernel. 
+
+## 5 GRAPH COMPRESSION 
+
+In Ginger, we also reduce the memory occupied by the proximity graph itself, which can exceed the footprint of the quantized vectors on low-dimensional datasets. For example, a 96-dimensional vector occupies 144 bytes at 12 bits per coordinate, whereas a flat adjacency list with 64 four-byte slots and a degree counter occupies 260 bytes. We therefore compress the graph losslessly while keeping decoding fast enough to avoid slowing search. Our approach first relabels vertices so that neighbors receive nearby IDs (Section 5.1), then stores each sorted neighbor list as gaps between consecutive IDs. We encode these gaps with a codec that packs small values into fewer than eight bits and decodes four at a time using a few SIMD instructions (Section 5.2). 
+
+Gap encoding. Let 𝑣 1 < 𝑣 2 < · · · < 𝑣 deg (𝑢 ) be the sorted neighbor IDs of a vertex 𝑢 . Gap encoding stores the first ID 𝑔 1 = 𝑣 1, followed by the differences 𝑔 𝑖 = 𝑣 𝑖 − 𝑣 𝑖 −1 for 2 ≤ 𝑖 ≤ deg (𝑢 ). A gap 𝑔 𝑖 needs about log 2 (𝑔 𝑖 + 1) bits, so small gaps mean a small graph. A prefix sum over the gaps recovers the IDs. 
+
+## 5.1 Graph Reordering 
+
+To reduce gaps between consecutive neighbor IDs, we place well-connected groups of vertices into contiguous ID ranges, an ap-proach well studied for web and social graphs [5, 11, 13, 14, 16, 51, 70, 75, 77] and inverted indexes [9, 10, 19, 20, 76, 78]. In Ginger, recursive graph partitioning ( RGP ) uses a parallel multilevel parti-tioner [33, 34] to recursively split the graph into balanced blocks with few crossing edges. We number the small leaf blocks in recur-sion order, assign consecutive IDs within each block, and permute the vectors accordingly. Balanced graph partitioning only works on undirected graphs, hence we symmetrize the graph by adding the reverse of every edge. Reciprocal connections then carry twice the weight, reflect-ing the potential for long gaps in both adjacency lists when their endpoints are separated. RGP yields smaller gaps than recursive graph bisection [19] on all six datasets and is faster to compute on all but the smallest (Section 6.3). 
+
+## 5.2 AdaptiveGap: Sub-Byte Gap Coding with SIMD Decoding 
+
+Beam search decodes a neighbor list at every expansion, so graph compression must keep decoding cheap enough to preserve query throughput. In codecs such as PrefixVarint [18], each gap takes one                                                        
+
+> encoded list tag anchor 5000 control 0x10 payload (3 B) . . .
+> payload bits 391000 5
+> byte 0 byte 1 byte 2 bit 0 on the left
+> after shuffle B0 lane 0 B0 lane 1 B1 B2 lane 2 B2 lane 3 00000000000
+> shift, mask
+> ≫0,4b
+> 3
+> ≫4,4b
+> 9
+> ≫0,12 b
+> 1000
+> ≫4,4b
+> 5
+> prefix sum 5003 5012 6012 6017
+> Figure 3: Encoding and SIMD decoding of an AdaptiveGap list in mode {4,12 ,20 ,28 }. With 5000 stored as the anchor, the control byte selects widths 4,4,12 ,4(2-bit selectors 0,0,1,0packed from the least significant bit) for gaps 3,9,1000 ,5, which occupy three payload bytes. One byte shuffle followed by per-lane shifts and masks recovers the gaps, and a prefix sum reconstructs the neighbor IDs.
+
+to five bytes and begins with a unary length prefix, so locating the next gap requires reading the current gap’s length. 
+
+StreamVByte. We build on StreamVByte [48], which removes this dependency by storing lengths separately from gaps. It encodes groups of four gaps using a control byte with four 2-bit length selectors and a separate payload holding the gap values back to back. Each selector specifies a gap length of one to four bytes. To decode a group, StreamVByte loads 16 payload bytes into a SIMD register and uses one byte shuffle ( pshufb ) to distribute the values among four 32-bit lanes. A precomputed shuffle mask for each of the 256 control bytes specifies which payload bytes to copy into each lane, and a SIMD prefix sum recovers the neighbor IDs. However, rounding each gap to whole bytes wastes space; for example, a 9-bit gap requires two bytes. 
+
+AdaptiveGap. AdaptiveGap retains StreamVByte’s single-shuffle decoding while adding adaptive bit widths and optional separate storage of the first neighbor ID. Each neighbor list selects one of 16 
+
+modes , each specifying four bit widths that the 2-bit selectors choose among. Mode 0 uses the widths {8, 16 , 24 , 32 }, which corresponds to StreamVByte, while the other modes use sub-byte widths, such as {4, 12 , 20 , 28 }. For example, StreamVByte stores the gaps 3, 9, 1000, and 5 in 1 + 1 + 2 + 1 = 5 bytes. In the mode {4, 12 , 20 , 28 },they occupy 4 + 4 + 12 + 4 = 24 bits, or 3 bytes, with the same single control byte. AdaptiveGap packs gaps without padding within each byte-aligned group, so adjacent gaps can share a byte. In Figure 3, for example, the gap 9 starts at bit 4 of byte 0. A single shuffle gathers the bytes covering each gap into a 32-bit lane, and a right shift and mask isolate its value. For this to work, all bytes that contain a gap must fit into its lane. A gap of width 𝑤 that starts at bit offset 𝑜 
+
+of a byte spans 𝑜 + 𝑤 bits, so every gap must satisfy 𝑜 + 𝑤 ≤ 32. In mode 0, all gaps are byte-aligned, so the offset is always 0. In the other modes, all widths are even, so the offset is at most 6, and widths up to 26 bits are safe. If all widths of a mode are multiples of 4, the offset is 0 or 4, and widths up to 28 bits are safe. Unlike in StreamVByte, the shuffle mask depends on both the mode and the control byte, so we precompute a mask, along with the per-lane shifts and bit masks, for each of the 16 × 256 combinations.                                                                                  
+
+> 7Salwasser et al.
+> Table 1: Overview of datasets used in our evaluation, where 𝑑 is the dimensionality of the vectors, 𝑛 is the number of vectors, and 𝑛 𝑞 is the number of queries.
+> Dataset 𝑑 𝑛 𝑛 𝑞 Type Metric Low dimensional  GloVe [67] 100 1.2M 10k float MIPS Deep [7] 96 1B 10k float L2 MS-Turing [80] 100 1B 100k float L2 MS-SPACEV [80] 100 1B 29k int8 L2 BigANN [42] 128 1B 10k uint8 L2 Text2Image [80] 200 1B 100k float MIPS High dimensional  Wiki-Cohere [71] 768 35M 5k float MIPS Wiki-All [65] 768 88M 10k float MIPS MS-MARCO [79] 768 101.07M 9376 float MIPS DBpedia-1536 [68] 1536 999k 1k float L2 OpenAI-arXiv [64] 1536 2.32M 20k float L2 DataComp-DR [6] 1536 12.78M 1k float L2 DBpedia-3072 [69] 3072 999k 1k float L2 Wiki-Qwen [55] 4096 500k 100k float L2
+
+The first entry 𝑔 1 = 𝑣 1 is an absolute ID and can require 30 bits at 
+
+𝑛 = 10 9, potentially forcing the entire list onto mode 0. AdaptiveGap avoids this by optionally storing the first ID separately as a varint, called the anchor . The encoder picks the mode, with or without the anchor, that minimizes the encoded size, and a 1-byte tag at the start of the list records its choice. As in a CSR layout, an offset array locates each encoded list, and each list stores its degree. 
+
+Summary. Together, reordering and AdaptiveGap shrink the graph by 2 .1× on average (up to 2 .5×) relative to a CSR layout without slowing down queries (Section 6.3). Compared with StreamVByte on the same ordering, AdaptiveGap stores an average of 0 .9 fewer bits per edge (up to 1 .2 bits). This reduction saves a further 5 .4% of graph memory (up to 7 .6%). 
+
+## 6 EXPERIMENTAL EVALUATION 
+
+We compare Ginger with seven widely used ANNS libraries across 14 large-scale datasets ranging up to a billion points and up to four-thousand dimensions. We assess query throughput, memory footprint, and indexing time for each method. Subsequently, we run ablation studies to isolate where our performance gains come from and how key design choices affect performance, including standalone evaluations of NTQ and AdaptiveGap (Section 6.3). 
+
+## 6.1 Experimental Setup 
+
+Machine. We use a Google Cloud c4-highmem-288 instance, a dual-socket server with two 72-core Intel Xeon 6985P-C processors (Granite Rapids) and 2.3 TB of RAM across 6 NUMA nodes. 
+
+Datasets. We evaluate Ginger on 14 public ANNS datasets cover-ing Euclidean and maximum inner-product search (MIPS), summa-rized in Table 1. Six low-dimensional datasets ( 𝑑 ≤ 200) comprise GloVe and five billion-vector benchmarks spanning image, web-search, and cross-modal retrieval. Eight high-dimensional datasets (768 ≤ 𝑑 ≤ 4096) contain up to 101 million vectors and cover text, encyclopedia, scientific, multimodal, and LLM embeddings. Input coordinates are 8-bit integers for MS-SPACEV and BigANN, and 32-bit floats for the remaining twelve datasets. 
+
+Existing Libraries. We compare Ginger against the seven li-braries introduced in Section 2.2: the Vamana implementations in ParlayANN [59, 66], SVS [1], and DiskANN [41, 46]; HNSW [57] from Hnswlib [58]; the IVF implementations in ScaNN [37, 81] and Faiss [22]; and SymphonyQG [35] from the RaBitQ-Library [27]. Together, these libraries form a comprehensive comparison set span-ning both widely adopted industrial systems and highly optimized research implementations. We select SymphonyQG to represent methods that store auxiliary data on graph edges because of its reported query performance and scalable, multithreaded C++ im-plementation [27, 35]. 
+
+Environment. All C++ implementations are compiled with Clang v19.1.7. DiskANN is built with Rust v1.97.0. We use full compile-time ( -O3 ) and link-time optimizations ( -lto ), and native archi-tecture tuning ( -march=native ). To avoid allocator contention and ensure a fair comparison, we link all implementations against 
+
+jemalloc v5.3.0. This change is either neutral or positive on QPS for all methods. To ensure accurate query timings, we perform one warm-up run (discarded) followed by 5 timed runs of the query set for each parameter configuration and report the average through-put. To prevent cache interference across runs, we flush the CPU cache between runs. 
+
+Query Setup. We evaluate query throughput without batching: individual queries are processed in parallel across threads. To ob-tain the Pareto-optimal frontier of throughput at each recall level, we sweep the search beam width 𝐿 search with select values in the range [10 , 2000 ] for graph-based indexes. For IVF-based indexes, we sweep the number of probed leaf clusters 𝑛 probe over select val-ues in [1, 1000 ] and the number of candidates to rerank 𝑛 rerank ∈{2𝑘, 4𝑘, 8𝑘, 16 𝑘, 32 𝑘, 64 𝑘 }. For multi-level ScaNN, we additionally sweep the number of top-level clusters to probe on two-level trees, and for three-level trees we evaluate selected pairs of middle- and top-level probe counts to cover various routing profiles that vary the search cost at each level, which we model by the amount of data loaded. See Appendix A for more details. Table 5 in Appendix A summarizes the vector representations used by each library. On the 8-bit integer datasets (MS-SPACEV and BigANN), all graph libraries operate directly on the native 
+
+int8 /uint8 coordinates without quantization. On high-dimensional float datasets ( 𝑑 ≥ 768), libraries combine dimensionality reduction (PCA, OPQ, or JL prefiltering) or 1–2-bit spherical codes with higher-precision reranking. On low-dimensional float datasets ( 𝑑 ≤ 200), dimensionality reduction degrades accuracy so we omit it. 
+
+Index Parameters. All graph-based indexes are constructed with maximum out-degree 𝑅 = 64 and construction beam width 𝐿 = 128 (corresponds to 𝑀 = 32 , 𝑒 𝑓 𝐶 = 128 for Hnswlib). PiPNN uses the standard parameters from the original paper: leaf size 𝐶 = 1024 and tree fanout (10 , 3). On GloVe, we use 𝑅 = 100 , 𝐿 = 250 for Vamana, and 𝑀 = 50 , 𝑒 𝑓 𝐶 = 250 for Hnswlib. For Vamana and PiPNN based methods we use the standard two build passes, except for DiskANN which only supports single-pass. We instead double the insertion beam-width to match the build effort and improve index quality. For ScaNN, we use anisotropic vector quantization (AVQ =
+
+2.5) and spilling with orthogonality-amplified residuals (SOAR =
+
+1.5, with 𝜆 = 1.0 on GloVe and Wiki-Cohere, and 𝜆 = 2.0 on DataComp-DR and DBpedia). We set the noise shaping threshold to NST = 0.2 for unit-norm datasets (NST = 0.1 on OpenAI-arXiv, DataComp-DR, and DBpedia), and scale it proportionally to the average vector norm on non-unit-norm datasets (NST = 24 .0 on     
+
+> 8GINGER: Spicing Up Graph-Based Vector Search 80% 85% 90% 95% 100% 10K 100K 1M
+> QPS
+
+GloVe     
+
+> 80% 85% 90% 95% 100% 10K 100K 1M
+
+Deep     
+
+> 80% 85% 90% 95% 100% 10K 100K 1M
+
+MS-Turing     
+
+> 80% 85% 90% 95% 100% 10K 100K 1M
+
+MS-SPACEV     
+
+> 80% 85% 90% 95% 100% 10K 100K 1M
+> QPS
+
+BigANN     
+
+> 80% 85% 90% 95% 100% 10K 100K
+
+Text2Image     
+
+> 80% 85% 90% 95% 100% 10K 100K 1M
+
+Wiki-Cohere     
+
+> 80% 85% 90% 95% 100% 10K 100K 1M
+
+Wiki-All     
+
+> 80% 85% 90% 95% 100% 1K 10K 100K
+> QPS
+
+MS-MARCO     
+
+> 80% 85% 90% 95% 100% 10K 100K 1M
+
+DBpedia-1536     
+
+> 80% 85% 90% 95% 100%
+> 10@10 Recall
+> 1K 10K 100K 1M
+
+OpenAI-arXiv     
+
+> 80% 85% 90% 95% 100%
+> 10@10 Recall
+> 1K 10K 100K
+
+DataComp-DR     
+
+> 80% 85% 90% 95% 100%
+> 10@10 Recall
+> 1K 10K 100K 1M
+> QPS
+
+DBpedia-3072   
+
+> 95% 97.5% 100%
+> 10@10 Recall
+> 1K 10K 100K 1M
+
+Wiki-Qwen 
+
+Ginger SVS ParlayANN DiskANN SymphonyQG Hnswlib Faiss ScaNN 
+
+1
+
+Figure 4: Throughput in queries per second (QPS) vs. recall 10@10 . Ginger uses 4+8-bit NTQ and graph compression. Missing curves are largely due to out-of-memory failures (see Table 2). SVS on MS-Turing leaves the graph disconnected from the entry point. SymphonyQG on Wiki-Cohere reaches at most ≈ 0.5% recall. 
+
+MS-SPACEV, 100 .0 on BigANN, 2 .75 on Wiki-Cohere, and 2 .0 on MS-MARCO). Refer to Table 6 for the dataset-specific parameters such as RobustPrune 𝛼 values, partition sizes, and IVF quantizer configurations. All methods use multi-threading for the builds. To support reproducibility, we will release our experimental setup, including the benchmark harness, build scripts, and dataset configurations alongside. 
+
+## 6.2 Comparison with other Libraries 
+
+We evaluate the libraries along three dimensions: query throughput, memory footprint, and indexing time. These three properties jointly comprise the bedrock of index performance. We use geometric means for comparing across datasets. In general: Ginger produces 
+
+smaller indexes which support higher query throughput with less indexing time as compared with all other libraries. 
+
+Query Throughput. Figure 4 shows throughput (queries per sec-ond) with respect to recall. Ginger leads on 13 of 14 datasets across the [90% , 100% ] recall range and in area under the QPS-recall curve (AUC). At 95% recall, its mean speedup over the fastest competi-tor on each dataset is 1 .8× overall and 2 .0× on high-dimensional datasets, with the largest dataset-specific gain of 2 .7× on Wiki-Cohere. The strongest competitors on high-dimensional datasets are SymphonyQG and SVS. The only exception is BigANN, whose byte coordinates we do not encode with TurboQuant; there, SVS is 4% faster at both 90% and 95% recall. Because different competitors are second-best on different datasets, the advantage over any indi-vidual library across completed datasets is larger. In AUC, Ginger achieves a geometric mean gain of 2 .35 × over ParlayANN, 2 .38 ×
+
+over SVS, 2 .42 × over SymphonyQG, and 2 .79 × over DiskANN. The IVF indexes Faiss and ScaNN trail the graph methods across all datasets, with Ginger achieving a geometric mean AUC gain of 10 .3× over ScaNN and 11 .7× over Faiss. 
+
+Memory Footprint. The memory comparison exposes two dif-ferent sources of savings: graph compression on low-dimensional datasets and vector quantization on high-dimensional datasets. In Figure 5, we compare the memory footprints. We split each in-dex into five parts. Graph is the adjacency structure, which only Ginger compresses. Raw Vectors are the uncompressed vectors, for indexes that keep them. Quantized Vectors (Navigation) are the codes scored during graph traversal or IVF scanning, including JL sketches and, for IVF indexes, the inverted lists and the coarse quan-tizer. Quantized Vectors (Reranking) are the higher-precision codes used to rerank candidates instead of raw vectors. Other covers ID remapping tables and locks. On the four low-dimensional datasets in Figure 5, Ginger has the smallest index of all graph-based methods. It is on average 
+
+> 9
+
+Salwasser et al. 0 500 1K Ginger (8-bit) Ginger (12-bit) Faiss ScaNN SVS ParlayANN DiskANN Hnswlib SymphonyQG 
+
+> -37% -25% -41% -35% +18% +93% +103% +95%
+> OOM
+
+Deep ( 𝑑 = 96) 
+
+0 500 1K 
+
+> -43% -31% -30% -36% +14% +90% +111% +91%
+> OOM
+
+MS-Turing ( 𝑑 = 100) 
+
+0 200 400 600 
+
+> +94% +94% +21% +158% +203% +203% +260% +285%
+> OOM
+
+BigANN ( 𝑑 = 128) 
+
+0 500 1K 1.5K  
+
+> -57% -45% -43%
+> OOM -23% +57% +62%
+> OOM OOM
+
+Text2Image ( 𝑑 = 200) 
+
+0 5K 10K 
+
+Bytes / Vector 
+
+Ginger (8-bit) Ginger (12-bit) Faiss ScaNN SVS ParlayANN DiskANN Hnswlib SymphonyQG 
+
+> -67% -54% -48% -38% -60% +38% +15% +12% +225%
+
+MS-MARCO ( 𝑑 = 768) 
+
+0 10K 20K 
+
+Bytes / Vector 
+
+> -71% -58% -74% -63% -68% +31% +10% +6% +212%
+
+OpenAI-arXiv ( 𝑑 = 1536) 
+
+0 20K 40K 
+
+Bytes / Vector 
+
+> -72% -60% -75% -63% -71% +28% +6% +3% +206%
+
+DBpedia-3072 ( 𝑑 = 3072) 
+
+0 20K 40K 60K 
+
+Bytes / Vector 
+
+> -72% -59% -49% -39% -71% +27% +6% +2% +205%
+
+Wiki-Qwen ( 𝑑 = 4096) 
+
+Graph Raw Vectors Quantized Vectors (Navigation) Quantized Vectors (Reranking) Other Raw Vector Size 
+
+1
+
+Figure 5: Memory footprint in bytes per vector broken down by index component. The dashed vertical indicates the uncompressed vector size. Percentages show the memory overhead or savings relative to the raw vectors. On high-dimensional datasets, we report Ginger with 8-bit (4 + 4) and 12-bit ( 4 + 8) NTQ reranking. Table 2: Index construction times. ∗Times for SVS include patches to speed up build but still produce the same graph. †Times for ScaNN include patches to significantly speed up build times with k-means on quantized vectors.                                                                                                                                                                                      
+
+> Ginger (PiPNN) Ginger (Vamana) SVS ∗ParlayANN DiskANN SymphonyQG Hnswlib ScaNN †Faiss Dataset Quantization & PCA Graph Compression Graph Construction Total (No Compression) Low dimensional  GloVe <1s 3s 1s 4s 7s 1m 11s 13s 8s 14s 12s 7s 2s
+> Deep 42s 16m 3s 17m 44s 34m 30s 1h 8m 9h 31m 2h 13m 2h 25m OOM 3h 34m 38h 23m 57m 51s MS-Turing 48s 20m 9s 18m 31s 39m 28s 49m 0s 18h 53m 1h 46m 1h 51m OOM 2h 58m 41h 55m 1h 6m MS-SPACEV –13m 21s 17m 55s 31m 16s 1h 37m 16h 4m 2h 4m 1h 44m OOM 3h 11m 41h 52m 1h 7m BigANN –16m 12s 18m 18s 34m 30s 1h 40m 5h 40m 2h 47m 2h 20m OOM 3h 14m 31h 17m 1h 9m Text2Image 1m 30s 15m 52s 20m 24s 37m 47s 1h 2m 13h 54m 4h 30m 1h 41m OOM OOM OOM 1h 28m High dimensional  Wiki-Cohere 17s 28s 49s 1m 34s 5m 9s 19m 56s 8m 16s 9m 20s 7m 33s 18m 37s 3m 6s 3m 52s Wiki-All 43s 1m 13s 2m 0s 3m 56s 10m 45s 40m 25s 13m 38s 20m 41s 40m 52s 39m 59s 10m 0s 9m 7s MS-MARCO 50s 2m 5s 2m 34s 5m 29s 18m 53s 1h 10m 30m 14s 33m 28s 47m 17s 1h 3m 13m 35s 9m 47s DBpedia-1536 2s 2s 2s 6s 9s 31s 8s 24s 24s 36s 19s 46s OpenAI-arXiv 4s 3s 4s 11s 22s 1m 8s 23s 1m 0s 50s 1m 22s 55s 1m 10s DataComp-DR 15s 10s 27s 52s 2m 19s 5m 47s 10m 53s 6m 32s 9m 57s 8m 49s 4m 20s 4m 13s DBpedia-3072 11s 2s 5s 18s 33s 1m 8s 11s 48s 48s 1m 6s 51s 50s Wiki-Qwen 22s 1s 5s 29s 35s 1m 10s 5s 30s 36s 39s 1m 16s 1m 34s
+
+80% 85% 90% 95% 100% 01M 2M 
+
+> QPS
+
+Wiki-Cohere 
+
+80% 85% 90% 95% 100% 01M 2M 
+
+Wiki-All 
+
+80% 85% 90% 95% 100% 0200K 400K 600K 
+
+MS-MARCO 
+
+80% 85% 90% 95% 100% 01M 2M DBpedia-1536 
+
+80% 85% 90% 95% 100% 
+
+10@10 Recall 
+
+0500K 1M 1.5M 
+
+> QPS
+
+OpenAI-arXiv 
+
+80% 85% 90% 95% 100% 
+
+10@10 Recall 
+
+0200K 400K 
+
+DataComp-DR 
+
+80% 85% 90% 95% 100% 
+
+10@10 Recall 
+
+0500K 1M 
+
+DBpedia-3072 
+
+95% 97.5% 100% 
+
+10@10 Recall 
+
+0500K 1M 
+
+Wiki-Qwen 
+
+Float TurboQuant TurboQuant + PCA TurboQuant + TurboSlice TurboQuant + JL 
+
+1
+
+Figure 6: Ablation comparing Ginger search variants. TurboSlice uses 𝑑 ts = 256 , JL uses 𝑑 jl = 1024 .
+
+1.54 × (up to 1 .65 ×) smaller than SVS, the most compact competitor. Most of this saving comes from graph compression. The graph of Ginger takes on average 111 bytes per vector, compared with 260 bytes for the flat adjacency arrays of SVS and ParlayANN. Only the IVF indexes Faiss and ScaNN are competitive with regards to memory footprint on low-dimensional datasets. On high-dimensional datasets the embeddings themselves domi-nate the memory footprint. Ginger needs on average 43% of the raw vector size across all eight high-dimensional datasets due to NTQ with 12 bits. ParlayANN, DiskANN, and Hnswlib keep the raw float vectors and are 2 .7× larger. SymphonyQG is 7 .4× larger because of its per-edge codes. SVS, Faiss, and ScaNN are smaller on some datasets, by up to 1 .6× (Faiss on OpenAI-arXiv), mainly 
+
+10 GINGER: Spicing Up Graph-Based Vector Search 
+
+because they rerank with 8-bit instead of 12-bit codes. SVS uses 19 .8% less memory in the geometric mean across all eight high-dimensional datasets. However, SVS is 2 .9× slower in the geometric mean at 95% recall. It also reaches lower peak recall than 12-bit Ginger on every dataset. With 8-bit NTQ, Ginger uses less mem-ory than SVS on all datasets, still achieves 2 .6× higher mean QPS at 95% recall and higher peak recall on seven of the eight datasets. 
+
+Indexing Time. These memory savings require additional pre- and post-processing, so we compare complete index construction times, including graph reordering, compression, quantization, and PCA. Table 2 breaks down Ginger (PiPNN) builds into graph construc-tion, graph compression, and quantization plus PCA. Fast graph construction comes from PiPNN [73, 74]; quantization is fast and grouped with PCA to save space. With PiPNN, Ginger builds fastest on 11 of 14 datasets, achieving a mean speedup of 1 .4× over the fastest competitor (up to 4 .9× on DataComp-DR). Note that these times include graph reordering and compression for Ginger, but not the other methods, trading some of the advantage of PiPNN for lower memory footprint. On the five billion-scale datasets, complete builds take an average of 35 minutes (up to 39 minutes), including 18 to 20 minutes for graph construction and 13 to 20 minutes for reordering and compression. Faiss, the fastest competitor, takes on average 69 minutes (up to 88 minutes), giving Ginger a 2 .0× mean speedup (up to 2 .3×). The remaining libraries require 1 .8 to 42 hours or run out of memory. On the three large high-dimensional datasets (35M to 101M vectors), Ginger builds 2 .0× faster in the geometric mean (up to 2 .3×) than the fastest competitor. On smaller datasets, all methods finish within two minutes. Par-layANN builds up to 5 .7× faster than Ginger on the very small datasets DBpedia-3072 and Wiki-Qwen, where PCA dominates our build time, while Faiss is 2 .1× faster on GloVe. If we look only at PiPNN graph construction time, it is fastest. The Ginger (Vamana) column reports our Vamana implementa-tion without graph compression for reference. Even with Vamana, Ginger builds faster than all external Vamana libraries on the 11 datasets with 𝑛 > 1M. To be able to include them in the experiments, we patched SVS and ScaNN to accelerate index construction. For SVS, we eliminate lock contention when adding backward edges to the Vamana graph by scaling the number of backedge buffers and clearing them in par-allel, giving greater than 2 × speedup without changing the resulting graph. For ScaNN, we parallelize several sequential loops and accel-erate k-means by running on quantized 8-bit vectors (SFP8), which has been shown to not compromise k-means quality [47]. 
+
+## 6.3 Ablation Studies 
+
+We now analyze the contributions of Ginger’s main components through ablation studies. We first examine search optimizations, then evaluate NTQ accuracy independently of graph traversal, and finally study how reordering and encoding affect graph size and query speed. 
+
+Search Optimizations. Figure 6 breaks down where Ginger’s speedups come from. At 90% recall, navigating on 4-bit TurboQuant codes instead of float vectors is the largest step, speeding up search by 5 .7× in the geometric mean (up to 7 .2×). Searching on PCA-projected coordinates speeds up search by another 1 .8× in the geometric mean (up to 2 .4× on DBpedia-3072, which has the largest reduction in dimension). The prefilters help to a lesser extent at 90% recall. TurboSlice speeds up search by 1 .26 × in the geometric mean (up to 1 .5×). JL speeds up search by 1 .12 × in the geometric mean (up to 1 .4× on DBpedia-3072), but incurs a 15% slowdown on Wiki-All. TurboSlice beats JL on six of the seven datasets. On Wiki-Qwen, TurboSlice is 1 .27 × faster than PCA at 97% recall, and the two are on par at 99% recall. We attribute this to the fact that the projection is expensive on Wiki-Qwen. PCA and the prefilters both cut memory traffic per candidate, so their gains do not stack. Next, we investigate how much time each phase of the search pro-cedure takes. Figure 7 shows how the runtime balance shifts as di-mensionality increases from 768 (Wiki-Cohere) to 1 ,536 (DBpedia-1536) and 4 ,096 (Wiki-Qwen). Beam search dominates on the first two datasets, while projection accounts for roughly half the run-time on Wiki-Qwen at 95% recall. This reflects the growing cost of multiplying each query by a projection matrix whose size in-creases with both the input and projected dimensions. On larger dimensionalities, we can significantly speed up projection without sacrificing recall by quantizing the matrix entries. Figure 8 shows little benefit from quantizing Wiki-Cohere’s projection matrix, whose float representation occupies only 0 .73 MiB and can fit in L2 cache. The larger float matrices for DBpedia-1536 and Wiki-Qwen occupy 2 .16 MiB and 13 .75 MiB, respectively. Quantization reduces their code storage to 0 .27 MiB and 1 .72 MiB, consistent with im-proved cache residency and the substantial throughput gains on these datasets. The benefit narrows near full recall as the fixed query-projection cost is amortized over more expensive search and reranking. 80% 85% 90% 95% 100%         
+
+> 10@10 Recall
+> 0% 20% 40% 60% 80% 100%
+> Running Time Share  Wiki-Cohere
+> 80% 85% 90% 95% 100%
+> 10@10 Recall
+> 0% 20% 40% 60% 80% 100% DBpedia-1536
+> 90% 92.5% 95% 97.5% 100%
+> 10@10 Recall
+> 0% 20% 40% 60% 80% 100% Wiki-Qwen
+> Quantization Projection Beam Search Reranking
+
+1        
+
+> Figure 7: Share of query time spent in each search phase. On higher-dimensional datasets, projection accounts for a growing share of query time due to the larger projection matrix. 80% 85% 90% 95% 100%
+> 10@10 Recall
+> 0500K 1M 1.5M
+> QPS
+> Wiki-Cohere
+> 80% 85% 90% 95% 100%
+> 10@10 Recall
+> 0500K 1M 1.5M
+> DBpedia-1536
+> 90% 92.5% 95% 97.5%100%
+> 10@10 Recall
+> 0500K 1M Wiki-Qwen
+> 32-bit Float Projection Matrix 4-bit TQ Projection Matrix
+
+1
+
+> Figure 8: Quantizing the PCA matrix improves QPS on very high dimensions.
+> 11
+
+Salwasser et al. 
+
+Table 3: Graph reordering quality and runtime. We report LogGap = 1 
+
+> |𝐸 |
+
+Í log 2 (𝑔 𝑖 + 1) and actual encoded bits per edge under AdaptiveGap for the neighbor lists only, excluding the CSR row-offset array. Cells are shaded per dataset from green (best) to red (worst).                                                        
+
+> Metric Reordering Method OpenAI-arXiv (2.3M) Wiki-Cohere (35M) Wiki-All (88M) Text2Image (100M) Deep (100M) MS-Turing (100M)
+> LogGap /AdaptiveGap
+> (bits/edge)
+> Unreordered 14.53 / 19.34 16.88 / 22.05 16.78 / 22.43 19.95 / 24.55 20.14 / 24.85 20.22 / 24.93
+> RGC 10.10 / 15.66 12.84 / 18.38 13.89 / 19.69 9.71 / 15.22 15.04 / 20.55 15.19 / 20.63
+> RGB [19] 8.80 / 14.17 11.08 / 16.54 12.01 / 17.82 8.65 / 13.99 11.99 / 17.51 13.18 / 18.79
+> RGP (Ours) 8.57 / 13.97 10.59 / 16.02 11.02 / 16.86 7.81 / 13.08 11.74 / 17.27 12.03 / 17.63
+> Reorder Time (s)
+> RGC 2.4s 83.2s 1573.4s 248.3s 210.7s 189.5s
+> RGB [19] 3.5s 103.8s 213.1s 521.5s 458.6s 474.4s
+> RGP (Ours) 3.2s 20.0s 59.8s 79.6s 91.4s 113.3s
+
+Table 4: QPS at ≥ 0.95 recall / graph memory (bits per edge, including CSR offsets). Cells are shaded per dataset column by QPS from green (highest) to red (lowest). Note that bits per edge is higher than in Table 3 due to including CSR offsets.                                                             
+
+> Graph Format & Reordering OpenAI-arXiv (2.3M) Wiki-Cohere (35M) Wiki-All (88M) Text2Image (100M) Deep (100M) MS-Turing (100M)
+> AdaptiveGap + Reordered (CSR) 519.5k / 14.5b 721.4k / 16.5b 1149.9k / 17.6b 118.5k / 13.4b 775.9k / 17.7b 501.9k / 18.1b
+> StreamVByte + Reordered (CSR) 527.9k / 15.7b 723.3k / 17.4b 1160.6k / 18.6b 117.9k / 14.3b 782.2k / 18.5b 511.2k / 18.7b
+> PrefixVarint + Reordered (CSR) 499.6k / 14.7b 693.9k / 17.0b 1098.1k / 18.0b 111.8k / 13.6b 688.4k / 18.1b 471.8k / 18.6b
+> Uncompressed + Reordered (FlatGraph) 523.9k / 65.2b 740.9k / 53.9b 1195.5k / 89.3b 119.6k / 39.2b 807.4k / 48.1b 527.0k / 49.6b
+> Uncompressed (FlatGraph) 526.9k / 65.2b 747.0k / 53.9b 1203.2k / 89.3b 119.2k / 39.2b 745.5k / 48.1b 525.6k / 49.6b
+> Uncompressed + Reordered (CSRGraph) 520.9k / 34.0b 726.2k / 33.7b 1180.0k / 34.7b 119.7k / 33.2b 752.1k / 33.5b 515.1k / 33.5b
+> Uncompressed (CSRGraph) 523.3k / 34.0b 731.9k / 33.7b 1176.7k / 34.7b 120.1k / 33.2b 777.3k / 33.5b 515.0k / 33.5b
+
+Quantization Ablations. In Figure 9 we plot the recall of NTQ at different bitwidths, showing that 12 bits achieves near float accu-racy. We measure the accuracy of the quantizer separate from the quality of an approximate search index by evaluating recall over a brute-force scoring of the dataset. We use subsets of 5 million datapoints per dataset so as to make this computationally tractable. Moreover, these results show that a simpler residual scheme, which quantizes 𝑟 = 𝑦 − ˜𝑦 with a second TurboQuant, plain uniform scalar quantization, and bf16 are all insufficient. We also compare with a reimplementation of Intel’s proprietary LVQ codec [1]. Like NTQ, two-level LVQ (LVQ-4x 𝑘 ) pairs a 4-bit navigation code with 𝑘 ad-ditional bits per coordinate for reranking. For LVQ-4x8, the recall of our reimplementation agrees with Intel’s SVS binaries to four decimal places. LVQ centers each vector by the global dataset mean and quantizes it uniformly to 4 bits with per-vector minimum and maximum bounds. For reranking, the residual of the centered vector with respect to its 4-bit code is requantized with uniform scalar quantization. At 4 bits, LVQ is less accurate than NTQ on the three high-dimensional datasets, while both approach float accuracy at 12 bits. The use of the global mean is crucial for LVQ’s recall which 99.9% 99.8% 99.5% 99% 98% 95% 90% 80% 
+
+> 10@10 Recall
+
+Deep 99.9% 99.8% 99.5% 99% 98% 95% 90% 80% 
+
+Text2Image     
+
+> 46810 12
+> Bits per dimension
+> 99.95% 99.9% 99.8% 99.5% 99% 98% 95% 90% 80%
+> 10@10 Recall
+
+MS-MARCO     
+
+> 46810 12
+> Bits per dimension
+> 100% 99.99% 99.9% 99% 95%
+
+DBpedia-3072 
+
+> NTQ 4+k NTQ 4+k (centered) TQ4 + residual TQ-k LVQ-4xk ScalarQuant BF16
+
+1
+
+Figure 9: Exhaustive search 10@10 recall on four datasets (subsetted to 5M datapoints) across bitwidths. Showing bf16 as a horizontal dashed line. 
+
+makes the codec less flexible in dynamic settings. Adding center-ing to NTQ can optionally boost recall on some datasets, such as DBpedia-3072. Extended RaBitQ [28] is another method that splits its codes, into a 1-bit sign and a 𝑘 -bit magnitude. Its only coarse level is thus the 1-bit sign code. Truncating the magnitude bits does not yield a well-tuned coarse code either, because all bits share one uniform grid whose per-vector scale is fit to the full code. 
+
+Graph Compression and Reordering. Lastly, we evaluate the impact of graph reordering on compression and query speed. Ta-ble 3 compares RGP (Section 5.1) against the original vertex order (Unreordered ), and two baselines from the literature: bottom-up agglomerative clustering on normalized edge weights ( RGC [11]), and top-down Recursive Graph Bisection ( RGB [19]). RGP achieves the smallest gaps on all six datasets and reduces the bits per edge under AdaptiveGap by 31 .5% in the geometric mean (up to 46 .7%) over the original order. On the larger graphs (35M to 100M vertices), 
+
+RGP is also 4 .2× faster in the geometric mean (up to 26 .3×) than 
+
+RGC and 4 .8× faster in the geometric mean (up to 6 .6×) than RGB .The graph-memory measurements in Table 4 include the CSR row-offset array, whereas Table 3 reports encoded neighbor-list storage alone. Table 4 compares query throughput at 95% recall and graph memory for three compression codecs on RGP -reordered graphs ( AdaptiveGap , StreamVByte [48], and PrefixVarint [18]) against uncompressed CSR ( CSRGraph ) and fixed-degree arrays (FlatGraph ). AdaptiveGap shrinks the graph by 2 .1× in the geomet-ric mean (up to 2 .5×) over CSRGraph and by 3 .4× in the geometric mean (up to 5 .1×) over FlatGraph , compared with 2 .0× and 3 .2× in the geometric mean for StreamVByte . AdaptiveGap comes within 1.4% of CSRGraph and 2 .8% of FlatGraph in the geometric mean while using 2 .1× and 3 .4× less graph memory. Non-vectorized de-coding makes PrefixVarint 5.9% slower in the geometric mean (up to 11 .3%) than AdaptiveGap . AdaptiveGap matches the throughput of StreamVByte while saving 0 .9 bits per edge in the geometric mean (up to 1 .2 bits), or 5 .4% of graph memory (up to 7 .6%). 
+
+12 GINGER: Spicing Up Graph-Based Vector Search 
+
+## 7 DISCUSSION & CONCLUSION 
+
+Ginger shows that graph-based vector search still has plenty of room to grow. It breaks new ground in query throughput, mem-ory footprint, and indexing time for ANNS. The key is designing every step of the search around reducing memory traffic. Nested TurboQuant lets a single code serve both fast 4-bit navigation and reranking with near-float accuracy. Graph compression shrinks the graph without slowing down queries. PiPNN completes the picture with fast index construction. 
+
+Looking Ahead. While this paper focuses on single-vector dense embeddings, retrieval applications at Google increasingly go be-yond this setting. We therefore designed Ginger to be flexible for more general retrieval settings. Graph construction and beam search operate only through a user-provided similarity function, abstracting away the specific data representation. This makes it easy to search under novel similarity functions like Chamfer on multi-vectors and black-box similarity functions such as learned relevance scorers. Neural scorer inference is more expensive than computing a dot product, increasing the appeal of the few distance evaluations that graph search needs. We are thrilled to share Gin-ger with the research community and look forward to seeing what others build with it. 
+
+## ACKNOWLEDGMENTS 
+
+We thank Richard Wen, Kishen Gowda, Majid Daliri, Rasto Lenhardt, Jirka Isa, Jan Wassenberg, Peter Sanders, John Owens and Daniel Seemaier for helpful discussions. 
+
+## REFERENCES 
+
+[1] Cecilia Aguerrebere, Ishwar Singh Bhati, Mark Hildebrand, Mariano Tepper, and Theodore L. Willke. 2023. Similarity Search in the Blink of an Eye with Compressed Indices. Proceedings of the VLDB Endowment 16, 11 (2023), 3433–3446. https://doi.org/10.14778/3611479.3611537 [2] Nir Ailon and Bernard Chazelle. 2009. The Fast Johnson–Lindenstrauss Trans-form and Approximate Nearest Neighbors. SIAM J. Comput. 39, 1 (2009), 302–322. [3] Alexandr Andoni, Piotr Indyk, Thijs Laarhoven, Ilya P. Razenshteyn, and Ludwig Schmidt. 2015. Practical and Optimal LSH for Angular Distance. In Advances in Neural Information Processing Systems (NeurIPS) . 1225–1233. [4] Fabien André, Anne-Marie Kermarrec, and Nicolas Le Scouarnec. 2016. Cache locality is not enough: High-performance nearest neighbor search with product quantization fast scan. In 42nd International Conference on Very Large Data Bases ,Vol. 9. 12. [5] Alberto Apostolico and Guido Drovandi. 2009. Graph Compression by BFS. 
+
+Algorithms 2, 3 (2009), 1031–1044. [6] Apple. 2024. DataCompDR-12M-bf16. https://huggingface.co/datasets/apple/ DataCompDR-12M-bf16. [7] Artem Babenko and Victor Lempitsky. 2016. Efficient indexing of billion-scale datasets of deep descriptors. In Proceedings of the IEEE conference on computer vision and pattern recognition . 2055–2063. [8] Ran Ben-Basat, Yaniv Ben-Itzhak, Gal Mendelson, Michael Mitzenmacher, Amit Portnoy, and Shay Vargaftik. 2026. A Note on TurboQuant and the Earlier DRIVE/EDEN Line of Work. arXiv preprint arXiv:2604.18555 (2026). [9] Roi Blanco and Álvaro Barreiro. 2005. Document Identifier Reassignment through Dimensionality Reduction. In Proceedings of the 27th European Conference on IR Research (ECIR) . 375–387. [10] Daniel K. Blandford and Guy E. Blelloch. 2002. Index Compression through Document Reordering. In Proceedings of the Data Compression Conference (DCC) .342–351. [11] Daniel K. Blandford, Guy E. Blelloch, and Ian A. Kash. 2003. Compact Represen-tations of Separable Graphs. In Proceedings of the Fourteenth Annual ACM-SIAM Symposium on Discrete Algorithms (SODA) . SIAM, 679–688. [12] Guy E Blelloch, Daniel Anderson, and Laxman Dhulipala. 2020. ParlayLib: A toolkit for parallel algorithms on shared-memory multicore machines. In Proceed-ings of the 32nd ACM Symposium on Parallelism in Algorithms and Architectures .507–509. https://doi.org/10.1145/3350755.3400254 [13] Paolo Boldi, Marco Rosa, Massimo Santini, and Sebastiano Vigna. 2011. Layered Label Propagation: A Multiresolution Coordinate-Free Ordering for Compressing Social Networks. In Proceedings of the 20th International Conference on World Wide Web (WWW) . 587–596. [14] Paolo Boldi and Sebastiano Vigna. 2004. The WebGraph Framework I: Compres-sion Techniques. In Proceedings of the 13th International Conference on World Wide Web (WWW) . 595–602. [15] Patrick H. Chen, Wei-Cheng Chang, Jyun-Yu Jiang, Hsiang-Fu Yu, Inderjit S. Dhillon, and Cho-Jui Hsieh. 2023. FINGER: Fast inference for graph-based approximate nearest neighbor search. In Proceedings of the ACM Web Conference (WWW) . 3225–3235. https://doi.org/10.1145/3543507.3583318 [16] Flavio Chierichetti, Ravi Kumar, Silvio Lattanzi, Michael Mitzenmacher, Alessan-dro Panconesi, and Prabhakar Raghavan. 2009. On Compressing Social Networks. In Proceedings of the 15th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD) . ACM, 219–228. [17] Majid Daliri, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Rajesh Jayaram. 2026. TurboSlice: Reusing Quantized Prefixes for Fast Vector Scoring. (2026). Under submission. [18] Jeffrey Dean. 2009. Challenges in building large-scale information retrieval systems: invited talk. In Proceedings of the Second ACM International Conference on Web Search and Data Mining (WSDM) . ACM, 1–1. [19] Laxman Dhulipala, Igor Kabiljo, Brian Karrer, Giuseppe Ottaviano, Sergey Pupyrev, and Alon Shalita. 2016. Compressing Graphs and Indexes with Re-cursive Graph Bisection. In Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD) . ACM, 1535–1544. [20] Shuai Ding, Josh Attenberg, and Torsten Suel. 2010. Scalable Techniques for Document Identifier Assignment in Inverted Indexes. In Proceedings of the 19th International Conference on World Wide Web (WWW) . 311–320. [21] Wei Dong, Moses Charikar, and Kai Li. 2011. Efficient k-nearest neighbor graph construction for generic similarity measures. In Proceedings of the 20th Interna-tional Conference on World Wide Web (WWW) . 577–586. https://doi.org/10.1145/ 1963405.1963487 [22] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. 2024. The Faiss library. (2024). arXiv:2401.08281 [cs.LG] [23] William H. R. Equitz and Thomas M. Cover. 1991. Successive Refinement of Information. IEEE Transactions on Information Theory 37, 2 (1991), 269–275. [24] Cong Fu and Deng Cai. 2016. EFANNA: An extremely fast approximate nearest neighbor search algorithm based on kNN graph. arXiv preprint arXiv:1609.07228 
+
+(2016). [25] Cong Fu, Changxu Wang, and Deng Cai. 2021. High dimensional similarity search with satellite system graph: Efficiency, scalability, and unindexed query compatibility. IEEE Transactions on Pattern Analysis and Machine Intelligence 44, 8 (2021), 4139–4150. [26] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast Approximate Nearest Neighbor Search With The Navigating Spreading-out Graph. Proceedings of the VLDB Endowment 12, 5 (2019), 461–474. https://doi.org/10.14778/3303753. 3303754 [27] Jianyang Gao, Yutong Gou, Yuexuan Xu, Jifan Shi, Zhonghao Yang, and Cheng Long. 2025. The RaBitQ Library. In The 1st Workshop on Vector Databases (VecDB), co-located with ICML 2025 . https://openreview.net/forum?id=OeZHhOsFir [28] Jianyang Gao, Yutong Gou, Yuexuan Xu, Yongyi Yang, Cheng Long, and Raymond Chi-Wing Wong. 2025. Practical and Asymptotically Optimal Quantization of High-Dimensional Vectors in Euclidean Space for Approximate Nearest Neighbor Search. In Proceedings of the ACM on Management of Data (SIGMOD) .[29] Jianyang Gao and Cheng Long. 2023. High-Dimensional Approximate Nearest Neighbor Search: with Reliable and Efficient Distance Comparison Operations. 
+
+ACM Transactions on Database Systems (TODS) 48, 3 (2023), 1–43. https://doi. org/10.1145/3589282 [30] Jianyang Gao and Cheng Long. 2024. Rabitq: Quantizing high-dimensional vectors with a theoretical error bound for approximate nearest neighbor search. 
+
+Proceedings of the ACM on Management of Data 2, 3 (2024), 1–27. [31] Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia, Jinliu Pan, Yuxi Bi, Yixin Dai, Jiawei Sun, Haofen Wang, and Haofen Wang. 2023. Retrieval-augmented generation for large language models: A survey. arXiv preprint arXiv:2312.10997 
+
+(2023). [32] Tiezheng Ge, Kaiming He, Qifa Ke, and Jian Sun. 2013. Optimized product quantization. IEEE transactions on pattern analysis and machine intelligence 36, 4 (2013), 744–755. [33] Lars Gottesbüren, Laxman Dhulipala, Rajesh Jayaram, and Jakub Łącki. 2025. Unleashing Graph Partitioning for Large-Scale Nearest Neighbor Search. Proc. VLDB Endow. 18, 6 (2025), 1649–1662. [34] Lars Gottesbüren, Tobias Heuer, Peter Sanders, Christian Schulz, and Daniel Seemaier. 2021. Deep Multilevel Graph Partitioning. In 29th Annual European Symposium on Algorithms (ESA) (Leibniz International Proceedings in Informatics (LIPIcs)) , Vol. 204. 48:1–48:17. [35] Yutong Gou, Jianyang Gao, Yuexuan Xu, and Cheng Long. 2025. SymphonyQG: Towards Symphonious Integration of Quantization and Graph for Approximate 13 Salwasser et al. 
+
+Nearest Neighbor Search. In Proceedings of the ACM on Management of Data (SIGMOD) .[36] Robert M. Gray and David L. Neuhoff. 1998. Quantization. IEEE Transactions on Information Theory 44, 6 (1998), 2325–2383. https://doi.org/10.1109/18.720541 [37] Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern, and Sanjiv Kumar. 2020. Accelerating Large-Scale Inference with Anisotropic Vector Quantization. In International Conference on Machine Learning . https: //arxiv.org/abs/1908.10396 [38] Ben Harwood and Tom Drummond. 2016. FANNG: Fast approximate nearest neighbour graphs. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR) . 5713–5722. [39] Intel Corporation. 2024. Intel Architecture Instruction Set Extensions and Future Features Programming Reference. https://www.intel.com/content/www/us/en/ developer/articles/technical/intel-sdm.html. AVX-512 Vector Neural Network Instructions (VNNI). [40] Masajiro Iwasaki and Daisuke Miyazaki. 2018. Optimization of indexing based on k-nearest neighbor graph for proximity search in high-dimensional data. arXiv preprint arXiv:1810.07355 (2018). [41] Suhas Jayaram Subramanya, Fnu Devvrit, Harsha Vardhan Simhadri, Ravishankar Krishnawamy, and Rohan Kadekodi. 2019. Diskann: Fast accurate billion-point nearest neighbor search on a single node. Advances in neural information pro-cessing Systems 32 (2019). [42] Hervé Jégou, Matthijs Douze, and Cordelia Schmid. 2011. Product quantization for nearest neighbor search. IEEE transactions on pattern analysis and machine intelligence 33, 1 (2011), 117–128. [43] Jeff Johnson, Matthijs Douze, and Hervé Jégou. 2019. Billion-scale similarity search with GPUs. IEEE Transactions on Big Data 7, 3 (2019), 535–547. [44] Ian T. Jolliffe and Jorge Cadima. 2016. Principal component analysis: a review and recent developments. Philosophical Transactions of the Royal Society A: Mathematical, Physical and Engineering Sciences 374, 2065 (2016), 20150202. https: //doi.org/10.1098/rsta.2015.0202 [45] Sungjun Jung, Yongsang Park, Haeun Lee, Young H. Oh, and Jae W. Lee. 2025. Angular Distance-Guided Neighbor Selection for Graph-Based Approximate Nearest Neighbor Search. In Proceedings of the ACM on Web Conference 2025 
+
+(Sydney NSW, Australia) (WWW ’25) . Association for Computing Machinery, New York, NY, USA, 4014–4023. https://doi.org/10.1145/3696410.3714870 [46] Ravishankar Krishnaswamy, Magdalen Dobson Manohar, and Harsha Vardhan Simhadri. 2024. The DiskANN library: Graph-Based Indices for Fast, Fresh and Filtered Vector Search. IEEE Data Eng. Bull. (2024). [47] Leonardo Kuffó, Sven Hepkema, and Peter Boncz. 2026. A Super Fast K-means for Indexing Vector Embeddings. CoRR abs/2603.20009 (2026). https://doi.org/ 10.48550/ARXIV.2603.20009 arXiv:2603.20009 [48] Daniel Lemire, Nathan Kurz, and Christoph Rupp. 2018. Stream VByte: Faster byte-oriented integer compression. Inform. Process. Lett. 130 (2018), 1–6. [49] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rock-täschel, et al. 2020. Retrieval-augmented generation for knowledge-intensive nlp tasks. Advances in Neural Information Processing Systems 33 (2020), 9459–9474. [50] Yuliang Li, Jinfeng Li, Yoshihiko Suhara, AnHai Doan, and Wang-Chiew Tan. 2020. Deep entity matching with pre-trained language models. Proc. VLDB Endow. 14, 1 (2020), 50–60. [51] Yongsub Lim, U. Kang, and Christos Faloutsos. 2014. SlashBurn: Graph Compres-sion and Mining Beyond Caveman Communities. IEEE Transactions on Knowledge and Data Engineering 26, 12 (2014), 3077–3089. [52] Stuart P. Lloyd. 1982. Least Squares Quantization in PCM. IEEE Transactions on Information Theory 28, 2 (1982), 129–137. [53] Kejing Lu, Chuan Xiao, and Yoshiharu Ishikawa. 2024. Probabilistic Routing for Graph-Based Approximate Nearest Neighbor Search. In Proceedings of the 41st International Conference on Machine Learning (ICML) (Proceedings of Machine Learning Research) , Vol. 235. PMLR, 33282–33309. https://proceedings.mlr.press/ v235/lu24l.html [54] Kejing Lu, Chuan Xiao, and Yoshiharu Ishikawa. 2026. Probabilistic Kernel Function for Fast Angle Testing. In Proceedings of the International Conference on Learning Representations (ICLR) . https://openreview.net/forum?id=nCsF3Bsn2n [55] Maknee. 2024. wikipedia_qwen_8b. https://huggingface.co/datasets/maknee/ wikipedia_qwen_8b. [56] Yury Malkov, Alexander Ponomarenko, Andrey Logvinov, and Vladimir Krylov. 2014. Approximate nearest neighbor algorithm based on navigable small world graphs. Information Systems 45 (2014), 61–68. [57] Yu A Malkov and Dmitry A Yashunin. 2018. Efficient and robust approximate nearest neighbor search using hierarchical navigable small world graphs. IEEE transactions on pattern analysis and machine intelligence 42, 4 (2018), 824–836. [58] Yu A Malkov and Dmitry A Yashunin. 2018. hnswlib. https://github.com/nmslib/ hnswlib. [59] Magdalen Dobson Manohar, Zheqi Shen, Guy Blelloch, Laxman Dhulipala, Yan Gu, Harsha Vardhan Simhadri, and Yihan Sun. 2024. Parlayann: Scalable and deterministic parallel graph-based approximate nearest neighbor search algo-rithms. In Proceedings of the 29th ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming . 270–285. [60] Yusuke Matsui, Yusuke Uchida, Hervé Jégou, and Shin’ichi Satoh. 2018. A Survey of Product Quantization. ITE Transactions on Media Technology and Applications 
+
+6, 1 (2018), 2–10. https://doi.org/10.3169/mta.6.2 [61] Joel Max. 1960. Quantizing for Minimum Distortion. IRE Transactions on Infor-mation Theory 6, 1 (1960), 7–12. [62] Bhaskar Mitra, Nick Craswell, et al. 2018. An introduction to neural information retrieval. Foundations and Trends® in Information Retrieval 13, 1 (2018), 1–126. [63] Javier Vargas Munoz, Marcos A Gonçalves, Zanoni Dias, and Ricardo da S Torres. 2019. Hierarchical clustering-based graphs for large scale approximate nearest neighbor search. Pattern Recognition 96 (2019), 106970. [64] Arvind Neelakantan, Tao Xu, Raul Puri, Alec Radford, Jesse Michael Han, Jerry Tworek, Qiming Yuan, Nikolas Tezak, Jong Wook Kim, Chris Hallacy, et al. 2022. Text and code embeddings by contrastive pre-training. arXiv preprint arXiv:2201.10005 (2022). [65] NVIDIA RAPIDS. 2024. wiki-all: a vector-search benchmark dataset. https: //data.rapids.ai/raft/datasets/. [66] ParlayANN contributors. 2024. ParlayANN: A library of algorithms for approxi-mate nearest neighbor search. https://github.com/cmuparlay/ParlayANN. [67] Jeffrey Pennington, Richard Socher, and Christopher D Manning. 2014. Glove: Global vectors for word representation. In Proceedings of the 2014 conference on empirical methods in natural language processing (EMNLP) . 1532–1543. [68] Qdrant. 2024. dbpedia-entities-openai3-text-embedding-3-large-1536-1M. https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M. [69] Qdrant. 2024. dbpedia-entities-openai3-text-embedding-3-large-3072-1M. https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-3072-1M. [70] Keith H. Randall, Raymie Stata, Rajiv G. Wickremesinghe, and Janet L. Wiener. 2002. The Link Database: Fast Access to Graphs of the Web. In Proceedings of the Data Compression Conference (DCC) . 122–131. [71] Nils Reimers. 2022. Cohere/wikipedia-22-12-en-embeddings. https://huggingface. co/datasets/Cohere/wikipedia-22-12-en-embeddings. [72] Deepjyoti Roy and Mala Dutta. 2022. A systematic review and research perspec-tive on recommender systems. Journal of Big Data 9, 1 (2022), 59. [73] Tobias Rubel, Richard Wen, Guy Blelloch, Laxman Dhulipala, Lars Gottesbüren, Jakub Łącki, and Vahab Mirrokni. 2026. Turbocharging PiPNN for Proxim-ity and 𝑘 -NN Graph Building. In Proceedings of the 2nd Workshop on Vector Databases (VecDB), co-located with VLDB 2026 . https://openreview.net/forum? id=8GzbSQMrLA [74] Tobias Rubel, Richard Wen, Laxman Dhulipala, Lars Gottesbüren, Rajesh Jayaram, and Jakub Łącki. 2026. PiPNN: Ultra-Scalable Graph-Based Nearest Neighbor Indexing. arXiv preprint arXiv:2602.21247 (2026). [75] Ilya Safro and Boris Temkin. 2011. Multiscale Approach for the Network Compression-Friendly Ordering. Journal of Discrete Algorithms 9, 2 (2011), 190–202. [76] Wann-Yun Shieh, Tien-Fu Chen, Jean Jyh-Jiun Shann, and Chung-Ping Chung. 2003. Inverted File Compression through Document Identifier Reassignment. 
+
+Information Processing & Management 39, 1 (2003), 117–131. [77] Julian Shun, Laxman Dhulipala, and Guy E. Blelloch. 2015. Smaller and Faster: Parallel Processing of Compressed Graphs with Ligra+. In Proceedings of the Data Compression Conference (DCC) . 403–412. [78] Fabrizio Silvestri. 2007. Sorting Out the Document Identifier Assignment Problem. In Proceedings of the 29th European Conference on IR Research (ECIR) . 101–112. [79] Harsha Vardhan Simhadri, Martin Aumüller, Amir Ingber, Matthijs Douze, George Williams, Magdalen Dobson Manohar, Dmitry Baranchuk, Edo Liberty, Frank Liu, Ben Landrum, et al. 2024. Results of the Big ANN: NeurIPS’23 compe-tition. arXiv preprint arXiv:2409.17424 (2024). [80] Harsha Vardhan Simhadri, George Williams, Martin Aumüller, Matthijs Douze, Artem Babenko, Dmitry Baranchuk, Qi Chen, Lucas Hosseini, Ravishankar Krish-naswamny, Gopal Srinivasa, et al. 2022. Results of the NeurIPS’21 challenge on billion-scale approximate nearest neighbor search. In NeurIPS 2021 Competitions and Demonstrations Track . PMLR, 177–189. [81] Philip Sun, David Simcha, Dave Dopson, Ruiqi Guo, and Sanjiv Kumar. 2023. SOAR: Improved Indexing for Approximate Nearest Neighbor Search. In Neural Information Processing Systems . https://arxiv.org/abs/2404.00774 [82] ZeAi Sun and Jinxu Liu. 2026. FastGANN: Marrying Quantization with Pruning for GPU ANNS. In The 2nd Workshop on Vector Databases (VecDB 2026), held in conjunction with VLDB 2026 . https://openreview.net/forum?id=FiMBPm5JxL [83] Mariano Tepper, Ishwar Singh Bhati, Cecilia Aguerrebere, Mark Hildebrand, and Ted Willke. 2024. LeanVec: Searching vectors faster by making them fit. 
+
+Transactions on Machine Learning Research (2024). https://openreview.net/ forum?id=wczqrpOrIc [84] Shay Vargaftik, Ran Ben-Basat, Amit Portnoy, Gal Mendelson, Yaniv Ben-Itzhak, and Michael Mitzenmacher. 2021. DRIVE: One-bit distributed mean estimation. In Advances in Neural Information Processing Systems (NeurIPS) .[85] Shay Vargaftik, Ran Ben-Basat, Amit Portnoy, Gal Mendelson, Yaniv Ben-Itzhak, and Michael Mitzenmacher. 2022. EDEN: Communication-efficient and robust 14 GINGER: Spicing Up Graph-Based Vector Search 
+
+distributed mean estimation for federated learning. In International Conference on Machine Learning (ICML) .[86] Sairaj Voruganti and M. Tamer Özsu. 2025. MIRAGE-ANNS: Mixed Approach Graph-based Indexing for Approximate Nearest Neighbor Search. Proc. ACM Manag. Data 3, 3, Article 188 (June 2025), 27 pages. https://doi.org/10.1145/ 3725325 [87] Jan Wassenberg and Google. 2024. Highway: Portable and Performance-Portable, Length-Agnostic SIMD. https://github.com/google/highway. [88] Lee Xiong, Chenyan Xiong, Ye Li, Kwok-Fung Tang, Jialin Liu, Paul N. Bennett, Junaid Ahmed, and Arnold Overwijk. 2021. Approximate Nearest Neighbor Neg-ative Contrastive Learning for Dense Text Retrieval. In International Conference on Learning Representations, ICLR .[89] Mingyu Yang, Wentao Li, Jiabao Jin, Xiaoyao Zhong, Xiangyu Wang, Zhitao Shen, Wei Jia, and Wei Wang. 2025. Effective and General Distance Computation for Approximate Nearest Neighbor Search. In IEEE International Conference on Data Engineering (ICDE) . 1098–1110. https://doi.org/10.1109/icde65448.2025.00087 [90] Shuo Yang, Jiadong Xie, Yingfan Liu, Jeffrey Xu Yu, Xiyue Gao, Qianru Wang, Yanguo Peng, and Jiangtao Cui. 2024. Revisiting the index construction of proximity graph-based approximate nearest neighbor search. arXiv preprint arXiv:2410.01231 (2024). [91] Shangdi Yu, Joshua Engels, Yihao Huang, and Julian Shun. 2025. Pecann: Paral-lel efficient clustering with graph-based approximate nearest neighbor search. In 2025 Proceedings of the Conference on Applied and Computational Discrete Algorithms (ACDA) . SIAM, 1–17. [92] Amir Zandieh, Majid Daliri, Majid Hadian, and Vahab Mirrokni. 2025. Tur-boquant: Online vector quantization with near-optimal distortion rate. arXiv preprint arXiv:2504.19874 (2025). [93] Alexandros Zeakis, George Papadakis, Dimitrios Skoutas, and Manolis Koubarakis. 2023. Pre-Trained Embeddings for Entity Resolution: An Experi-mental Analysis. Proc. VLDB Endow. 16, 9 (2023), 2225–2238. [94] Xi Zhao, Yao Tian, Kai Huang, Bolong Zheng, and Xiaofang Zhou. 2023. Towards efficient index construction and approximate nearest neighbor search in high-dimensional spaces. Proceedings of the VLDB Endowment 16, 8 (2023), 1979–1991. 15 Salwasser et al. 
+
+## A PARAMETER CONFIGURATION 
+
+For each library, we tune index structure, quantization method, and reranking formats for the highest throughput across the recall range. Every configuration we report is built and evaluated on the full dataset. We sweep query search parameters to extract the Pareto frontier of throughput versus recall. Table 5 summarizes the formats we use for each library, and Table 6 lists the selected parameters for all 14 datasets. Below, we first summarize the settings for graph indexes. For the IVF indexes (ScaNN and Faiss), point clustering, routing structure on top of the clusters, quantization, and reranking interact closely, making them hard to tune, so we describe their tuning in detail below. 
+
+Graph Indexes. All graph indexes use maximum degree 𝑅 = 64 and construction beam width 𝐿 = 128, except on GloVe, where they use 𝑅 = 100 and 𝐿 = 250. We tune the pruning threshold 𝛼 
+
+per dataset, with 𝛼 PiPNN for PiPNN graphs and a single 𝛼 Vamana 
+
+shared by all Vamana-based indexes. Table 5 lists the quantization methods and formats of each graph index. SymphonyQG runs out of memory during index construction on the billion-scale datasets, so we evaluate it only on GloVe and the eight high-dimensional datasets. On high-dimensional datasets ( 𝑑 ≥ 768), we initialize the PCA target dimension for Ginger to the smallest dimension that retains roughly 90% of dataset variance, rounded so that the 4-bit NTQ vector and its bundled metadata fill whole cache lines. Starting from there, we reduce the dimension in increments of whole cache lines to find the optimal throughput–recall trade-off against unprojected vectors. For SVS, we use LeanVec4x8 and follow the same tuning procedure, aligning dimensions directly to whole cache lines as it does not embed metadata into the codes. Table 6 lists the chosen dimensions. 
+
+ScaNN. ScaNN partitions the dataset with a 𝑘 -means tree. We evaluate up to three levels, with 𝐶 1 clusters on the bottom, 𝐶 2 in the middle and 𝐶 3 on the top. Within a leaf cluster, vectors are stored as anisotropic product-quantization codes [37] with 16 centers per two-dimensional subspace (AH2-LUT16). The best candidates retrieved from the leaves are rescored against higher-precision vectors. In high dimensions, we configure ScaNN to route and quantize in a PCA subspace while reranking against full-dimensional vectors. We also enable SOAR [81], an optimization that stores each vector in a second leaf, chosen so that the two assignments err in different directions, which delivers recall improvements. We use the default settings for SOAR ( 𝜆 = 1.5), except on GloVe and Wiki-Cohere ( 𝜆 = 1.0), and on DataComp-DR and DBpedia ( 𝜆 = 2.0). For anisotropic vector quantization, we also use the default weight AVQ = 2.5. Because the default noise-shaping threshold NST = 0.2assumes unit-norm vectors, we scale it proportionally to the average vector norm on non-unit-norm datasets (24 .0 on MS-SPACEV, 100 .0on BigANN, 2 .75 on Wiki-Cohere, and 2 .0 on MS-MARCO). We also tune it to NST = 0.1 on the unit-norm datasets OpenAI-arXiv, DataComp-DR, and DBpedia. Because ScaNN builds its hierarchy bottom-up, we first size the leaf clusters 𝐶 1 through target memory budgets of 2-bit AH codes: roughly 10 KB per leaf on billion-scale datasets, 20 to 64 KB in high-dimensional PCA space, and ≈ √𝑛 on small flat indexes. We train this leaf 𝑘 -means once and build the upper routing levels on the fixed leaf centroids without retraining. To balance centroid routing overhead against leaf scanning, we scale the routing depth with dataset size. Small datasets use flat routing, as scanning all leaf centroids directly is fast. Medium datasets use a two-level tree with 𝐶 2 ≈ √𝐶 1 top-level clusters for a balanced branching factor. Billion-scale datasets use a three-level tree with a uniform geometric branching factor 𝐵 ≈ 𝐶 1/31 . Over these fixed leaf partitions, we evaluate different upper-level routing layouts to select the best configuration without reclustering the dataset. For reranking, we choose the most compact format that pre-serves accuracy: int8 suffices on DBpedia-1536, OpenAI-arXiv, and DBpedia-3072, and is lossless on MS-SPACEV. We rerank with 
+
+bf16 on BigANN (where signed int8 caps recall at 88 .5%), on the 
+
+𝑑 = 768 inner-product datasets (where int8 caps recall at 96%), and on the billion-scale float datasets to halve bandwidth with minimal accuracy loss. At query time, we sweep the number of probed leaves, the num-ber of upper-level clusters visited, and the number of reranked candidates to pick the Pareto-optimal configurations. To choose the upper-level clusters visited, we sweep over them directly on two-level trees. On three-level trees, an independent grid over both upper levels is intractable. Instead, because query latency is domi-nated by memory bandwidth, we set the upper-level probes as a function of the leaf probes so that each routing level scans a fixed ratio of the leaf bytes. We evaluate nine routing profiles across three categories: uniform allocations (spending 0 .5×, 1 ×, or 2 × of leaf bytes at both upper levels), mid-heavy allocations (0 .5×–1 ×
+
+at the root and 1 ×–2 × in the middle), and low-routing allocations (0 .05 ×–0 .1× at the root and 0 .25 ×–0 .5× in the middle). 
+
+Faiss. Faiss composes an inverted file (IVF) index from modu-lar pipeline stages [22], listed in Table 6 in factory notation. The dataset is partitioned into 𝑛 clusters using 𝑘 -means. Within each cluster, vectors are split into 𝑚 subspaces and stored as 4-bit product-quantization codes in a cache-aligned fast-scan layout [4] ( PQ 𝑚 x4fs ). To route queries across large numbers of clusters efficiently, Faiss builds an HNSW graph over the 𝑛 centroids ( IVF 𝑛 _HNSW32 ). To balance routing cost against cluster scanning, we sweep the cluster count 𝑛 around recommended baselines: {1,024, 2 ,048, 4 ,096 }
+
+on small datasets, {16 ,384, 32 ,768, 65 ,536, 98 ,304, 131 ,072, 196 ,608, 262 ,144 } on medium datasets, and {524 ,288, 1 ,048 ,576, 2 ,097 ,152 } on billion-scale datasets. Small datasets use flat routing, as scanning all cluster centroids directly is fast. Larger datasets route through an HNSW32 graph over the centroids. To keep 𝑘 -means training tractable for tens of thousands to millions of centroids, we use top-down two-level clustering on datasets with ≥ 10M vectors. An optional OPQ rotation [32] balances the variance across PQ subspaces and can also project vectors to fewer dimensions. We eval-uate OPQ across different target dimensions, but omit it on GloVe where rotation does not improve accuracy. In low dimensions, we evaluate two- and four-dimensional OPQ subspaces, where two dimensions per subspace with centroid residuals ( PQ 𝑚 x4fsr ) per-forms best. In high dimensions, we sweep OPQ target dimensions in {128 , 192 , 256 , 384 , 512 }, and store uncentered vectors because centroid subtraction degrades throughput–recall performance. The best candidates retrieved from the clusters are rescored against higher-precision vectors. We choose the most compact 
+
+> 16
+
+GINGER: Spicing Up Graph-Based Vector Search 
+
+Table 5: Vector representations across libraries. On the integer datasets (MS-SPACEV and BigANN), the graph indexes operate directly on native 
+
+int8 /uint8 vectors. ‡DiskANN always builds its graph with 4-bit spherical codes. It navigates with 4-bit codes in low dimensions and with 1-bit codes in high dimensions, except for 2-bit codes on DataComp-DR. §SVS reranks with LVQ4x8 in low dimensions and with 8-bit LVQ in high dimensions. 
+
+Library High-Dim Transform Navigation / Search Reranking Ginger PCA 4-bit NTQ (4+8)-bit NTQ SVS PCA (LeanVec) 4-bit LVQ LVQ4x8 / 8-bit LVQ §
+
+ParlayANN JL filter SQ8 float DiskANN – 4-bit / 1-bit spherical ‡ float Hnswlib – float –SymphonyQG – RaBitQ float ScaNN PCA 2-bit PQ float / bf16 / int8 
+
+Faiss Projective OPQ 2-bit PQ float / bf16 / int8 
+
+Table 6: Dataset-specific index and quantization parameters: robust pruning thresholds 𝛼 PiPNN and 𝛼 Vamana , reduced PCA dimensionality, ScaNN leaf, intermediate, and top-level cluster counts ( 𝐶 1, 𝐶 2, 𝐶 3) and reranking formats, and Faiss factory stages ( OPQ , IVF , PQ , and Refine ). 
+
+> †
+
+ScaNN ran out of memory during index construction on Text2Image. 
+
+Dataset 𝛼 PiPNN 𝛼 Vamana PCA ScaNN Faiss Factory Stages Ginger SVS ScaNN 𝐶 1 𝐶 2 𝐶 3 Rerank OPQ IVF PQ Refine Low dimensional  GloVe 0.87 0.95 – – – 2,000 – – float – IVF1024 PQ50x4fsr RFlat 
+
+Deep 1.15 1.10 – – – 2,398,082 17,916 134 bf16 OPQ48_96 IVF1048576_HNSW32 PQ48x4fsr Refine(SQbf16) 
+
+MS-Turing 1.08 1.10 – – – 2,500,000 18,420 136 bf16 OPQ50_100 IVF1048576_HNSW32 PQ50x4fsr Refine(Pad128,SQbf16) 
+
+MS-SPACEV 1.13 1.10 – – – 2,500,000 18,420 136 int8 OPQ50_100 IVF1048576_HNSW32 PQ50x4fsr Refine(Pad128,SQ8_direct_signed) 
+
+BigANN 1.15 1.10 – – – 3,205,129 21,739 147 bf16 OPQ64_128 IVF1048576_HNSW32 PQ64x4fsr Refine(SQ8_direct) 
+
+Text2Image † 0.95 1.00 – – – 5,000,000 – – – OPQ100_200 IVF1048576_HNSW32 PQ100x4fsr Refine(SQbf16) 
+
+> High dimensional
+
+Wiki-Cohere 0.98 0.98 248 256 192 35,000 350 – bf16 OPQ96_192 IVF65536_HNSW32 PQ96x4fs Refine(SQbf16) 
+
+Wiki-All 0.93 0.95 248 256 192 87,556 1,369 – bf16 OPQ96_192 IVF131072_HNSW32 PQ96x4fs Refine(SQbf16) 
+
+MS-MARCO 0.96 0.98 248 256 256 101,071 1,580 – bf16 OPQ128_256 IVF16384_HNSW32 PQ128x4fs Refine(SQbf16) 
+
+DBpedia-1536 1.05 1.00 368 256 256 2,048 – – int8 OPQ96_192 IVF2048 PQ96x4fs Refine(SQ8) 
+
+OpenAI-arXiv 1.10 1.05 368 256 446 10,000 300 – int8 OPQ128_256 IVF4096 PQ128x4fs Refine(SQ8) 
+
+DataComp-DR 1.15 1.15 624 640 512 12,805 201 – bf16 OPQ256_512 IVF98304_HNSW32 PQ256x4fs Refine(SQbf16) 
+
+DBpedia-3072 1.05 1.00 496 256 384 2,048 – – int8 OPQ96_192 IVF2048 PQ96x4fs Refine(SQ8) 
+
+Wiki-Qwen 0.95 1.00 880 768 384 1,024 – – bf16 OPQ192_384 IVF2048 PQ192x4fs Refine(SQbf16) 
+
+format that preserves accuracy: 8-bit scalar quantization ( SQ8 )suffices on DBpedia-1536, OpenAI-arXiv, and DBpedia-3072, and is lossless on the two integer datasets. We rerank with bfloat16 
+
+(SQbf16 ) on the 𝑑 = 768 inner-product datasets and the billion-scale float datasets. On GloVe, we rerank against exact floats ( RFlat ). At query time, we sweep the number of probed clusters and the number of reranked candidates to pick the Pareto-optimal configu-rations. When using an HNSW coarse quantizer, we additionally sweep the graph search depth ( efSearch ) to balance centroid routing latency against cluster retrieval recall. 
+
+17 Salwasser et al. 
+
+## B LIBRARY VERSIONS 
+
+Table 7: Evaluated libraries, versions, and Git commit hashes. 
+
+Library Version Git Commit Faiss [22] v1.15.0 20f14b 
+
+Hnswlib [58] v0.9.0 d9b360 
+
+ParlayANN [59, 66] – a48c6a 
+
+SVS [1] v0.4.0 75e30f 
+
+DiskANN [46] v0.59.0 c84530 
+
+ScaNN [37, 81] v1.4.3 807d4a 
+
+SymphonyQG [27, 35] v0.3.4 1182cb 
+
+18
