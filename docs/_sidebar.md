@@ -1,6 +1,9 @@
 * <a class="dpr-sidebar-root-link" href="#/">首页</a>
 * <a class="dpr-sidebar-root-link dpr-sidebar-noactive-link" href="javascript:void(0)" data-dpr-hash="#/tutorial/README">使用教程</a>
 * Daily Papers
+  * 2026-11-07 <!--dpr-date:20261107-->
+    * 速读区
+      * <a class="dpr-sidebar-item-link dpr-sidebar-item-structured" href="#/202611/07/2611.05900v1-weaver-weaving-preference-evidence-through-incremental-reasoning-for-personalized-retrieval-augmented-generation" data-sidebar-item="{&quot;title&quot;: &quot;Weaver: Weaving Preference Evidence through Incremental Reasoning for Personalized Retrieval-Augmented Generation&quot;, &quot;link&quot;: &quot;https://arxiv.org/abs/2611.05900v1-weaver-weaving-preference-evidence-through-incremental-reasoning-for-personalized-retrieval-augmented-generation&quot;, &quot;score&quot;: &quot;6.0&quot;, &quot;tags&quot;: [{&quot;kind&quot;: &quot;query&quot;, &quot;label&quot;: &quot;vector-db&quot;}], &quot;evidence&quot;: &quot;面向个性化RAG的记忆条件检索轨迹&quot;}">Weaver: Weaving Preference Evidence through Incremental Reasoning for Personalized Retrieval-Augmented Generation</a>
   * 2026-11-06 <!--dpr-date:20261106-->
     * 精读区
       * <a class="dpr-sidebar-item-link dpr-sidebar-item-structured" href="#/202611/06/2611.07579v1-per-query-recall-guarantees-for-approximate-nearest-neighbor-search-in-dynamic-vector-databases" data-sidebar-item="{&quot;title&quot;: &quot;Per-Query Recall Guarantees for Approximate Nearest Neighbor Search in Dynamic Vector Databases&quot;, &quot;link&quot;: &quot;https://arxiv.org/abs/2611.07579v1-per-query-recall-guarantees-for-approximate-nearest-neighbor-search-in-dynamic-vector-databases&quot;, &quot;score&quot;: &quot;9.0&quot;, &quot;tags&quot;: [{&quot;kind&quot;: &quot;query&quot;, &quot;label&quot;: &quot;vector-ann&quot;}], &quot;evidence&quot;: &quot;面向动态向量数据库的逐查询召回保证&quot;}">Per-Query Recall Guarantees for Approximate Nearest Neighbor Search in Dynamic Vector Databases</a>
