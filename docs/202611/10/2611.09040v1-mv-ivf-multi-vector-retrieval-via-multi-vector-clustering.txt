@@ -1,0 +1,2064 @@
+Title: MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering
+
+URL Source: https://arxiv.org/pdf/2611.09040v1
+
+Published Time: Mon, 09 Nov 2026 02:07:20 GMT
+
+Number of Pages: 25
+
+Markdown Content:
+# MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 
+
+## Kishen N Gowda 
+
+University of Maryland College Park, MD, USA 
+
+## Laxman Dhulipala 
+
+University of Maryland College Park, MD, USA 
+
+## Lars Gottesbüren 
+
+Google Research Zürich, Switzerland 
+
+## Rajesh Jayaram 
+
+Google Research New York City, NY, USA 
+
+Abstract 
+
+Multi-vector retrieval represents each query and document as a set of embeddings and scores relevance via fine-grained set-to-set interactions such as MaxSim (Chamfer similarity). This expressive-ness improves retrieval quality over single-vector representations, but makes search substantially more expensive. Existing systems address this challenge primarily through proxy representations or filter-and-rerank pipelines that reduce candidate generation to single-vector search. In this work, we study the complementary direction of building a native IVF-style index directly over multi-vector data. We introduce MV-IVF , an inverted-file index for multi-vector retrieval built on MV-Lloyd , a new Lloyd-style algorithm for cluster-ing point clouds under a Chamfer objective. Our key observation is that once point clouds are assigned to clusters, the center-update step reduces to a standard single-vector clustering problem over the flattened embeddings in each cluster. This enables efficient construction of a hierarchical IVF tree whose internal nodes are represented by center point clouds. At query time, MV-IVF performs best-first beam search over the tree to identify promising leaf clusters, then scores the documents in those leaves. We further accelerate search using low-bit quanti-zation, query compression, and cache-efficient batched search. We implement MV-IVF as part of MVSIC , an optimized C++ library and unified evaluation framework for multi-vector retrieval that includes several major multi-vector retrieval approaches. Across BEIR and LoTTE text retrieval benchmarks, MV-IVF achieves strong latency–recall tradeoffs, the best batched throughput frontiers, and favorable build-time and index-size profiles. At 90% Recall-10@10, MV-IVF achieves up to 8 .03 × lower single-query latency and up to 173 .5× higher QPS than the baselines, demonstrating that native IVF-style indexing is a practical and effective approach for scalable multi-vector retrieval. 
+
+1 Introduction 
+
+Multi-vector retrieval has emerged as a powerful paradigm for mod-ern retrieval systems, in which each query and document is repre-sented not by a single embedding, but by a set of embeddings (i.e., a point cloud). Such representations arise naturally in late-interaction models for text retrieval (e.g., ColBERT [11, 14]), where relevance is computed via token-level interactions using operators such as MaxSim, as well as in region-based representations for images and other modalities (e.g., ColPali [8]). This added expressiveness yields significantly better retrieval quality than single-vector encoders (e.g., on standard benchmarks such as BEIR [18], LoTTE [14], and ViDoRe [8]) but the increased complexity of the representation makes search substantially more expensive. The gold-standard multi-vector similarity, introduced by Col-BERT [11] and used by most subsequent late-interaction models, is MaxSim. Given a query point cloud 𝐴 ⊆ R𝑑 and a document point cloud 𝐵 ⊆ R𝑑 ,MaxSim (𝐴, 𝐵 ) :=∑︁ 
+
+> 𝑎 ∈𝐴
+
+max   
+
+> 𝑏 ∈𝐵
+
+⟨𝑎, 𝑏 ⟩,
+
+i.e., each query embedding is matched to its most similar docu-ment embedding and the resulting scores are summed. Thus, un-like single-vector retrieval, even a single query–document MaxSim score can require many inner product computations. At scale, the central challenge is therefore to recover the top-𝑘 documents under MaxSim without exhaustively scoring the entire collection. A large body of recent work has focused on making multi-vector retrieval under MaxSim efficient. Most practical approaches follow a common philosophy: rather than indexing point clouds directly, they reduce candidate generation to a simpler proxy or filtering problem built using single-vector retrieval techniques, and reserve exact multi-vector scoring for a smaller set of candidates. For ex-ample, PLAID [13] and its follow-up, WARP [15], use single-vector search over clustered token centroids to generate candidates, which are then scored using quantized and exact MaxSim; Dhulipala et al. [5] formalize this style of pipeline as the single-vector heuristic 
+
+(SVH). MUVERA [5] instead constructs fixed-dimensional encod-ings (FDEs), large single-vector representations whose inner prod-ucts provably approximate multi-vector similarity, thereby reducing the problem to standard single-vector MIPS. These approaches are highly effective, but the quality of the final top-𝑘 results depends on how well the surrogate representation or candidate-generation stage preserves documents that rank highly under MaxSim. This motivates a complementary direction: can we build scalable indexes that operate directly over multi-vector representations while accurately preserving the top-𝑘 results under MaxSim ? A smaller body of work has explored such native multi-vector indexing through hashing- and graph-based approaches, including DESSERT [7] and IGP [4]. In this work, we investigate a different direction: extend-ing clustering-based inverted-file (IVF) indexing, one of the most widely used paradigms for large-scale single-vector retrieval [6, 10], to multi-vector data. IVF is an appealing candidate for this setting. In the single-vector case, an IVF index partitions the dataset into clusters and probes only those whose representatives are most relevant to the query. This organization is simple and scalable to build, has low indexing overhead, exposes substantial parallelism, and is naturally suited to arXiv:2611.09040v1 [cs.IR] 6 Nov 2026 Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 
+
+high-throughput batched search. These properties are particularly attractive for multi-vector retrieval, where scoring each candidate is substantially more expensive. However, extending IVF to multi-vector data is non-trivial: how should we cluster point clouds, and what representatives should we use to route queries to the resulting clusters? 
+
+We address these challenges through a set of contributions cen-tered around MV-IVF, our native IVF-style index for multi-vector retrieval. 
+
+1.1 Our Contributions 
+
+Our main contribution is MV-IVF , a hierarchical IVF-style index for multi-vector retrieval. Our approach represents each cluster by a center that is itself a point cloud containing at most 𝑠 vectors, and uses MaxSim scores between the query and these center point clouds for routing. In this sense, MV-IVF is a native multi-vector index: both the indexed objects and the routing representatives remain point clouds, rather than being reduced to single-vector surrogates. The key algorithmic ingredient is MV-Lloyd . We first formulate a natural multi-vector analogue of 𝑘 -median, in which each cluster center is a point cloud of size at most 𝑠 , and assignment costs are measured using the analogous Chamfer distance: 
+
+Ch (𝐴, 𝐵 ) := 1
+
+|𝐴 |∑︁ 𝑎 ∈𝐴 
+
+min   
+
+> 𝑏 ∈𝐵
+
+∥𝑎 − 𝑏 ∥2.
+
+We then develop MV-Lloyd, a practical Lloyd-style algorithm for this problem. Our key observation is that, once the point-cloud assignments to clusters are fixed, finding the optimal center point cloud for a cluster reduces exactly to a weighted 𝑠 -median problem over the flattened embeddings of the point clouds assigned to that cluster. This allows the center-update step to leverage standard, highly optimized single-vector clustering machinery. MV-IVF recursively applies MV-Lloyd to construct a tree-structured partition of the document point clouds and stores the resulting center point clouds at internal nodes for routing. At query time, MV-IVF performs a best-first beam search over the tree to identify a small number of promising leaf clusters and scores only the docu-ments contained in those leaves. We further accelerate search using low-bit quantization, query compression, and early termination. For high-throughput workloads, many queries probe overlap-ping sets of leaves, creating an opportunity to reuse leaf data across queries. Rather than processing each query independently, we group queries that probe the same leaf and score them together, allowing the leaf data to be reused while cache-resident. This is particularly valuable in the multi-vector setting, where each leaf contains many document point clouds, each comprising many em-beddings, and repeatedly loading the same leaf can incur substantial memory traffic. To further explore the design space of native multi-vector in-dexes, we also develop MV-Vamana , a graph-based index extend-ing the Vamana algorithm [17] to operate directly over point clouds. MV-Vamana builds a proximity graph over document point clouds and performs beam search using multi-vector scores directly. We find that it is highly competitive in the single-query regime, where graph-based search is effective at minimizing the number of expen-sive point-cloud comparisons. Finally, we develop Multi-Vector Search, Indexing and Clustering (MVSIC , pronounced “music”), an optimized C++ library and uni-fied evaluation framework for multi-vector retrieval. MVSIC in-cludes implementations of SVH, MUVERA, MV-Vamana, and MV-IVF using a common framework, optimized scoring kernels, and evaluation pipeline, and also supports direct comparison with PLAID and IGP. We evaluate MVSIC on eight text retrieval datasets from BEIR and the pooled LoTTE benchmark, using ColBERTv2 multi-vector embeddings. We measure retrieval quality against the exact MaxSim ranking, with particular emphasis on Recall-𝑘 @𝑘 , which measures how accurately the full exact top-𝑘 neighborhood is recovered. Across these datasets, MV-IVF achieves strong latency–recall tradeoffs and the best batched throughput frontiers across recall metrics. At 90% Recall-10@10, MV-IVF achieves up to 8.03 × lower single-query latency and up to 173 .5× higher QPS than MUVERA, SVH, and MV-Vamana; the corresponding geometric-mean improve-ments are 1.22 –1.55 × in latency and 2.07 –4.01 × in throughput. MV-IVF also has a favorable build-time and index-size profile, with practical construction times and moderate index size. MV-Vamana is highly competitive in the single-query regime, although its con-struction is substantially more expensive. We additionally compare against FastPLAID and IGP on arguana and fiqa , where MV-IVF achieves substantially higher batched throughput, including over one and two orders of magnitude over IGP and FastPLAID, respec-tively. Taken together, our results show that native IVF-style indexing provides a practical route to scalable, high-quality multi-vector re-trieval: MV-IVF accurately recovers the top-𝑘 neighborhood under MaxSim, supports both low-latency and high-throughput search, and retains the practical build-time and space properties that make IVF attractive in the single-vector setting. To the best of our knowl-edge, MVSIC provides the most comprehensive evaluation of multi-vector retrieval methods across a wide range of datasets to date. 
+
+2 Background 
+
+Multi-vector retrieval. In multi-vector retrieval, each query and each document is represented as a set of embeddings, or equiva-lently, a point cloud. Formally, let P = {𝑃 1, . . . , 𝑃 𝑛 } denote a collec-tion of document point clouds, where each 𝑃 𝑖 ⊆ R𝑑 is a finite set of embeddings, and let 𝑄 ⊆ R𝑑 denote a query point cloud. The retrieval task is to return the top-𝑘 document point clouds most relevant to 𝑄 under a suitable set-to-set scoring rule. 
+
+Definition 1 (Chamfer distance and MaxSim) . Let 𝐴, 𝐵 ⊆ R𝑑 be finite sets of embeddings. The (asymmetric) Chamfer distance from 𝐴 
+
+to 𝐵 is 
+
+Ch (𝐴, 𝐵 ) := 1
+
+|𝐴 |∑︁ 𝑎 ∈𝐴 
+
+min   
+
+> 𝑏 ∈𝐵
+
+∥𝑎 − 𝑏 ∥2.
+
+The MaxSim similarity is 
+
+MaxSim (𝐴, 𝐵 ) :=∑︁ 
+
+> 𝑎 ∈𝐴
+
+max   
+
+> 𝑏 ∈𝐵
+
+⟨𝑎, 𝑏 ⟩.
+
+Multi-vector retrieval is typically phrased in terms of MaxSim: throughout the paper, we use MaxSim to rank documents and to route queries during search. For the clustering primitive underlying MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 
+
+our IVF construction (defined and studied in Section 3), it is more natural to work with the Chamfer distance. 
+
+Inverted-file (IVF) indexes. In the single-vector setting, an inverted-file (IVF) index partitions the documents into clusters and stores the points assigned to each cluster in an inverted list. Each cluster is represented by a centroid; at query time, the query is compared against these centroids and only a small number of promising lists are probed. Hierarchical variants recursively partition the data, yielding a tree whose internal nodes store routing representatives and whose leaves contain the database points. Sections 3 and 4 develop the corresponding clustering and indexing primitives for multi-vector data. 
+
+3 Multi-Vector Clustering 
+
+In this section, we develop MV-Lloyd, a practical Lloyd-style heuris-tic for clustering point clouds under a Chamfer-based objective. We now formally define the multi-vector clustering problem. 
+
+3.1 The Clustering Objective 
+
+Let P = {𝑃 1, 𝑃 2, . . . , 𝑃 𝑛 } denote a collection of point clouds, where each 𝑃 𝑖 ⊆ R𝑑 is a finite set of embeddings. For clustering, we seek 
+
+𝑘 representative center-sets, each of size at most 𝑠 , that minimize the total assignment cost under Chamfer distance. 
+
+Definition 2 (Chamfer (𝑘, 𝑠 )-median) . Given P = {𝑃 1, . . . , 𝑃 𝑛 } and parameters 𝑘, 𝑠 ∈ N, the goal is to find a collection of center-sets 
+
+C = {𝐶 1, 𝐶 2, . . . , 𝐶 𝑘 }, 𝐶 𝑗 ⊆ R𝑑 , |𝐶 𝑗 | ≤ 𝑠 , minimizing 
+
+cost (C) :=
+
+> 𝑛
+
+∑︁ 
+
+> 𝑖 =1
+
+min    
+
+> 𝑗 ∈ [ 𝑘 ]
+
+Ch (𝑃 𝑖 , 𝐶 𝑗 ).
+
+This objective can be viewed as a natural multi-vector analogue of the classical 𝑘 -median clustering problem. Each center is itself a point cloud, and the budget 𝑠 controls the size, and hence the expressiveness, of the representative stored for each cluster. Larger values of 𝑠 allow the center-set to capture more of the structure of its assigned point clouds; if 𝑠 is large enough, the center-set can contain the union of all embeddings in the cluster. 
+
+3.2 MV-Lloyd 
+
+We now present MV-Lloyd, a practical Lloyd-style heuristic for iteratively refining a clustering of point clouds under the Chamfer 
+
+(𝑘, 𝑠 )-median objective. As in classical Lloyd’s algorithm, MV-Lloyd alternates between two steps: (1) Assignment step: assign each point cloud to its nearest center-set under Chamfer distance. (2) Update step: recompute each center-set from the point clouds assigned to it. More concretely, given current centers C = {𝐶 1, . . . , 𝐶 𝑘 }, the as-signment step induces a partition 
+
+Π𝑗 := {𝑃 𝑖 ∈ P : 𝑗 = arg min   
+
+> ℓ∈ [ 𝑘 ]
+
+Ch (𝑃 𝑖 , 𝐶 ℓ )} , 𝑗 ∈ [ 𝑘 ].
+
+The main challenge in the multi-vector setting lies in the update step. Unlike vanilla 𝑘 -means, where the optimal update is given by the arithmetic mean of the assigned vectors, here each updated center must itself be a point cloud of size at most 𝑠 . Given a cluster 
+
+Algorithm 1: MV-Lloyd 
+
+Input : Collection of point clouds P, 𝑘, 𝑠 > 0
+
+Output : Collection of 𝑘 point clouds 
+
+C = {𝐶 1, 𝐶 2, . . . , 𝐶 𝑘 }, where |𝐶 𝑖 | = 𝑠 
+
+// Step 1: Initialization  
+
+> 1
+
+Let C ← uniform random sample of 𝑘 point clouds from 
+
+P
+
+// Step 2: Lloyd’s Iterations  
+
+> 2
+
+for 𝑡 = 1 to 𝑇 do 
+
+// Assign point clouds to nearest centers  
+
+> 3
+
+parallel for 𝑖 = 1 to 𝑘 do  
+
+> 4
+
+Π(𝑖 ) ← { 𝑃 ∈ P : 𝑖 = arg min 𝑗 ∈ [ 𝑘 ] Ch (𝑃, C( 𝑗 ))} 
+
+// Compute new centroid point clouds  
+
+> 5
+
+parallel for 𝑖 = 1 to 𝑘 do  
+
+> 6
+
+C( 𝑖 ) ← kmeans (Flatten (Π(𝑖 )) , 𝑠 ) 
+
+> 7
+
+return C
+
+Π𝑗 , the new center is found by solving 
+
+𝐶 𝑗 = arg min     
+
+> 𝐶 ⊆R𝑑 ,|𝐶 | ≤ 𝑠
+
+∑︁ 𝑃 ∈Π𝑗 
+
+Ch (𝑃, 𝐶 ).
+
+This is precisely a Chamfer (1, 𝑠 )-median problem on the point clouds assigned to cluster 𝑗 .
+
+Center Updates via 𝑠 -Median on the Flattened Set. The key observation here is that the Chamfer (1, 𝑠 )-median problem decom-poses into a standard clustering problem on the individual points 
+
+appearing in the assigned point clouds. Specifically, for a cluster 
+
+Π𝑗 ⊆ P , let Flatten (Π𝑗 ) := Ò𝑃 ∈Π𝑗 𝑃 denote the multiset obtained by flattening all points in the point clouds assigned to Π𝑗 .
+
+Proposition 1. For any cluster Π𝑗 and any candidate center-set 
+
+𝐶 ⊆ R𝑑 with |𝐶 | ≤ 𝑠 ,∑︁  
+
+> 𝑃 ∈Π𝑗
+
+Ch (𝑃, 𝐶 ) =∑︁   
+
+> 𝑥 ∈Flatten (Π𝑗 )
+
+𝑤 (𝑥 ) · min   
+
+> 𝑐 ∈𝐶
+
+𝑑 (𝑥, 𝑐 ),
+
+where 𝑤 (𝑥 ) = 1/| 𝑃 | for 𝑥 ∈ 𝑃 . Computing the optimal Chamfer 
+
+(1, 𝑠 )-median center-set for Π𝑗 is equivalent to solving a (weighted) 
+
+𝑠 -median problem on the multiset Flatten (Π𝑗 ).
+
+Proposition 1 shows that the center-update step has a particularly simple structure: once the assignment of point clouds to clusters is fixed, updating each center-set reduces to an ordinary weighted single-vector clustering problem on the flattened embeddings in that cluster. Thus, the multi-vector nature of the problem appears only in the assignment step; the update step can reuse standard single-vector clustering routines. In the formal objective above, the update corresponds to a weighted 
+
+𝑠 -median problem. In our implementation, however, we use an 
+
+𝑠 -means update with cosine similarity, matching the geometry of the normalized embeddings used by the retrieval model and allow-ing us to leverage highly optimized 𝑘 -means implementations. This gives a practical approximation to the ideal Chamfer center update. Algorithm 1 summarizes the overall procedure. Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 
+
+Algorithm 2: GreedySearch 
+
+Input : Query point cloud 𝑄 , MVIVF tree 𝑇 , nprobe ,and beam_size 
+
+Output : Top nprobe leaf nodes to probe  
+
+> 1
+
+Initialize a beam with the root node of 𝑇  
+
+> 2
+
+Initialize an empty top-𝑘 structure L with 𝑘 = nprobe  
+
+> 3
+
+while the beam is non-empty do  
+
+> 4
+
+Extract the best node 𝑢 from the beam  
+
+> 5
+
+if |L| = nprobe and MaxSim (𝑄, 𝑢 ) ≤ 
+
+min 𝑣 ∈ L MaxSim (𝑄, 𝑣 ) then  
+
+> 6
+
+break // early termination  
+
+> 7
+
+Compute MaxSim values from 𝑄 to all children of 𝑢  
+
+> 8
+
+foreach child 𝑣 of 𝑢 do  
+
+> 9
+
+if 𝑣 is a leaf then  
+
+> 10
+
+insert 𝑣 into L if it belongs to the current top 
+
+nprobe leaves  
+
+> 11
+
+else  
+
+> 12
+
+insert 𝑣 into the beam if it belongs to the current top beam_size internal nodes  
+
+> 13
+
+return L
+
+4 Multi-Vector IVF Index (MV-IVF) 
+
+In this section, we describe MV-IVF, a clustering-based retrieval method that generalizes the inverted-file (IVF) framework to multi-vector data. During indexing, the data point clouds are recursively partitioned using MV-Lloyd, producing a tree-structured IVF index whose internal nodes are represented by centroid point clouds. During search, a query is routed to relevant leaf clusters, and the document point clouds contained in those leaves are scored to obtain the final candidates. The key distinction from standard single-vector IVF is that both the indexed objects and the routing representatives are point clouds. Thus, routing decisions are made directly in the native multi-vector space, using MaxSim between the query point cloud and the cen-troid point clouds stored in the tree. 
+
+4.1 Index Construction 
+
+Given the point clouds P associated with a node 𝑢 , the construction proceeds as follows. If |P | ≤ ℓmax , where ℓmax is the maximum leaf size, then 𝑢 becomes a leaf and stores P. Otherwise, we run MV-Lloyd on P with branching factor 𝑏 and centroid point cloud size 
+
+𝑠 , obtaining a partition Π1, Π2, . . . , Π𝑏 together with centroid point clouds 𝐶 1, 𝐶 2, . . . , 𝐶 𝑏 . We create one child for each cluster Π𝑖 , store the corresponding centroid point cloud 𝐶 𝑖 at that child, and recurse on Π𝑖 .In this way, MV-IVF builds a tree whose leaves contain document point clouds, while the internal node store centroid point clouds used for routing. The resulting structure is a direct multi-vector analogue of a standard 𝑘 -means tree, except that clustering and routing are done over point clouds. 
+
+4.2 Search 
+
+To identify the top nprobe leafs to probe for a query point cloud 
+
+𝑄 , we perform a greedy beam search over the tree, prioritizing nodes by their MaxSim score with 𝑄 . The search maintains a beam of active internal nodes, truncated to size beam_size , and a list 
+
+L of the best nprobe leaves encountered so far. At each step, it expands the highest-scoring internal node, scores its child centroid point clouds, and inserts the most promising child nodes into the appropriate collection: internal nodes into the beam, and leaves into L.We also employ the following early termination strategy. Sup-pose the algorithm has already found nprobe leaf nodes. If the best remaining internal node in the beam has MaxSim value no larger than the worst leaf currently in L, then the search terminates. In-tuitively, this indicates that the remaining frontier is unlikely to contain a better probe leaf, and further exploration is unlikely to improve the final probe set. We note that this rule is a heuristic: the centroid point cloud stored at an internal node is used as a routing representative, rather than a certified upper bound on the scores of all leaves in its subtree. Empirically, however, this early termination substantially reduces search time with little effect on retrieval quality. Algorithm 2 summarizes the greedy search procedure. Once the top nprobe leaves have been identified, MV-IVF scores the document point clouds contained in those leaves using MaxSim and returns the top-𝑘 results overall. 
+
+4.3 Batch Search 
+
+In high-throughput settings, queries either arrive in, or can be read-ily grouped into batches . A naive approach for this batch setting is to simply run the single-query algorithm independently per query, but this misses significant optimization opportunities as many queries end up probing the same leaf clusters, and repeatedly loading the same leaf data, wasting memory bandwidth. This structure is partic-ular to IVF-style indexes: unlike graph-based beam search, whose traversal is irregular and query-dependent, IVF exposes shared leaf-level work that can be batched and scored with good locality. To exploit this structure, MV-IVF uses a batched search procedure that preserves the logical behavior of the single-query algorithm, but reorganizes the work to improve locality and vectorization. The input is a batch of query point clouds 𝑄 1, 𝑄 2, . . . , 𝑄 𝑚 , where each query may have its own search parameters such as 𝑘 and nprobe .For each query, the goal is still to identify a set of probe leaves, score the document point clouds in those leaves, and return the final results. The difference is that MV-IVF schedules the expensive scoring work across queries so that shared tree and leaf data can be reused while it is cache-resident. 
+
+Batched probe generation. At the root, every query must score the same set of child centroid point clouds. We therefore compute these scores for the entire query batch together, turning root scoring into a many-to-many MaxSim computation. After the root, each query continues its own greedy search independently. Although the same batching idea could be applied deeper in the tree, doing so requires additional synchronization and gives diminishing returns as queries quickly diverge to different subtrees. 
+
+Leaf-grouped scoring. After probe generation, each query has a set of leaves that it needs to scan. Rather than processing each query–leaf pair independently, MV-IVF groups the work by leaf. For each leaf 𝑢 , we collect all queries whose probe set contains 𝑢 , load MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 
+
+the document point clouds stored in 𝑢 , and score them against all queries assigned to that leaf. This improves cache locality by reusing the same leaf data across multiple queries and avoids repeatedly streaming large point-cloud data from memory. 
+
+Gathering results. The leaf-grouped organization introduces a final gathering step: after each leaf has scored the queries assigned to it, the resulting candidates must be collected back into per-query result sets. We implement this by having each leaf-scoring kernel produce local top candidates for its assigned queries, then scatter these candidates into per-query buffers. Each query then aggregates the candidates returned from all of its probed leaves, keeps the best 
+
+𝑘 candidates, and returns them as the final top-𝑘 results. This scatter-and-gather step adds synchronization and memory traffic, but in our setting this overhead is outweighed by the improved locality from grouping leaf scans and reusing leaf data across multiple queries. The common computational primitive in both batched probe generation and leaf-grouped scoring is a many-to-many MaxSim problem: a group of query point clouds must be scored against a group of document point clouds stored in the same leaf. For exact scoring, we decompose this into a sequence of vectorized matrix multiplications and reduction operations, using optimized linear-algebra kernels where appropriate. We also use standard systems techniques such as cache-aware blocking and software prefetching to reduce memory stalls during leaf scans. Nevertheless, exact many-to-many MaxSim scoring remains expensive, especially for large leaves and long point clouds. In Section 5, we describe how the same batched organization is combined with quantization, compact representations, and specialized low-bit scoring kernels. Overall, batched search keeps the same retrieval semantics as single-query MV-IVF. The advantage is in how the work is orga-nized. By grouping queries by leaf and using vectorized many-to-many MaxSim kernels, MV-IVF better exploits cache locality, mem-ory bandwidth, and SIMD parallelism in high-throughput retrieval workloads. 
+
+5 Practical Optimizations 
+
+In MV-IVF, multi-vector scoring remains the expensive bottleneck because each query-document comparison involves many vector interactions. In this section, we describe the main optimizations used in our implementation to accelerate routing, leaf scoring, and batched retrieval. 
+
+5.1 Quantization 
+
+A key bottleneck in multi-vector retrieval is the cost of comput-ing Chamfer distances, which requires evaluating many pairwise single-vector distances. We leverage three quantization schemes at different points on the accuracy–compression tradeoff curve. All three share the same preprocessing step: a randomized rotation via a Fast Hadamard Transform (FHT) with random sign flips, following the approach used in RaBitQ [9] and TurboQuant [20]. 
+
+Rand-1bit. Here we quantize each rotated coordinate to a single bit by simply taking its sign. This yields 𝐷 ′/8 bytes per vector (i.e., 32 × compression over float32). Because the rotation isotropizes the coordinates, sign bits after random rotation preserve angular relationships between vectors: the expected fraction of differing sign bits between two vectors is arccos (⟨ 𝑥, 𝑦 ⟩)/ 𝜋 , so the Hamming distance of the sign-bit codes is a faithful proxy for angular distance. Rand-1Bit is amenable to very fast SIMD implementations as the distance kernel reduces to XOR plus population count, avoiding all multiply-add arithmetic. On hardware supporting VPOPCNTDQ, each inner-loop iteration processes 512 dimensions via a single XOR and a single per-64-bit-lane popcount. Furthermore, the per-cloud running minimum in the Chamfer computation can be maintained entirely in integer arithmetic, with a single conversion to floating point at the end. 
+
+TurboQuant 4-bit. We integrate an existing 4-bit scalar quanti-zation scheme [3] that uses a fixed, non-uniform codebook of 16 centroids (8 positive, 8 negative, symmetric about zero) whose spac-ing is tailored to the approximately sub-Gaussian distribution of coordinates after rotation. Each rotated coordinate is mapped to the nearest centroid and two 4-bit codes are nibble-packed per byte, giv-ing 𝐷 ′/2 bytes per vector. Queries are encoded asymmetrically at 8-bit precision. We adapt the single-vector SIMD kernels from this implementation to the multi-vector setting by tailoring the GEMM kernel to small matrices, circumventing the heavy cache-blocking machinery and unrolling. We pre-transpose database vectors into panels of sub-vectors to compute 16 4-dimensional dot products per instruction using VPDPBUSD. 
+
+Rand-8bit. Our 8-bit scheme uses adaptive per-vector uniform quantization: after rotation, each coordinate is scaled by 127 /max  
+
+> 𝑖
+
+|𝑥 rot [𝑖 ]| 
+
+and rounded to the nearest integer in [− 127 , 127 ]. This is 2 × more storage than our 4-bit format, but yields very high-quality quantiza-tion (almost identical to scoring with floats), and also simplifies the implementation. In particular, since each dimension occupies a full byte, the SIMD kernel requires no codebook lookup or nibble un-packing. The multi-vector panel layout and GEMM micro-kernels are similar to the 4-bit case. 
+
+Other methods. We also explored other popular quantization strategies, including Product Quantization with FastScan-style opti-mizations and RaBitQ [9]. We discuss these variants, together with some empirical comparisons, in Appendix B.2. 
+
+5.2 Query Compression 
+
+Query point clouds often contain substantial redundancy, so many MaxSim computations can be accelerated by scoring a smaller rep-resentative set of query vectors. Following this observation, also used in [5], we compress each query point cloud before routing and leaf scoring. Given a query 𝑄 , both compression methods considered below produce a partition B = {𝐵 1, . . . , 𝐵 𝑟 } of the query embeddings, and replace each block 𝐵 𝑖 by a single representative ¯ 𝑞 𝑖 := Í𝑞 ∈𝐵 𝑖 𝑞. 
+
+The compressed query is then ¯ 𝑄 = { ¯𝑞 1, . . . , ¯𝑞 𝑟 }. Using sums rather than averages preserves the scale of the original MaxSim score: a block with more query embeddings contributes proportionally more to the final score. Larger compression thresholds produce fewer representatives and faster scoring, but can reduce retrieval quality. 
+
+Ball Carving. Ball carving is the greedy query-compression method used by MUVERA [5]. Given a distance threshold 𝜏 , the algorithm Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram                               
+
+> Dataset Corpus Size Num Queries Avg # Embs per Doc
+> nfcorpus 3.6K 323 235.49
+> scifact 5.1K 300 235.65
+> arguana 8.6K 1,406 154.72
+> scidocs 25.6K 1,000 165.05
+> fiqa 57.6K 648 126.9
+> nq 2.68M 3,452 100.3
+> hotpotqa 5.23M 7,405 68.65
+> msmarco 8.84M 6,980 78.8
+> lotte (pooled) 2.4M 2,931 141.2
+
+Table 1: Datasets used in this paper. 
+
+repeatedly selects an unassigned query embedding 𝑞 , forms a block consisting of all currently unassigned embeddings within distance 
+
+𝜏 of 𝑞 , replaces this block by the sum of its vectors, and removes the block from the active set. This process continues until all query embeddings have been assigned. Thus, the number of compressed query vectors is not fixed in advance; it is determined by the geom-etry of the query and the threshold 𝜏 .
+
+Ward’s Method. We also consider compression based on Ward’s agglomerative clustering method [19]. Each query embedding is initialized as a singleton cluster. We then repeatedly merge the pair of clusters that causes the smallest increase in within-cluster variance, stopping once the next merge exceeds a threshold 𝜏 . As with ball carving, each final cluster is represented by the sum of its embeddings. Ward compression tends to form more balanced and coherent groups of query vectors, and in our experiments gives a slightly better quality–compression tradeoff. In our implementation, we use Ward’s method by default. We also align the compressed query size to the blocking requirements of our many-to-many kernels, avoiding inefficient epilogue cases in the vectorized scoring routines. An empirical comparison of the two compression methods is provided in Appendix B.3. 
+
+6 Experiments 
+
+We evaluate MV-IVF through MVSIC, our unified framework for 
+
+Multi-Vector Search, Indexing, and Clustering (pronounced “mu-sic”). Our evaluation focuses on four questions: (1) how does MV-IVF compare with existing multi-vector retrieval methods in single-query latency; (2) how does it perform for high-throughput batched search; (3) what are its indexing time and space requirements; and (4) how do its main design parameters and optimizations affect performance? 
+
+6.1 Experimental Setup 
+
+Datasets. We evaluate on eight text retrieval datasets from BEIR [18] and the pooled LoTTE benchmark from ColBERTv2 [14]. All docu-ments and queries are encoded using ColBERTv2, yielding one point cloud of token embeddings per document or query. The datasets are summarized in Table 1. 
+
+Metrics. Search quality is measured with respect to the exact top-𝐾 
+
+documents under MaxSim. We report Recall-1@ 𝐾 , the fraction of queries for which the exact nearest neighbor appears in the returned top-𝐾 set, and Recall-𝐾 @𝐾 , the average fraction of the exact top-𝐾 
+
+set recovered. While much of the multi-vector retrieval literature emphasizes Recall-1@ 𝐾 , Recall-𝐾 @𝐾 is the natural analogue of the standard approximate top-𝐾 retrieval metric: it measures how well the full top-𝐾 neighborhood under MaxSim is preserved. We restrict the reported operating points to latency at most 100 ms 
+
+and throughput at least 10 QPS , keeping the Pareto curves focused on practically relevant regimes. 
+
+Methods. We compare MV-IVF against three multi-vector retrieval methods representing different indexing strategies: (1) SVH is the single-vector candidate-generation approach un-derlying PLAID [13] and WARP [15]. It indexes the flattened document embeddings using a single-vector ANN index and performs an independent ANN search for each query embed-ding. Within each search, vectors from the same document are deduplicated by retaining their maximum similarity; these scores are then summed across query embeddings to obtain an approximate MaxSim score for each candidate document. The highest-scoring candidates are then reranked using MaxSim to produce the final top-𝑘 results. (2) MUVERA [5] maps each query and document point cloud to a fixed-dimensional encoding (FDE) whose inner product ap-proximates their MaxSim score. It indexes the document FDEs using a single-vector ANN index and searches this index using the query FDE to generate candidate documents. The highest-scoring candidates are then reranked using MaxSim to produce the final top-𝑘 results. (3) MV-Vamana is our native graph-based baseline. It extends Vamana [17] to point-cloud data by constructing a proximity graph over document point clouds and performing beam search directly using MaxSim scores. 
+
+Implementation and parameter settings. All four methods are implemented in MVSIC and use the same document/query em-beddings, shared optimized scoring infrastructure, and evaluation pipeline. For SVH and MUVERA, the underlying single-vector ANN index is Vamana. For MUVERA, we use 𝑑 FDE = 10240, except on 
+
+msmarco , where we use 𝑑 FDE = 2560, following [5]. For the Vamana indexes, we use standard build parameters from ParlayANN [12]. The rest of the build and search parameters are described in Ap-pendix B.1. 
+
+Quantization. We use low-bit quantization to accelerate scoring for all methods. For MV-IVF, we use TQ-4bit during tree search, Rand-1bit for coarse leaf scoring, and Rand-8bit for reranking. For SVH, MUVERA, and MV-Vamana, we use TQ-4bit during Vamana search and Rand-8bit for reranking. The quality and performance of the quantization schemes used in our implementation are evaluated in Appendix B.2. 
+
+Machine Information. We ran all experiments other than on the MS MARCO dataset on a dual-socket Intel® Xeon® Platinum 8481C CPU @ 2.70 GHz machine with 88 physical cores (176 hyperthreads) and 1.4 TiB of main memory. The machine has 6.9 MiB of L1 cache, 176 MiB of L2 cache, and 210 MiB of L3 cache. We ran the experiments for msmarco (our largest dataset) on a dual-socket Intel Xeon 6985P-C CPU @ 2.30GHz machine with 144 physical cores (288 hyperthreads), 2.1 TiB of main memory, and MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 0.90 0.95 1.00 
+
+Recall-1@10 
+
+> 10 0
+> 10 1
+> 10 2
+> 10 3
+> Latency (ms)
+
+scidocs   
+
+> 0.90 0.95 1.00
+
+Recall-1@10 
+
+fiqa   
+
+> 0.90 0.95 1.00
+
+Recall-1@10 
+
+nq   
+
+> 0.90 0.95 1.00
+
+Recall-1@10 
+
+hotpotqa   
+
+> 0.90 0.95 1.00
+
+Recall-1@10 
+
+lotte    
+
+> 0.85 0.90 0.95 1.00
+
+Recall-10@10    
+
+> 10 0
+> 10 1
+> 10 2
+> 10 3
+> Latency (ms)
+> 0.85 0.90 0.95 1.00
+
+Recall-10@10    
+
+> 0.85 0.90 0.95 1.00
+
+Recall-10@10    
+
+> 0.85 0.90 0.95 1.00
+
+Recall-10@10    
+
+> 0.85 0.90 0.95 1.00
+
+Recall-10@10   
+
+> 0.8 0.9 1.0
+
+Recall-100@100   
+
+> 10 0
+> 10 1
+> 10 2
+> Latency (ms)
+> 0.8 0.9 1.0
+
+Recall-100@100   
+
+> 0.8 0.9 1.0
+
+Recall-100@100   
+
+> 0.8 0.9 1.0
+
+Recall-100@100   
+
+> 0.8 0.9 1.0
+
+Recall-100@100    
+
+> MV-IVF MUVERA MV-Vamana SVH
+
+Figure 1: Latency vs Recall on representative datasets. Lower-right is better. 0.90 0.95 1.00 
+
+Recall-1@10 
+
+> 10 2
+> 10 4
+> QPS
+
+scidocs   
+
+> 0.90 0.95 1.00
+
+Recall-1@10 
+
+fiqa   
+
+> 0.90 0.95 1.00
+
+Recall-1@10 
+
+nq   
+
+> 0.90 0.95 1.00
+
+Recall-1@10 
+
+hotpotqa   
+
+> 0.90 0.95 1.00
+
+Recall-1@10 
+
+lotte    
+
+> 0.85 0.90 0.95 1.00
+
+Recall-10@10    
+
+> 10 2
+> 10 4
+> QPS
+> 0.85 0.90 0.95 1.00
+
+Recall-10@10    
+
+> 0.85 0.90 0.95 1.00
+
+Recall-10@10    
+
+> 0.85 0.90 0.95 1.00
+
+Recall-10@10    
+
+> 0.85 0.90 0.95 1.00
+
+Recall-10@10   
+
+> 0.8 0.9 1.0
+
+Recall-100@100   
+
+> 10 2
+> 10 4
+> QPS
+> 0.8 0.9 1.0
+
+Recall-100@100   
+
+> 0.8 0.9 1.0
+
+Recall-100@100   
+
+> 0.8 0.9 1.0
+
+Recall-100@100   
+
+> 0.8 0.9 1.0
+
+Recall-100@100    
+
+> MV-IVF MUVERA MV-Vamana SVH
+
+Figure 2: Throughput vs. Recall on representative datasets. Upper-right is better. 
+
+15.8 MiB of L1 cache, 288 MiB of L2 cache, and 1008 MiB of L3 cache. Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 
+
+6.2 End-to-End Search Performance 
+
+Latency Experiments. We first evaluate query latency. For each method and dataset, we sweep the method’s search parameters and plot the Pareto frontier of latency versus Recall-1@10, Recall-10@10, and Recall-100@100. The system uses only a single core here. Figure 1 shows these curves on a representative subset of the datasets; see Appendix B.4 for full results. The three recall metrics highlight different aspects of the retrieval problem. For Recall-1@10, SVH is a particularly strong baseline. This is expected: SVH performs candidate generation at the level of individual embedding vectors, and is therefore well suited to finding documents with a small number of highly matching token-level interactions. After reranking, this is often enough to recover the nearest document under MaxSim. The picture changes for Recall-10@10. On most datasets, SVH is no longer competitive, indicating that recovering the full top-10 neighborhood requires more than finding a few high-signal token matches. In this regime, MV-IVF, MV-Vamana, and MUVERA are all competitive on the larger datasets ( hotpotqa, lotte ), while MV-IVF outperforms all methods on the smaller datasets ( nfcorpus, scifact, arguana, scidocs, fiqa ). The main exception is nq ,where SVH remains strong even for Recall-10@10. This suggests that on this dataset, the top-10 documents are often recoverable from a small number of strong token-level matches, making single-vector candidate generation unusually effective. Recall-100@100 gives the most demanding test of approximate multi-vector retrieval. Here, the goal is to preserve a much larger neighborhood under MaxSim. In this regime, SVH struggles even on 
+
+nq , consistent with the view that token-level candidate generation is most effective for recovering the very top of the ranking, but less effective for preserving a broader neighborhood under MaxSim. On larger datasets, MV-Vamana often gives the best single-query latency frontier, consistent with the advantages of graph-based indexes in minimizing the number of point-cloud score evaluations. At the same time, MV-IVF is competitive with the best method across datasets for Recall-100@100, showing that the clustering-based partition preserves enough multi-vector structure for high-quality routing. We note that SVH remains strong on msmarco even for Recall-100@100. This may partly reflect that msmarco is part of the train-ing data for ColBERTv2, making token-level matching unusually effective on this dataset. Overall, at 90% Recall-10@10, MV-IVF is 1 .33 × faster than MU-VERA, 1 .55 × faster than SVH, and 1 .22 × faster than MV-Vamana in geometric mean, with maximum speedups of up to 4 .76 ×, 8 .03 ×,and 5 .13 ×, respectively. 
+
+Throughput Experiments. 
+
+We next evaluate batched throughput. In this setting, the input is a batch of queries and the system uses all available cores; we report queries per second (QPS) as a function of Recall-1@10, Recall-10@10, and Recall-100@100. For the baselines, batching essentially parallelizes independent query executions. For MV-IVF, batching applies the cache-efficient batch search procedure described in Section 4. Figure 2 shows results on a representative subset of datasets; see Appendix B.5 for full results. 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000    
+
+> Recall-10@10
+> 10 1
+> 10 2
+> 10 3
+> 10 4
+> 10 5
+> QPS
+> arguana
+> 0.825 0.850 0.875 0.900 0.925 0.950 0.975 1.000
+> Recall-10@10
+> 10 1
+> 10 2
+> 10 3
+> 10 4
+> 10 5
+> fiqa MV-IVF SVH IGP FastPlaid
+
+Figure 3: Batched throughput versus Recall-10 @10 for MV-IVF, SVH, FastPLAID, and IGP on arguana and fiqa . Upper-right is better. 
+
+In the batched setting, MV-IVF consistently gives the strongest throughput frontier across datasets and recall metrics. The im-provement is especially pronounced on the smaller datasets, where MV-IVF dominates the other methods across nearly the full recall range. Two aspects of MV-IVF help explain this behavior. First, the IVF structure is highly parallelizable: once the probe leaves have been identified, the leaf scans expose a large amount of independent scoring work. Second, the batched search procedure of Section 4 improves locality by grouping queries that visit the same leaf. This effect is particularly important in the high-recall regime, where each query probes many leaves and the same leaf data is more likely to be reused across queries. MV-Vamana is generally the closest competitor, but its through-put degrades in the very high-recall regime. This is consistent with the behavior of graph-based search: while it is effective at reducing the number of expensive multi-vector comparisons for a single query, its data-dependent traversal is less amenable to batching and leads to less regular memory access. SVH and MUVERA are less competitive in the batched setting, especially on the larger datasets and for Recall-100@100, where recovering a broad neighborhood under MaxSim requires substantially more candidate-generation and reranking work. At 90% Recall-10@10, MV-IVF improves QPS by 2 .19 × over MU-VERA, 4 .01 × over SVH, and 2 .07 × over MV-Vamana in geometric mean, with best observed improvements of up to 8 .40 ×, 173 .5×,and 4 .99 ×, respectively. 
+
+Comparison with PLAID and IGP. 
+
+We also compare against PLAID [13] and IGP [4]. For PLAID, we use FastPLAID [16], a highly optimized implementation of PLAID; for IGP, we use the implementation released by the authors [4]. These implementations did not scale reliably across the full col-lection of datasets and low-latency operating points considered in our main experiments, so we report representative comparisons on 
+
+arguana and fiqa .Figure 3 shows that MV-IVF substantially outperforms both ex-ternal implementations on both datasets. Over the recall ranges where they overlap, MV-IVF achieves tens of times higher through-put than IGP and over two orders of magnitude higher throughput than FastPLAID. SVH also substantially outperforms FastPLAID, supporting its use as an optimized implementation of the single-vector candidate-generation approach underlying PLAID-style meth-ods. MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering arguana fiqa hotpotqa lotte msmarco nfcorpus nq scidocs scifact 
+
+> 10 1
+> 10 2
+> 10 3
+> 10 4
+> Build time (s)
+> MV-IVF MUVERA MV-Vamana SVH arguana fiqa hotpotqa lotte msmarco nfcorpus nq scidocs scifact
+> 10 0
+> 10 1
+> 10 2
+> 10 3
+> 10 4
+> 10 5
+> Index size on disk (MB)  MV-IVF MUVERA MV-Vamana SVH
+
+Figure 4: Wall-clock build time (left) and on-disk index size (right). 0.85 0.90 0.95 1.00      
+
+> Recall-10@10
+> 10 0
+> 10 1
+> 10 2
+> Latency (ms)
+> fiqa
+> 0.60 0.70 0.80 0.90 1.00
+> Recall-10@10
+> 10 1
+> 10 2
+> hotpotqa
+> Raw MaxSim + Leaf Quant (Rand-1bit) + Tree Quant (TQ-4bit) + Query Compress (Ward's) + Rerank Quant (Rand-8bit)
+
+Figure 5: Effect of the MV-IVF optimizations on single-query latency versus Recall-10 @10 on fiqa and hotpotqa . Each curve cumulatively adds the indicated optimization. Lower-right is better. 
+
+6.3 Build Time and Index Size 
+
+We next compare the preprocessing cost and storage overhead of each method. Figure 4 reports wall-clock build time and final on-disk index size across datasets. Overall, MV-IVF has a favorable build-time and index-storage profile. Its construction is practical across datasets and is often substantially faster than methods that use single-vector retrieval machinery as a black box. The IVF tree introduces little additional storage beyond the center point clouds and leaf-level membership information. MV-Vamana produces the smallest index, but its con-struction is substantially more expensive because building the graph requires many multi-vector comparisons. Thus, MV-IVF provides a useful middle ground: it retains native multi-vector routing while keeping both preprocessing time and index size moderate. 
+
+6.4 Ablation Studies 
+
+We next study how the main design choices and systems opti-mizations in MV-IVF affect retrieval performance. We report these experiments on fiqa and hotpotqa , representing a smaller and a larger retrieval dataset, respectively. 
+
+Impact of optimizations. Figure 5 shows the latency–recall fron-tier as we cumulatively add the optimizations described in Section 5. Starting from full-precision MaxSim scoring, we successively add Rand-1bit leaf scoring, TQ-4bit tree scoring, Ward query compres-sion, and Rand-8bit reranking. The optimizations substantially improve the latency–recall fron-tier. In particular, the unoptimized implementation does not reach 90% Recall-10@10 within our 100ms latency budget on either dataset. At 90% Recall-10@10 on fiqa , Rand-1bit leaf scoring alone pro-vides at least a 5 .37 × speedup over the unoptimized implementation. 0.6 0.7 0.8 0.9 1.0 510 15 20 25                               
+
+> Latency (ms)
+> fiqa
+> b= 0
+> b= 10
+> b= 50
+> 0.6 0.7 0.8 0.9 1.0 20 40 60 80 100 120 140 hotpotqa
+> b= 0
+> b= 10
+> b= 50
+> 0.6 0.7 0.8 0.9 1.0 0510 15 20 25 30
+> Latency (ms)
+> ℓmax = 100
+> ℓmax = 500
+> ℓmax = 1000
+> 0.6 0.7 0.8 0.9 1.0 20 40 60 80 100 120 ℓmax = 100
+> ℓmax = 500
+> ℓmax = 1000
+> 0.6 0.7 0.8 0.9 1.0
+
+Recall-10@10     
+
+> 510 15 20
+> Latency (ms)
+> niters=0 niters=5 niters=10
+> 0.6 0.7 0.8 0.9 1.0
+
+Recall-10@10 
+
+> 20 40 60 80 100 120 140
+> niters=0 niters=5 niters=10 Ablating  bAblating  ℓmax Ablating niters
+
+Figure 6: Sensitivity of MV-IVF to the branching parameter 𝑏 (top), maximum leaf size ℓmax (middle), and number of MV-Lloyd iterations (down), on fiqa (left) and hotpotqa (right). Lower-right is better. 
+
+Adding tree quantization, query compression, and quantized rerank-ing gives further speedups of 1 .31 ×, 1 .76 ×, and 1 .39 ×, respectively. We observe similar incremental improvements on hotpotqa . Over-all, the complete optimization stack is at least 17 .2× faster on fiqa 
+
+at 90% recall. 
+
+Sensitivity to MV-IVF parameters. We next study the three main parameters controlling the structure and construction of the MV-IVF index: the branching parameter 𝑏 , the maximum leaf size ℓmax ,and the number of MV-Lloyd iterations. We vary one parameter at a time while holding the remaining parameters fixed at their default values. Figure 6 shows that the default settings are robust across the two datasets. Setting 𝑏 = 0 enables our automatic branching rule, which chooses the branching factor based on the number of point clouds Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 
+
+at each node (roughly its square root, subject to the target leaf size). Automatic branching is competitive with fixed branching on 
+
+fiqa and gives the strongest frontier on hotpotqa . Performance is relatively insensitive to ℓmax over the range tested; however, smaller leaves increase both index size and construction time. We therefore use ℓmax = 500 as a reasonable default, although ℓmax = 1000 gives similar search performance. Finally, niters = 0 performs no MV-Lloyd updates and simply samples the initial center point clouds from the input. Running MV-Lloyd substantially improves the latency–recall frontier, show-ing that refining the center point clouds is important for effective routing. The improvement from 5 to 10 iterations is small, so we use 5 iterations by default. 
+
+7 Conclusion 
+
+We presented MV-IVF, a native IVF-style index for multi-vector retrieval. The key ingredient is MV-Lloyd, a Lloyd-style cluster-ing primitive for point clouds under a Chamfer-based objective, which lets us build an IVF tree whose routing representatives are themselves point clouds. Together with quantized scoring, query compression, and cache-efficient batched search, MV-IVF gives a practical clustering-based approach to multi-vector search. We also presented MV-Vamana, a native graph-based index, and MVSIC, a unified C++ framework for implementing and evaluating multi-vector retrieval methods. Our experiments show that MV-IVF pro-vides strong latency–recall and throughput–recall tradeoffs while maintaining moderate build time and index size. Several directions remain open. First, the clustering problem underlying MV-Lloyd deserves further study, including approxi-mation algorithms, initialization schemes, and variants based on different normalizations or set-to-set similarities. Although clus-tering with non-metric objectives is generally hard, it is not clear whether existing hardness results fully capture the structure of Chamfer objectives arising from multi-vector embeddings. Second, the design space for multi-vector IVF is still far from exhausted: spilling, probe allocation, and reranking strategies may lead to further improvements, especially on larger datasets. Finally, MV-Vamana is a promising direction in its own right. While its build time is high and its irregular search pattern is less favorable for batching, graph-based search is effective at minimizing expensive multi-vector comparisons, and merits deeper study. 
+
+Acknowledgments 
+
+We thank Vincent Cohen-Addad and Anupam Gupta for helpful dis-cussions. Kishen N Gowda and Laxman Dhulipala were supported in part by NSF awards CCF-2403235 and CNS-2317194. 
+
+References 
+
+[1] Fabien André, Anne-Marie Kermarrec, and Nicolas Le Scouarnec. 2016. Cache locality is not enough: High-Performance Nearest Neighbor Search with Product Quantization Fast Scan. In Proceedings of the VLDB Endowment , Vol. 9. New Delhi, India, 12. https://inria.hal.science/hal-01239055 [2] Fabien André, Anne-Marie Kermarrec, and Nicolas Le Scouarnec. 2017. Accel-erated Nearest Neighbor Search with Quick ADC. In Proceedings of the 2017 ACM on International Conference on Multimedia Retrieval (Bucharest, Romania) 
+
+(ICMR ’17) . Association for Computing Machinery, New York, NY, USA, 159–166. https://doi.org/10.1145/3078971.3078992 [3] Anonymous. 2026. TurboQuant 4-bit implementation. Personal communication. [4] Zheng Bian, Man Lung Yiu, and Bo Tang. 2025. IGP: Efficient Multi-Vector Retrieval via Proximity Graph Index. In Proceedings of the 48th International ACM SIGIR Conference on Research and Development in Information Retrieval .[5] Laxman Dhulipala, Majid Hadian, Rajesh Jayaram, Jason Lee, and Vahab Mirrokni. 2024. MUVERA: Multi-Vector Retrieval via Fixed Dimensional Encodings. In 
+
+Neural Information Processing Systems (NeurIPS) .[6] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. 2024. The Faiss Library. arXiv preprint arXiv:2401.08281 (2024). [7] Joshua Engels, Benjamin Coleman, Vihan Lakshman, and Anshumali Shrivastava. 2023. DESSERT: An Efficient Algorithm for Vector Set Search with Vector Set Queries. In Neural Information Processing Systems (NeurIPS) .[8] Manuel Faysse, Hugues Sibille, Tony Wu, Bilel Omrani, Gautier Viaud, Céline Hudelot, and Pierre Colombo. 2025. ColPali: Efficient Document Retrieval with Vision Language Models. In The Thirteenth International Conference on Learning Representations (ICLR) .[9] Jianyang Gao and Cheng Long. 2024. RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search. Proceedings of the ACM on Management of Data 2, 3, Article 167 (2024). [10] Hervé Jégou, Matthijs Douze, and Cordelia Schmid. 2011. Product Quantization for Nearest Neighbor Search. IEEE Transactions on Pattern Analysis and Machine Intelligence 33, 1 (2011), 117–128. [11] Omar Khattab and Matei Zaharia. 2020. ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT. In Proceedings of the 43rd International ACM SIGIR Conference on Research and Development in Information Retrieval . 39–48. [12] Magdalen Dobson Manohar, Zheqi Shen, Guy Blelloch, Laxman Dhulipala, Yan Gu, Harsha Vardhan Simhadri, and Yihan Sun. 2024. ParlayANN: Scalable and Deterministic Parallel Graph-Based Approximate Nearest Neighbor Search Algorithms. In Proceedings of the 29th ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming (Edinburgh, United Kingdom) 
+
+(PPoPP ’24) . Association for Computing Machinery, New York, NY, USA, 270–285. https://doi.org/10.1145/3627535.3638475 [13] Keshav Santhanam, Omar Khattab, Christopher Potts, and Matei Zaharia. 2022. PLAID: An Efficient Engine for Late Interaction Retrieval. In Proceedings of the 31st ACM International Conference on Information & Knowledge Management (CIKM) .[14] Keshav Santhanam, Omar Khattab, Jon Saad-Falcon, Christopher Potts, and Matei Zaharia. 2022. ColBERTv2: Effective and Efficient Retrieval via Lightweight Late Interaction. In Proceedings of the 2022 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (NAACL-HLT) .[15] Jan Luca Scheerer, Matei Zaharia, Christopher Potts, Gustavo Alonso, and Omar Khattab. 2025. WARP: An Efficient Engine for Multi-Vector Retrieval. In Proceed-ings of the 48th International ACM SIGIR Conference on Research and Development in Information Retrieval .[16] Raphaël Sourty. 2025. FastPlaid: A High-Performance Engine for Multi-Vector Search. https://github.com/lightonai/fast-plaid [17] Suhas Jayaram Subramanya, Devvrit, Harsha Vardhan Simhadri, Ravishankar Krishnaswamy, and Rohan Kadekodi. 2019. DiskANN: Fast Accurate Billion-Point Nearest Neighbor Search on a Single Node. In Neural Information Processing Systems (NeurIPS) .[18] Nandan Thakur, Nils Reimers, Andreas Rücklé, Abhishek Srivastava, and Iryna Gurevych. 2021. BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of Information Retrieval Models. In Thirty-fifth Conference on Neural Information Processing Systems (NeurIPS) Datasets and Benchmarks Track .[19] Joe H. Ward. 1963. Hierarchical Grouping to Optimize an Objective Function. J. Amer. Statist. Assoc. 58, 301 (1963), 236–244. https://doi.org/10.1080/01621459. 1963.10500845 [20] Amir Zandieh, Majid Daliri, Majid Hadian, and Vahab Mirrokni. 2025. Turbo-Quant: Online Vector Quantization with Near-optimal Distortion Rate. arXiv preprint arXiv:2504.19874 (2025). 
+
+A Proof of Proposition 1 
+
+Proof of Proposition 1. By definition of Chamfer distance, for any center-set 𝐶 ,∑︁  
+
+> 𝑃 ∈Π𝑗
+
+Ch (𝑃, 𝐶 ) =∑︁  
+
+> 𝑃 ∈Π𝑗
+
+1
+
+|𝑃 |∑︁ 𝑥 ∈𝑃 
+
+min   
+
+> 𝑐 ∈𝐶
+
+𝑑 (𝑥, 𝑐 ).MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 
+
+Reindexing the double sum over the multiset Flatten (Π𝑗 ), the point 
+
+𝑥 ∈ 𝑃 receives weight 1 /| 𝑃 |. Hence, ∑︁  
+
+> 𝑃 ∈Π𝑗
+
+Ch (𝑃, 𝐶 ) =∑︁   
+
+> 𝑥 ∈Flatten (Π𝑗 )
+
+𝑤 (𝑥 ) min   
+
+> 𝑐 ∈𝐶
+
+𝑑 (𝑥, 𝑐 ),
+
+where 𝑤 (𝑥 ) = 1/| 𝑃 | for 𝑥 coming from 𝑃 . Therefore, minimizing the Chamfer (1, 𝑠 )-median objective over all center-sets 𝐶 with 
+
+|𝐶 | ≤ 𝑠 is exactly the weighted 𝑠 -median problem on the flattened multiset Flatten (Π𝑗 ). □
+
+B Experiments (continued) 
+
+In this section, we continue the discussion of the experiments from the main paper. 
+
+B.1 Baselines and Parameter Settings 
+
+We compare MV-IVF against three methods: SVH, MUVERA, and MV-Vamana. SVH is a single-vector candidate-generation base-line: it indexes the flattened document embeddings with a single-vector ANN index, retrieves candidate documents through their individual embeddings, and reranks the resulting candidates using multi-vector scoring. MUVERA reduces each point cloud to a fixed-dimensional encoding and performs candidate generation using a single-vector ANN index over these encodings. MV-Vamana is our native graph-based baseline, obtained by building a Vamana-style graph directly over document point clouds. All four methods are implemented in MVSIC and use the same document/query embeddings, scoring kernels, and evaluation pipeline. For SVH and MUVERA, the underlying single-vector ANN index is Vamana. For MUVERA, we use the parameter settings recom-mended in [5]; for all Vamana graphs, we use standard settings from ParlayANN [12]. For each method, we sweep the search-time parameters listed in Table 2 and report the Pareto frontier over all resulting operating points. Thus, the main comparisons are based on the best recall–efficiency tradeoff achieved by each method over its specified parameter grid, rather than on a single hand-tuned setting. 
+
+B.2 Quantization 
+
+We evaluate several quantization paradigms used throughout the paper. In addition to the TQ, Rand-1bit, and Rand-8bit variants described in Section 5, we also compare against PQ FastScan-style kernels [1, 2] and RaBitQ [9]. For RaBitQ, we use the publicly avail-able RaBitQ library implementation [9]. 
+
+Single-vector over-retrieval benchmark. We first evaluate the quantizers on single-vector inner-product search. For each quan-tized scorer, we retrieve the top 𝑘 ′ candidates under the approximate scores and report Recall-10@ 𝑘 ′ with respect to the exact top-10 neighbors. This measures how much over-retrieval is needed for the quantized scores to preserve the true nearest neighbors. Figure 7 reports the resulting recall curves. In the plot labels, FS-4 𝑏 , FS-8 𝑏 , etc. denote the block-size vari-ants used by our FastScan implementation; in this notation, FS-4 𝑏 
+
+corresponds to one bit per coordinate, while FS-8 𝑏 corresponds to one half-bit per coordinate. We also include both Rand-1bit and Rand-1bit-asym: Rand-1bit quantizes both database and query vec-tors, while Rand-1bit-asym uses an asymmetric query variant. We observe that Rand-8bit and RQ-8bit preserve quality extremely well, making them suitable as high-fidelity reranking quantizers. RQ-4bit and TQ-4bit provide a good medium-quality tradeoff and are well suited for candidate generation, while Rand-1bit, RQ-1bit, FS-2 𝑏 ,and FS-4 𝑏 are lower-quality but substantially cheaper scorers. 
+
+Multi-vector over-retrieval benchmark. We next evaluate the same quantizers inside the multi-vector retrieval pipeline. Figure 8 reports the resulting recall–over-retrieval curves. An interesting observation is that the quantizers perform com-paratively better in the multi-vector setting than in the single-vector setting. One reason is that MaxSim aggregates many query-token contributions into a single query-document score. As a result, er-rors in individual inner-product estimates can partially smooth out at the level of the full point-cloud score. This makes even relatively low-precision quantizers useful for coarse multi-vector scoring, especially when the goal is to recover a sufficiently large candidate set rather than exactly match the full-precision ordering. 
+
+B.3 Query Compression 
+
+Multi-vector scoring is linear in the number of query embeddings, and many queries contain redundant token vectors. We therefore compress each query point cloud before scoring. Given a query 𝑄 ,both compression methods considered below produce a partition 
+
+B = {𝐵 1, . . . , 𝐵 𝑟 } of the query embeddings, and replace each block 
+
+𝐵 𝑖 by a single representative ¯ 𝑞 𝑖 := Í𝑞 ∈𝐵 𝑖 𝑞. The compressed query is then ¯ 𝑄 = { ¯𝑞 1, . . . , ¯𝑞 𝑟 }. Using sums rather than averages preserves the scale of the original MaxSim score: a block with more query em-beddings contributes proportionally more to the final score. Larger compression thresholds produce fewer representatives and faster scoring, but can reduce retrieval quality. 
+
+Ball Carving. Ball carving is the greedy query-compression method used by MUVERA [5]. Given a distance threshold 𝜏 , the algorithm repeatedly selects an unassigned query embedding 𝑞 , forms a block consisting of all currently unassigned embeddings within distance 
+
+𝜏 of 𝑞 , replaces this block by the sum of its vectors, and removes the block from the active set. This process continues until all query embeddings have been assigned. Thus, the number of compressed query vectors is not fixed in advance; it is determined by the geom-etry of the query and the threshold 𝜏 .
+
+Ward’s Method. We also consider compression based on Ward’s agglomerative clustering [19]. Each query embedding is initialized as a singleton cluster. We then repeatedly merge the pair of clus-ters that causes the smallest increase in within-cluster variance, stopping once the next merge exceeds a threshold 𝜏 . As with ball carving, each final cluster is represented by the sum of its embed-dings. Ward compression tends to form more balanced and coherent groups of query vectors, and in our experiments gives a slightly better quality–compression tradeoff. 
+
+Discussion. Figure 9 compares the two compression methods as the threshold is varied. Both methods are effective: moderate com-pression reduces the number of query embeddings substantially with little effect on recall. We use Ward’s method with threshold 0.5 by default, since it is slightly faster in our implementation and gives comparable or better recall across the operating points we Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 
+
+Method Build parameters Search parameters MV-IVF • Recursive MV-Lloyd tree with automatic branching. 
+
+• If a node contains 𝑛 𝑢 point clouds and 𝑏 = 0, then 𝑏 𝑢 =
+
+min { ⌈ √𝑛 𝑢 ⌉, ⌈𝑐𝑛 𝑢 /ℓmax ⌉ } .
+
+• 5 Lloyd iterations; at most 100 point clouds per update cluster. 
+
+• Build-time assignments use TQ-8bit scoring. 
+
+• ℓmax = 500 .
+
+• nprobe ∈ { 1, 2, 4, . . . , }.
+
+• TQ-4bit for greedy search; Rand-1bit for leaf scoring; Rand-8bit for reranking. 
+
+• Query compression: Ward’s method with 𝜏 = 0.5.
+
+• num_rerank ∈ { 20 , 100 , 500 } for 𝐾 = 10 .
+
+• num_rerank ∈ { 200 , 1000 , 5000 } for 𝐾 = 100 .MUVERA • 𝑑 FDE = 10240 , except MS MARCO where 𝑑 FDE = 2560 .
+
+• Vamana graph with 𝑅 = 200 , 𝐿 build = 600 , and 𝛼 = 1.0.
+
+• Search beam 𝐿 ∈ { 16 , 32 , . . . , }.
+
+• TQ-4bit for graph search; Rand-8bit for reranking. 
+
+• num_rerank ∈ { 500 , 1000 } for 𝐾 = 10 .
+
+• num_rerank ∈ { 5000 , 10000 } for 𝐾 = 100 .SVH • Vamana graph over flattened individual embeddings. 
+
+• 𝑅 = 64 , 𝐿 build = 128 , and 𝛼 = 1.0.
+
+• Search beam 𝐿 ∈ { 16 , 32 , . . . , }.
+
+• TQ-4bit for graph search; Rand-8bit for reranking. 
+
+• num_rerank ∈ { 50 , 100 , 500 } for 𝐾 = 10 .
+
+• num_rerank ∈ { 1000 , 5000 } for 𝐾 = 100 .MV-Vamana • Native Vamana graph over document point clouds. 
+
+• 𝑅 = 64 , 𝐿 build = 128 , and 𝛼 = 1.0.
+
+• Search beam 𝐿 ∈ { 16 , 32 , . . . , }.
+
+• TQ-4bit for graph search; Rand-8bit for reranking. 
+
+• num_rerank ∈ { 20 , 50 } for 𝐾 = 10 .
+
+• num_rerank ∈ { 200 , 500 } for 𝐾 = 100 .
+
+Table 2: Build parameters and search-time grids used to generate the Pareto curves in Sections 6. Early cut-off was applied when latency went above 100ms, or QPS dropped below 10. 10 1 10 2 10 3  
+
+> k0
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Recall-10@ k0
+> nfcorpus: Recall-10@ k0vs k0
+> Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8
+
+(a) nfcorpus 10 1 10 2 10 3   
+
+> k0
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Recall-10@ k0
+> scifact: Recall-10@ k0vs k0
+> Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8
+
+(b) scifact 10 1 10 2 10 3   
+
+> k0
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Recall-10@ k0
+> arguana: Recall-10@ k0vs k0
+> Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8
+
+(c) arguana 10 1 10 2 10 3   
+
+> k0
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Recall-10@ k0
+> scidocs: Recall-10@ k0vs k0
+> Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8
+
+(d) scidocs 10 1 10 2 10 3
+
+k0
+
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Recall-10@ k0
+
+fiqa: Recall-10@ k0 vs k0
+
+> Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8
+
+(e) fiqa 10 1 10 2 10 3
+
+k0
+
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Recall-10@ k0
+
+nq: Recall-10@ k0 vs k0 
+
+> Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8
+
+(f) nq 10 1 10 2 10 3
+
+k0
+
+> 0.0 0.2 0.4 0.6 0.8 1.0
+> Recall-10@ k0
+
+hotpotqa: Recall-10@ k0 vs k0 
+
+> Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8
+
+(g) hotpotqa 
+
+Figure 7: Single-vector over-retrieval quality across datasets. Each panel shows recall as a function of the candidate budget 𝑘 ′.
+
+consider. The cost of query compression itself is negligible com-pared to the overall search time; its main effect is to reduce the cost of the subsequent multi-vector scoring kernels. Furthermore, most of the loss in quality here can be recovered with reranking, allowing us to compress more aggressively. 
+
+B.4 Extended Latency Experiments 
+
+We present the latency vs recall plots on all of the datasets here; see Figures 10,11,12,13,14,15,16,17, and 18. See Tables 3 and 4 for a summary of the speedups obtained. MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 10 1 10 2 10 3
+
+k0
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall-10@ k0
+
+nfcorpus: Recall-10@ k0 vs k0
+
+Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8 
+
+(a) nfcorpus 10 1 10 2 10 3
+
+k0
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall-10@ k0
+
+scifact: Recall-10@ k0 vs k0
+
+Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8 (b) scifact 10 1 10 2 10 3
+
+k0
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall-10@ k0
+
+arguana: Recall-10@ k0 vs k0
+
+Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8 (c) arguana 10 1 10 2 10 3
+
+k0
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall-10@ k0
+
+scidocs: Recall-10@ k0 vs k0
+
+Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8 (d) scidocs 10 1 10 2 10 3
+
+k0
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall-10@ k0
+
+fiqa: Recall-10@ k0 vs k0
+
+Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8 
+
+(e) fiqa 10 1 10 2 10 3
+
+k0
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall-10@ k0
+
+nq: Recall-10@ k0 vs k0
+
+Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8 (f) nq 10 1 10 2 10 3
+
+k0
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall-10@ k0
+
+hotpotqa: Recall-10@ k0 vs k0
+
+Rand-1bit Rand-1bit-asym TQ-4bit Rand-8bit RQ-1bit RQ-4bit RQ-8bit FS-b2 FS-b4 FS-b8 (g) hotpotqa 
+
+Figure 8: Multi-vector over-retrieval quality across datasets. Each panel shows recall as a function of the candidate budget 𝑘 ′.
+
+Ball Carving 0.0 0.2 0.4 0.6 0.8 1.0 
+
+Threshold τ
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall
+
+nfcorpus - Ball Carving 
+
+Recall-1@10 Recall-10@10 Avg Query Size 
+
+010 20 30 
+
+> Avg Query Size
+
+(a) nfcorpus 0.0 0.2 0.4 0.6 0.8 1.0 
+
+Threshold τ
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall
+
+scifact - Ball Carving 
+
+Recall-1@10 Recall-10@10 Avg Query Size 
+
+010 20 30  
+
+> Avg Query Size
+
+(b) scifact 0.0 0.2 0.4 0.6 0.8 1.0 
+
+Threshold τ
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall
+
+arguana - Ball Carving 
+
+Recall-1@10 Recall-10@10 Avg Query Size 
+
+010 20 30  
+
+> Avg Query Size
+
+(c) arguana 0.0 0.2 0.4 0.6 0.8 1.0 
+
+Threshold τ
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall
+
+scidocs - Ball Carving 
+
+Recall-1@10 Recall-10@10 Avg Query Size 
+
+010 20 30  
+
+> Avg Query Size
+
+(d) scidocs 0.0 0.2 0.4 0.6 0.8 1.0 
+
+Threshold τ
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall
+
+fiqa - Ball Carving 
+
+Recall-1@10 Recall-10@10 Avg Query Size 
+
+010 20 30  
+
+> Avg Query Size
+
+(e) fiqa 
+
+Ward’s Method 0.0 0.5 1.0 1.5 2.0 
+
+Threshold τ
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall
+
+nfcorpus - Ward's Method 
+
+Recall-1@10 Recall-10@10 Avg Query Size 
+
+10 20 30 
+
+> Avg Query Size
+
+(f) nfcorpus 0.0 0.5 1.0 1.5 2.0 
+
+Threshold τ
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall
+
+scifact - Ward's Method 
+
+Recall-1@10 Recall-10@10 Avg Query Size 
+
+10 20 30  
+
+> Avg Query Size
+
+(g) scifact 0.0 0.5 1.0 1.5 2.0 
+
+Threshold τ
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall
+
+arguana - Ward's Method 
+
+Recall-1@10 Recall-10@10 Avg Query Size 
+
+10 20 30  
+
+> Avg Query Size
+
+(h) arguana 0.0 0.5 1.0 1.5 2.0 
+
+Threshold τ
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall
+
+scidocs - Ward's Method 
+
+Recall-1@10 Recall-10@10 Avg Query Size 
+
+510 15 20 25 30  
+
+> Avg Query Size
+
+(i) scidocs 0.0 0.5 1.0 1.5 2.0 
+
+Threshold τ
+
+0.0 0.2 0.4 0.6 0.8 1.0 
+
+> Recall
+
+fiqa - Ward's Method 
+
+Recall-1@10 Recall-10@10 Avg Query Size 
+
+10 20 30  
+
+> Avg Query Size
+
+(j) fiqa 
+
+Figure 9: Query-compression quality for Ball Carving (top row) and Ward’s method (bottom row). Each panel plots retrieval quality as the compression threshold varies. 
+
+B.5 Extended Throughput Experiments 
+
+We present the batch throughput vs recall plots on all of the datasets here; see Figures 19,20,21,22,23,24,25,26, and 27. See Tables 3 and 4 for a summary of the speedups obtained. 
+
+B.6 Multi-thread Latency Experiments 
+
+We also present the multi-threaded latency vs recall plots, i.e. la-tency when single-queries run on all cores. This measures the amount of intra-query parallelization in the algorithm. See Fig-ures 28,29,30,31, and 32. Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+nfcorpus: Recall vs Latency (1 thrd) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 10: Latency: nfcorpus .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 0
+
+10 1
+
+10 2
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 0
+
+10 1
+
+10 2
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 0
+
+10 1
+
+10 2
+
+scifact: Recall vs Latency (1 thrd) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 11: Latency: scifact .
+
+Regime Baseline 90% Recall-10 @10 95% Recall-10 @10 99% Recall-10 @10 
+
+Latency MUVERA 1.33 × / 4.76 × (9) 1.91 × / 4.51 × (6) 2.09 × / 2.92 × (3) SVH 1.55 × / 8.03 × (8) 2.89 × / 8.86 × (6) 12 .46 × / 31 .09 × (4) MV-Vamana 1.22 × / 5.13 × (9) 1.88 × / 3.35 × (6) 3.30 × / 4.98 × (4) Throughput MUVERA 2.19 × / 8.40 × (9) 1.92 × / 6.97 × (7) 2.10 × / 6.28 × (3) SVH 4.01 × / 173 .53 × (8) 4.71 × / 42 .85 × (7) 67 .49 × / 1482 .60 × (4) MV-Vamana 2.07 × / 4.99 × (9) 2.20 × / 4.77 × (8) 5.05 × / 11 .65 × (4) 
+
+Table 3: MVIVF speedups. Each cell reports geometric-mean speedup / maximum speedup over the baseline, with the number of datasets compared in parentheses. The latency/throughput is computed by taking the best value with Recall-10 @10 at least the fixed value. MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 0
+
+10 1
+
+10 2
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 0
+
+10 1
+
+10 2
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 0
+
+10 1
+
+10 2
+
+arguana: Recall vs Latency (1 thrd) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 12: Latency: arguana .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+scidocs: Recall vs Latency (1 thrd) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 13: Latency: scidocs .
+
+Regime Baseline 90% Recall-100 @100 95% Recall-100 @100 99% Recall-100 @100 
+
+Latency MUVERA 2.25 × / 4.50 × (6) 3.08 × / 3.96 × (5) 2.45 × / 4.13 × (4) SVH 3.03 × / 4.06 × (5) 3.54 × / 5.06 × (5) 2.63 × / 3.99 × (4) MV-Vamana 1.91 × / 3.68 × (6) 2.45 × / 3.12 × (5) 1.98 × / 2.62 × (4) Throughput MUVERA 3.43 × / 26 .55 × (8) 4.53 × / 16 .00 × (5) 3.22 × / 5.93 × (4) SVH 3.12 × / 32 .24 × (8) 3.04 × / 12 .16 × (6) 5.95 × / 80 .08 × (5) MV-Vamana 1.96 × / 5.34 × (9) 2.83 × / 4.86 × (9) 2.65 × / 4.03 × (5) 
+
+Table 4: MVIVF speedups. Each cell reports geometric-mean speedup / maximum speedup over the baseline, with the number of datasets compared in parentheses. The latency/throughput is computed by taking the best value with Recall-100 @100 at least the fixed value. Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+fiqa: Recall vs Latency (1 thrd) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 14: Latency: fiqa .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 1
+
+10 2
+
+10 3
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 1
+
+10 2
+
+10 3
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 1
+
+10 2
+
+10 3
+
+nq: Recall vs Latency (1 thrd) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 15: Latency: nq .MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 1
+
+10 2
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 1
+
+10 2
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 1
+
+10 2
+
+hotpotqa: Recall vs Latency (1 thrd) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 16: Latency: hotpotqa .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 1
+
+10 2
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 1
+
+10 2
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 1
+
+10 2
+
+msmarco: Recall vs Latency (1 thrd) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 17: Latency: msmarco .Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 1
+
+10 2
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 1
+
+10 2
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 1
+
+10 2
+
+lotte: Recall vs Latency (1 thrd) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 18: Latency: lotte .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 3
+
+10 4
+
+10 5
+
+> QPS
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 3
+
+10 4
+
+10 5
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 3
+
+10 4
+
+10 5
+
+nfcorpus: Recall vs Throughput (Batch) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 19: Throughput: nfcorpus .MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 3
+
+10 4
+
+10 5
+
+> QPS
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 3
+
+10 4
+
+10 5
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 3
+
+10 4
+
+10 5
+
+scifact: Recall vs Throughput (Batch) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 20: Throughput: scifact .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 3
+
+10 4
+
+10 5
+
+> QPS
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 3
+
+10 4
+
+10 5
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 3
+
+10 4
+
+10 5
+
+arguana: Recall vs Throughput (Batch) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 21: Throughput: arguana .Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+10 5
+
+> QPS
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+10 5
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+10 5
+
+scidocs: Recall vs Throughput (Batch) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 22: Throughput: scidocs .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+10 5
+
+> QPS
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+10 5
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+10 5
+
+fiqa: Recall vs Throughput (Batch) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 23: Throughput: fiqa .MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+> QPS
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+nq: Recall vs Throughput (Batch) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 24: Throughput: nq .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+> QPS
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+hotpotqa: Recall vs Throughput (Batch) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 25: Throughput: hotpotqa .Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+10 5
+
+> QPS
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+10 5
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+10 5
+
+msmarco: Recall vs Throughput (Batch) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 26: Throughput: msmarco .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+> QPS
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 1
+
+10 2
+
+10 3
+
+10 4
+
+lotte: Recall vs Throughput (Batch) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 27: Throughput: lotte .MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 0
+
+10 1
+
+10 2
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 0
+
+10 1
+
+10 2
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 0
+
+10 1
+
+10 2
+
+nfcorpus: Recall vs Latency (all thrds) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 28: Multi-thread latency: nfcorpus .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 0
+
+10 1
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 0
+
+10 1
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 0
+
+10 1
+
+scifact: Recall vs Latency (all thrds) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 29: Multi-thread latency: scifact .Kishen N Gowda, Laxman Dhulipala, Lars Gottesbüren, and Rajesh Jayaram 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 0
+
+10 1
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 0
+
+10 1
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 0
+
+10 1
+
+arguana: Recall vs Latency (all thrds) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 30: Multi-thread latency: arguana .0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+scidocs: Recall vs Latency (all thrds) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 31: Multi-thread latency: scidocs .MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering 0.900 0.925 0.950 0.975 1.000 
+
+Recall-1@10 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+> Latency (ms)
+
+0.85 0.90 0.95 1.00 
+
+Recall-10@10 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+0.85 0.90 0.95 1.00 
+
+Recall-100@100 
+
+10 0
+
+10 1
+
+10 2
+
+10 3
+
+fiqa: Recall vs Latency (all thrds) 
+
+MV-IVF MUVERA MV-Vamana SVH 
+
+Figure 32: Multi-thread latency: fiqa .
