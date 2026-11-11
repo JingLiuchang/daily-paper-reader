@@ -51,14 +51,14 @@
       <span class="dpr-home-dashboard-kicker">2026-11-10</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 16 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 34 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
-    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>3</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>13</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>2 次</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>8</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>26</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-10 02:08:27 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-11 00:09:13 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今天筛完16篇AI Agent论文，精读3篇、速读13篇，重点锁定多智能体协作评测与记忆持久代理的跨会话提示注入风险。最值得看的是MAC-Bench（9.0/10）用互联任务评测多智能体协作，以及MemHarmBench（8.0/10）聚焦记忆持久代理的跨会话提示注入，二者都强调“能力评测+安全评测”并重。普通读者可先读这两篇精读，再扫一眼速读中的规则合规与上下文压缩基准，整理一份自己的Agent评测清单。</p>
+<p>今天筛完 34 篇论文，精读 8 篇、速读 26 篇，重点看主动式常驻智能体与动态图索引。最值得看的是 AutoBuddy 对模拟职场中任务发现与执行的评测（9.0），以及面向标签过滤近邻搜索的动态图索引（9.0）。普通读者可先读这两篇，再顺着速读里的长寿命智能体经验生命周期基准继续看。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +78,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">3 篇</strong>
+    <strong class="dpr-home-dashboard-count">8 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="MAC-Bench: Benchmarking Multi-Agent Collaboration via Interconnected Tasks">MAC-Bench: Benchmarking Multi-Agent Collaboration via Interconnected Tasks</span></li><li><span class="dpr-home-dashboard-paper-title" title="MemHarmBench: Evaluating Cross-Session Prompt Injection in Memory-Persistent AI Agents">MemHarmBench: Evaluating Cross-Session Prompt Injection in Memory-Persistent AI Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering">MV-IVF: Multi-Vector Retrieval via Multi-Vector Clustering</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="AutoBuddy: Evaluating Proactive, Always-On Agents on Task Discovery and Execution in a Simulated Workplace">AutoBuddy: Evaluating Proactive, Always-On Agents on Task Discovery and Execution in a Simulated Workplace</span></li><li><span class="dpr-home-dashboard-paper-title" title="Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search">Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search</span></li><li><span class="dpr-home-dashboard-paper-title" title="MAC-Bench: Benchmarking Multi-Agent Collaboration via Interconnected Tasks">MAC-Bench: Benchmarking Multi-Agent Collaboration via Interconnected Tasks</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>2</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +91,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">13 篇</strong>
+    <strong class="dpr-home-dashboard-count">26 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="TRIO: Task Refinement with Individual Optimization for Retrieval-Augmented Generation">TRIO: Task Refinement with Individual Optimization for Retrieval-Augmented Generation</span></li><li><span class="dpr-home-dashboard-paper-title" title="Toward Knowledge-Centric AI: Discovering, Internalizing, and Using Explicit Knowledge Across Agents and Generations">Toward Knowledge-Centric AI: Discovering, Internalizing, and Using Explicit Knowledge Across Agents and Generations</span></li><li><span class="dpr-home-dashboard-paper-title" title="Do Agents Still Follow the Rules? Benchmarking Rule Compliance under Agent Context Compaction">Do Agents Still Follow the Rules? Benchmarking Rule Compliance under Agent Context Compaction</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Towards Robust Long-Lived Agents: Benchmarking Experience Lifecycles in Evolving Environments">Towards Robust Long-Lived Agents: Benchmarking Experience Lifecycles in Evolving Environments</span></li><li><span class="dpr-home-dashboard-paper-title" title="ArcRAG: Agentic Compositional Retrieval over Knowledge Graphs">ArcRAG: Agentic Compositional Retrieval over Knowledge Graphs</span></li><li><span class="dpr-home-dashboard-paper-title" title="Task-Efficient Agent Evaluation Using Cached Traces">Task-Efficient Agent Evaluation Using Cached Traces</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>8</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>4</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>14</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>11</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 </div>
 

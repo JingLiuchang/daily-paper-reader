@@ -1,0 +1,2888 @@
+Dynamic Graph Indexing for Label-Filtered Approximate
+Nearest Neighbor Search
+MENGXU JIANG, The Chinese University of Hong Kong, Hong Kong
+ZHI YANG, The Chinese University of Hong Kong, Hong Kong
+FANGYUAN ZHANG, Harbin Institute of Technology, China
+YIN YANG, Hamad Bin Khalifa University, Qatar
+SIBO WANG∗, The Chinese University of Hong Kong, Hong Kong
+Approximate nearest neighbor search (ANNS) over high-dimensional vectors is a core primitive in modern
+retrieval systems. In practice, objects are often also associated with labels (e.g., attributes or keywords), and
+retrieval must combine vector similarity with explicit label-based filtering, giving rise to label-filtered ANNS.
+This task is challenging because label filtering and ANNS favor very different index structures, selective filters
+fragment the admissible search space, and updates complicate index maintenance.
+To address these challenges, we propose DYLAN, a dynamic composite index for label-filtered ANNS
+supporting containment, overlap, and their conjunctions and disjunctions. DYLAN organizes label sets by
+shared prefixes in a frequency-ordered trie and selectively shares HNSW-style graph indices across trie-induced
+subsets, so that each trie region has a constant-factor covering index while each object participates in only
+logarithmically many indices. To mitigate fragmentation, DYLAN performs a cross-region multi-graph search
+that exploits ancestor-level indices as bridges between otherwise isolated trie regions. To support insertions,
+it adopts a threshold-based maintenance scheme that rebuilds shared indices only when necessary, yielding
+low amortized update cost.
+Extensive experiments with real data show that DYLAN consistently improves query throughput at compa-
+rable recall, by up to two orders of magnitude on challenging label-rich datasets, while retaining competitive
+memory, construction, and update costs.
+CCS Concepts: • Information systems →Retrieval models and ranking.
+Additional Key Words and Phrases: Label-Filtering Approximate Nearest Neighbor Search; Vector Database;
+Dynamic Indexing
+ACM Reference Format:
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang. 2026. Dynamic Graph Indexing for
+Label-Filtered Approximate Nearest Neighbor Search. Proc. ACM Manag. Data 4, 6 (SIGMOD), Article 335
+(December 2026), 34 pages. https://doi.org/10.1145/3856330
+1
+Introduction
+Recent advances in machine learning, especially large language models (LLMs), have significantly
+increased the demand for managing high-dimensional vector data. Through a machine learning
+∗Sibo Wang is the corresponding author.
+Authors’ Contact Information: Mengxu Jiang, mxjiang@se.cuhk.edu.hk, The Chinese University of Hong Kong, Hong
+Kong; Zhi Yang, zyang@se.cuhk.edu.hk, The Chinese University of Hong Kong, Hong Kong; Fangyuan Zhang, Harbin
+Institute of Technology, Shenzhen, China, zzzzzfy@link.cuhk.edu.hk; Yin Yang, Hamad Bin Khalifa University, Doha, Qatar,
+yyang@hbku.edu.qa; Sibo Wang, swang@se.cuhk.edu.hk, The Chinese University of Hong Kong, Hong Kong.
+This work is licensed under a Creative Commons Attribution 4.0 International License.
+© 2026 Copyright held by the owner/author(s).
+ACM 2836-6573/2026/12-ART335
+https://doi.org/10.1145/3856330
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+arXiv:2611.12539v1  [cs.DB]  9 Nov 2026
+
+
+335:2
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+Table 1. Comparison of label-filtered ANNS methods. ✓: full support; ×: no support; “Partial”: limited support.
+Query-efficiency ratings summarize the empirical trends in Sec. 4. “High”: consistently reaches the target
+recall and is among the fastest across reported datasets; “Medium”: reaches the recall but with clearly lower
+throughput or only on some datasets; “Low”: often falls short or is substantially slower. Label scalability is
+rated by how index space grows with the label universe. “High”: near-constant or slowly growing; “Low”: a
+growth rate that becomes prohibitive.
+Method
+Label Aware
+Query Efficiency
+Update Support
+Label Scalability
+Containment
+Overlap
+Complex
+Vector
+Label set
+ACORN [28]
+×
+Low
+Low
+Low
+✓
+✓
+High
+NaviX [32]
+×
+Low
+Low
+Low
+✓
+✓
+High
+Filtered-DiskANN [19]
+✓
+Low
+Medium
+×
+✓
+✓
+High
+RWalks [5]
+✓
+Medium
+Medium
+×
+×
+×
+Low
+UNG [11]
+✓
+Medium
+Medium
+×
+✓
+×
+High
+UniFilter [41]
+✓
+Low
+×
+×
+✓
+Partial
+High
+Curator [23]
+✓
+Medium
+Medium
+Medium
+✓
+✓
+High
+DYLAN (Ours)
+✓
+High
+High
+High
+✓
+✓
+High
+model, an unstructured object, such as an image or a full-text article, can be mapped to a high-
+dimensional vector called its embedding, in such a way that objects close in the vector space are
+often semantically related. For example, under a vision-language model such as CLIP [29], the image
+of a pill and the textual instructions of the corresponding medicine map to nearby embeddings. This
+enables semantic retrieval over unstructured data, typically through approximate nearest neighbor
+search (ANNS) [20], which is supported effectively in modern vector database systems [12, 13, 37].
+In practice, however, retrieval is rarely based on vector similarity alone. Each object is often also
+associated with a set of labels, such as categories, tags, or keywords. For example, medical articles
+may be tagged as “papers in reputed medical journals”, “manufacturer instructions”, or “social
+posts”. Accordingly, ANNS is often augmented with explicit label-based filtering, e.g., retrieving
+only papers in reputed medical journals and manufacturer instructions, so as to provide stronger
+control over the source of information. Such a query is referred to as label-filtered ANNS [19].
+Main challenges. Although both ANNS and label-based filtering have been studied extensively,
+their combination remains challenging because the two tasks favor fundamentally different index
+structures. Label filtering is typically supported by set-oriented structures such as inverted lists [45],
+whereas ANNS is usually supported by graph-based indices such as HNSW [26]. A straightforward
+approach is to choose one of these structures, which leads to either pre-filtering (i.e., employing a
+label index to filter objects but performing ANNS index-free) or post-filtering (index-based ANNS
+with post-processing to filter the results with labels). The former may incur a costly scan over a
+large candidate set, whereas the latter often requires substantial over-retrieval to maintain recall.
+A more integrated direction, called in-filtering [28], performs filtering during graph traversal.
+Specifically, when processing a label-filtered ANNS query on an HNSW-style graph [26], the
+search expands only neighbors that satisfy the filter. The main difficulty is that a selective filter
+may eliminate a large fraction of graph edges, effectively sparsifying the admissible subgraph
+and making many qualified objects unreachable, which leads to false dismissals and low recall.
+Existing techniques alleviate this issue by exploring larger local neighborhoods, e.g., via two-hop
+expansion [28, 32], but this increases traversal cost and still does not exploit the structure of label-set
+relationships. In particular, such methods are largely label-agnostic: they treat the filter as a generic
+predicate rather than explicitly indexing how label sets relate to one another.
+Existing label-aware solutions. To our knowledge, only a limited number of label-aware ANNS
+indices have been proposed, and existing solutions still address only part of the problem. Table 1
+summarizes representative methods in terms of label awareness, query efficiency across predicates,
+update support, and label scalability. Label filter types (i.e., containment/overlap/complex) are
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:3
+formally defined in Section 2.1. Update support and label scalability are assessed from each method’s
+reported behavior.
+A first line of work augments a single graph index with label information. Filtered-DiskANN [19]
+incorporates labels into both index construction and search and supports incremental updates, but
+focuses on overlap filters, performs poorly on containment filters, and does not extend to complex
+predicates. RWalks [5] instead guides retrieval by a hybrid score combining vector proximity with
+label similarity, avoiding a hard admissibility check during expansion; however, it encodes labels
+into vector-like representations, so its index expands substantially with many distinct label types,
+and updates are not explicitly addressed. As reflected in Table 1, both fail to preserve enough edges
+that guide the search from one qualified object to another, and hence struggle with highly selective
+label filters, as shown in our experiments.
+Another line of work adopts a partitioned multi-graph design. Notably, UNG [11] groups objects
+by distinct label sets and builds a separate graph index for each group, which fragments the vector
+space and weakens global navigability. UNG alleviates this with a label navigating graph (LNG)
+connecting related subgraphs, but cross-region connectivity may still be insufficient for queries
+spanning multiple regions, hurting recall. Inserting a new label set may also trigger widespread
+changes in the LNG, slowing down updates.
+A third category materializes filter states, e.g., UniFilter [41] combines an HNSW graph with
+an AND/OR-style graph for label relationships. Targeting containment queries, it caps the size of
+its auxiliary label index, so its memory stays bounded as the label universe grows; the price, as
+reflected in Table 1, is that new labels are only partially absorbed and query performance degrades
+substantially on label-rich datasets.
+Finally, Curator [23] applies an IVF-based index for filtered ANNS under low selectivity, whose
+search effectiveness is weaker than that of graph-based ANNS indices as acknowledged in [23].
+Our solution. We propose DYnamic Label-filtered Approximate Nearest neighbor search (DYLAN),
+an index for label-filtered ANNS with efficient updates. DYLAN supports containment, overlap,
+and complex predicates composed via conjunction and disjunction. In this paper, we assume the
+index fits in main memory, and our implementation is single-threaded.
+Our starting point is simple: organizing data objects in a shared-prefix label trie (efficient for
+label-based filtering), and then materializing graph indices (effective for ANNS) over trie-induced
+subsets of vectors. The challenge, however, is that materializing a graph index for every trie node
+incurs prohibitive space and update costs for a large trie, whereas maintaining graph indices only
+at lower-level (i.e., fine-grained) trie nodes fragments the search space and restricts the global
+navigability required by graph-based ANNS; moreover, updates may substantially change the
+trie structure and invalidate pre-built graph indices. DYLAN therefore builds on three key ideas:
+selective graph materialization, cross-region graph navigation, and threshold-based maintenance of
+shared graph indices.
+Concretely, DYLAN is built in two phases. The first constructs a label trie 𝑇capturing the
+relationships among label sets in the data: each non-root node 𝑢∈𝑇carries a label and a prefix
+formed by the labels on the root-to-𝑢path, each object is assigned to the leaf whose prefix matches
+its label set, and the objects assigned to leaves in the subtree rooted at 𝑢form the trie region of 𝑢.
+The second phase selectively materializes multiple HNSW-style graph indices embedded in 𝑇, rather
+than building one for every trie node. Each object participates in only logarithmically many graph
+indices, keeping the total index size near-linear (Theorem 3.9), while the shared index covering a
+trie region contains at most a constant factor more objects than the region itself, thereby avoiding
+substantial degradation in search efficiency. Intuitively, graph indices near the root capture more
+global vector relationships across broader label regions, whereas those near the leaves preserve
+denser local connectivity among objects with highly similar label sets.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:4
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+Given a query vector q with a label predicate Φ, the filtered search space often spans multiple trie
+regions. DYLAN first identifies a set N of trie nodes whose subtrees jointly cover the filtered object
+set: the regions of containment and overlap predicates are located directly on the trie, whereas a
+complex predicate is recursively decomposed into sub-predicates combined by conjunction or dis-
+junction, whose regions are computed separately and then combined. Searching the corresponding
+graph indices in isolation is ineffective, because the search may become trapped in local optima
+and miss promising candidates in other regions. DYLAN therefore performs a cross-region multi-
+graph search, further exploiting the graph indices at common ancestors of the nodes in N; these
+ancestor-level indices may contain cross-subtree connections that serve as effective bridges across
+otherwise isolated trie regions, restoring the global navigability needed by graph-based ANNS.
+DYLAN also supports dynamic updates. Following common practice in dynamic graph-based
+ANNS indices [22, 41, 43], deletions are handled lazily by marking deleted objects as invalid and
+skipping them during search. Insertions are more challenging: a single insertion may affect multiple
+shared graph indices along the corresponding root-to-leaf path, and an eager strategy would trigger
+the construction of new graph indices or the rebuilding of existing ones. DYLAN therefore adopts
+a threshold-based maintenance scheme, which rebuilds a shared graph index only when its size
+mismatch with the target region exceeds a prescribed threshold, yielding a provably bounded
+amortized insertion cost while preserving the search effectiveness of the maintained indices.
+Extensive experiments on multiple real datasets validate the effectiveness of DYLAN. Our main
+contributions are as follows.
+• We propose the DYLAN index, which introduces a selective graph materialization scheme on a
+label trie for effective label-filtered ANNS, while keeping the index size near-linear.
+• We design a cross-region multi-graph search algorithm that exploits ancestor graph indices to
+bridge fragmented trie regions, balancing query efficiency and accuracy.
+• We develop a threshold-based maintenance scheme for dynamic updates, with a provably bounded
+amortized insertion cost.
+• Extensive experiments show that DYLAN achieves superior query efficiency at similar recall
+levels, with favorable update and indexing costs across multiple datasets for label-filtered ANNS.
+2
+Preliminaries
+2.1
+Problem Definition
+Let 𝑂be a dataset containing 𝑛objects, where each object is represented as a vector in R𝑑. Given
+two vectors p, q ∈R𝑑, let 𝛿(p, q) represent their distance, e.g., Euclidean distance in R𝑑. We define
+nearest neighbor search as follows.
+Definition 2.1 (Nearest Neighbor Search (NNS)). Given an object set 𝑂consisting of 𝑛objects, a
+query vector q ∈R𝑑, and a positive integer 𝑘≤𝑛, the nearest neighbor search returns a set of
+vectors 𝑅∗= {o∗
+1, o∗
+2, . . . , o∗
+𝑘} ⊆𝑂with the top-𝑘smallest distances to q, such that ∀o∗∈𝑅∗, ∀o ∉𝑅∗,
+we have 𝛿(o∗, q) ≤𝛿(o, q).
+Next, we focus on the situation in which each object in 𝑂is further associated with a label set.
+For instance, Figure 1 shows a set of objects 𝑂= {o1, o2, . . . , o6} where each object is associated
+with a set of integer-valued labels, e.g., o1 has a label set {1, 2}.
+We define label-filtered NNS as follows.
+Definition 2.2 (Label-Filtered NNS). Given an object set 𝑂where each object o ∈𝑂is associated
+with a label set 𝑓o, a query is defined as 𝑄= (q, Φ,𝑘), where q ∈R𝑑is a query vector and Φ is a
+label filtering predicate. The label-filtered NNS returns the min(𝑘, |𝑂Φ|)-nearest neighbors to q
+within the subset 𝑂Φ = {o ∈𝑂| 𝑓o |= Φ}, i.e., the objects satisfying the label filter constraint Φ.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:5
+Fig. 1. Example of a label-filtered nearest neighbor search
+In the above definition, a common notion for the filter predicate Φ (e.g., [11]) is Φ ::= cont(𝐹)
+|over(𝐹)|(Φ ∧Φ)|(Φ ∨Φ), which include (i) containment: given a query label set 𝑓𝑞, an object o
+with label set 𝑓o satisfies 𝑓o |= cont(𝑓𝑞) iff 𝑓𝑞⊆𝑓o, and (ii) overlap: 𝑓o |= over(𝑓𝑞) iff 𝑓𝑞∩𝑓o ≠∅. In
+addition, we can combine predicates using logical connectors to form complex filters: Conjunction:
+𝑓o |= (Φ1 ∧Φ2) iff 𝑓o |= Φ1 and 𝑓o |= Φ2; Disjunction: 𝑓o |= (Φ1 ∨Φ2) iff 𝑓o |= Φ1 or 𝑓o |= Φ2. Here Φ1
+and Φ2 can themselves be complex label filters.
+In the example of Figure 1, given a query vector q (represented by a cross) and 𝑘= 2, an NNS on
+𝑂returns o1 and o5, which are closest to q. Meanwhile, given a query label set 𝑓𝑞= {1, 3} and the
+predicate Φ = cont(𝑓𝑞), the label-filtered NNS returns o5 and o6, which are the closest objects to q
+whose label sets contain both query labels 1 and 3. Now consider two query label sets 𝑓𝑞,1 = {3, 6}
+and 𝑓𝑞,2 = {1, 2}, and let Φ = cont(𝑓𝑞,1) ∨cont(𝑓𝑞,2). Then o6 satisfies cont(𝑓𝑞,1), while o1, o2, o5, o6
+satisfy cont(𝑓𝑞,2). Hence, the filtered object set is {o1, o2, o5, o6}, and the label-filtered NNS returns
+the top-𝑘objects from this set, namely o1 and o5.
+Exact NNS in a high-dimensional space is computationally expensive due to the curse of dimen-
+sionality [20]. Hence, approximate nearest neighbor search (ANNS) is widely used [5, 11], which
+offers a tradeoff between query efficiency and result quality (commonly measured by recall). In
+particular, let 𝑅∗be the exact label-filtered NNS result and 𝑅is the ANNS result for the same query.
+We define Recall(𝑅) = |𝑅∩𝑅∗|
+|𝑅∗| , which is |𝑅∩𝑅∗|
+𝑘
+when |𝑂Φ| ≥𝑘.
+2.2
+HNSW
+Among existing ANNS algorithms, graph-based methods [17, 26, 35], notably hierarchical navigable
+small world (HNSW) [26], have demonstrated superior performance in terms of the trade-off
+between query time and accuracy. Given a set 𝑂of 𝑛vectors in R𝑑, it builds a proximity graph
+𝐺, in which each vertex corresponds to a vector in 𝑂and each directed edge connects a pair of
+vertices according to a pre-defined proximity rule under the distance metric 𝛿of Section 2.1. In
+the particular case of HNSW, 𝐺consists of 𝐿layers, each of which contains a proximity graph
+known as a navigable small world (NSW); let 𝐻[𝑖] be the graph at layer 𝑖. The number of vertices
+decreases exponentially from the bottom layer 𝐻[0] to the top layer 𝐻[𝐿−1], and the maximum
+out-degree is 2𝑀at 𝐻[0] and 𝑀at all higher layers, where 𝑀is a system parameter.
+Search. To process an ANNS query q, HNSW starts from an entry vertex in the highest layer
+𝐻[𝐿−1] and iteratively descends the layers, using the vertex closest to q at the current layer as
+the entry point for the next. At the bottom layer 𝐻[0], it performs a greedy search maintaining
+a candidate queue 𝐶of discovered vertices to be expanded and a result queue 𝑊of up to 𝑒𝑓
+closest vertices to q seen so far. At each step, the vertex closest to q is extracted from 𝐶; the search
+terminates once it is farther from q than the farthest vertex in 𝑊, and otherwise its out-neighbors
+are examined and eligible vertices are inserted into both queues, with 𝑊truncated to size 𝑒𝑓.
+Finally, the top-𝑘closest vertices in 𝑊are returned. A larger value of the system parameter 𝑒𝑓
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:6
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+increases the number of vertices visited before termination, leading to higher recall with increased
+query cost, and vice versa.
+Construction and updates. The proximity graph𝐺is built incrementally, by sequentially inserting
+vertices into an initially empty 𝐺. To insert a vertex 𝑢, the algorithm first determines its highest
+level 𝐿𝑢using a truncated geometric distribution, and then inserts 𝑢from level 𝐻[𝐿𝑢] down to
+𝐻[0]. At each level, a greedy layer search with construction parameter 𝑒𝑓𝑐collects a bounded
+candidate set of vertices close to 𝑢, which is then pruned to form the out-neighbor set 𝑁(𝑢) within
+the out-degree limit: candidates are sorted by their distance to 𝑢, and a candidate 𝑣is discarded if it
+is dominated by an already selected 𝑤, i.e., 𝛿(𝑢,𝑤) < 𝛿(𝑢, 𝑣) and 𝛿(𝑣,𝑤) < 𝛿(𝑢, 𝑣). Each selected
+neighbor 𝑣adds 𝑢to 𝑁(𝑣), and 𝑁(𝑣) is pruned in the same way if it exceeds the limit. Since 𝐿𝑢has
+a constant expected value, building an HNSW graph of 𝑛vectors takes 𝑂(𝑛· 𝑐upd) time and 𝑂(𝑛𝑀)
+space, where 𝑐upd denotes the insertion cost of a single vector. Insertions are thus already covered
+by the construction procedure; for deletions, HNSW commonly employs soft deletion, marking a
+vertex as deleted without removing it from the graph structure and skipping it in future searches.
+3
+Our Solution: DYLAN
+Next, we present the proposed DYLAN indexing scheme. Sec. 3.1 introduces the label trie and the
+selective graph materialization scheme. Secs. 3.2 and 3.3 describe the cross-region query processing
+algorithm and the update mechanism based on threshold-based maintenance, respectively. These
+three components correspond to the three core challenges outlined in the introduction: index
+materialization, cross-region navigability, and dynamic maintenance. Table 2 summarizes the
+common notations used in the paper.
+3.1
+Index Structure
+Recall from Sec. 1 that DYLAN organizes objects in a frequency-ordered label trie and selectively
+materializes HNSW-style graph indices over trie-induced subsets: the trie captures how label sets
+relate to one another, while the graph indices preserve vector-space navigability within and across
+the resulting subsets. Materializing a graph index for every trie node, however, would lead to
+prohibitive space and update costs. DYLAN therefore selectively shares graph indices among trie
+nodes, while bounding the additional search space introduced by such sharing. We next describe
+the label trie and the selective graph materialization scheme.
+Label trie. The DYLAN index employs a label trie 𝑇to organize the labels of the given object set 𝑂.
+To avoid confusion, in the following we use different terms to distinguish elements of the trie
+and the HNSW graph: in particular, a node always resides in the trie, whereas a vertex appears in
+the graph.
+Each graph vertex represents an object. In the following, 𝑜𝑖denotes the ID of the object rep-
+resented by a vertex, whereas o𝑖∈R𝑑denotes its corresponding vector. As detailed later, graph
+adjacency lists store only object IDs, while the vectors are stored separately in a global vector array.
+Let L = Ð
+𝑜∈𝑂𝑓𝑜be the label universe, and let freq(𝑙) = |{𝑜∈𝑂| 𝑙∈𝑓𝑜}| denote the frequency of
+label 𝑙. We sort the labels in descending order of frequency and assign them integer IDs 1, 2, . . . , |L|
+accordingly. We further introduce a special terminal label # with frequency zero and treat it as
+larger than every ordinary label ID.
+During trie construction, the labels in each 𝑓𝑜are traversed in increasing ID order, followed by
+the terminal label #.
+This ordering is purely frequency-based and assumes no semantic hierarchy among labels. Then,
+the label trie 𝑇is defined as follows.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:7
+Table 2. Frequently used notations
+Symbol
+Meaning
+𝑂,𝑛
+Given set of objects and its cardinality
+𝑓o
+Label set of object o
+𝛿(𝑢, 𝑣)
+Distance between 𝑢and 𝑣
+Φ, q
+Query label filter and the query vector
+𝑂Φ
+Set of objects whose label sets satisfy Φ
+𝑀
+Maximum out-degree of HNSW (except vertices in the bottom layer
+whose out-degree is 2𝑀)
+𝑒𝑓,𝑒𝑓𝑐
+Size of the candidate set during graph search and graph construction,
+respectively
+𝑇
+Label trie in DYLAN
+𝑂𝑢
+Set of objects falling into the subtree of 𝑢∈𝑇
+𝑁𝐺(𝑣)
+Out-neighbor set of vertex 𝑣in graph index 𝐺
+log_size(𝑢)
+⌊log2 |𝑂𝑢|⌋
+𝑢.𝑝, 𝑢.𝑐ℎ
+Parent and children of node 𝑢∈𝑇
+𝑢.𝑖𝑛𝑑𝑒𝑥
+Trie node whose materialized graph used by 𝑢
+𝑢.chheavy
+Child with the same log_size as node 𝑢∈𝑇
+𝑏𝑒𝑙𝑜𝑛𝑔𝑜,𝑖
+Materialized graph of log size 𝑖that contains 𝑜
+Definition 3.1 (Label trie). Given the label universe L of 𝑂, the label trie 𝑇is a rooted tree whose
+root is unlabeled and carries no ordinary label on its path, whose other internal nodes represent
+ordinary labels in L, and whose leaves represent the terminal label #; ordinary-label IDs strictly
+increase along every root-to-leaf path.
+For a node 𝑢∈𝑇, let prefix(𝑢) ⊆L denote the set of ordinary labels on the path from the
+root to 𝑢, and let 𝑂𝑢denote the objects assigned to leaves in the subtree rooted at 𝑢. Thus, each
+node 𝑢represents a trie region 𝑂𝑢consisting of objects that share prefix(𝑢); this region serves as
+the basic unit for graph materialization described next. We use 𝑢.𝑝to denote the parent of 𝑢, and
+𝑢.𝑐ℎ= {(𝑙,𝑐)} to denote its children, where each pair (𝑙,𝑐) indicates that child 𝑐corresponds to
+label 𝑙.
+Example 3.2. Consider again the object set 𝑂in Fig. 1. Its label universe contains six original
+labels, and we append the special terminal label # to every object’s label set. Fig. 2a shows the label
+trie 𝑇in the DYLAN index. Node 𝑢2, for instance, corresponds to label 2 and 𝑝𝑟𝑒𝑓𝑖𝑥(𝑢2) = {1, 2},
+following the path root-𝑢1-𝑢2. Its parent is 𝑢2.𝑝= 𝑢1, and its two children 𝑢2.𝑐ℎare 𝑢4 (with label 3)
+and 𝑢10 (with terminal label #). Accordingly, 𝑂𝑢2 = {o1, o2, o5, o6}, since the ordered label sequences
+of all four objects begin with labels 1 and 2.
+In particular, o1 and o2 terminate at 𝑢10, while o5 and o6 are assigned to 𝑢8 and 𝑢9, respectively.
+Graph indices integrated in 𝑻. As will be clarified later in Sec. 3.2, given a query label filter Φ,
+we decompose the filtered object set 𝑂Φ into the union of subsets, each corresponding to a subtree
+rooted at a node in 𝑇. Formally, we can find a node set N in 𝑇, where Ð
+𝑢∈N 𝑂𝑢= 𝑂Φ. We then
+aim to assign each node 𝑢∈N a graph index through which all objects in 𝑂𝑢can be searched
+efficiently, while keeping the total index space bounded. Rather than materializing a separate graph
+index for every trie node, DYLAN materializes graph indices only at selected nodes and allows
+other nodes to share them. We bound the additional search space incurred by such sharing using
+the notion of an 𝛼-approximate index.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:8
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+(a)
+(b)
+Fig. 2. The DYLAN index for object set 𝑂in Fig. 1.
+Definition 3.3 (𝛼-Approximate Index). Given a graph index 𝐺built on an object set 𝑂𝐺and a
+target object set 𝑂, we say 𝐺is an 𝛼-approximate index for 𝑂iff. 𝑂⊆𝑂𝐺and |𝑂𝐺|/|𝑂| ≤𝛼.
+Here, 𝛼bounds the size of the indexed object set relative to the target object set. Specifically, if
+𝐺is an 𝛼-approximate index for 𝑂𝑢, then 𝐺contains all objects in 𝑂𝑢and at most 𝛼|𝑂𝑢| vertices in
+total, including at most (𝛼−1)|𝑂𝑢| vertices outside 𝑂𝑢. To bound the number of such additional
+vertices under graph sharing, we group trie nodes by the sizes of their corresponding trie regions.
+For each trie node 𝑢and materialized graph 𝐺, let log_size(𝑢) = ⌊log2 |𝑂𝑢|⌋and log_size(𝐺) =
+⌊log2 |𝑂𝐺|⌋, respectively. If 𝑢is the root or log_size(𝑢) < log_size(𝑢.𝑝), we materialize an HNSW
+index 𝑢.𝐺on 𝑂𝑢and set 𝑢.𝑖𝑛𝑑𝑒𝑥= 𝑢. Otherwise, we set 𝑢.𝑖𝑛𝑑𝑒𝑥= 𝑢.𝑝.𝑖𝑛𝑑𝑒𝑥, so that 𝑢shares the
+graph index assigned to its parent. Here, 𝑢.𝑖𝑛𝑑𝑒𝑥points to the trie node whose materialized graph
+is assigned to 𝑢; hence, 𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺denotes the graph index used to search 𝑂𝑢. This design yields
+the following guarantee1.
+Lemma 3.4. For any node𝑢in𝑇, the initial graph index𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺built by Alg. 1 is a 2-approximate
+index for 𝑂𝑢.
+By Lem. 3.4 and Def. 3.3, the initially constructed index 𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺contains all objects in 𝑂𝑢
+and at most 2|𝑂𝑢| vertices in total, i.e., at most |𝑂𝑢| additional vertices outside 𝑂𝑢. After dynamic
+insertions, this local bound is relaxed to 4|𝑂𝑢|, as will be established in Thm. 3.15. To record graph
+sharing in the trie, if a child 𝑐of node 𝑢satisfies log_size(𝑐) = log_size(𝑢), then 𝑐.𝑖𝑛𝑑𝑒𝑥= 𝑢.𝑖𝑛𝑑𝑒𝑥,
+and we set 𝑢.𝑐ℎheavy = 𝑐. Such a child is unique, as stated below.
+Lemma 3.5. For any node 𝑢in the trie𝑇, there exists at most one child 𝑐of 𝑢such that log_size(𝑐) =
+log_size(𝑢).
+Although an object may appear as a vertex in multiple materialized graph indices, its vector
+is stored only once. As illustrated in Fig. 3, DYLAN uses a separated memory layout, in which
+graph adjacency lists store only neighbor object IDs, while all vectors are stored in a global vector
+1All proofs can be found in Appendix B.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:9
+Fig. 3. Memory Layout of DYLAN.
+array. This additional level of indirection may incur extra memory accesses during graph traversal.
+However, our experiments on HNSW show that it has negligible impact (less than 1%) on query
+performance. See Appendix A.6 for details.
+Example 3.6. Continuing Fig. 2, we have |𝑂𝑢1| = 6 and |𝑂𝑢3| = 2, giving log_size(𝑢1) = 2
+and log_size(𝑢3) = 1. Since 𝑢1 = 𝑢3.𝑝and their logarithmic sizes differ, we materialize 𝑢3.𝐺on
+𝑂𝑢3. In contrast, 𝑢11 has the same logarithmic size as its parent 𝑢3 and therefore shares 𝑢3.𝐺, i.e.,
+𝑢11.𝑖𝑛𝑑𝑒𝑥= 𝑢3.𝑖𝑛𝑑𝑒𝑥= 𝑢3 and 𝑢3.𝑐ℎheavy = 𝑢11. As illustrated in Fig. 3, although 𝑜6 appears in
+multiple materialized graphs, its vector o6 is stored only once in the global vector array and retrieved
+through its object ID. Note that in each example we only show the layer 0 of each graph index.
+Auxiliary structures. To efficiently access the selectively materialized graphs during query
+processing, DYLAN maintains two auxiliary structures. For each object ID 𝑜, an array 𝑏𝑒𝑙𝑜𝑛𝑔𝑜,𝑖
+points to the materialized graph 𝑢.𝐺with log _𝑠𝑖𝑧𝑒(𝑢) = 𝑖that contains 𝑜as a vertex, or is null if
+no such graph exists.
+We also maintain an inverted list 𝐼𝑙for each label 𝑙: if the edge from a node 𝑢to its child 𝑐is
+labeled 𝑙, then 𝑐is inserted into 𝐼𝑙. During query processing, 𝑏𝑒𝑙𝑜𝑛𝑔locates the graphs containing a
+given object and 𝐼𝑙locates the trie nodes reachable by label 𝑙(Sec. 3.2).
+Example 3.7. Continuing Figs. 2 and 3, one can check that 𝐼4 = {𝑢3,𝑢5} and 𝐼5 = {𝑢6}, while
+𝑏𝑒𝑙𝑜𝑛𝑔records the materialized graphs containing 𝑜5: 𝑢5.𝐺, 𝑢4.𝐺, and 𝑅𝑜𝑜𝑡.𝐺.
+Base index construction. Alg. 1 inserts all objects into the label trie and updates the inverted lists
+(Lines 1–3 and 10–18), then recursively materializes or shares graph indices according to log _𝑠𝑖𝑧𝑒,
+updating 𝑏𝑒𝑙𝑜𝑛𝑔and the heavy-child pointers (Lines 19–29).
+Connectivity enhancement. Finally, we apply supplementEdges as an additional connectivity
+enhancement (Lines 5–8 and 30–35). For an object 𝑜with fewer than 2𝑀bottom-layer neighbors in
+𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺, supplementEdges fills the missing slots using nearby objects sharing label 𝑙(Lines 5–8
+and 30–35). For 𝑘′ missing edges, it uses search parameter ⌊𝑒𝑓𝑐𝑘′/(2𝑀)⌋and is applied only to
+the first 𝑙th = 𝑂(log𝑛) labels. Supplemented neighbors are stored as object-ID references rather
+than vertices of 𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺; hence, they do not change 𝑂𝐺or its approximation bound, and 𝑏𝑒𝑙𝑜𝑛𝑔
+locates their resident graphs when expanded.
+Lem. 3.8 and Thm. 3.9 give the time and space bounds of Alg. 1.
+Lemma 3.8. For an object 𝑜, there are O(min{|𝑓𝑜|, log𝑛}) distinct nodes 𝑢in the label trie 𝑇such
+that 𝑢.𝑖𝑛𝑑𝑒𝑥= 𝑢and 𝑜∈𝑂𝑢.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:10
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+Algorithm 1: DYLAN index construction
+Input: Object set 𝑂with label set L, HNSW parameters 𝑀and 𝑒𝑓𝑐
+Output: Root node of the DYLAN index
+1 Create an empty trie 𝑇with 𝑅𝑜𝑜𝑡; initialize 𝐼and 𝑏𝑒𝑙𝑜𝑛𝑔as empty
+2 for o ∈𝑂do
+3
+𝑓o ←𝑓o ∪{#}, TrieInsert(𝑅𝑜𝑜𝑡, o)
+4 buildGraph(𝑅𝑜𝑜𝑡,𝑂, 𝑀,𝑒𝑓𝑐)
+5 for 𝑙←1 to 𝑙𝑡ℎdo
+6
+for 𝑢∈𝐼𝑙do
+7
+for 𝑜∈𝑂𝑢do
+8
+supplementEdges(𝑇, 𝐼,𝑙,𝑜,𝑢, 𝑀,𝑒𝑓𝑐)
+9 return Root
+10 procedure TrieInsert(𝑅𝑜𝑜𝑡,o):
+11
+Initialize node 𝑢←𝑅𝑜𝑜𝑡
+12
+for 𝑖𝑑𝑥←1 to |𝑓o| do
+13
+if (𝑙,𝑐) ∈𝑢.𝑐ℎ,𝑙= 𝑓o[𝑖𝑑𝑥] then
+14
+Create new child 𝑐, and set its parent 𝑐.𝑝←𝑢
+15
+𝐼𝑓o [𝑖𝑑𝑥] ←𝐼𝑓o [𝑖𝑑𝑥] ∪{𝑐}
+16
+𝑢.𝑐ℎ←𝑢.𝑐ℎ∪{(𝑓o[𝑖𝑑𝑥],𝑐)}
+17
+𝑢←the child of 𝑢corresponding to 𝑓o[𝑖𝑑𝑥]
+18
+assign o to 𝑢
+19 procedure buildGraph(𝑢, 𝑂𝑢, 𝑀, 𝑒𝑓𝑐):
+20
+if 𝑢= 𝑅𝑜𝑜𝑡or log_size(𝑢) < log_size(𝑢.𝑝) then
+21
+for o ∈𝑂𝑢do
+22
+HNSWInsert(𝑢.𝐺, o, 𝑀,𝑒𝑓𝑐)
+23
+𝑏𝑒𝑙𝑜𝑛𝑔o,log_size(𝑢) ←𝑢.𝐺
+24
+𝑢.𝑖𝑛𝑑𝑒𝑥←𝑢
+25
+else
+26
+𝑢.𝑖𝑛𝑑𝑒𝑥←𝑢.𝑝.𝑖𝑛𝑑𝑒𝑥
+27
+𝑢.𝑝.𝑐ℎheavy ←𝑢
+28
+for (𝑙,𝑐) ∈𝑢.𝑐ℎdo
+29
+buildGraph(𝑐,𝑂𝑐, 𝑀,𝑒𝑓𝑐)
+30 procedure supplementEdges(𝑇, 𝐼, 𝑙, 𝑜, 𝑢, 𝑀, 𝑒𝑓𝑐):
+31
+𝑘′ ←2𝑀−|𝑁𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺(𝑜)| // only the bottom layer
+32
+if 𝑘′ > 0 then
+33
+𝐶←Alg. 4(𝑇, 𝐼, (o,𝑐𝑜𝑛𝑡({𝑙})), 𝑀, ⌊𝑒𝑓𝑐∗𝑘′
+2𝑀
+⌋, ⌊𝑒𝑓𝑐∗𝑘′
+2𝑀
+⌋)
+34
+𝑁′ ←Prune(𝑜,𝑘′,𝐶\ (𝑁𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺(𝑜) ∪{𝑜}))
+35
+𝑁𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺(𝑜) ←𝑁𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺(𝑜) ∪𝑁′
+Theorem 3.9. Alg. 1 takes O(𝑛log𝑛+ Í
+o∈𝑂(𝑀· min{|𝑓𝑜|, log𝑛} + |𝑓𝑜|)) space and O(𝑛log𝑛+
+Í
+o∈𝑂|𝑓𝑜| + Í
+o∈𝑂min{|𝑓𝑜|, log𝑛}(𝑐𝑢𝑝𝑑+ 𝑐𝑞)) time to build the DYLAN index, where 𝑐𝑢𝑝𝑑is the cost
+of inserting an object into the HNSW graph and 𝑐𝑞is the cost of a query in DYLAN.
+3.2
+Query Processing
+Query processing consists of three steps. First, given a filter Φ, we identify a set N of trie nodes
+whose corresponding trie regions 𝑂𝑢form an exact disjoint cover of 𝑂Φ. Second, since the graph
+indices associated with these trie nodes may be disconnected, we augment them with graph indices
+from selected common ancestors, obtaining a graph set G that improves cross-region connectivity.
+Finally, we jointly traverse the graphs in G and apply Φ to filter the visited objects. We describe
+these three steps below.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:11
+Algorithm 2: Disjoint cover set & graph index set retrieval
+Input: Label trie 𝑇, inverted list 𝐼, query label filter Φ
+1 N ←complexSearch(𝑇, 𝐼, Φ); G ←∅
+2 for 𝑢∈N do
+3
+G ←G ∪{𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺}
+4
+for 𝑎∈ancestors of 𝑢do
+5
+if 𝑎is a key ancestor of N then
+6
+G ←G ∪{𝑎.𝑖𝑛𝑑𝑒𝑥.𝐺}
+7 return N, G
+8 function contSearch(𝑇, 𝐼, 𝑓𝑞):
+9
+N ←∅; 𝑙←𝑚𝑎𝑥{𝑓q}
+10
+for 𝑢∈𝐼𝑙do
+11
+if 𝑓𝑞⊆𝑝𝑟𝑒𝑓𝑖𝑥(𝑢) then
+12
+N ←N ∪{𝑢}
+13
+return N
+14 function overSearch(𝑇, 𝐼, 𝑓𝑞):
+15
+N ←∅
+16
+for 𝑙∈𝑓𝑞do
+17
+for 𝑢∈𝐼𝑙do
+18
+if 𝑝𝑟𝑒𝑓𝑖𝑥(𝑢) ∩(𝑓𝑞\ {𝑙}) = ∅then
+19
+N ←N ∪{𝑢}
+20
+return N
+21 function complexSearch(𝑇, 𝐼, Φ):
+22
+N ←∅
+23
+if Φ is (Φ0 ∧Φ1) or (Φ0 ∨Φ1) then
+24
+N0 ←complexSearch(𝑇, 𝐼, Φ0)
+25
+N1 ←complexSearch(𝑇, 𝐼, Φ1)
+26
+for 𝑖∈{0, 1} do
+27
+for 𝑢∈N𝑖do
+28
+𝐴𝑢←ancestors of 𝑢
+29
+if Φ = Φ0 ∧Φ1 and ({𝑢} ∪𝐴𝑢) ∩N1−𝑖≠∅then
+30
+N ←N ∪{𝑢}
+31
+if Φ = Φ0 ∨Φ1 and 𝐴𝑢∩N1−𝑖= ∅then
+32
+N ←N ∪{𝑢}
+33
+return N
+34
+else
+35
+if Φ is 𝑐𝑜𝑛𝑡(𝑓𝑞) then return contSearch(𝑇, 𝐼, 𝑓𝑞)
+36
+if Φ is 𝑜𝑣𝑒𝑟(𝑓𝑞) then return overSearch(𝑇, 𝐼, 𝑓𝑞)
+Disjoint cover computation. Given a label filter Φ, we first identify a set N of trie nodes whose
+corresponding trie regions are pairwise disjoint and collectively cover all qualifying objects in 𝑂Φ.
+Definition 3.10 (Disjoint Cover Set). A node set N (N ⊆𝑇) is a disjoint cover set of a label filter
+Φ if its corresponding trie regions form a partition of 𝑂Φ, i.e., Ð
+𝑢∈N 𝑂𝑢= 𝑂Φ and 𝑂𝑢𝑖∩𝑂𝑢𝑗=
+∅for all 𝑖≠𝑗and 𝑢𝑖,𝑢𝑗∈N.
+The disjoint cover N identifies the exact trie regions for Φ. For each 𝑢∈N, DYLAN searches
+𝑂𝑢through 𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺, which remains a 2-approximate index for 𝑂𝑢initially by Lem. 3.4, and a
+4-approximate one after dynamic insertions by Thm. 3.15.
+Alg. 2 computes N (Lines 8–36). For containment, it scans 𝐼𝑙for 𝑙= max 𝑓𝑞, the query label with
+the largest ID and hence the least frequent one under the build-time ordering, and retains 𝑢iff 𝑓𝑞⊆
+prefix(𝑢) (Lines 9–13). For overlap, it scans 𝐼𝑙for each𝑙∈𝑓𝑞and retains𝑢iff prefix(𝑢)∩(𝑓𝑞\{𝑙}) = ∅,
+which removes nested duplicates and yields an exact disjoint cover (Lines 15–20). For a complex
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:12
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+Algorithm 3: Multi-Graph Search
+Input: Label trie 𝑇, disjoint cover set N, graph index set G, query (q, Φ), HNSW parameters 𝑀and 𝑒𝑓
+1 𝑒𝑛𝑡𝑟𝑖𝑒𝑠←∅
+2 for 𝑢∈N do
+3
+𝑒𝑛𝑡𝑟𝑖𝑒𝑠←𝑒𝑛𝑡𝑟𝑖𝑒𝑠∪{HNSW_entry(𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺, q)}
+4 Set 𝐶←−𝑒𝑛𝑡𝑟𝑖𝑒𝑠and mark all vertices in 𝑒𝑛𝑡𝑟𝑖𝑒𝑠as visited
+5 𝑊←up to the 𝑒𝑓closest qualifying vertices in 𝑒𝑛𝑡𝑟𝑖𝑒𝑠to q
+6 Denote 𝑊𝑚𝑎𝑥as the current farthest vertex in 𝑊to q. If 𝑊= ∅, define 𝛿(𝑊𝑚𝑎𝑥, q) = +∞
+7 while |𝐶| > 0 do
+8
+𝑣←−extract nearest vertex to q in 𝐶;
+9
+if |𝑊| = 𝑒𝑓and 𝛿(v, q) > 𝛿(𝑊𝑚𝑎𝑥, q) then break
+10
+𝑀cnt ←0
+11
+for 𝑖←log_size(𝑅𝑜𝑜𝑡) downto 0 do
+12
+if 𝑏𝑒𝑙𝑜𝑛𝑔𝑣,𝑖≠𝑁𝑈𝐿𝐿and 𝑏𝑒𝑙𝑜𝑛𝑔𝑣,𝑖∈G then
+13
+𝐺←𝑏𝑒𝑙𝑜𝑛𝑔𝑣,𝑖[0] // only use the bottom layer
+14
+for 𝑤∈𝑁𝐺(𝑣) do
+15
+if 𝑤is not visited then
+16
+Mark 𝑤as visited
+17
+if 𝑓𝑤|= Φ then
+18
+𝑀cnt ←𝑀cnt + 1
+19
+if |𝑊| < 𝑒𝑓or 𝛿(w, q) < 𝛿(𝑊𝑚𝑎𝑥, q) then
+20
+𝐶←−𝐶∪{𝑤}, 𝑊←−𝑊∪{𝑤}
+21
+if |𝑊| > 𝑒𝑓then 𝑊←𝑊\ {𝑊𝑚𝑎𝑥}
+22
+if 𝑀cnt ≥2𝑀then break
+23
+if 𝑀cnt ≥2𝑀then break
+24 return W
+predicate, the algorithm recursively computes the two covers. Since trie regions are either nested or
+disjoint, conjunction keeps the smaller region in each overlapping pair, whereas disjunction keeps
+the larger one (Lines 24–32). The recursion ends at containment or overlap predicates (Lines 35–36).
+Key-ancestor graph selection. Once the disjoint cover set N is computed, it is still challenging
+to process the query. For each node 𝑢∈N, the 𝛼-approximate guarantee ensures that 𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺
+contains all objects in 𝑂𝑢while introducing only a constant-factor amount of additional search
+space. Thus, the selected graph indices primarily serve to maintain search quality. However, these
+graphs may be disconnected. A naive approach is to perform a separate ANN search on each graph
+and subsequently merge the results, which is inefficient as the cost grows with the number of
+nodes in N. Another approach is to perform a single HNSW search over all graphs with a shared
+priority queue initialized with the entry point of each graph. However, in the absence of connecting
+edges between different graphs, the search may become trapped in one graph and overlook closer
+candidates in other regions.
+The composite structure of DYLAN provides a natural solution to this problem. In particular,
+if nodes in N occur in the subtrees rooted at two or more distinct children of a trie node 𝑎, the
+HNSW graph associated with 𝑎may contain edges spanning these child subtrees.
+Such edges can connect otherwise isolated graph indices and guide the search across different
+coverage regions. We refer to selected common ancestors that provide such cross-region connectivity
+as key ancestor nodes, defined below.
+Definition 3.11 (Key Ancestor Node). Given a disjoint cover N, a trie node 𝑎is a key ancestor if
+nodes in N occur in the subtrees rooted at two or more distinct children of 𝑎.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:13
+Algorithm 4: DYLAN-Query
+Input: Label trie 𝑇, inverted index 𝐼, query (q, Φ), HNSW parameters 𝑀, search parameters 𝑒𝑓and 𝑘
+1 N, G ←Algorithm 2(𝑇, 𝐼, Φ);
+2 𝑟𝑒𝑠𝑢𝑙𝑡𝑠←Algorithm 3(𝑇, N, G, (q, Φ), 𝑀,𝑒𝑓);
+3 return the top-𝑘objects in 𝑟𝑒𝑠𝑢𝑙𝑡𝑠
+By Lem. 3.4, 𝑎.𝑖𝑛𝑑𝑒𝑥.𝐺contains all objects in 𝑂𝑎. It therefore includes objects from the distinct
+child subtrees containing these cover nodes and may contain edges that bridge their search spaces.
+Note that this constant-factor bound applies separately to the graph assigned to each selected trie
+region to ensure search quality, rather than to the union of all graphs in G. Therefore, it does not
+bound the total number of vertices visited during multi-graph search.
+Alg. 2 first computes the disjoint cover set N and initializes the graph index set G (Line 1). It then
+adds the graph assigned to each cover node (Lines 2–3) and the graphs assigned to key ancestors
+encountered during the upward traversals (Lines 4–6). The resulting graph index set G, together
+with N, is returned in Line 7 for the multi-graph search to be explained shortly. During the upward
+traversals, we record for each visited ancestor the child subtree from which it is first reached; the
+ancestor is marked as a key ancestor once it is reached from a second child subtree.
+Theorem 3.12. Alg. 2 runs in O Í
+𝑢∈𝐼𝑙max |prefix(𝑢)|
+time for a containment query,
+O Í
+𝑙∈𝑓𝑞
+Í
+𝑢∈𝐼𝑙|prefix(𝑢)| for an overlap query, and O Í
+𝑙∈LΦ
+Í
+𝑢∈𝐼𝑙|prefix(𝑢)| · |Φ| for a
+complex query, where 𝑙max is the query label with the largest ID, LΦ the set of labels appearing in Φ,
+and |Φ| the number of containment and overlap predicates in Φ.
+Example 3.13. Revisiting the example in Fig. 2, suppose the predicate Φ is overlap, with label set
+𝑓q = {4, 5}, meaning that the result objects must contain either label 4 or 5. Using inverted lists,
+we locate nodes 𝑢3, 𝑢5 (both corresponding to label 4), 𝑢6 (label 5). Since these nodes have disjoint
+subtrees of trie 𝑇, they form a disjoint cover set N = {𝑢3,𝑢5,𝑢6}. Then we identify 𝑢4 and 𝑢1 as key
+ancestor nodes for N = {𝑢3,𝑢5,𝑢6}. We add 𝑢4.𝐺and Root.𝐺(since 𝑢1.𝑖𝑛𝑑𝑒𝑥= 𝑅𝑜𝑜𝑡) to the index
+set G. Observe that graph indices of 𝑢5, 𝑢6, and 𝑢3 in N are isolated; meanwhile, the edge from 𝑜5
+to 𝑜3 in Root.𝐺and the edge from 𝑜5 to 𝑜6 in 𝑢4.𝐺connect the three isolated indices, improving
+search effectiveness, explained next.
+Multi-graph search. Given the disjoint cover N and graph index set G, we jointly search selected
+graphs with Alg. 3. We first use upper layers of 𝑢.𝑖𝑛𝑑𝑒𝑥.𝐺for each 𝑢∈N to obtain entry points of
+layer 0 (Lines 1–3). The entry points initialize the candidate queue 𝐶, while their qualifying subset
+initializes the result queue 𝑊(Lines 4–6). As in standard HNSW search, we repeatedly expand the
+candidate 𝑣closest to the query. Once 𝑊contains 𝑒𝑓vertices, the search ends when 𝑣is farther
+than the current farthest vertex 𝑊max in 𝑊(Lines 7–9).
+For each expanded vertex 𝑣, we traverse its graphs in G, identified by 𝑏𝑒𝑙𝑜𝑛𝑔, in descending
+order of logarithmic size (Lines 11–23).
+For each unvisited neighbor 𝑤, we first check if 𝑓𝑤|= Φ. Only qualifying neighbors trigger vector
+access and distance computation, and are inserted into 𝐶and 𝑊when appropriate (Lines 14–21).
+As G also contains key-ancestor graphs, the traversal can follow bridge edges across different trie
+regions. To limit excessive expansion, we stop expanding 𝑣once 𝑀cnt ≥2𝑀(Lines 22–23), where
+𝑀cnt counts examined neighbors satisfying Φ.
+Example 3.14. In Fig. 3, suppose that object ID 𝑜5 is being expanded. The 𝑏𝑒𝑙𝑜𝑛𝑔array identifies
+the selected graphs containing 𝑜5, including 𝑅𝑜𝑜𝑡.𝐺. When the neighbor ID 𝑜6 is encountered in
+𝑅𝑜𝑜𝑡.𝐺, we first test whether 𝑓𝑜6 |= Φ. If so, 𝑜6 is used to retrieve its vector o6 from the global vector
+array for distance computation.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:14
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+(a)
+(b)
+(c)
+Fig. 4. An example of the object insertion in the DYLAN index from Fig. 2.
+Algorithm 5: DYLAN-Insert
+Input: object o, label set 𝑓o, HNSW construction parameters 𝑀, 𝑒𝑓𝑐
+1 𝑓o ←𝑓o ∪{#}
+2 TrieInsert(𝑅𝑜𝑜𝑡, o)
+3 𝑢←𝑅𝑜𝑜𝑡
+4 for 𝑖𝑑𝑥←1 to |𝑓o| + 1 do
+5
+if 𝑢is newly created then initialize graph assignment of 𝑢;
+6
+if 𝑢.𝑖𝑛𝑑𝑒𝑥= 𝑢then
+7
+if o ∉𝑢.𝐺then HNSWInsert(𝑢.𝐺, o, 𝑀,𝑒𝑓𝑐);
+8
+if |𝑂𝑢| > 1 and log_size(𝑢) ≠⌊log2 (|𝑂𝑢| −1)⌋then
+9
+if 𝑢.𝑐ℎheavy ≠𝑁𝑈𝐿𝐿then
+10
+𝑢.𝑐ℎheavy.𝐺←CopyGraph(𝑢.𝐺)
+11
+𝑐←𝑢.𝑐ℎheavy
+12
+changeIndexNode(𝑐)
+13
+if log_size(𝑐.𝐺) > log_size(𝑐) + 1 then
+14
+Rebuild(𝑐.𝐺,𝑂𝑐)
+15
+𝑢.𝑐ℎheavy ←𝑁𝑈𝐿𝐿
+16
+if 𝑢≠𝑅𝑜𝑜𝑡and log_size(𝑢) = log_size(𝑢.𝑝) then
+17
+DestroyGraph(𝑢.𝐺)
+18
+𝑢.𝑝.𝑐ℎheavy ←𝑢; 𝑢.𝑖𝑛𝑑𝑒𝑥←𝑢.𝑝.𝑖𝑛𝑑𝑒𝑥
+19
+update 𝑏𝑒𝑙𝑜𝑛𝑔
+20
+if 𝑖𝑑𝑥> 1 and 𝑓o[𝑖𝑑𝑥−1] ≤𝑙𝑡ℎthen
+21
+supplementEdges(𝑇, 𝐼, 𝑓o[𝑖𝑑𝑥−1],𝑜,𝑢, 𝑀,𝑒𝑓𝑐)
+22
+if 𝑖𝑑𝑥≤|𝑓𝑜| then
+23
+𝑢←the child node of 𝑢corresponding to 𝑓o[𝑖𝑑𝑥];
+The complete query procedure (Alg. 4) first invokes Alg. 2 to obtain the disjoint cover set N and
+graph set G. It then runs Alg. 3 and returns the top-𝑘objects in the resulting queue.
+Multi-threading extension. Although our current implementation is single-threaded, query
+processing extends naturally to parallel execution: different queries are independent and can be
+processed concurrently without modifying the index, and within a query, the entry-point searches
+over different cover nodes’ graph indices can also run in parallel. Parallelizing the joint multi-graph
+traversal would require synchronizing shared search states such as the candidate and result queues,
+which we leave as future work.
+3.3
+Index Update
+Updating the DYLAN index requires keeping the graph index at each label trie node up-to-date.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:15
+Table 3. Summary of datasets in the experiments.
+Dataset
+Vector Type
+Dim.
+# Vector
+# Query
+Attribute Type
+|L|
+|𝑓𝑜|
+Avg. Selectivity
+|𝑟|
+Med.
+P90
+Max
+containment
+overlap
+TripClick
+text
+768
+1,055,976
+1000
+clinical area
+29
+1
+2
+8
+0.07
+0.19
+0.0055
+LAION1M
+image
+512
+1,000,448
+1000
+entities, locations, etc
+30
+2
+2
+3
+0.09
+0.19
+0.0428
+YFCC
+image
+192
+1,000,000
+1000
+classes
+181,931
+6
+16
+1332
+0.038
+0.19
+0.0217
+YTB-Audio
+audio
+128
+5,000,000
+1000
+classes
+3862
+3
+5
+23
+0.09
+0.19
+0.0009
+YTB-Video
+video
+1024
+1,000,000
+200
+classes
+3862
+3
+5
+21
+0.09
+0.19
+0.0206
+Yelp1M
+text chunk
+384
+1,000,000
+1000
+business categories
+1,227
+5
+9
+36
+0.09
+0.19
+0.4791
+For deletions, as in most ANNS indices such as HNSW described in Sec. 2.2, we apply soft
+deletion and simply mark the corresponding vertices as invalid, which are skipped during search.
+We therefore focus on insertions, which trigger non-trivial index maintenance. The insertion of an
+object o includes three main steps: (i) insert o into the label trie 𝑇, (ii) update the affected graph
+indices along the insertion path in𝑇, and (iii) adjust the graph index used by each node, and rebuild
+an index if it becomes insufficiently effective for its associated node.
+The first two steps update the existing trie and graph structures locally. For (i), all operations
+are lightweight, using only O(|𝑓𝑜|) time, where |𝑓𝑜| is the number of labels in 𝑜. For step (ii), since
+an object belongs to at most 𝑂(min{|𝑓𝑜|, log𝑛}) graphs, the cost is bounded by 𝑂(min{|𝑓𝑜|, log𝑛} ·
+(𝑐upd + 𝑐𝑞)), where 𝑛is the number of objects in the dataset 𝑂, 𝑐upd is the cost for inserting an
+object into an HNSW index, and 𝑐𝑞is the cost of a query in DYLAN.
+The main challenge lies in the third step, where the size change of an affected subtree may
+alter its log_size and hence its graph-sharing relationship. Adjusting this relationship may involve
+expensive index rebuilding. To avoid rebuilding an index immediately after every such change, we
+adopt a threshold-based maintenance strategy: we allow the effective index for each node to be a
+4-approximate index (see Def. 3.3). By tolerating a slightly weaker index guarantee, we postpone
+expensive rebuilds until the accumulated changes exceed a threshold. The cost of rebuilding is
+then amortized over later updates, which bounds the amortized time complexity per insertion to
+O |𝑓𝑜|𝑀+ min{|𝑓𝑜|, log𝑛} · (𝑐upd + 𝑐𝑞).
+Alg. 5 appends # and inserts𝑜into the trie (Lines 1–2), then traverses its root-to-leaf path (Lines 4–
+23). We omit the straightforward auxiliary routines: CopyGraph, Rebuild, and DestroyGraph
+copy, rebuild, and release a graph, while changeIndexNode redirects affected 𝑖𝑛𝑑𝑒𝑥pointers;
+𝑏𝑒𝑙𝑜𝑛𝑔is updated in Line 19.
+New nodes follow the materialization rule (Line 5), and𝑜is inserted into each graph it materializes
+(Lines 6–7). If log_size(𝑢) increases, 𝑢.𝐺is copied to its heavy child 𝑐and the affected pointers
+are redirected. Because the copy may contain objects outside 𝑂𝑐, it is rebuilt on 𝑂𝑐only when
+log_size(𝑐.𝐺) > log_size(𝑐) + 1 (Lines 8–15). If log_size(𝑢) = log_size(𝑢.𝑝), 𝑢instead shares its
+parent’s graph; we therefore destroy 𝑢.𝐺and update the pointers and 𝑏𝑒𝑙𝑜𝑛𝑔entries (Lines 16–19).
+Finally, we supplement edges (Lines 20–21).
+The following theorem shows the efficiency of Alg. 5 and the validity of the index structure.
+Theorem 3.15. Alg. 5 inserts each new object in amortized O |𝑓𝑜|𝑀+ min{|𝑓𝑜|, log𝑛}(𝑐upd + 𝑐𝑞)
+time while ensuring that for each node 𝑢, the associated index remains a 4-approximate index for 𝑂𝑢.
+Example 3.16. Consider again the index in Fig. 2 and insert 𝑜7 with label set {1, 2, 3, 5}. In Fig. 4(b),
+𝑜7 enters the trie, the graph indices along its path (𝑅𝑜𝑜𝑡.𝐺, 𝑢4.𝐺, 𝑢6.𝐺) are updated, and the new
+node 𝑢12 gets its graph assignment. This raises |𝑂𝑢6| to 2, changing log_size(𝑢6), so we adjust
+the assignments as in Fig. 4(c): 𝑢6.𝐺is copied to its heavy child 𝑢7, with 𝑢7.𝑖𝑛𝑑𝑒𝑥and 𝑢9.𝑖𝑛𝑑𝑒𝑥
+redirected to 𝑢7; meanwhile 𝑢6 now matches its parent 𝑢4 in log_size, so 𝑢6.𝐺is removed, 𝑢6.𝑖𝑛𝑑𝑒𝑥
+points to 𝑢4, and 𝑢6 becomes the heavy child of 𝑢4. The copied 𝑢7.𝐺may temporarily hold vertices
+outside 𝑂𝑢7; these are retained until the logarithmic-size gap reaches the threshold.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:16
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+New labels and frequency drift. A label unseen at build time does not restructure the trie: it is
+assigned the next available ID upon its first insertion, and since this ID is the largest so far, it is
+traversed last in 𝑓o, so the insertion path follows existing nodes over the previously seen labels
+and branches off only near the leaf. Existing IDs are never reassigned, and the terminal symbol #
+ranks after every ordinary label, so the ordering invariant of Def. 3.1 is preserved. However, the
+frequency order drifts from the true frequencies as updates accumulate, which affects efficiency
+only, not correctness: the label trie and the disjoint cover computation of Sec. 3.2 are exact under
+any ordering, which serves solely to place frequent labels near the root, where larger trie regions
+admit more graph sharing. Drift has two effects: contSearch selects max{𝑓𝑞} as the least frequent
+query label (Alg. 2, Line 9), so a frequent new label makes this choice suboptimal and widens the
+scan of 𝐼𝑙; and frequent labels placed deep in the trie make it bushier, increasing trie space. Both
+effects remain mild in our experiments (Figs. 23–24). If desired, rebuilding whenever 𝑛doubles
+refreshes the ordering and amortizes to the same order as Thm. 3.15.
+4
+Experiments
+We compare our DYLAN with state-of-the-art label-filtered ANNS methods. DYLAN is implemented
+in C++, and all optimizations are enabled for competitor code. All indices reside in memory, and all
+experiments are conducted single-threaded on a Linux machine with an Intel Xeon Gold 5320 CPU
+@ 2.20GHz and 1TB memory.
+Datasets. The experiments involve six real datasets. Five of them, together with their query settings,
+are taken from the filtered-ANNS benchmark [33], which is widely tested in related research for
+filtered ANNS [5, 11, 28, 32]: (i) TripClick [30], a large-scale health information retrieval dataset
+comprising click logs from the Trip Database health web search engine; (ii) LAION1M [31], a
+publicly available dataset of CLIP-filtered [29] image-text pairs; (iii) YFCC [36], a 1M-vector subset
+of YFCC100M containing image/video embeddings and associated labels; and (iv) YTB-Audio and (v)
+YTB-Video [4], a benchmark of millions of videos annotated with thousands of machine-generated
+topical entities. We additionally build (vi) Yelp1M for RAG-style workloads: each review in the
+Yelp Open Dataset [3] is treated as one text chunk, embedded into a 384-dimensional vector using
+all-MiniLM-L6-v2 [39], and labeled with the multi-valued categories of its associated business.
+Table 3 reports the statistics of these 6 datasets. The last column reports |𝑟|, the absolute Pearson
+correlation between the label-set Jaccard similarity and the 𝐿2 distance of 1M randomly sampled
+object pairs per dataset (using distance instead of similarity only flips the sign). A small |𝑟| thus
+indicates that objects with similar label sets are not systematically closer in the vector space.
+4.1
+Experimental Settings
+Evaluation metrics. Following prior work [5, 11, 19], we use queries per second (QPS) to measure
+throughput and recall (defined in Sec. 2.1) to measure result quality, with 𝑘= 10 in all experiments.
+We use 𝑠𝑒𝑙𝑒𝑐𝑡𝑖𝑣𝑖𝑡𝑦(𝑂, Φ) = |𝑂Φ|/|𝑂| to denote the proportion of objects satisfying the filter.
+Query generation. We generate two types of queries for each dataset, with containment and
+overlap label constraints. We first randomly generate candidate query label sets according to label
+frequencies and compute their actual filter selectivities. We bucket the candidates into selectivity
+ranges defined by powers of two and sample queries across these buckets to obtain workloads with
+diverse selectivities while keeping the average selectivity around 0.09 for containment and 0.19
+for overlap. Due to their skewed label distributions, the resulting averages on YFCC and TripClick
+may deviate from these targets.
+Competitors. We include the following methods in our experimental evaluation: (i) ACORN-1
+and ACORN-𝛾[28], (ii) NaviX [32], (iii) Filtered-DiskANN [19], (iv) RWalks [5], (v) UNG [11], (vi)
+UniFilter [41], (vii) Curator [23], (viii) Prefilter (described in Sec. 1), (ix) our DYLAN.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:17
+UNG
+ACORN-1
+ACORN-
+NaviX
+Filtered-DiskANN
+RWalks
+DYLAN 
+Curator
+UniFilter
+Prefilter
+10
+100
+1000
+10000
+ 0.9
+ 1
+QPS
+Recall
+✩
+(a) Containment
+10
+100
+1000
+ 0.9
+ 1
+QPS
+Recall
+✩
+(b) Overlap
+Fig. 5. QPS vs. recall on TripClick.
+10
+100
+1000
+10000
+ 0.9
+ 1
+QPS
+Recall
+✩
+(a) Containment
+10
+100
+1000
+ 0.9
+ 1
+QPS
+Recall
+✩
+(b) Overlap
+Fig. 6. QPS vs. recall on LAION1M.
+10
+100
+1000
+10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(a) Containment
+10
+100
+1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(b) Overlap
+Fig. 7. QPS vs. recall on YFCC.
+10
+100
+1000
+10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(a) Containment
+10
+100
+1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(b) Overlap
+Fig. 8. QPS vs. recall on YTB-Audio.
+10
+100
+1000
+10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(a) Containment
+10
+100
+1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(b) Overlap
+Fig. 9. QPS vs. recall on YTB-Video.
+10
+100
+1000
+10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(a) Containment
+10
+100
+1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(b) Overlap
+Fig. 10. QPS vs. recall on Yelp1M.
+To ensure fair comparisons, we tune the build-time parameters of every method, DYLAN included,
+on every dataset, selecting the configuration with the best QPS at recall 0.9 across both query types.
+The tuning details are given in Appendix A.1. For each method, we then vary its query-time search
+parameter to obtain the recall-QPS tradeoff. Our code is available at [1].
+4.2
+Comparison Results
+Query performance. Figs. 5-10 plot the QPS-recall curves for the 6 datasets in our experiments. We
+report methods that achieve at least 0.9 recall for LAION1M and TripClick. For YFCC, YTB-Audio,
+YTB-Video, and Yelp1M, which are large datasets with many label categories and are therefore more
+challenging, most methods fail to achieve strong performance. Hence, we only report methods that
+achieve at least 0.8 recall. RWalks is excluded from the experiments on YFCC because its memory
+consumption exceeds 1 TB. Prefilter is exact and appears as a single point in the figures. The
+proposed DYLAN consistently yields the best overall performance across all datasets. On datasets
+with relatively few label categories and simple label sets, such as TripClick and LAION1M, DYLAN
+remains highly competitive. At 0.99 recall, it is 5× faster than the best baseline on LAION1M and
+TripClick for containment queries.
+On datasets with more label categories and complex label sets, DYLAN shows a substantial
+advantage over its competitors. YFCC contains a large number of labels with an uneven distribution.
+Other methods perform well only on either containment or overlap queries, but not both. For
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:18
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+UNG
+ACORN-1
+ACORN-
+NaviX
+Filtered-DiskANN
+RWalks
+DYLAN 
+Curator
+UniFilter
+Prefilter
+1
+10
+100
+1000
+1
+2
+3
+4
+5
+QPS
+Selectivity
+✩
+✩
+✩
+✩
+✩
+(a) Containment
+1
+10
+100
+1000
+1
+2
+3
+4
+5
+QPS
+Selectivity
+✩
+✩
+✩
+✩
+✩
+(b) Overlap
+Fig. 11. Impact of selectivity on the LAION1M.
+1
+10
+100
+1000
+2
+3
+4
+5
+6
+QPS
+Selectivity
+✩
+✩
+✩
+✩
+✩
+(a) Containment
+1
+10
+100
+1000
+1
+2
+3
+4
+5
+QPS
+Selectivity
+✩
+✩
+✩
+✩
+✩
+(b) Overlap
+Fig. 12. Impact of selectivity on the YTB-Audio.
+1
+10
+100
+1000
+2
+3
+4
+5
+6
+QPS
+Selectivity
+✩
+✩
+✩
+✩
+✩
+(a) Containment
+1
+10
+100
+1000
+1
+2
+3
+4
+5
+QPS
+Selectivity
+✩
+✩
+✩
+✩
+✩
+(b) Overlap
+Fig. 13. Impact of selectivity on the YTB-Video.
+1
+10
+100
+1000
+1
+2
+3
+4
+5
+QPS
+Selectivity
+✩
+✩
+✩
+✩
+✩
+(a) Containment
+1
+10
+100
+1000
+1
+2
+3
+4
+5
+QPS
+Selectivity
+✩
+✩
+✩
+✩
+✩
+(b) Overlap
+Fig. 14. Impact of selectivity on the Yelp1M.
+UNG
+ACORN-1
+ACORN-
+NaviX
+Filtered-DiskANN
+RWalks
+DYLAN 
+Curator
+UniFilter
+Prefilter
+10
+100
+1000
+10000
+ 0.9
+ 1
+QPS
+Recall
+✩
+(a) TripClick
+10
+100
+1000
+10000
+ 0.9
+ 1
+QPS
+Recall
+✩
+(b) LAION1M
+Fig. 15. Complex predicate.
+example, UNG performs well on containment queries but fails to reach high recall on overlap queries.
+DYLAN handles both query types effectively. On YTB-Audio, DYLAN is consistently faster than the
+fastest baseline, with speedups of 5.7× for containment and 2.3× for overlap at recall at least 0.8; in
+the higher-recall region, the speedups are 43.5× and 8.7× at recall at least 0.95, respectively. On
+the YTB-Video dataset, Curator achieves high QPS at high recall, at a level comparable to DYLAN.
+This is because the YTB-Video dataset is inherently difficult to search; regardless of the index type,
+a large number of vectors must be accessed to achieve high recall. Curator is based on IVF, and
+compared to graph-based methods, it does not incur excessive random access when scanning many
+vectors, resulting in faster performance. Yet, on most other datasets, DYLAN outperforms Curator
+by one to two orders of magnitude; the exception is YFCC, where the speedup over Curator is about
+5×. On Yelp1M, a text/RAG-style workload, DYLAN also consistently outperforms the baselines
+for both containment and overlap queries, demonstrating its effectiveness on text chunks with
+real-world multi-valued category labels.
+Impact of query selectivity. Next, we evaluate the performance of overlap and containment
+queries under varying selectivity levels across all datasets. Note that the label distribution is
+discrete, so we cannot generate a large number of queries with a specific selectivity. For datasets
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:19
+ACORN-1
+ACORN-\(\gamma\)
+NaviX
+DYLAN 
+Filtered-DiskANN
+RWalks
+Curator
+UniFilter
+UNG
+ 0
+ 2
+ 4
+ 6
+ 8
+ 10
+TripClick
+LAION1M
+YFCC
+YTB-Audio
+YTB-Video
+Yelp1M
+index size (GB)
+Fig. 16. Memory cost.
+102
+103
+104
+105
+106
+TripClick
+LAION1M
+YFCC
+YTB-Audio
+YTB-Video
+Yelp1M
+build time (s)
+Fig. 17. Indexing time.
+10-2
+10-1
+100
+101
+102
+103
+TripClick
+LAION1M
+YFCC
+YTB-Audio
+YTB-Video
+Yelp1M
+running time (ms)
+Fig. 18. Insertion time.
+except YTB-Audio and YTB-Video, we generate queries whose selectivity falls into five intervals:
+[2−2, 2−1), [2−3, 2−2), [2−4, 2−3), [2−5, 2−4), and [2−6, 2−5). For YTB-Audio and YTB-Video, where
+label frequencies are generally lower, we create queries in the intervals [2−3, 2−2) to [2−7, 2−6) for
+containment queries. For each interval, we report the QPS achieved at 0.99 recall on TripClick and
+LAION1M. Most baselines struggle to reach high recall on challenging datasets YFCC, YTB-Audio,
+YTB-Video, and Yelp1M. Hence, we report QPS at 0.9 recall for these. Due to the label distributions
+in YFCC and TripClick, it is infeasible to generate containment queries spanning a continuous
+selectivity range. We therefore report only overlap queries on these two datasets, deferring the
+results to Appendix A.2 for space.
+Figs. 11-14 present the evaluation results. On the x-axis, each tick value 𝑖represents the interval
+[2−(𝑖+1), 2−𝑖). Observe that DYLAN maintains consistently high performance across all selectivity
+levels and datasets. On the LAION1M dataset, UNG and DYLAN achieve comparable performance
+when the selectivity is very low. This is because LAION1M has relatively few labels, and low-
+selectivity queries involve only a small number of highly similar label sets. UNG’s static LNG
+can capture these relationships in advance by pre-building cross edges, whereas DYLAN incurs
+overhead to dynamically construct edges across label sets. On the other hand, UNG performs poorly
+on datasets with more labels. DYLAN shows a clear advantage on datasets with a larger number of
+labels. On YTB-Audio, DYLAN is the only approach that maintains both high recall and high QPS
+across all selectivity levels and query types. The cost of Prefilter is mainly determined by |𝑂Φ|, so
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:20
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+DYLAN-FULL
+DYLAN-Update
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(a) Containment
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(b) Overlap
+Fig. 19. Impact of insertion-only update on YTB-Video.
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(a) Containment
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(b) Overlap
+Fig. 20. Impact of mixed update on YTB-Video.
+# of visited nodes
+# of dist computation
+Query time
+Distance computation time
+103
+104
+105
+106
+DYLAN
+ACORN−1
+ACORN−γ
+NaviX
+UNG
+Filtered−DiskANN
+RWalks
+10−2
+10−1
+100
+101
+102
+103
+average count
+average time(ms)
+(a) Containment
+103
+104
+105
+106
+DYLAN
+ACORN−1
+ACORN−γ
+NaviX
+UNG
+Filtered−DiskANN
+RWalks
+10−2
+10−1
+100
+101
+102
+103
+average count
+average time(ms)
+(b) Overlap
+Fig. 21. Query-cost breakdown on YFCC.
+# of visited nodes
+# of dist computation
+Query time
+Distance computation time
+103
+104
+105
+106
+DYLAN
+ACORN−1
+ACORN−γ
+NaviX
+UNG
+Filtered−DiskANN
+RWalks
+10−2
+10−1
+100
+101
+102
+103
+average count
+average time(ms)
+(a) Containment
+103
+104
+105
+106
+DYLAN
+ACORN−1
+ACORN−γ
+NaviX
+UNG
+Filtered−DiskANN
+RWalks
+10−2
+10−1
+100
+101
+102
+103
+average count
+average time(ms)
+(b) Overlap
+Fig. 22. Query-cost breakdown on YTB-Audio.
+its throughput improves as selectivity decreases, yet it remains an order of magnitude slower than
+DYLAN in most settings.
+Query performance of complex predicate. In this experiment, for each query, we randomly
+select two containment predicates and combine them via disjunction to construct a complex
+predicate. Fig. 15 presents the results on the TripClick and LAION1M datasets. Owing to space
+constraints, the results on additional datasets are provided in Appendix A.3. It is worth noting
+that only Curator and DYLAN are label-aware methods capable of handling complex predicates.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:21
+Original
+Frequency Shift
+New Label
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(a) Containment
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(b) Overlap
+Fig. 23. Robustness: YFCC
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(a) Containment
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(b) Overlap
+Fig. 24. Robustness: YTB-Audio
+In comparison with other methods, our approach achieves a speedup of one to nearly two orders
+of magnitude on LAION1M and TripClick. This result demonstrates that our method retains high
+performance even in the presence of complex predicates.
+Index cost. Figs. 16-17 show the memory consumption and indexing time of all solutions. Note
+that the RAM usage of RWalks on YTB-Audio and YTB-Video is not included in the figure because it
+consumes 32GB on YTB-Audio and 147GB on YTB-Video, which would dominate the scale. Among
+methods specifically designed for label-filtered ANNS, index construction of DYLAN is faster than
+that of Filtered-DiskANN, but slower than UNG and RWalks, while still remaining within the same
+order of magnitude. This overhead arises since DYLAN spends additional time constructing the
+hierarchical trie-graph structure to capture label relationships. The higher index building cost of
+DYLAN is compensated by its superior query performance, as demonstrated in the results above.
+For TripClick and LAION1M, the memory usage of DYLAN is comparable to that of other
+methods. The higher memory on other datasets is due to the larger number of label sets and more
+complex label relationships in these datasets, which require additional space to achieve high recall.
+Recall from Fig. 7 that our method is the only one that achieves high performance on both query
+types on YFCC, outperforming other approaches by a factor of 3-5×; on YTB-Audio (Fig. 8), the
+performance gap reaches two orders of magnitude.
+We measure the memory cost of DYLAN by component. Since each vector is stored only once in
+the global vector array, materializing an object in multiple graph indices adds only graph metadata,
+and the label trie and auxiliary structures do not dominate the memory cost. Appendix A.4 reports
+the full breakdown.
+Update cost. As discussed in Sec. 1, among existing label-aware indices, only Filtered-DiskANN [19]
+and Curator [23] natively support both label and vector updates. UniFilter caps the size of its
+auxiliary label graph, so once that capacity is reached, an update performs only the HNSW (i.e.,
+vector) part. Fig. 18 compares the update time of DYLAN with that of other methods: for each
+dataset, we pre-build the index on 80% of the objects and then insert the remaining 20%, reporting
+the average insertion time. The results show that DYLAN is 3–5× faster than Filtered-DiskANN,
+which must perform a label-filtered ANNS during each insertion. UniFilter achieves faster update
+times, but this is because our datasets contain a large number of labels, and UniFilter only updates
+the HNSW graph. Since Curator is based on an IVF structure, it enables rapid updates, as no graph
+modifications are necessary—only the cluster assignments of points need to be updated. Both,
+however, pay for this in search performance, as our earlier experiments show. We also measure a
+mixed workload that interleaves the same 20% insertions with deletions of a randomly selected,
+disjoint 20% of the initial build set. Its update cost follows the same trends, and we defer the details
+to Appendix A.8.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:22
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+Original
+Independent Search
+Without SupEdge
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(a) Containment
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(b) Overlap
+Fig. 25. Ablation study of optimizations: YTB-Audio.
+UNG
+ACORN-1
+ACORN-
+NaviX
+Filtered-DiskANN
+RWalks
+DYLAN 
+Curator
+UniFilter
+Prefilter
+1
+10
+100
+1000
+10000
+2
+4
+6
+8
+10
+QPS
+Number of Vectors (106)
+✩
+✩
+✩
+✩
+✩
+(a) Containment
+1
+10
+100
+1000
+2
+4
+6
+8
+10
+QPS
+Number of Vectors (106)
+✩
+✩
+✩
+✩
+✩
+(b) Overlap
+Fig. 26. Scalability study.
+Impact of update. We evaluate two update workloads, comparing in each case an index built
+directly on the final object set against one that reaches the same set through updates. The insertion-
+only workload pre-builds on 80% of the objects and inserts the remaining 20%; the mixed workload
+additionally deletes a disjoint, randomly selected 20% of the initial build set. Figs. 19 and 20 report
+the two workloads on YTB-Video; the other datasets lead to the same conclusions and are deferred
+to Appendix A.8. Under both, the recall-QPS curves of the updated index stay close to those of the
+directly built one. This confirms the trade-off targeted by our threshold-based maintenance: keeping
+a static index consistent with the data would require a full rebuild per update, at about 2×104 s each
+(Fig. 17), whereas DYLAN absorbs an insertion in milliseconds (Fig. 18) with essentially no loss in
+query accuracy. Insertions go through the maintenance scheme of Sec. 3.3, which keeps each node’s
+index a 4-approximate one for its region (Thm. 3.15), while deletions are even cheaper, since they
+only mark vertices as invalid and leave the graph topology untouched. As in standard soft-deletion
+practice, invalid vertices accumulate under deletion-heavy workloads; a periodic compaction can
+be applied when needed.
+Query cost breakdown. To attribute DYLAN’s speedup to its index design, we instrument graph-
+based search at recall 0.9 and record the numbers of visited points and distance computations,
+together with a query-time breakdown. The two counts differ because points rejected by the
+label filter incur no distance computation. On YTB-Audio, DYLAN visits 38.6× fewer points and
+performs 75.5× fewer distance computations than UNG, reducing distance-computation time by
+37.3×. The remaining throughput gap mainly comes from UNG’s preprocessing for finding minimum
+supersets of the query label set, which is negligible in DYLAN. Figs. 21-22 report the corresponding
+breakdowns on YFCC and YTB-Audio for both containment and overlap queries, excluding methods
+that cannot reach 0.9 recall. Across both datasets, the speedup is explained by the number of points
+the search needs to examine and the number of distance computations rather than by per-operation
+efficiency, indicating that it stems from the index design rather than from implementation-level
+optimizations.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:23
+Robustness study: frequency drift and new labels. We test robustness under frequency shift
+and new label insertion with 50/50 dynamic workloads on YFCC and YTB-Audio (a 50/50 split
+rather than the 80/20 used elsewhere, for a more aggressive shift): half of the data builds the initial
+index and the other half is inserted, with label ordering determined only from the initial set. For
+frequency shift, each object is scored by the average of log(1 + freq(𝑙)) over its labels 𝑙, and the
+50% insertion suffix is sampled without replacement with probability biased toward high-score
+objects. This makes high-frequency-label objects appear disproportionately during insertion. For
+new label insertion, we maximize label diversity in the inserted half, introducing 169,496 new labels
+on YFCC and 3,612 on YTB-Audio (93% and 94% of their label universes). Figs. 23-24 show that the
+performance remains close to the original, demonstrating the robustness of DYLAN to evolving
+label distributions.
+Ablation study of optimizations. Fig. 25 evaluates two optimizations of DYLAN on YTB-Audio.
+The corresponding results on YFCC are deferred to Appendix A.9 for space. First, we replace
+multi-graph search with independent search, which searches each graph separately and merges
+the results. The resulting drop in the QPS-recall tradeoff confirms that the key-ancestor graphs
+are important for bridging otherwise disconnected regions and avoiding local optima. Second,
+we disable supplementEdges. Its impact is dataset-dependent: it yields a clear improvement on
+YTB-Audio but little on YFCC, whose materialized graphs are already well connected.
+Scalability study. We evaluate scalability in two dimensions: the number of vectors and the size
+of the label universe.
+For the former, we use YFCC10M from the Big ANN Benchmarks [34], which shares the same
+data source as YFCC. We vary the dataset size from 2M to 10M vectors, using the same queries as
+on YFCC, and report QPS at a fixed recall of 0.90. Fig. 26 shows that the QPS of DYLAN degrades
+only mildly as the dataset grows, and that DYLAN is the fastest method on both containment and
+overlap queries across the entire range, typically by an order of magnitude over most baselines. The
+only competitive baseline is Filtered-DiskANN on overlap queries, which performs well on overlap
+filters but has no straightforward support for containment; on containment queries it becomes
+the slowest method. Hence, no baseline is competitive on both predicate types, whereas DYLAN
+handles them within a single index.
+For the latter, we measure how the index size of each method grows with the size of the label
+universe across the five 1M-scale datasets, excluding the raw vector storage so that only the index
+structures are compared. The results, reported in Appendix A.5, are empirically consistent with the
+Label Scalability column of Table 1: the index size of DYLAN and most baselines stays within a
+narrow range, while that of RWalks grows sharply.
+Impact of label-vector correlation. DYLAN does not assume that objects with similar label sets
+are close in vector space. As shown in Table 3, the five widely adopted datasets all have absolute
+Pearson correlation |𝑟| ≤0.0428, whereas the newly added Yelp1M reaches 0.48; bucketing object
+pairs by label-set size does not change this picture, as reported in Appendix A.7. We therefore use
+Yelp1M to isolate the effect of |𝑟|: keeping both the vectors and the multiset of label sets unchanged,
+we vary their assignment to construct six variants with |𝑟| from approximately 0 to 0.5 (higher
+values are hard to realize without synthesizing label sets). Fig. 27 reports the QPS at recall 0.9, which
+is nearly unchanged across all correlation levels for both query types. This robustness follows
+from our design. Correlation mainly changes how the qualifying objects sit in the vector space
+relative to the trie regions, and either way the search covers them: when |𝑟| is high, the results
+concentrate within a region’s own graph; when |𝑟| is low, they are reached across regions via the
+key-ancestor graphs, so the effective search graph is the union of the graphs in G rather than any
+single per-region graph.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:24
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+ 100
+ 1000
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+QPS
+|Pearson|
+(a) Containment
+ 100
+ 1000
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+QPS
+|Pearson|
+(b) Overlap
+Fig. 27. Impact of correlation.
+Impact of parameter 𝑒𝑓𝑐. We also conduct experiments to evaluate the impact of 𝑒𝑓𝑐on query
+performance and indexing cost. Interested readers are referred to Appendix A.10 for detailed results.
+5
+Related Work
+Approximate nearest neighbor search. Existing ANNS solutions can be broadly categorized
+into three classes: LSH-based, PQ-based, and graph-based. Locality-sensitive hashing (LSH) and
+its variants, e.g., [6, 7, 14, 20, 40], provide rigorous theoretical error guarantees, but often incur
+considerable time and space overhead in practice. Product quantization (PQ) [21] partitions the high-
+dimensional vector space into multiple low-dimensional subspaces, and quantizes each subspace to
+compress the vectors. PQ-based methods, e.g. [8–10, 18, 24] trade result accuracy for significantly
+lower memory usage, achieving high scalability. Graph-based methods [15, 17, 25, 26, 35] build a
+proximity graph for the dataset, where vertices represent vectors and edges connect similar vectors.
+ANNS with attribute filtering. There exist a plethora of research works [16, 19, 27, 38, 44, 46] on
+designing generic solutions for attribute-filtered ANNS. Such solutions are often less effective than
+specialized methods for particular filters [16, 46]. Beyond label filters, range-filtered ANNS has also
+been studied [22, 42, 43, 46], which is orthogonal to our work.
+6
+Conclusion
+This paper presented DYLAN, a dynamic composite index for label-filtered ANNS that combines a
+frequency-ordered label trie, selective HNSW-style graph materialization, cross-region multi-graph
+search, and threshold-based index maintenance. Experiments on real datasets show that DYLAN
+achieves superior query efficiency at comparable recall, especially on label-rich datasets, while
+maintaining favorable indexing and update-cost trade-offs. Future work includes an efficient multi-
+threaded implementation, designing efficient index for external-memory settings, and considering
+more complex settings such as joint label and multi-attribute range filters.
+Acknowledgments
+This work is supported by the “1+1+1” CUHK-CUHK(SZ)-GDST Joint Collaboration Fund (No.
+2025A0505000045) and a CUHK direct grant.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:25
+References
+[1] 2026. Code and technical report. https://github.com/CUHK-DBGroup/DYLAN.
+[2] 2026. Hnswlib. https://github.com/nmslib/hnswlib.
+[3] 2026. Yelp Dataset. https://business.yelp.com/data/resources/open-dataset.
+[4] Sami Abu-El-Haija, Nisarg Kothari, Joonseok Lee, Paul Natsev, George Toderici, Balakrishnan Varadarajan, and
+Sudheendra Vijayanarasimhan. 2016. YouTube-8M: A Large-Scale Video Classification Benchmark. CoRR abs/1609.08675
+(2016).
+[5] Anas Ait Aomar, Karima Echihabi, Marco Arnaboldi, Ioannis Alagiannis, Damien Hilloulin, and Manal Cherkaoui.
+2025. RWalks: Random Walks as Attribute Diffusers for Filtered Vector Search. Proc. ACM Manag. Data 3, 3 (2025),
+212:1–212:26.
+[6] Alexandr Andoni and Piotr Indyk. 2008. Near-optimal hashing algorithms for approximate nearest neighbor in high
+dimensions. Commun. ACM 51, 1 (2008), 117–122.
+[7] Alexandr Andoni, Piotr Indyk, Thijs Laarhoven, Ilya P. Razenshteyn, and Ludwig Schmidt. 2015. Practical and Optimal
+LSH for Angular Distance. In NeurIPS. 1225–1233.
+[8] Fabien André, Anne-Marie Kermarrec, and Nicolas Le Scouarnec. 2015. Cache locality is not enough: High-Performance
+Nearest Neighbor Search with Product Quantization Fast Scan. Proc. VLDB Endow. 9, 4 (2015), 288–299.
+[9] Artem Babenko and Victor S. Lempitsky. 2015. Tree quantization for large-scale similarity search and classification. In
+CVPR. 4240–4248.
+[10] Davis W. Blalock and John V. Guttag. 2017. Bolt: Accelerated Data Mining with Fast Vector Compression. In SIGKDD.
+727–735.
+[11] Yuzheng Cai, Jiayang Shi, Yizhuo Chen, and Weiguo Zheng. 2024. Navigating Labels and Vectors: A Unified Approach
+to Filtered Approximate Nearest Neighbor Search. Proc. ACM Manag. Data 2, 6 (2024), 246:1–246:27.
+[12] Cheng Chen, Chenzhe Jin, Yunan Zhang, Sasha Podolsky, Chun Wu, Szu-Po Wang, Eric Hanson, Zhou Sun, Robert
+Walzer, and Jianguo Wang. 2024. SingleStore-V: An Integrated Vector Database System in SingleStore. Proc. VLDB
+Endow. 17, 12 (2024), 3772–3785.
+[13] Dechuang Chen, Bing Chen, Jianwei Lu, Zhiwei Wu, Zeyu Yang, Qiang Gu, Fangyuan Zhang, Sibo Wang, Zeyuan Yu,
+Caihua Yin, Wenchao Zhou, and Feifei Li. 2026. Nova: A Multi-Purpose Vector Engine for Low-Latency, Multi-Tenant,
+and Cross-Table Hybrid Retrieval. Proc. VLDB Endow. 19, 12 (2026), 4453–4465.
+[14] Mayur Datar, Nicole Immorlica, Piotr Indyk, and Vahab S Mirrokni. 2004. Locality-sensitive hashing scheme based on
+p-stable distributions. In PoCG. 253–262.
+[15] Wei Dong, Moses Charikar, and Kai Li. 2011. Efficient k-nearest neighbor graph construction for generic similarity
+measures. In WWW. 577–586.
+[16] Joshua Engels, Benjamin Landrum, Shangdi Yu, Laxman Dhulipala, and Julian Shun. 2024. Approximate Nearest
+Neighbor Search with Window Filters. In ICML.
+[17] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast Approximate Nearest Neighbor Search With The
+Navigating Spreading-out Graph. Proc. VLDB Endow. 12, 5 (2019), 461–474.
+[18] Jianyang Gao and Cheng Long. 2024. RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound
+for Approximate Nearest Neighbor Search. Proc. ACM Manag. Data 2, 3 (2024), 167.
+[19] Siddharth Gollapudi, Neel Karia, Varun Sivashankar, Ravishankar Krishnaswamy, Nikit Begwani, Swapnil Raz, Yiyong
+Lin, Yin Zhang, Neelam Mahapatro, Premkumar Srinivasan, Amit Singh, and Harsha Vardhan Simhadri. 2023. Filtered-
+DiskANN: Graph Algorithms for Approximate Nearest Neighbor Search with Filters. In WWW. 3406–3416.
+[20] Piotr Indyk and Rajeev Motwani. 1998. Approximate Nearest Neighbors: Towards Removing the Curse of Dimension-
+ality. In STOC. 604–613.
+[21] Hervé Jégou, Matthijs Douze, and Cordelia Schmid. 2011. Product Quantization for Nearest Neighbor Search. IEEE
+Trans. Pattern Anal. Mach. Intell. 33, 1 (2011), 117–128.
+[22] Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Guanhao Hou, Jieming Shi, Wenchao Zhou, Feifei Li, and Sibo Wang. 2025.
+DIGRA: A Dynamic Graph Indexing for Approximate Nearest Neighbor Search with Range Filter. Proc. ACM Manag.
+Data 3, 3 (2025), 148:1–148:26.
+[23] Yicheng Jin, Yongji Wu, Wenjun Hu, Bruce M. Maggs, Jun Yang, Xiao Zhang, and Danyang Zhuo. 2026. Curator:
+Efficient Vector Search with Low-Selectivity Filters. CoRR abs/2601.01291 (2026).
+[24] Jeff Johnson, Matthijs Douze, and Hervé Jégou. 2021. Billion-Scale Similarity Search with GPUs. IEEE Trans. Big Data
+7, 3 (2021), 535–547.
+[25] Yury Malkov, Alexander Ponomarenko, Andrey Logvinov, and Vladimir Krylov. 2014. Approximate nearest neighbor
+algorithm based on navigable small world graphs. Inf. Syst. 45 (2014), 61–68.
+[26] Yury A. Malkov and Dmitry A. Yashunin. 2020. Efficient and Robust Approximate Nearest Neighbor Search Using
+Hierarchical Navigable Small World Graphs. IEEE Trans. Pattern Anal. Mach. Intell. 42, 4 (2020), 824–836.
+[27] Yusuke Matsui, Ryota Hinami, and Shin’ichi Satoh. 2018. Reconfigurable Inverted Index. In MM. 1715–1723.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:26
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+[28] Liana Patel, Peter Kraft, Carlos Guestrin, and Matei Zaharia. 2024. ACORN: Performant and Predicate-Agnostic Search
+Over Vector Embeddings and Structured Data. Proc. ACM Manag. Data 2, 3 (2024), 120.
+[29] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry, Amanda
+Askell, Pamela Mishkin, Jack Clark, Gretchen Krueger, and Ilya Sutskever. 2021. Learning Transferable Visual Models
+From Natural Language Supervision. In ICML, Vol. 139. 8748–8763.
+[30] Navid Rekabsaz, Oleg Lesota, Markus Schedl, Jon Brassey, and Carsten Eickhoff. 2021. TripClick: The Log Files of a
+Large Health Web Search Engine. In SIGIR. 2507–2513.
+[31] Christoph Schuhmann, Richard Vencu, Romain Beaumont, Robert Kaczmarczyk, Clayton Mullis, Aarush Katta, Theo
+Coombes, Jenia Jitsev, and Aran Komatsuzaki. 2021. LAION-400M: Open Dataset of CLIP-Filtered 400 Million Image-
+Text Pairs. CoRR abs/2111.02114 (2021).
+[32] Gaurav Sehgal and Semih Salihoglu. 2025. NaviX: A Native Vector Index Design for Graph DBMSs With Robust
+Predicate-Agnostic Search Performance. Proc. VLDB Endow. 18, 11 (2025), 4438–4451.
+[33] Jiayang Shi, Yuzheng Cai, and Weiguo Zheng. 2025. Filtered Approximate Nearest Neighbor Search: A Unified
+Benchmark and Systematic Experimental Study [Experiment, Analysis & Benchmark]. arXiv preprint arXiv:2509.07789
+(2025).
+[34] Harsha Vardhan Simhadri, Martin Aumüller, Amir Ingber, Matthijs Douze, George Williams, Magdalen Dobson
+Manohar, Dmitry Baranchuk, Edo Liberty, Frank Liu, Ben Landrum, et al. 2024. Results of the Big ANN: NeurIPS’23
+competition. arXiv preprint arXiv:2409.17424 (2024).
+[35] Suhas Jayaram Subramanya, Devvrit, Harsha Vardhan Simhadri, Ravishankar Krishnaswamy, and Rohan Kadekodi.
+2019. Rand-NSG: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node. In NeurIPS. 13748–13758.
+[36] Bart Thomee, David A Shamma, Gerald Friedland, Benjamin Elizalde, Karl Ni, Douglas Poland, Damian Borth, and
+Li-Jia Li. 2016. Yfcc100m: The new data in multimedia research. Commun. ACM 59, 2 (2016), 64–73.
+[37] Jiang Wang, Xin Wen, Ruicheng Liu, Xiaoyan Tang, Yongqing Xie, Pinghua Wang, Ji Sun, Yanfeng Zhang, Yong Li,
+Guoliang Li, Xiaoguang Ren, Wen Nie, and Chunbo Li. 2025. GaussDB-Vector: A Large-Scale Persistent Real-Time
+Vector Database for LLM Applications. Proc. VLDB Endow. 18, 12 (2025), 4951–4963.
+[38] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li, Xiangyu Wang, Xiangzhou Guo, Chengming
+Li, Xiaohai Xu, Kun Yu, Yuxing Yuan, Yinghao Zou, Jiquan Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang, Yihua
+Mo, Jun Gu, Ruiyi Jiang, Yi Wei, and Charles Xie. 2021. Milvus: A Purpose-Built Vector Data Management System. In
+SIGMOD. 2614–2627.
+[39] Wenhui Wang, Furu Wei, Li Dong, Hangbo Bao, Nan Yang, and Ming Zhou. 2020. MiniLM: Deep Self-Attention
+Distillation for Task-Agnostic Compression of Pre-Trained Transformers. In Advances in Neural Information Processing
+Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual,
+Hugo Larochelle, Marc’Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, and Hsuan-Tien Lin (Eds.).
+[40] Jiuqi Wei, Botao Peng, Xiaodong Lee, and Themis Palpanas. 2024. DET-LSH: A Locality-Sensitive Hashing Scheme
+with Dynamic Encoding Tree for Approximate Nearest Neighbor Search. Proc. VLDB Endow. 17, 9 (2024), 2241–2254.
+[41] Jiadong Xie, Jeffrey Xu Yu, Siyi Teng, and Yingfan Liu. 2025. Beyond Vector Search: Querying With and Without
+Predicates. Proc. ACM Manag. Data 3, 6 (2025), 1–26.
+[42] Yuexuan Xu, Jianyang Gao, Yutong Gou, Cheng Long, and Christian S. Jensen. 2024. iRangeGraph: Improvising Range-
+dedicated Graphs for Range-filtering Nearest Neighbor Search. Proc. ACM Manag. Data 2, 6 (2024), 239:1–239:26.
+[43] Fangyuan Zhang, Mengxu Jiang, Guanhao Hou, Jieming Shi, Hua Fan, Wenchao Zhou, Feifei Li, and Sibo Wang. 2025.
+Efficient Dynamic Indexing for Range Filtered Approximate Nearest Neighbor Search. Proc. ACM Manag. Data 3, 3
+(2025), 152:1–152:26.
+[44] Qianxi Zhang, Shuotao Xu, Qi Chen, Guoxin Sui, Jiadong Xie, Zhizhen Cai, Yaoqi Chen, Yinxuan He, Yuqing Yang, Fan
+Yang, Mao Yang, and Lidong Zhou. 2023. VBASE: Unifying Online Vector Similarity Search and Relational Queries via
+Relaxed Monotonicity. In OSDI. 377–395.
+[45] Justin Zobel and Alistair Moffat. 1998. Inverted files versus signature files for text indexing. TODS 23, 4 (1998), 453–490.
+[46] Chaoji Zuo, Miao Qiao, Wenchao Zhou, Feifei Li, and Dong Deng. 2024. SeRF: Segment Graph for Range-Filtering
+Approximate Nearest Neighbor Search. Proc. ACM Manag. Data 2, 1 (2024), 69:1–69:26.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:27
+A
+Additional experimental results
+A.1
+Parameter Tuning
+Query parameters. All queries retrieve 𝑘= 10 results and are executed single-threaded. For each
+approximate method, we vary its query-time search parameter to trace the recall–QPS tradeoff:
+𝐿search for Filtered-DiskANN and UNG, efSearch for NaviX and ACORN, 𝑒𝑓for RWalks and
+DYLAN, 𝐿for UniFilter, and search_ef for Curator. Prefilter evaluates the label predicate exactly
+and performs an exact 𝐿2 scan over the survivors, and therefore appears as a single point in the
+recall–QPS plots.
+Construction parameters. We tune the build-time parameters of every method, DYLAN included,
+on every dataset under one common protocol. Each configuration is scored by its QPS at recall 0.9 —
+the operating point used throughout Sec. 4 for most experiments — on containment and on overlap
+queries, and we select the configuration maximizing the geometric mean of the two; if only one
+query type reaches this recall, the configuration is scored on that type alone, and if neither does,
+configurations are ranked by the geometric mean of their highest attained recalls. The swept grids,
+with the remaining parameters fixed to the values recommended by the corresponding papers,
+are: (𝐿build, 𝑅) ∈{(96, 64), (144, 96), (192, 128), (240, 160)} with 𝛼= 1.2 for Filtered-DiskANN;
+(𝑅, 𝐿) ∈{(16, 100), (32, 100), (32, 200), (48, 200)} with 𝛼= 1.2, 6 cross-group edges and 16 query
+entry vectors for UNG; (nlist, 𝐵max) ∈{(16, 64), (32, 128), (64, 256), (64, 512)} with beam size 4
+for Curator; and 𝑀∈{16, 32, 48, 64} with 𝑒𝑓𝑐= 400 for NaviX, RWalks, ACORN-1 (𝛾= 1, 𝑀𝛽= 2𝑀),
+ACORN-𝛾(𝛾= 100, 𝑀𝛽= 64), UniFilter (𝑀𝑝= 𝑛), and DYLAN, ACORN-1 and ACORN-𝛾being
+swept independently. We further extend Filtered-DiskANN’s detect_common_filters to support
+both containment and overlap predicates. Table 6 reports the selected values. Each baseline is thus
+evaluated under its own best configuration rather than a default one, and DYLAN receives no larger
+construction budget: except on YTB-Video, its selected 𝑀is 16, no larger than that of any baseline.
+RWalks is omitted on YFCC, as its memory consumption exceeds the available 1 TB.
+A.2
+Impact of Query Selectivity
+Fig. 28 shows the additional results of the impact of filter selectivity on query performance on
+TripClick and YFCC omitted in Sec. 4. Recall that it is infeasible to generate containment queries
+spanning a continuous range of target selectivity due to the label distributions in YFCC and
+TripClick. We only report overlap queries on these two datasets. These results are consistent with
+the trends presented in Sec. 4. It can be observed that our method generally outperforms the other
+approaches, except on YFCC under very low selectivity.
+A.3
+Query Performance of Complex Predicate
+Fig. 32 shows the results on the remaining 4 datasets omitted in Sec. 4. Our method achieves
+performance comparable to Curator on YFCC and YTB-Video, significantly outperforming other
+approaches. On the YTB-Audio dataset, our method outperforms all other methods, including
+Curator, by two orders of magnitude. This demonstrates that our method maintains superior
+performance across all datasets and under any query conditions.
+A.4
+Memory Breakdown of DYLAN Index
+Tab. 4 reports the memory consumption of DYLAN by component. We separately account for the
+global vector array, object labels, the label trie, materialized graph indices, and other auxiliary
+structures. The “Other” category includes the belong arrays and the label inverted lists. Since each
+vector is stored only once in the global vector array, materializing an object in multiple graph
+indices only introduces graph metadata rather than additional vector copies. The breakdown also
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:28
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+Table 4. DYLAN memory cost breakdown by component (GB)
+Dataset
+Vector
+Labels
+Trie
+Graph
+Other
+Total
+TripClick
+3.02
+0.06
+0.01
+0.41
+0.06
+3.56
+LAION1M
+1.91
+0.05
+0.01
+0.48
+0.06
+2.52
+YFCC
+0.72
+0.07
+1.09
+0.77
+0.15
+2.80
+YTB-Audio
+2.39
+0.27
+0.28
+3.08
+0.38
+6.38
+YTB-Video
+3.82
+0.05
+0.09
+2.12
+0.08
+6.15
+Yelp1M
+1.43
+0.06
+0.03
+0.71
+0.08
+2.32
+Table 5. Absolute Pearson correlation |𝑟| between label-set Jaccard similarity and 𝐿2 distance. Object pairs
+are grouped by max(|𝑓𝑖|, |𝑓𝑗|).
+Dataset
+[1, 2]
+[3, 5]
+[6, 10]
+> 10
+Overall
+TripClick
+0.0055
+0.0078
+0.0528
+–
+0.0055
+LAION1M
+0.0408
+0.0617
+–
+–
+0.0428
+YFCC
+0.1891
+0.0028
+0.0073
+0.0012
+0.0217
+YTB-Audio
+0.0018
+0.0011
+0.0028
+0.0031
+0.0009
+YTB-Video
+0.0216
+0.0209
+0.0217
+0.0047
+0.0206
+Yelp1M
+0.5742
+0.5089
+0.4711
+0.4458
+0.4791
+UNG
+ACORN-1
+ACORN-
+NaviX
+Filtered-DiskANN
+RWalks
+DYLAN 
+Curator
+UniFilter
+Prefilter
+1
+10
+100
+1000
+1
+2
+3
+4
+5
+QPS
+Selectivity
+✩
+✩
+✩
+✩
+✩
+(a) TripClick
+1
+10
+100
+1000
+1
+2
+3
+4
+5
+QPS
+Selectivity
+✩
+✩
+✩
+✩
+✩
+(b) YFCC
+Fig. 28. Impact of selectivity on different datasets.
+UNG
+ACORN-1
+ACORN-
+NaviX
+Filtered-DiskANN
+RWalks
+DYLAN 
+Curator
+UniFilter
+Prefilter
+0.1
+1
+10
+100
+102
+103
+104
+105
+Index Size(GB)
+Number of Unique Labels
+Fig. 29. Index size vs. |L|.
+reflects the different characteristics of the datasets. For example, YFCC incurs a relatively large trie
+cost due to its large label universe and complex label sets, whereas the graph indices constitute
+the main additional cost on YTB-Audio. Overall, the trie and auxiliary structures remain moderate
+compared with the vector and graph storage, confirming that the additional structures introduced
+by DYLAN do not dominate its memory consumption.
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:29
+HNSW-Original
+HNSW-Split
+ 1000
+ 0.9
+ 1
+QPS
+Recall
+Fig. 30. Memory layout.
+Original
+Independent Search
+Without SupEdge
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(a) Containment
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(b) Overlap
+Fig. 31. Ablation study of optimizations: YFCC.
+A.5
+Label Scalability
+Sec. 4 evaluates scalability along two dimensions, the number of vectors and the size of the label
+universe, and reports only the former; we report the latter here. Fig. 29 plots the index size of each
+method against the number of distinct labels over the five 1M-scale datasets (all datasets except
+YTB-Audio), whose label universes span from 29 labels on TripClick to 181,931 on YFCC. Since
+all five datasets hold roughly the same number of vectors, the raw vector payload is essentially
+constant across them and would mask the differences of interest; we therefore exclude it for every
+method and report only the index structures built on top of it. The index size of DYLAN grows by
+only 4.4× across the entire span and follows a trend similar to most existing methods, indicating
+that neither the label trie nor the auxiliary structures grows substantially with the label universe.
+RWalks is the clear exception: it encodes labels into vector-like representations, so its index size
+increases sharply as labels accumulate, which is also why it exceeds the available 1 TB on YFCC.
+These results are consistent with the Label Scalability column of Tab. 1 and confirm that DYLAN
+scales effectively to large label universes.
+A.6
+Impact of Memory Layout
+DYLAN stores vectors and adjacency lists separately, so reaching a neighbor’s vector requires an
+extra indirection through its object ID. To isolate the cost of this indirection, we compare two layouts
+of a standard HNSW graph on LAION1M in Figure 30. The first follows the original implementation
+of HNSWlib [2], where each vertex stores its vector contiguously with its adjacency list, avoiding
+an additional pointer dereference to locate the vector. The second is the separated layout used
+by DYLAN, where adjacency lists hold only object IDs and all vectors reside in a global array, so
+expanding a neighbor requires a second random access into that array. The two layouts achieve
+nearly identical query performance, differing by less than 1%: the indirection is amortized over the
+distance computation that follows it, and the vector array is accessed in the same order regardless
+of layout. In DYLAN the effect is even smaller, since many visited neighbors fail the label filter and
+are skipped without any vector access at all. Together with Fig. 30, this confirms that the separated
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:30
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+Table 6. Selected construction parameters for each method and dataset. Here 𝑅and 𝑀denote the graph out-
+degree, 𝐿build and 𝐿denote the construction candidate size, and nlist and 𝐵max denote Curator’s branching
+factor and maximum leaf size. ACORN-1 and ACORN-𝛾are tuned independently, and “–” indicates that the
+method is omitted due to out-of-memory.
+Dataset
+Filtered-DiskANN
+UNG
+NaviX
+ACORN-1
+ACORN-𝛾
+Curator
+RWalks
+UniFilter
+DYLAN
+(𝐿build, 𝑅)
+(𝑅, 𝐿)
+𝑀
+𝑀
+𝑀
+(nlist, 𝐵max)
+𝑀
+𝑀
+𝑀
+LAION1M
+(144, 96)
+(48, 200)
+48
+48
+48
+(64, 512)
+48
+16
+16
+TripClick
+(192, 128)
+(32, 200)
+64
+48
+48
+(64, 512)
+32
+16
+16
+YFCC
+(240, 160)
+(16, 100)
+48
+48
+48
+(64, 512)
+–
+32
+16
+YTB-Audio
+(240, 160)
+(48, 200)
+48
+64
+64
+(64, 512)
+48
+48
+16
+YTB-Video
+(240, 160)
+(48, 200)
+64
+64
+64
+(64, 512)
+64
+16
+64
+Yelp1M
+(240, 160)
+(16, 100)
+48
+64
+64
+(64, 512)
+48
+64
+16
+UNG
+ACORN-1
+ACORN-
+NaviX
+Filtered-DiskANN
+RWalks
+DYLAN 
+Curator
+UniFilter
+Prefilter
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(a) YFCC
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(b) YTB-Audio
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(c) YTB-Video
+10
+100
+1000
+10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+✩
+(d) Yelp1M
+Fig. 32. Complex predicate.
+DYLAN-FULL
+DYLAN-Update
+ 10
+ 100
+ 1000
+ 10000
+ 0.9
+ 1
+QPS
+Recall
+(a) LAION1M
+ 10
+ 100
+ 1000
+ 10000
+ 0.9
+ 1
+QPS
+Recall
+(b) TripClick
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(c) YFCC
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(d) YTB-Audio
+ 100
+ 1000
+ 0.9
+ 1
+QPS
+Recall
+(e) Yelp1M
+Fig. 33. Impact of insertion-only update: containment queries.
+layout, which lets an object appear in multiple materialized graphs without duplicating its vector,
+does not trade memory for query latency.
+A.7
+Label-Vector Correlation by Label-Set Size
+We analyze whether label-set similarity is correlated with vector proximity, and whether such
+correlation depends on how many labels the objects carry. For each dataset, we uniformly sample
+1M distinct object pairs and compute the Pearson correlation 𝑟between their label-set Jaccard
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:31
+DYLAN-FULL
+DYLAN-Update
+ 10
+ 100
+ 1000
+ 0.9
+ 1
+QPS
+Recall
+(a) LAION1M
+ 10
+ 100
+ 1000
+ 0.9
+ 1
+QPS
+Recall
+(b) TripClick
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(c) YFCC
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(d) YTB-Audio
+ 100
+ 1000
+ 0.9
+ 1
+QPS
+Recall
+(e) Yelp1M
+Fig. 34. Impact of insertion-only update: overlap queries.
+DYLAN-FULL
+DYLAN-Update
+ 10
+ 100
+ 1000
+ 10000
+ 0.9
+ 1
+QPS
+Recall
+(a) LAION1M
+ 10
+ 100
+ 1000
+ 10000
+ 0.9
+ 1
+QPS
+Recall
+(b) TripClick
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(c) YFCC
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(d) YTB-Audio
+ 10
+ 100
+ 1000
+ 10000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(e) Yelp1M
+Fig. 35. Impact of mixed updates: containment queries.
+similarity and their 𝐿2 distance, reporting |𝑟| since negating the distance only flips the sign. A single
+overall correlation can be misleading here, as pairs with few labels and pairs with many labels
+differ in both their Jaccard values and their distance distributions: the overall coefficient absorbs
+these cross-bucket shifts under a global normalization. We therefore also group the sampled pairs
+by max(|𝑓𝑖|, |𝑓𝑗|) into four ranges—[1, 2], [3, 5], [6, 10], and > 10—and report the within-bucket
+correlation for each.
+Tab. 5 reports the results. On the five benchmark datasets, the overall correlations are consistently
+very small, the largest being |𝑟| = 0.0428 on LAION1M, and the bucket-level correlations stay below
+0.0617 in almost all cases. The only exception is the [1, 2] bucket of YFCC with |𝑟| = 0.1891, which
+draws on just 3,774 sampled pairs and therefore has limited support. Grouping by label-set size thus
+does not change the picture: on these datasets, objects with similar label sets are not systematically
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:32
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+DYLAN-FULL
+DYLAN-Update
+ 10
+ 100
+ 1000
+ 0.9
+ 1
+QPS
+Recall
+(a) LAION1M
+ 10
+ 100
+ 1000
+ 0.9
+ 1
+QPS
+Recall
+(b) TripClick
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(c) YFCC
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(d) YTB-Audio
+ 10
+ 100
+ 1000
+ 0.8
+ 0.9
+ 1
+QPS
+Recall
+(e) Yelp1M
+Fig. 36. Impact of mixed updates: overlap queries.
+closer in the vector space, at any label-set size. Yelp1M is the exception by construction: its labels
+are business categories attached to review text, so an overall |𝑟| of 0.4791 together with consistently
+high bucket-level correlations makes it a complementary workload on which label similarity does
+carry information about vector proximity.
+A.8
+Impact of Update
+Sec. 4.2 reports both update workloads on YTB-Video only. Here we give the results on the remaining
+datasets: Figs. 33 and 34 for the insertion-only workload, Figs. 35 and 36 for the mixed workload, in
+each case for containment and overlap queries respectively, and Fig. 37 for the update time under
+the mixed workload. The protocol follows Sec. 4.2: an index built directly on the final object set
+is compared against one that reaches the same set through updates. Across all datasets and both
+workloads, the two recall-QPS curves stay close, confirming that the threshold-based maintenance
+scheme preserves index quality under insertions, and that lazy deletions leave the graph topology
+untouched.
+A.9
+Ablation study of optimizations
+Sec. 4.2 evaluates the two optimizations of DYLAN on YTB-Audio only; Fig. 31 reports the same
+ablation on YFCC. Replacing multi-graph search with independent search again degrades the QPS-
+recall tradeoff, most visibly on overlap queries, where a filter spans more trie regions and the key-
+ancestor graphs therefore matter most for cross-region connectivity. Disabling supplementEdges,
+in contrast, has almost no effect on YFCC: its materialized graphs are already well connected,
+so the supplemented edges are rarely traversed. This confirms the dataset-dependence noted in
+Sec. 4.2—the multi-graph search is the essential component, while supplementEdges helps only
+where per-region connectivity is insufficient.
+A.10
+Impact of Parameter 𝑒𝑓𝑐on DYLAN
+Fig. 38 shows the impact of 𝑒𝑓𝑐. As we can observe, increasing 𝑒𝑓𝑐leads to higher indexing time
+but strengthens the quality of the graph, resulting in better performance. This improvement in
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search
+335:33
+ACORN-1
+ACORN-
+NaviX
+DYLAN 
+Filtered-DiskANN
+RWalks
+Curator
+UniFilter
+UNG
+10-2
+10-1
+100
+101
+102
+103
+TripClick
+LAION1M
+YFCC
+YTB-Audio
+YTB-Video
+Yelp1M
+running time (ms)
+Fig. 37. Mixed update time.
+TripClick
+LAION1M
+YFCC
+YTB-Audio
+YTB-Video
+Yelp1M
+ 100
+ 1000
+ 10000
+100
+200
+400
+800
+QPS
+efc
+(a) containment
+ 100
+ 1000
+100
+200
+400
+800
+QPS
+efc
+(b) overlap
+ 1000
+ 10000
+100
+200
+400
+800
+Index Time (s)
+efc
+(c) indexing cost
+Fig. 38. Impact of 𝒆𝒇𝒄to query and indexing cost.
+connectivity enhances query performance. Based on the experimental results, we set 𝑒𝑓𝑐= 400 as
+the default parameter as it gains a nice trade-off between the query performance and indexing cost.
+B
+Proofs
+Proof of Lemma 3.4. Let 𝑣= 𝑢.index. By construction, 𝑣is an ancestor of 𝑢, so 𝑂𝑢⊆𝑂𝑣, and 𝑢
+shares 𝑣.𝐺only when log_size(𝑢) = log_size(𝑣). Hence, for some 𝑘,
+2𝑘≤|𝑂𝑢| ≤|𝑂𝑣| < 2𝑘+1,
+which implies |𝑂𝑣| < 2|𝑂𝑢|. Therefore, 𝑣.𝐺is a 2-approximate index for 𝑂𝑢by Definition 3.3.
+Proof of Lemma 3.5. We prove by contradiction. Assume that node 𝑢has two distinct children 𝑐1
+and 𝑐2 such that log2(|𝑂𝑐1|) = log2(|𝑂𝑢|) and log2(|𝑂𝑐2|) = log2(|𝑂𝑢|). Without loss of generality,
+let |𝑂𝑐1| ≤|𝑂𝑐2|. Since 𝑂𝑢is the set of all objects in the subtree of 𝑢and 𝑐1,𝑐2 are disjoint subtrees,
+we have |𝑂𝑢| ≥|𝑂𝑐1| + |𝑂𝑐2| ≥2|𝑂𝑐1|. Consequently, log2(|𝑂𝑢|) ≥log2(2|𝑂𝑐1|) = log2(|𝑂𝑐1|) + 1 =
+log2(|𝑂𝑢|) + 1, which is a contradiction. Therefore, the assumption is false, and the lemma holds.
+Proof of Lemma 3.8. For the object 𝑜, it only belongs to the graph indexes of its ancestors in the
+Trie; hence there are at most O(|𝑓𝑜|) such nodes. Moreover, because a node 𝑢maintains its own
+index (𝑢.𝑖𝑛𝑑𝑒𝑥= 𝑢) only when log_size(𝑢) ≠log_size(𝑢.𝑝), the number of distinct log_size values
+along the root-to-leaf path is O(log𝑛). Therefore, 𝑜can belong to at most O(log𝑛) such indexes.
+Combining the two bounds yields the result.
+Proof of Theorem 3.9. The space complexity of our index consists of the following components:
+the Trie structure, the inverted lists 𝐼, the belong array, and all the HNSW graph indexes. Each
+object 𝑜is inserted into the Trie by traversing (or creating) at most |𝑓𝑜| nodes. Hence the Trie and
+the associated inverted lists require O Í
+𝑜∈𝑂|𝑓𝑜| space. The 𝑏𝑒𝑙𝑜𝑛𝑔o,𝑖indicates whether object 𝑜
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.
+
+
+335:34
+Mengxu Jiang, Zhi Yang, Fangyuan Zhang, Yin Yang, and Sibo Wang
+belongs to a graph of logarithmic size 𝑖. Since 𝑖can take at most O(log𝑛) distinct values, the total
+size of the belong array is O(𝑛log𝑛). Through Lemma 3.8, the overall space occupied by all graph
+indexes is O
+Í
+𝑜∈𝑂min{|𝑓𝑜|, log𝑛} 𝑀
+
+Summing the three parts, the total space complexity is
+O
+
+𝑛log𝑛+
+∑︁
+𝑜∈𝑂
+|𝑓𝑜| +
+∑︁
+𝑜∈𝑂
+min{|𝑓𝑜|, log𝑛} 𝑀
+
+.
+For construction time, we first build the Trie and the inverted lists, which takes O Í
+𝑜∈𝑂|𝑓𝑜|
+time. Initializing and updating the belong array costs O(𝑛log𝑛). The dominant cost is the HNSW
+insertion: each object 𝑜is inserted into at most min{|𝑓𝑜|, log𝑛} graphs, and each insertion has
+complexity 𝑐upd (the time to insert one point into a plain HNSW graph). For lines 5–8 of Algo. 1,
+each element 𝑜is subject to the supplementEdges operation at most min{𝑙th, |𝑓𝑜|} times, where
+the cost of each such operation is 𝑐𝑞, which denotes the cost of performing one query on DYLAN.
+Hence the total construction time is
+O
+
+𝑛log𝑛+
+∑︁
+𝑜∈𝑂
+|𝑓𝑜| +
+∑︁
+𝑜∈𝑂
+min{|𝑓𝑜|, log𝑛} (𝑐upd + 𝑐𝑞)
+
+.
+Proof of Theorem 3.12. For containment queries, we access ancestors of nodes in 𝐼max and
+examine the prefix of each node. For overlap queries, we access ancestors of nodes from the
+inverted list of every label in 𝑓𝑞and also examine the prefix of each node. The number of ancestors
+of a node 𝑢is |prefix(𝑢)|, and each ancestor can be accessed in O(1) time. Now consider a complex
+query. For any node𝑢∈𝐼𝑙where𝑙∈LΦ, if𝑢is inspected during a merge step in ComplexSearch, the
+associated cost is prefix(𝑢). In the worst-case scenario, every merge operation in ComplexSearch
+includes 𝑢. Since a complex predicate comprising |Φ| containment or overlap queries entails |Φ|
+merge operations, the overall complexity, when combined with the costs of ContainmentSearch
+and OverlapSearch, is given by O  Í
+𝑙∈LΦ
+Í
+𝑢∈𝐼𝑙|prefix(𝑢)| · |Φ|. Therefore, the theorem holds.
+Proof of Theorem 3.15. Operations on the Trie and updates to the inverted lists take O(|𝑓𝑜|)
+time. Traversing the path from the root to the leaf also costs O(|𝑓𝑜|). For HNSW insertion and
+supplementEdge, an object belongs to at most O(min{|𝑓𝑜|, log𝑛}) graphs, so the total insertion
+cost is O(min{|𝑓𝑜|, log𝑛} · (𝑐upd +𝑐𝑞)). Adjusting the index assigned to a node may involve copying
+or deleting an index; one such operation on node 𝑢costs O(|𝑂𝑢|𝑀) and is triggered only when
+a change in |𝑂𝑢| alters log_size(𝑢). After one such change, the next copy/delete on this index
+occurs after Ω(|𝑂𝑢|) insertions into 𝑂𝑢. Hence the amortized cost per insertion contributed by
+copying/deleting is O(𝑀). Since an insertion affects at most |𝑓𝑜| subtrees, the total amortized
+overhead from copying/deleting is O(|𝑓𝑜|𝑀).
+Rebuilding the index for node 𝑢costs O(|𝑂𝑢|𝑐upd). After a rebuild, 𝑢.𝐺contains at most
+2log_size(𝑢)+1 −1 nodes, and the next rebuild is triggered after Ω(|𝑂𝑢|) further insertions. Therefore,
+the amortized cost per insertion from rebuilding is O(𝑐upd). Because an insertion touches at
+most min{|𝑓𝑜|, log𝑛} graphs, the total amortized rebuilding overhead is O(min{|𝑓𝑜|, log𝑛} · 𝑐upd).
+Summing all parts yields an amortized time complexity per update of O |𝑓𝑜|𝑀+ min{|𝑓𝑜|, log𝑛} ·
+(𝑐upd + 𝑐𝑞). Moreover, the graph 𝑢.index.𝐺is allowed to contain at most 2log_size(𝑢)+2 −1 vertices,
+so
+|𝑂𝑢.index.𝐺|
+|𝑂𝑢|
+≤2log_size(𝑢)+2 −1
+2log_size(𝑢)
+< 4,
+assuring that the index remains a 4-approximate index for 𝑂𝑢.
+Received 17 April 2026; revised 19 August 2026; accepted 12 September 2026
+Proc. ACM Manag. Data, Vol. 4, No. 6 (SIGMOD), Article 335. Publication date: December 2026.

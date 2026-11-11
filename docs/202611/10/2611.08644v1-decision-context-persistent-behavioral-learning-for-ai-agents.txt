@@ -1,0 +1,1545 @@
+Decision Context: Persistent Behavioral Learning for
+AI Agents
+Nima Vahdat∗
+Georgian AI Lab
+nima.vahdat@georgian.io
+Pashootan Vaezipoor
+Georgian AI Lab
+pashootan@georgian.io
+Abstract
+LLM agents do not learn from corrections across sessions. A user fixes the same
+mistake at the start of every conversation. Existing agent memory systems handle
+facts (preferences, entities, conversational history [1, 2, 3]) but not procedural
+knowledge [4].
+We present Forge Decision Context (forge_dc), a system that captures behavioral
+signals from human corrections and from self-assessed tool-call failures, compiles
+them into imperative RULE directives, and injects them at the decision points where
+they apply. We evaluate forge_dc alongside four predecessor approaches on
+DC-Bench, a new benchmark of 71 scenarios across 9 behavioral dimensions,
+built from real executed agent traces in a deterministic mocked-tool environment.
+forge_dc reaches 95% compliance, up from 55% with naive retrieval, while
+injecting roughly 10× fewer tokens per query.
+Across the five-stage progression, the strongest systems represent behavioral mem-
+ory as explicit directives and deliver it at the decision points where it applies. The
+results identify representation, activation, and placement as central design choices
+for persistent behavioral learning.
+1
+Introduction
+LLM agents are increasingly deployed beyond question-answering: writing code, managing infras-
+tructure, orchestrating multi-step workflows. Yet they are memoryless learners: every session begins
+from the same blank state. Every correction must be repeated. Every hard-won behavioral insight is
+lost.
+Consider a security analyst correcting an agent over many sessions: “always check Identity and Access
+Management (IAM) policies before network configurations,” “use –recursive when scanning S3
+buckets,” “that API returns paginated results, so loop.” Within each session the agent improves as
+corrections accumulate in context. But the next day every correction must be re-issued, in the same
+order, with the agent making the same mistakes with the same confidence.
+The problem has two dimensions. First is the loss of human corrections: explicit feedback transfer-
+ring domain expertise about metrics, parameters, and strategies. Second is the loss of self-generated
+patterns: signals from the agent’s own execution such as tool retries that eventually succeed,
+errors that force strategy changes, and outputs the user silently regenerates. Existing prompt-
+engineering practice is fundamentally lossy (most corrections never propagate to system prompts),
+situational (most judgments are conditional), and ignores self-generated signals entirely. What is
+needed is a system that captures situational judgments as they occur and surfaces the right judgment
+at the right moment.
+∗Currently at PwC. nima.vahdat@pwc.com
+40th Conference on Neural Information Processing Systems (NeurIPS 2026). Workshop: Personalized, Aligned, Long-Term
+Memory for AI Systems.
+arXiv:2611.08644v1  [cs.AI]  5 Nov 2026
+
+
+The agent memory landscape has grown rapidly [5, 6]. Many systems emphasize facts, such as
+a meeting on Tuesday, a Python version, or a preference for dark mode. Other systems extend
+memory beyond factual recall by learning user preferences from edits [7] and reusable procedures
+from interaction traces [8, 9, 10]. We study how a tool-using agent can turn explicit corrections and
+implicit execution signals into actor-scoped guidance, determine when that guidance applies, and
+deliver it at the decision point where it can change behavior. Storing the correction “use QRR for
+enterprise revenue” is trivial; knowing when, how, and whether to apply it is the hard problem.
+A separate line of work learns reusable procedures, workflows, or hints from past trajectories, scored
+by task success [11, 12, 13, 14]. These methods assume a reward: something outside the agent says
+which trajectory was better. Deployment provides no such signal. What the agent has is the session
+itself: an explicit human correction, or an implicit cue in its own execution, such as a tool call that
+fails and then succeeds on retry, or an output the user silently regenerates.
+This paper makes three contributions:
+1. DC-Bench. A benchmark of 71 scenarios across 9 behavioral dimensions and two agent
+domains, built from real traces captured by running agents in a deterministic mocked-tool
+environment. Each scenario seeds corrections on one subject and tests on another, so it
+measures whether a correction is applied, not whether it is recalled.
+2. Forge Decision Context (forge_dc). A system that learns from human corrections and
+self-assessed tool-call failures without a reward signal, compiles both into scoped, actor-
+attributed RULE directives, and injects them at the decision points where they apply. It
+reaches 95% compliance on DC-Bench, against 12–15% for factual-memory systems and
+34–49% for procedural-memory baselines.
+3. Empirical findings from a five-stage system progression. The progression reveals an
+advantage for directive-form memory, a retrieval gap between formatting and content rules,
+the failure of implicit signals without explicit extraction, and sensitivity to the injection
+channel (Section 7).
+The
+implementation
+and
+evaluation
+artifacts
+are
+available
+at
+https://github.com/
+NimaVahdat/decision-context-memory
+and
+https://github.com/NimaVahdat/
+decision-context-benchmark.
+2
+Related Work
+Agent memory systems.
+Existing systems target factual memory in three families.
+Graph-
+structured systems (Zep/Graphiti [3], GraphMem [15]) use typed graphs with traversal-based retrieval.
+LLM-as-controller systems (MemGPT/Letta [1], MemOS [16]) page tiered memory in and out via
+LLM tool calls. Extraction-pipeline systems (Mem0 [2], Hindsight [17]) extract structured records
+offline with an LLM, then retrieve via non-LLM hybrid search. These systems primarily optimize
+factual or conversational recall; procedural memory remains comparatively underexplored [6, 18].
+DC is complementary: an agent may use Mem0 for facts and DC for behavior simultaneously.
+Procedural and experiential memory.
+A recent line distills reusable knowledge from past trajec-
+tories: AWM [11] induces workflows, Memp [12] builds step-level procedures, ACE [13] curates
+a context playbook, and JEF-Hinter [14] extracts offline hints. AutoManual [8] constructs and
+maintains an online rule manual, while skill-centric systems persist and revise reusable procedures:
+Memento-Skills [9] grows a routed skill library, and SkillRevise [10] diagnoses and repairs skills
+through re-execution. These systems primarily learn procedures that expand or repair how an agent
+completes tasks. Decision Context instead learns scoped behavioral guidance that changes when and
+how an agent uses capabilities it already has. It converts explicit corrections and patterns from tool-use
+traces into actor- and condition-scoped directives delivered at relevant decision points. Accordingly,
+skill-learning systems are generally evaluated by task success, whereas DC-Bench measures condi-
+tional compliance, generalization, scope precision, and non-transfer. We adapt AWM and Memp
+as baselines because their trace-to-procedure pipelines most directly match the behavioral-memory
+setting.
+2
+
+
+Learning preferences from edits.
+PRELUDE/CIPHER [7] infers context-dependent latent prefer-
+ences from users’ direct edits and retrieves and aggregates those preferences to guide future generation.
+It is the closest prior work on reusing naturally occurring user revisions. Our setting broadens the
+feedback beyond edited text to explicit conversational corrections and tool-execution patterns, and
+focuses on multi-step tool agents where a rule may need to activate between calls, be scoped to an
+actor, or be suppressed to avoid negative transfer. Conversely, PRELUDE directly optimizes edit cost
+in writing tasks, which DC-Bench does not measure.
+Memory benchmarks.
+LongMemEval [19], MABench [20], MemoryBench [4], MemBench [21],
+MemoryArena [22], and LOCOMO [23] converge on four findings: (i) single-fact retrieval is largely
+solved; (ii) cross-session reasoning remains difficult; (iii) conflict resolution is weak across all
+systems; (iv) procedural memory is unsolved. MemoryBench [4] explicitly identifies the procedural
+gap that motivates this work. DC-Bench differs by evaluating behavioral compliance (does the agent
+apply the correction to an unseen subject?), using real executed agent traces with controlled tool
+outputs, and covering 9 behavioral dimensions including self-assessment and multi-actor conflict. The
+benchmark is intended to complement, not replace, task-success and preference-learning evaluations.
+Learning from feedback and RAG.
+RLHF [24] adjusts model weights at the population level
+and is unsuitable for per-user behavioral adaptation. Constitutional AI [25] encodes manually
+authored, universal principles; DC automates and personalizes the same idea. In-context learning [26]
+requires manual example selection and does not persist across sessions. Continual learning [18] faces
+catastrophic forgetting and training cost. Standard RAG [27] retrieves information once at query
+start; DC retrieves behavioral guidance progressively at the decision points where it applies.
+3
+The Dimensions of Behavioral Memory
+Behavioral memory must satisfy several dimensions that factual memory does not, and prior ap-
+proaches address only some of them. The two signal sources (human corrections and self-generated
+trace patterns) must be turned into reusable guidance and surfaced when relevant. Six challenges
+define these dimensions: extracting signals from noise, generalizing without losing fidelity, retrieving
+at scale, surfacing at the decision point, updating knowledge as corrections supersede one another,
+and not regressing behavior the agent already gets right.
+Extracting signals from noise.
+Behavioral corrections arrive as natural language embedded in
+conversation. “Oh, and include the USD symbol next to monetary amounts” is a correction, but it
+looks like a casual remark. Trace patterns present a different challenge: not every tool error is a
+behavioral failure (rate limits, empty results, and sequential narrowing all produce errors that are not
+signals).
+Generalizing without losing fidelity.
+A correction observed against one subject must transfer to
+others without dropping qualifiers. Three properties make this hard: (i) corrections chain, so the
+same behavior is corrected repeatedly and only the final state matters; (ii) they are conditional, with
+qualifiers (“for enterprise clients”) that must be preserved; (iii) the generalization scope is ambiguous,
+since a failure on one subject may or may not generalize to others.
+Retrieval at scale.
+Behavioral guidance has narrow windows of relevance: the same tool with a
+different source, the same metric for a different segment. Scale stresses precision: the system must
+work with 5 corrections and with 500. Different categories also retrieve differently. Content-related
+guidance has semantic overlap with the query; formatting guidance (“include USD next to amounts”)
+does not, since “USD formatting” has no embedding similarity to “Beta Inc.”
+Surfacing at the right moment.
+Unlike facts, behavioral guidance must appear at the decision
+point where it is actionable. Guidance about S3 scanning is irrelevant during planning and critical
+during execution. Premature injection wastes context, late injection misses the decision point, and
+content placed in the middle of long contexts attenuates [28].
+Updating and resolving conflicts.
+Corrections accumulate, change, and conflict. A later correction
+supersedes an earlier one, and different actors correct the same behavior differently (one says “QRR,”
+3
+
+
+Capture
+Store
+Retrieve
+Inject
+Detect corrections, classify aftermath, build evidence
+Document chunks or typed graph (nodes, edges, evidence)
+Hybrid BM25 + cosine + RRF, edge expansion, type tags
+System prompt + per-tool-call, with directive formatting
+agent traces
+Figure 1: Four-layer Decision Context architecture. The dashed arrow is the feedback loop: traces
+from injected sessions become input to capture.
+another says “ARR”). The system must track provenance (who said what, when) and keep the
+knowledge current both at maintenance time (deduplication, supersession) and at injection time
+(selecting the right actor’s preferences).
+Not regressing prior behavior.
+Injected guidance must not degrade outputs the agent already
+produces correctly. A rule that fires on a case it does not apply to, or that contradicts behavior already
+in place, can make the agent worse than no memory at all, so the system needs a default of staying
+silent when nothing needs to change.
+4
+System Design
+The six challenges in Section 3 map to a four-layer pipeline (Figure 1): Capture extracts behavioral
+signals from agent traces; Store persists them in queryable form; Retrieve finds relevant rules for
+a new query; Inject delivers them at the right moment. Five approaches implement this pipeline
+with progressively more sophistication (Table 1). forge_dc, the strongest approach and the main
+technical contribution, combines all of them.
+Shared
+infrastructure.
+All
+five
+approaches
+share
+an
+embedding
+pipeline
+(text-embedding-3-small)
+and
+hybrid
+search
+via
+Reciprocal
+Rank
+Fusion
+[29]
+(RRF(n) = 1/(k + remb) + 1/(k + rBM25), k = 60). Four of the five (all except doc_naive)
+additionally implement aftermath classification: deterministic keyword detection (“wrong,” “actually,”
+“instead”) with LLM fallback that decides whether each subsequent message is a correction, an
+acceptance, or a new request. These chain boundaries matter for grouping related corrections.
+Two storage models.
+The first two approaches (doc_naive,
+doc_chunk) use a flat
+Documents →Chunks schema. The remaining three (hybrid_raw, lucid_dc, forge_dc) use
+a typed graph: DecisionNodes carry both a node embedding (local content) and an accumulated
+embedding (concatenated content up to that node), enabling stage-to-stage matching. Eight base edge
+types (MADE, ABOUT, APPLIED, LED_TO, PRODUCED, INFORMED_BY, HAS_SUMMARY, FOLLOWED_BY)
+connect actors, subjects, nodes, and evidence; forge_dc adds a ninth (FORGED_FROM) linking each
+compiled rule to the trigger node that should surface it.
+4.1
+Four predecessor approaches
+doc_naive (55%): naive RAG.
+The simplest pipeline: each trace is split at tool-call boundaries
+and chunked; embed, retrieve the top-k via the shared hybrid search (BM25 + cosine + RRF), and
+inject as “relevant past context” in the system prompt. No annotation, no aftermath classification, no
+edges, no per-tool injection. This is what happens when a team dumps logs into a vector database.
+Corrections get fragmented across chunks, are mixed with conversational filler, and are injected as
+raw text the agent must interpret. The 55% baseline succeeds only on simple, recent corrections that
+happen to land in a retrievable chunk.
+4
+
+
+Table 1: The five Decision Context approaches. Compliance scores are averages across the 71
+DC-Bench scenarios (Section 6).
+Approach
+Storage
+Self-Assess
+Compilation
+Per-Tool
+Avg.
+doc_naive
+Chunk
+—
+—
+—
+55%
+doc_chunk
+Annot. chunk
+—
+—
+—
+63%
+hybrid_raw
+Graph
+—
+—
+Evidence
+70%
+lucid_dc
+Graph
+Sonnet 4
+—
+Evidence
+82%
+forge_dc
+Graph
+Sonnet 4
+Sonnet 4
+Re-retrieval
+95%
+doc_chunk (63%): annotated chunks.
+The motivation here is to improve retrieval by adding
+annotations, and see whether the same annotations can shrink the injected context. doc_chunk
+adds deterministic per-chunk annotations and aftermath classification on top of doc_naive, and
+prepends a global readout of per-action correction rates to the system prompt alongside top precedents.
+Storage stays flat (no graph edges). Annotation makes BM25 hits sharper and lets injection drop
+conversational filler, raising compliance by 8 points (55%→63%); but without edges the system still
+cannot follow correction chains, traverse actor-scoped history, or use accumulated embeddings.
+hybrid_raw (70%): graph storage.
+Replaces chunks with the typed-graph storage model: each
+session becomes a sequence of DecisionNodes with eight edge types and both node and accumulated
+embeddings. The shared hybrid search now operates over nodes, with the embedding component
+combining node and accumulated similarity (0.7·node+0.3·accum). After RRF fusion, multiplicative
+boosts re-rank candidates by matching subjects, actors, and corrected documents. Injection occurs at
+two points: a system-prompt global readout plus top precedents, and a separate per-tool-call lookup
+that matches the current tool result against stored evidence via INFORMED_BY edges. Structure alone
+fixes retrieval (chains, conditional matching, long-conversation and scale scenarios), but hybrid_raw
+only captures explicit human corrections. Implicit signals from the agent’s own execution, tool retries,
+recurring failures, and suboptimal sequences, are never extracted. This sets up the next approach.
+lucid_dc (82%): autonomous self-assessment.
+Asks whether the agent can learn from its own
+traces rather than human corrections. After base capture, a separate Sonnet 4 analyzer reads tool-only
+data (no conversational context) and compiles recurring failures, retry-then-succeed sequences, and
+suboptimal strategies into behavioral directives. Tool-only input is deliberate: when the analyzer sees
+full traces, it produces rules about everything; restricting input to tool calls keeps it focused on ob-
+servable patterns. Compiled rules are injected unconditionally under a MANDATORY TOOL-CALLING
+RULES header, alongside the hybrid_raw retrieval. Only the self-assessment directives were fol-
+lowed reliably; raw human corrections were often ignored. This observation motivated forge_dc’s
+correction compiler and the “Only Rules Rule” mnemonic (Section 7).
+4.2
+forge_dc: correction compilation with progressive injection
+forge_dc combines both behavioral signal sources through a compilation pipeline that transforms
+raw corrections and trace patterns into structured, conflict-resolved, progressively injectable RULE
+directives.
+Pipeline.
+On top of the lucid_dc capture and self-assessment: (1) Correction chains are dis-
+covered by grouping per conversation_id and actor_id, then splitting at accepted aftermath
+boundaries (per-actor grouping prevents cross-preference merging). (2) Compilation (Sonnet 4)
+turns each chain, and the self-assessment patterns, into structured output: RULE (imperative directive),
+TYPE (FORMAT or CONTENT), TRIGGER (precondition node), DROP/SKIP (noise filters), and GROUP
+markers that cluster related rules. (3) Each rule is wired to its trigger node via a FORGED_FROM edge.
+(4) Rulebook maintenance deduplicates, merges agreements, supersedes earlier rules from the same
+actor, and flags cross-actor conflicts for runtime resolution. (5) At query time, progressive injection
+delivers rules across two stages.
+Precondition triggers.
+For each rule the compiler answers: at which point in the trace, if the
+agent had known this rule, would the mistake have been prevented? For tool-specific rules this is the
+node before the failing call (so the rule fires in time to prevent the mistake). The trigger anchors the
+5
+
+
+FORGED_FROM edge; at query time, matching the agent’s current context against trigger embeddings
+surfaces the linked rule.
+Progressive injection.
+Rules arrive at the model through two channels. Stage 1 (before the agent
+starts) injects unconditional rules (FORMAT type, plus any rule whose trigger matches the initial query)
+through the user channel as a fabricated user/assistant dialogue pair prepended to the conversation.
+Stage 2+ (between tool calls) re-retrieves using the agent’s accumulated context (query plus all prior
+tool calls and results) against trigger accumulated embeddings, and adds each newly triggered rule to
+the system prompt for the next model call. The two channels are intentionally different (Section 7).
+This stage-to-stage matching surfaces data-conditional rules at the moment the triggering data appears,
+and re-injecting at the decision point mitigates the “lost in the middle” problem [28].
+Conflict resolution.
+When retrieval surfaces rules from the same conflict group, resolution is
+three-tiered: (i) prefer the querying actor’s rule if they are a party to the conflict; (ii) otherwise pick
+the majority rule by supporting corrections; (iii) if no majority, abstain. All rules are stored, and
+selection happens at injection time per actor, allowing the same rule set to serve different actors
+differently.
+5
+DC-Bench
+DC-Bench evaluates behavioral recall: can the system learn from corrections and self-assessment,
+then apply that learning to a novel subject? It comprises 71 scenarios across 9 behavioral dimen-
+sions (Behavioral Change, Conditional Activation, Exception Handling, Generalization Boundary,
+Implicit Learning, Persistence, Recall, Scope Precision, Temporal Coherence; per-scenario scores
+in Appendix A), built on four principles. Each dimension contains scenarios from both a financial
+analyst skill and a customer support skill, testing whether behavioral learning transfers across agent
+domains.
+Real agent traces with controlled tools.
+Every seed is a real trace captured by running the agent
+end to end. The trace records the model’s actual messages, reasoning trajectory, tool calls, tool results,
+and subsequent author-provided behavioral corrections. The agent therefore determines which tools
+to call, in what order, and how to react to their results. Only the external environment is controlled:
+tools are mocks whose outputs are predetermined for each scenario, ensuring that every approach
+encounters the same evidence while preserving natural action sequences and trace structure.
+Seed-then-test on unseen subjects.
+Each scenario seeds corrections for one company (Acme) and
+queries about a different company (Beta), forcing behavioral generalization.
+Decoupled evaluation.
+Each approach captures with its own pipeline, but the test phase uses an
+identical agent (same skill prompts, tools, LLM config). The only variable at test time is the injected
+context, so score differences reflect retrieval and injection quality.
+Scenario isolation.
+Every scenario starts with a fresh memory store. Memories do not carry across
+scenarios, preventing contamination from unrelated corrections and ensuring that each score reflects
+only the seed trace specified for that scenario. The five repeated runs share the scenario specification
+but do not inherit memory from another scenario.
+Dual scoring and compliance.
+A GPT-4 judge evaluates each output against a 3–8-item rubric
+(positive or negative mode, weighted 1–3). The satisfied rubric weight is normalized by the applicable
+total weight to produce a per-run compliance score between 0 and 100. We average the five runs
+for each scenario–approach pair, then macro-average scenario scores within each dimension and
+across all 71 scenarios. Programmatic checks verify deterministic constraints (tool_call_max,
+source_not_called, output_contains, tool_param_check); programmatic failure forces a 0.
+Each scenario–approach pair is evaluated over 5 runs.
+6
+
+
+6
+Results
+The main results use Opus 4.7 as the agent backbone,
+GPT-4 as the judge,
+and
+text-embedding-3-small for embeddings, with 5 runs per scenario–approach pair (mean re-
+ported). mem0 and zep are factual-memory baselines; awm [11] and memp [12] are procedural-memory
+baselines, given the identical seed traces and injection channel so any difference reflects what each
+system learns. Table 2 reports mean compliance by behavioral dimension.
+Table 2: Mean compliance (%) by behavioral dimension across 71 scenarios. ctrl = no injection.
+mem0/zep are factual memory baselines; awm/memp are procedural-memory baselines. Best per row
+bolded. ∆= forge −naive.
+Dimension
+ctrl mem0 zep awm memp naive chunk hybrid lucid forge
+∆
+Behav. Change (7)
+14
+14
+14
+43
+71
+71
+71
+86
+86
+86
++15
+Cond. Activation (12)
+8
+0
+12
+49
+40
+53
+76
+80
+84
+95
++42
+Exception (3)
+67
+67
+67
+67
+100
+67
+100
+87
+87
+100
++33
+Generalize (3)
+67
+33
+33
+33
+100
+67
+67
+67
+67
+100
++33
+Implicit Learn. (10)
+0
+0
+0
+0
+10
+10
+20
+0
+78
+90
++80
+Persistence (10)
+8
+2
+5
+41
+21
+21
+37
+82
+83
+100
++79
+Recall (9)
+0
+0
+6
+33
+89
+89
+89
+89
+89
+100
++11
+Scope Precision (8)
+50
+45
+57
+39
+45
+65
+70
+81
+78
+96
++31
+Temporal Coh. (9)
+7
+11
+0
+25
+47
+81
+69
+75
+79
+97
++16
+Overall (71)
+10
+12
+15
+34
+49
+55
+63
+70
+82
+95
++40
+The progression.
+Each step unlocks specific failure dimensions. naive →hybrid (55 →70%):
+structure. Typed LED_TO edges and accumulated embeddings resolve Persistence (21 →82%) and
+Conditional Activation (53 →80%). However, hybrid provides no improvement on Implicit Learning
+(10 →0%), which requires tool-trace analysis. hybrid →lucid (70 →82%): self-assessment.
+Sonnet 4 over tool-only traces unlocks Implicit Learning (0 →78%), inaccessible to any correction-
+only approach. lucid →forge (82 →95%): compiled, triggered delivery. Strong-model rule
+compilation, per-actor conflict groups, and trigger-based progressive injection close Generalization
+(67 →100%), Implicit Learning (78 →90%), Recall (89 →100%), and Conditional Activation
+(84 →95%). This cumulative stage measures the combined effect of compilation, conflict resolution,
+triggering, and progressive injection. The memory also never regresses the base: on every scenario
+the no-injection control already passes, forge_dc still passes, while each predecessor fails at least
+one (Table 5).
+Token efficiency and efficacy.
+forge_dc achieves the highest compliance with the fewest injection
+tokens (Table 3): ∼10:1 compression vs. hybrid_raw. The efficacy rate (the fraction of injected
+runs that score > 0) further separates the approaches: forge_dc 90.7% vs. mem0 4.2%. Under this
+configuration, mem0 injects 25 tokens per query on average but reaches only 4.2% efficacy; forge_dc
+combines compact directives with targeted retrieval and placement.
+Table 3: Mean injection tokens and efficacy rate per approach.
+Approach
+Tokens
+Efficacy
+mem0
+25
+4.2%
+zep
+4
+16.1%
+awm
+1,207
+39.7%
+memp
+1,545
+52.1%
+doc_naive
+1,705
+59.4%
+doc_chunk
+1,063
+64.8%
+hybrid_raw
+1,651
+72.4%
+lucid_dc
+1,641
+84.5%
+forge_dc
+159
+90.7%
+End-to-end accounting (Table 4) shows that forge_dc’s per-run savings amortize its one-time capture
+cost after ∼4 queries.
+7
+
+
+Table 4: End-to-end token cost per scenario (capture once + one agent run). LLM tokens dominate
+cost. forge_dc capture (25,185 LLM tokens, one-time) is offset by the lowest per-run agent cost
+(5,621 tokens), making it cheaper than doc_naive after 4 queries (25,185/(11,871 −5,621) ≈4).
+Capture (once)
+Embed
+Agent (per run)
+Approach
+LLM in
+LLM out
+total
+Input
+Output
+Total LLM
+mem0
+57,666
+1,231
+9,155
+4,190
+1,241
+64,328
+zep
+34,395
+845
+130
+2,413
+530
+38,183
+awm
+8,230
+556
+0
+5,212
+1,519
+15,517
+memp
+7,902
+748
+76
+5,538
+1,791
+15,979
+doc_naive
+0
+0
+13,236
+10,371
+1,500
+11,871
+doc_chunk
+0
+0
+9,180
+7,984
+1,481
+9,465
+hybrid_raw
+0
+0
+12,152
+9,281
+1,666
+10,947
+lucid_dc
+4,805
+69
+12,150
+8,936
+1,645
+15,455
+forge_dc
+23,008
+2,177
+13,620
+4,318
+1,303
+30,806
+forge_dc is also the fastest DC approach in user-facing latency (query + agent: 14,956 ms vs.
+16,468 ms for doc_naive), despite the most expensive capture phase (45,673 ms). Fewer, better-
+formatted tokens outperform more, raw tokens.
+Cross-model validation.
+We also ran the full benchmark on five additional frontier models: Sonnet
+4.5, Opus 4.5, Opus 4.6, GPT-4.1, and GPT-5.5. forge_dc mean compliance stays in the 0.93 to
+0.97 range on every model, and the relative gains across the five-stage progression remain consistent
+across model families.
+In-session value.
+In a separate test we kept the seed conversation in the agent’s message history
+at test time, on the 54 scenarios that do not hinge on a cross-session boundary by design. The raw
+conversation alone reaches 69% compliance; forge_dc on top of the same in-context conversation
+reaches 90%. The gap is sharpest on implicit-learning, where the raw conversation scores 0% (the
+patterns come from tool-call traces, not from human corrections) and forge_dc scores above 80%.
+Behavioral memory adds value within a session as well as across sessions.
+7
+Findings and Design Considerations
+Each finding pairs with a design consideration for anyone building behavioral memory for an LLM
+agent.
+Finding 1: Directive-form memory produces a recurring compliance advantage (the “Only
+Rules Rule”).
+Across the system progression, agents follow compiled behavioral directives more
+consistently than retrieved descriptive corrections. We call this recurring pattern the “Only Rules
+Rule.” Its practical implication is that behavioral memory must be optimized for action, not retrieval
+alone: representation, activation, and delivery jointly shape compliance. Consideration: evaluate
+whether retrieved memory changes behavior, not only whether the correct text was retrieved.
+Finding 2: FORMAT and CONTENT rules retrieve differently.
+Formatting rules (“include USD”)
+have no embedding similarity to the queries they apply to. Pure semantic retrieval misses them at
+scale. Consideration: tag rules by type at capture and route them differently at retrieval. Embedding
+similarity is the right primitive for content rules and the wrong primitive for formatting rules.
+Finding 3: Data-conditional rules need to fire at the decision point.
+Rules that depend on tool
+data cannot be evaluated at query time. They have to be surfaced when the triggering data appears.
+Consideration: re-retrieve as the agent accumulates context and add newly triggered rules to the
+system prompt between tool calls.
+Finding 4: Adding reasoning to a rule does not help, and sometimes hurts.
+A variant (forge_dc
+_reasoning) that attaches a one-sentence justification to each rule scores flat or slightly lower than
+8
+
+
+the bare directive on every model we tested. Given the reason behind a directive, the model evaluates
+the directive and sometimes decides to override it. Consideration: do not try to convince the
+model with reasoning. In our rule-based configuration, extra judgment material does not improve
+compliance and can invite the model to second-guess.
+Finding 5: The injection channel is part of the design.
+The channel a rule arrives through is
+a design choice separate from what the rule says. Different channels carry different trust profiles,
+compete differently with the task for attention, and dilute when multiple instruction streams share
+one slot. The channel that works for one stage of injection is not always the right one for another, and
+what works on one model is not guaranteed to work on the next. Consideration: treat each stage’s
+channel as a first-class design decision and re-validate when the model generation changes.
+Finding 6: A memory must not regress the base.
+Injected guidance can make an agent worse than
+no memory: a rule that surfaces on a case it does not fit, or that overrides behavior the agent already
+produces correctly, degrades an output that needed no change. This is easy to miss when a memory is
+scored only on the cases it targets, so it is worth measuring against a no-injection baseline across
+every dimension. Consideration: learn only from failures and corrections, and default to staying
+silent when nothing needs to change, so the memory never degrades behavior the agent already gets
+right.
+Closing observation.
+An LLM agent is a wrapped LLM. The memory layer is one source of the
+tokens the model conditions on. Whether the agent acts on those tokens depends on what the model
+was trained to do with instructions in that form, from that slot, in that voice. A behavioral memory
+architecture has to be designed with this dependency in mind.
+8
+Discussion
+Limitations.
+The five-stage progression evaluates cumulative architectures and does not isolate the
+individual effects of compilation, triggering, conflict resolution, or injection placement. DC-Bench,
+the five approaches, the judge rubrics, and the AWM/Memp adaptations were built by the same
+team. The mem0 and zep results reflect the retrieval configurations used here and may improve under
+different tuning. The benchmark covers two domains, and compliance depends on the instruction-
+following behavior of specific model versions.
+Why corrections detach from retrieval (hypothesis).
+We hypothesize that the asymmetry between
+in-session and retrieved corrections is mediated by attention. With a wrong output present, the
+correction text has a high-similarity neighbor that pulls it into attention at generation time. Without
+one, the correction competes poorly with the rest of the prompt for attention, especially when placed
+early in a long context [28]. We further hypothesize that imperative tokens (RULE, MUST, MANDATORY)
+act as attention magnets independent of semantic similarity, because instruction following is heavily
+reinforced during training. This is an interpretation consistent with the data, not a verified mechanism.
+Verifying it would require attention analysis on a white-box model of comparable capability.
+9
+Conclusion
+Much of the agent memory landscape emphasizes factual recall. Whether an agent applies a previously
+learned correction to a new situation is what decides if a long-running deployment improves over time,
+and it has been largely unmeasured. We built DC-Bench to make that question testable and developed
+Decision Context, a four-layer pipeline that compiles behavioral signals into imperative RULE
+directives. Through five approaches we arrived at forge_dc, which reaches 95% mean compliance
+on DC-Bench and holds in the 0.93 to 0.97 range across six frontier models from Anthropic and
+OpenAI. The external memory baselines, mem0 and zep, sit at 12% and 15%.
+What emerges is a different shape for behavioral memory than for factual memory. Retrieval is
+necessary but not sufficient. The form the rule takes, the slot it occupies, and the channel it travels
+through decide whether the agent acts on the retrieved content, and those choices shift across model
+generations. The next frontier is behavioral memory: systems that learn how to act differently as a
+result of what happened. We hope DC-Bench provides a measurable target for that work.
+9
+
+
+References
+[1] Charles Packer, Sarah Wooders, Kevin Lin, Vivian Fang, Shishir G. Patil, Ion Stoica, and
+Joseph E. Gonzalez.
+MemGPT: Towards LLMs as operating systems.
+arXiv preprint
+arXiv:2310.08560, 2023. URL https://arxiv.org/abs/2310.08560.
+[2] Prateek Chhikara, Dev Khant, Saket Aryan, Taranjeet Singh, and Deshraj Yadav. Mem0:
+Building production-ready AI agents with scalable long-term memory.
+arXiv preprint
+arXiv:2504.19413, 2025. URL https://arxiv.org/abs/2504.19413.
+[3] Preston Rasmussen, Pavlo Paliychuk, Travis Beauvais, Jack Ryan, and Daniel Chalef. Zep: A
+temporal knowledge graph architecture for agent memory. arXiv preprint arXiv:2501.13956,
+2025. URL https://arxiv.org/abs/2501.13956.
+[4] Qingyao Ai, Yichen Tang, Changyue Wang, Jianming Long, Weihang Su, and Yiqun Liu.
+MemoryBench: A benchmark for memory and continual learning in LLM systems. arXiv
+preprint arXiv:2510.17281, 2025. URL https://arxiv.org/abs/2510.17281.
+[5] Yuyang Hu et al. Memory in the age of AI agents. arXiv preprint arXiv:2512.13564, 2025.
+URL https://arxiv.org/abs/2512.13564.
+[6] Pengfei Du. Memory for autonomous LLM agents: Mechanisms, evaluation, and emerging
+frontiers. arXiv preprint arXiv:2603.07670, 2026. URL https://arxiv.org/abs/2603.
+07670.
+[7] Ge Gao, Alexey Taymanov, Eduardo Salinas, Paul Mineiro, and Dipendra Misra. Aligning
+LLM agents by learning latent preference from user edits. In Advances in Neural Information
+Processing Systems, volume 37, 2024. URL https://arxiv.org/abs/2404.15269.
+[8] Minghao Chen, Yihang Li, Yanting Yang, Shiyu Yu, Binbin Lin, and Xiaofei He. AutoManual:
+Constructing instruction manuals by LLM agents via interactive environmental learning. In
+Advances in Neural Information Processing Systems, volume 37, 2024. URL https://arxiv.
+org/abs/2405.16247.
+[9] Huichi Zhou, Siyuan Guo, Anjie Liu, Zhongwei Yu, Ziqin Gong, Bowen Zhao, Zhixun Chen,
+Menglong Zhang, Yihang Chen, Jinsong Li, Runyu Yang, Qiangbin Liu, Xinlei Yu, Jianmin
+Zhou, Na Wang, Chunyang Sun, and Jun Wang. Memento-Skills: Let agents design agents.
+arXiv preprint arXiv:2603.18743, 2026. URL https://arxiv.org/abs/2603.18743.
+[10] Yuxuan Liu, Zhaochen Su, Lingyun Xie, Yuhao Zhang, Qing Zong, Jiahe Guo, Zhongwei Xie,
+Yiyan Ji, Yauwai Yim, Hongyu Luo, Xiyu Ren, Chenyu Ruan, Haoran Li, and Yangqiu Song.
+SkillRevise: Improving LLM-authored agent skills via trace-conditioned skill revision. arXiv
+preprint arXiv:2606.01139, 2026. URL https://arxiv.org/abs/2606.01139.
+[11] Zora Zhiruo Wang et al. Agent workflow memory. arXiv preprint arXiv:2409.07429, 2024.
+URL https://arxiv.org/abs/2409.07429.
+[12] Runnan Fang et al.
+Memp:
+Exploring agent procedural memory.
+arXiv preprint
+arXiv:2508.06433, 2025. URL https://arxiv.org/abs/2508.06433.
+[13] Qizheng Zhang et al. Agentic context engineering: Evolving contexts for self-improving
+language models. arXiv preprint arXiv:2510.04618, 2025. URL https://arxiv.org/abs/
+2510.04618.
+[14] Hadi Nekoei et al. JEF-Hinter: Leveraging offline knowledge for improving web agents
+adaptation. arXiv preprint arXiv:2510.04373, 2025. URL https://arxiv.org/abs/2510.
+04373.
+[15] Chang Yang et al. Graph-based agent memory: Taxonomy, techniques, and applications. arXiv
+preprint arXiv:2602.05665, 2026. URL https://arxiv.org/abs/2602.05665.
+[16] Zhiyu Li et al. MemOS: A memory OS for AI system. arXiv preprint arXiv:2507.03724, 2025.
+URL https://arxiv.org/abs/2507.03724.
+10
+
+
+[17] Vectorize et al.
+Hindsight: Agentic memory with LLM metacognition.
+arXiv preprint
+arXiv:2512.12818, 2025. URL https://arxiv.org/abs/2512.12818.
+[18] Joe Logan. Continuum memory architectures for long-horizon LLM agents. arXiv preprint
+arXiv:2601.09913, 2026.
+[19] Di Wu et al. LongMemEval: Benchmarking chat assistants on long-term interactive memory.
+2024.
+[20] Yuanzhe Hu, Yu Wang, and Julian McAuley. Evaluating memory in LLM agents via incremental
+multi-turn interactions. In International Conference on Learning Representations (ICLR), 2026.
+URL https://arxiv.org/abs/2507.05257.
+[21] Haoran Tan, Zeyu Zhang, Chen Ma, Xu Chen, Quanyu Dai, and Zhenhua Dong. MemBench:
+Towards more comprehensive evaluation on the memory of LLM-based agents. In Findings of
+the Association for Computational Linguistics (ACL), 2025. URL https://arxiv.org/abs/
+2506.21605.
+[22] Zexue He, Yu Wang, et al. MemoryArena: Benchmarking agent memory in interdependent
+multi-session agentic tasks. arXiv preprint arXiv:2602.16313, 2026. URL https://arxiv.
+org/abs/2602.16313.
+[23] Adyasha Maharana, Dong-Ho Lee, Sergey Tulyakov, Mohit Bansal, Francesco Barbieri, and
+Yuwei Fang. Evaluating very long-term conversational memory of LLM agents. In Association
+for Computational Linguistics (ACL), 2024. URL https://arxiv.org/abs/2402.17753.
+[24] Long Ouyang et al. Training language models to follow instructions with human feedback.
+NeurIPS, 2022.
+[25] Yuntao Bai et al.
+Constitutional AI: Harmlessness from AI feedback.
+arXiv preprint
+arXiv:2212.08073, 2022.
+[26] Tom B Brown et al. Language models are few-shot learners. NeurIPS, 2020.
+[27] Patrick Lewis et al.
+Retrieval-augmented generation for knowledge-intensive NLP tasks.
+NeurIPS, 2020.
+[28] Nelson F Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio Petroni,
+and Percy Liang. Lost in the middle: How language models use long contexts. Transactions of
+the Association for Computational Linguistics, 12:157–173, 2024.
+[29] Gordon V Cormack, Charles LA Clarke, and Stefan Buettcher. Reciprocal rank fusion outper-
+forms condorcet and individual rank learning methods. In SIGIR, pages 758–759, 2009.
+A
+Per-Scenario Results
+Table 5: Per-scenario compliance (%) across all 71 scenarios. ✓= 100%; scores < 50% are italicized;
+best per row bolded. ctrl = no injection.
+Dimension
+Scenario
+ctrl
+mem0
+zep
+naive
+chunk
+hybrid
+lucid
+forge
+Behav.
+Change
+(7)
+threat_score
+0
+✓
+0
+✓
+✓
+✓
+✓
+✓
+comp_format
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+cond_skip
+0
+0
+0
+0
+0
+0
+0
+0
+runway_flag
+0
+0
+0
+0
+0
+✓
+✓
+✓
+tool_order
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+esc_susp_first
+0
+0
+✓
+✓
+✓
+✓
+✓
+✓
+order_before_kb
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+Cond. Act. (12)
+cond_growth
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+neg_runway
+0
+0
+0
+0
+20
+0
+10
+40
+thresh_stage
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+informed_by
+0
+0
+0
+10
+0
+60
+0
+✓
+multi_tool
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+(continued on next page)
+11
+
+
+(continued from previous page)
+Dimension
+Scenario
+ctrl
+mem0
+zep
+naive
+chunk
+hybrid
+lucid
+forge
+class_chain
+0
+0
+0
+23
+93
+✓
+✓
+✓
+cond_format
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+ext_patched
+0
+0
+50
+0
+✓
+✓
+✓
+✓
+insider
+0
+0
+✓
+0
+✓
+✓
+✓
+✓
+prog_narrow
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+ent_skip_kb
+0
+0
+0
+0
+0
+0
+✓
+✓
+susp_skip_ord
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+Exception (3)
+ephem_support
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+no_persist
+✓
+✓
+✓
+✓
+✓
+60
+60
+✓
+vs_rule
+0
+0
+0
+0
+✓
+✓
+✓
+✓
+Generalize (3)
+runway_stage
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+saas_mrr
+0
+0
+0
+0
+0
+0
+0
+✓
+no_gen_company
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+Implicit
+Learn.
+(10)
+avoid_bad
+0
+0
+0
+0
+✓
+0
+0
+✓
+learn_pattern
+0
+0
+0
+✓
+✓
+0
+✓
+✓
+cross_subj
+0
+0
+0
+0
+0
+0
+✓
+✓
+recurring
+0
+0
+0
+0
+0
+0
+✓
+✓
+retry
+0
+0
+0
+0
+0
+0
+✓
+✓
+auth_retry
+0
+0
+0
+0
+0
+0
+✓
+✓
+chan_lookup
+0
+0
+0
+0
+0
+0
+✓
+✓
+new_prod_gap
+0
+0
+0
+0
+0
+0
+✓
+✓
+presales_skip
+0
+0
+0
+0
+0
+0
+80
+✓
+repeat_esc
+0
+0
+0
+0
+0
+0
+0
+0
+Persistence (10)
+10msg_scat
+0
+0
+0
+0
+0
+80
+73
+✓
+20msg_early
+0
+0
+0
+0
+0
+✓
+✓
+✓
+vol_dist
+0
+0
+20
+80
+0
+✓
+✓
+✓
+100_corr
+0
+0
+0
+0
+0
+80
+80
+✓
+mixed_sigs
+0
+0
+0
+0
+✓
+✓
+✓
+✓
+50_corr
+0
+0
+0
+0
+0
+60
+80
+✓
+5conv
+13
+3
+7
+33
+67
+✓
+✓
+✓
+cross_co
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+rout_10tick
+0
+20
+20
+0
+0
+0
+0
+✓
+rout_noise
+0
+0
+0
+0
+✓
+✓
+✓
+✓
+Recall (9)
+cap_scores
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+content_qrr
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+format_table
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+runway_risk
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+terminology
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+two_sents
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+phrasing
+0
+0
+10
+✓
+✓
+✓
+✓
+✓
+acct_format
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+rout_rule
+0
+0
+0
+0
+0
+0
+0
+✓
+Scope Prec. (8)
+3user
+0
+0
+0
+0
+0
+✓
+✓
+✓
+conflict
+0
+0
+0
+0
+✓
+✓
+✓
+✓
+cross_user
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+ambiguous
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+cross_skill
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+✓
+neg_transfer
+✓
+✓
+✓
+40
+0
+0
+0
+✓
+cross_sk_iso
+✓
+40
+✓
+✓
+✓
+✓
+✓
+✓
+rule_iso
+20
+20
+35
+80
+60
+45
+25
+65
+Temporal
+Coh.
+(9)
+accum_5
+0
+0
+0
+33
+3
+33
+33
+✓
+conflicting
+0
+0
+0
+✓
+0
+0
+0
+✓
+superseding
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+explicit_del
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+partial_roll
+0
+0
+0
+50
+40
+✓
+✓
+✓
+poli_super
+0
+0
+0
+✓
+✓
+40
+80
+✓
+tier_change
+0
+✓
+0
+✓
+✓
+✓
+✓
+97
+evolving_pref
+0
+0
+0
+50
+80
+✓
+✓
+75
+reversion
+0
+0
+0
+✓
+✓
+✓
+✓
+✓
+Overall (71)
+10
+12
+15
+55
+63
+70
+82
+95
+12

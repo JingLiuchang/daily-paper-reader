@@ -1,0 +1,2624 @@
+MEMOIR: A Training-Free Memory Lifecycle for Long-Horizon LLM Agents
+Mayank Anand1, Subham Raj2∗, Aman Vaibhav Jha2, Sriparna Saha2
+1Indian Institute of Information Technology Allahabad
+2Indian Institute of Technology Patna
+Corresponding author: subham_2221cs25@iitp.ac.in
+Abstract
+Long-horizon LLM agents require memory systems that pre-
+serve useful information across sessions and retrieve it when
+needed. Existing systems treat these as separate problems:
+memories are written prospectively with static importance
+scores that are never revised after use. This creates two cou-
+pled failure modes: consolidation can silently destroy evidence
+that future queries require, while retrieval continues to favor
+stale memories. We propose MEMOIR (Memory Evidence
+via Merge-certified, Online Importance Revision), a training-
+free memory lifecycle that unifies judge-gated consolidation
+with retrospective attribution. Before compressing memory,
+screening gates test whether answer-relevant evidence is pre-
+served. After each query, attribution estimates which retrieved
+memories supported the answer and updates their retrieval
+priority. A UCB-style exploration bonus additionally encour-
+ages retrieval of under-exposed memories, reducing the risk
+that frequently retrieved memories crowd out useful but less-
+seen evidence. On 1,905 deduplicated LoCoMo QA pairs, the
+full retrieval stack improves evidence recall@5 by 11.92 per-
+centage points over bare cosine, with confidence-gated feed-
+back adding 1.50 points overall without reference answers
+or reranker training; a deployment-unavailable oracle adds
+1.84 points overall and 8.05 points on multi-hop. Judge-gated
+merge changes the recall of text-based evidence from 58.82%
+to 59.08%, reduces the active store by 1.42%, and incurs 0
+observed losses in 100 independently audited merges, with
+a one-sided 95% upper loss-rate bound of 2.95%. Together,
+these results outline a practical deployment path: no addi-
+tional LLM call on the online write path, with merge screen-
+ing confined to periodic offline consolidation. The lifecycle
+reduces to one principle: attribute usefulness after use, and
+screen for preservation before compression. Code is available
+at https://github.com/AnandMayank/MEMOIR.
+1
+Introduction
+LLM agents can use tools and reason over immediate con-
+text, but long-horizon agents require external memory to
+reuse historical experience across sessions that exceed any
+practical context window (Park et al. 2023; Wu et al. 2024).
+As agents are deployed for multi-session tasks such as per-
+sonal assistance, customer support, and research copiloting,
+∗Corresponding author.
+Copyright © 2027, Association for the Advancement of Artificial
+Intelligence (www.aaai.org). All rights reserved.
+accumulated interaction history grows beyond what a single
+inference call can attend to. External memory is therefore
+not merely an efficiency optimization; it is a lifecycle re-
+quirement: agents must decide what to keep, what to con-
+solidate, what to retrieve, and how to revise those decisions
+after observing outcomes.
+Most existing systems handle only part of this lifecy-
+cle. Write-time memory systems construct summaries, facts,
+links, or graph structures when an interaction is stored. Re-
+trieval systems then rank those memories using recency, rel-
+evance, and static importance. Generative Agents, for ex-
+ample, scores memory priority as a fixed combination of
+recency, importance, and relevance (Park et al. 2023). Later
+systems such as Mem0 and A-MEM add stronger extraction,
+linking, or graph structure (Chhikara et al. 2025; Xu et al.
+2026), but the importance signal is still largely assigned at
+write time. A memory that was judged important when stored
+can remain highly ranked even if later sessions show that it
+is no longer useful.
+This paper reframes the problem around two coupled fail-
+ure modes. The first is prospective corruption: memory con-
+solidation can merge, summarize, or prune items that look
+redundant locally but contain evidence required by future
+queries. The second is retrospective staleness: retrieval can
+continue to favor memories that merely resemble the query
+rather than memories that have actually helped answer prior
+queries. These are not merely engineering artifacts: prospec-
+tive corruption reflects the loss of answer-relevant traces
+during consolidation, while retrospective staleness reflects
+the absence of retrieval-induced strengthening (Roediger and
+Karpicke 2006). We treat established properties of bounded-
+capacity memory under delayed, sparse feedback (Tulving
+1972; Craik and Lockhart 1972; Ebbinghaus 1885; Stern
+2002) as convergent design constraints for a memory life-
+cycle, not as claims of biological or structural isomorphism.
+Treating the two failures separately is insufficient. Consolida-
+tion changes the objects to which retrieval credit is attached,
+while retrieval feedback reveals which objects consolidation
+should protect.
+We therefore propose a combined lifecycle: screen
+prospectively, attribute retrospectively. Prospectively,
+certificate-gated consolidation applies merge operations only
+when a judge ensemble finds that answer-relevant support is
+preserved. Retrospectively, we introduce TRACE (Training-
+arXiv:2611.07631v1  [cs.IR]  5 Nov 2026
+
+
+free Retrieval Attribution and Credit Estimation), with two
+instantiations: TRACE-FB (feedback attribution) estimates
+memory support via lexical overlap, and TRACE-CF (coun-
+terfactual attribution) measures support by leave-one-out
+answer change. TRACE-UCB (Upper Confidence Bound
+exploration) couples these importance updates with count-
+based exploration to reduce feedback-driven retrieval lock-
+in. The bridge is that attribution provides online estimates of
+support sets for consolidation, while accepted merges pre-
+serve and transfer the credit ledger. In short, the system con-
+solidates what the screening procedure accepts as redundant
+and up-weights what is estimated to be useful.
+This framing follows the two-phase shape of RMM,
+which combines prospective memory construction with ret-
+rospective reflection (Tan et al. 2025), but changes both
+halves. RMM’s prospective step is heuristic summariza-
+tion and its retrospective step uses an LLM citation labeler
+plus a REINFORCE-trained reranker. Our direction replaces
+heuristic summarization with certificate-gated consolidation
+and replaces trained reranking with closed-form, training-
+free attribution updates. The goal is not simply better re-
+trieval, but a memory lifecycle in which compression and
+credit assignment are mutually consistent.
+Our contributions can be summarized as the following:
+1. A combined prospective-retrospective memory lifecy-
+cle unifies certificate-gated consolidation with outcome-
+conditioned attribution in a training-free framework for
+long-horizon agents. Its full RECALL-Q retrieval stack
+improves evidence recall by 11.92 percentage points over
+cosine retrieval on LoCoMo.
+2. TRACE-UCB couples these with count-based explo-
+ration to mitigate exposure lock-in. Confidence-gated au-
+tonomous feedback improves evidence recall@5 by 1.50
+percentage points over the matched no-TRACE retriever,
+while reference-answer feedback reaches a 1.84-point
+gain and an 8.05-point multi-hop gain.
+3. Certified merge provides a conservative prospective
+safety gate combining judge screening, retrieval coverage,
+provenance preservation, and hard compression. Under
+a fixed retrieved-token budget, it changes text-grounded
+evidence recall from 58.82% to 59.08%, reduces the ac-
+tive store by 1.42%, and incurs 0 observed audited losses
+among 100 accepted merges.
+4. A training-free architecture separates low-latency online
+memory operations from asynchronous certified consol-
+idation. The online write path requires no LLM call and
+takes 6.8ms median latency, while lexical and counter-
+factual attribution expose a configurable quality-latency
+trade-off.
+2
+Related Work
+2.1
+Agent Memory Systems
+Agent memory systems can be organized by how they store
+and update long-term context (Zhou et al. 2026). Stream-
+and-reflection systems such as MemoryBank maintain con-
+versation as a timestamped log and periodically distill it
+into higher-level reflections (Zhong et al. 2024). Hierarchi-
+cal systems such as MemGPT and Letta separate bounded
+in-context memory from an archival store, moving items be-
+tween tiers through explicit control operations (Packer et al.
+2023). Knowledge-graph systems such as Mem0 and Zep
+represent memory as entities and typed relations, some-
+times including temporal validity intervals for factual up-
+dates (Chhikara et al. 2025; Rasmussen et al. 2025). Com-
+posite systems such as A-MEM route structured memory
+objects across vector and graph substrates (Xu et al. 2026).
+A common cost of this write-time structure is that entity
+extraction, relation inference, and summarization typically
+require one or more LLM calls per write, which accumu-
+lates into non-trivial latency and token cost as interaction
+volume grows. Recent work such as Memanto (Abtahi et al.
+2026) instead pursues LLM-free ingestion, showing that raw
+conversational content can be stored without any write-path
+LLM call. MEMOIR shares this training-free write-time goal
+but differs in what the saved cost is used for: rather than opti-
+mizing ingestion alone, MEMOIR uses the freed write-time
+budget to support closed-form, retrospective importance re-
+vision, so that cheap writes are paired with an evolving no-
+tion of which memories remain load-bearing. These systems
+improve storage and retrieval structure, but they still assign
+importance, relevance, or link strength at write time rather
+than revising it from retrieval outcomes.
+MEMOIR’s write path deliberately shifts processing cost
+from initial ingestion to retrospective usage-driven accrual —
+a design trade-off informed by established cognitive memory
+principles (Tulving 1972; Craik and Lockhart 1972; Roedi-
+ger and Karpicke 2006; Ebbinghaus 1885; Stern 2002) as
+engineering design pressures rather than biological claims.
+2.2
+Retrieval and Importance Scoring
+The retrieval layer beneath agent memory is often a fixed
+scoring function. Dense retrieval scores candidates by em-
+bedding similarity; BM25 (Robertson and Walker 1994)
+scores by lexical statistics; and hybrid methods such as
+SPLADE and ColBERT combine lexical and semantic
+matching through learned sparse expansion or late interac-
+tion (Izacard et al. 2023; Formal, Piwowarski, and Clinchant
+2021; Khattab and Zaharia 2020). Generative Agents add a
+write-time LLM importance rating to recency and relevance,
+but the importance term is static (Park et al. 2023). The
+closest prior work is RMM, which introduces Retrospective
+Reflection: an LLM assigns binary citation scores to retrieved
+memories, and those scores train a lightweight reranker with
+REINFORCE (Tan et al. 2025). RMM shares MEMOIR’s in-
+tuition that generation-time attribution can improve retrieval,
+but it operationalizes that intuition as a training loop. MEM-
+OIR instead updates wimp as a closed-form running statistic,
+requiring no reranker training and no write-path LLM call.
+2.3
+Long-Horizon Memory Benchmarks
+We evaluate MEMOIR primarily on LoCoMo, a long-
+conversation benchmark spanning up to 32 sessions per dia-
+logue with single-hop, multi-hop, temporal, and adversarial
+query categories (Maharana et al. 2024). We also consider
+LongMemEval-S, which targets memory abilities such as
+
+
+information extraction, multi-session reasoning, and knowl-
+edge updates (Wu et al. 2024). These benchmarks are appro-
+priate for MEMOIR because TRACE-FB requires repeated
+retrieval events across sessions; single-session QA bench-
+marks cannot exercise a feedback loop that accumulates im-
+portance over time. The broader agent-memory evaluation
+literature also motivates avoiding expensive write-time ex-
+traction when coarser retention can preserve more answer-
+able evidence (Zhou et al. 2026).
+2.4
+Retrospective Credit Assignment
+MEMOIR is conceptually related to Hindsight Experience
+Replay, which relabels failed trajectories with achieved goals
+after the fact so that agents can extract learning signal from
+outcomes not anticipated at decision time (Andrychowicz
+et al. 2017). TRACE-FB applies an analogous idea to mem-
+ory: rather than relabeling a trajectory goal, it revises a
+memory’s importance after observing whether that memory
+contributed to a successful answer. Unlike reinforcement-
+learning approaches, TRACE-FB operates entirely at in-
+ference time and does not require environment rollouts or
+policy-gradient updates. Recent work has begun to apply
+hindsight-style reasoning directly to memory-write credit
+assignment: HiMPO treats each memory update as a state-
+writing transition and compares the updated memory against
+the prior memory under the same pre-write state, using hind-
+sight relevance as a retrospective filter for policy optimization
+(Yan et al. 2026). TRACE-FB targets the same underlying
+question: how necessary was a given memory to a success-
+ful answer, but resolves it as a closed-form running statis-
+tic rather than a trained reward signal, requiring no policy-
+gradient updates or reward-model training. Concurrently,
+RL-aligned lifecycle controllers such as Fine-Mem (Ma et al.
+2026) and Agentic Memory (Yu et al. 2026) train policies
+to jointly control storage, summarization, and hard deletion.
+However, learned pruning policies typically assume station-
+ary distractor distributions; in open-ended multi-session di-
+alogues, evidence utility is non-Markovian and restless, a
+memory dormant for ten sessions may become critical for
+a later multi-hop query (where utility-based hard pruning
+destroys required evidence in 63.6%–83.9% of audited oper-
+ations; Appendix H). Similarly, unlike reflective knowledge-
+flagging frameworks (e.g., Mozilla CQ) that require on-
+line LLM self-assessment calls after each session, MEM-
+OIR maintains a 6.8ms zero-LLM online write path through
+closed-form outcome attribution and restricts compression
+to non-destructive, empirical judge-certified merges.
+3
+Proposed Methodology
+3.1
+Problem Formulation
+Let Mt = {m1, . . . , mn} be the memory store before query
+qt. Retrieval returns Rt ⊂Mt, the agent produces answer
+at, and feedback yields an attribution value τt,i for each
+retrieved memory. Each item stores an importance value
+wimp(mi) and retrieval count ni. During a sleep phase, a
+candidate cluster C ⊂Mt may be replaced by a merged item
+z, or an ordered pair (mo, mn) may be proposed as an older
+and newer statement of the same evolving fact. MEMOIR
+optimizes two coupled objectives: improve evidence recall
+through retrospective credit while allowing only judge-gated
+lifecycle changes intended to preserve answerability or ex-
+plicitly retire stale evidence with provenance.
+Credit-Preservation Lifecycle Invariant. As illustrated in
+Figure 1, MEMOIR couples its online and offline phases
+throughasingleinvariant: amemoryitemmayretainretrieval
+credit only while it preserves the underlying evidence that
+earned that credit. Online TRACE-UCB estimates post-query
+support and explores under-exposed items, while offline con-
+solidation enforces empirical judge-based sufficiency gates
+before transferring accumulated credit and exposure counts
+to merged representations. Core consolidation relies on cer-
+tified MERGE, whereas SUPERSEDE and DIGEST serve
+as modular extensions for temporal contradiction retirement
+and additive synthesis.
+The full closed-loop algorithm is provided in the A.
+3.2
+Judge-Gated Prospective Consolidation
+Candidate clusters are proposed from embedding similarity
+and observed co-citation structure. A merge generator pro-
+duces a shorter candidate z = g(C). MEMOIR applies the
+merge only when three gates pass:
+Apply(C, z) = 1
+⇐⇒
+c(C, z) ≥τc, κ(C, z) ≥τr,
+|z| ≤η
+X
+m∈C
+|m|.
+(1)
+where Apply(C, z) = 1 denotes that the merge is accepted
+and cluster C is replaced by the merged item z; c(C, z) is the
+fraction of LOSSLESS judge verdicts from three differently
+framed prompts; κ(C, z) is retrieval coverage of the source
+content; and η = 0.9 is the hard length ratio. The evaluated
+operating point uses τc = 0.6 and τr = 0.45 (see Appendix
+C for worked accepted/rejected merge examples). The fram-
+ings separately test factual preservation, future-question an-
+swerability, and adversarial omissions or contradictions; the
+prompt templates are provided in Appendix B.
+TRACE makes this certificate data-aware: memories
+whose attribution exceeds a threshold identify which pro-
+posed operations intersect previously answer-carrying evi-
+dence. If a cluster contains a high-credit item, MEMOIR
+requires a unanimous certificate before replacement. Co-
+citation supplies a complementary proposal signal: highly
+similar memories that repeatedly earn credit together are
+plausible redundancy candidates, whereas co-cited memo-
+ries with low pairwise similarity are more likely to encode
+distinct hops and are protected from naive merging.
+The consolidation operator is deliberately merge-only.
+Dominated pruning failed an independent audit and is re-
+tained only as a supplementary ablation. After an accepted
+merge, the new item inherits
+wimp(z) = max
+m∈C wimp(m),
+nz = max
+m∈C nm,
+(2)
+In addition to inheriting maximum constituent importance
+wimp(z) and maximum exposure count nz (preventing a con-
+solidated item from receiving an artificial UCB cold-start
+bonus), the merged entry z inherits the most recent con-
+stituent timestamp tz = maxm∈C tm, recomputes its dense
+
+
+Figure 1: MEMOIR architecture. The online path retrieves memories with TRACE-UCB and applies a closed-form retrospective
+update from observed outcomes. During periodic offline sleep, MEMOIR proposes a core MERGE or optional SUPERSEDE
+operation, commits it only when all screening gates pass, and preserves archived originals and provenance for rollback.
+embedding vector, updates the inverted BM25 lexical index,
+preserves all source evidence identifiers, and re-attaches ex-
+ternal co-citation edges using maximum constituent edge
+weights. The maximum rules avoid double-counting while
+retaining the strongest previously observed usefulness and
+association signals. Because one merged item may inherit
+several identifiers, post-merge identifier recall is interpreted
+together with the independent text-loss audit rather than as
+a standalone end-to-end answerability measure. This con-
+solidation step aims to compress redundant support while
+retaining recoverable content (Tulving 1972).
+3.3
+Certified Temporal Supersession
+Judge-gated merge removes redundancy but cannot represent
+a fact that becomes obsolete. MEMOIR therefore includes an
+optional SUPERSEDE operator for contradiction and tem-
+poral updates. Candidate pairs are ordered by timestamp and
+proposed when the newer item mn is semantically close
+to the older item mo (cosine similarity at least 0.85) and
+TRIAGE-α, a lightweight lexical negation and contradiction
+detector, flags a conflict signal wconf. This proposal stage is
+intentionally conservative: similarity alone indicates topical
+overlap, whereas the conflict signal identifies pairs for which
+retaining both items as concurrently valid may serve stale
+evidence.
+The candidate pair is evaluated by three judge framings
+that test direct replacement, temporal precedence, and ad-
+versarial compatibility. Each judge returns SUPERSEDES
+or INDEPENDENT; the operation is accepted only when the
+fraction of SUPERSEDES verdicts exceeds a separate thresh-
+old τs (operating point τs = 0.6, matching the MERGE
+judge threshold). Appendix B gives the prompt templates.
+On acceptance, mo is marked as retired rather than physi-
+cally deleted, and the newer item retains links to both source
+records. This reversible representation preserves the audit
+trail and permits rollback if a later query reveals that the
+statements were conditionally compatible rather than contra-
+dictory.
+Because supersession changes the valid content rather than
+compressing equivalent content, it uses discounted rather
+than full credit transfer:
+wimp(mn) ←max(wimp(mn), λswimp(mo)) ,
+λs = 0.5.
+(3)
+The discount preserves evidence that the underlying topic
+was useful without treating the newer statement as having
+earned all of the older statement’s retrieval credit. SUPER-
+SEDE is implemented and unit-tested, but its real-scale stale-
+serving and independent-audit evaluation remains pending.
+3.4
+Retrospective TRACE-UCB and RECALL-Q
+After answer generation, TRACE estimates whether each
+retrieved memory contributed to the observed answer. Sup-
+pressing the time index t for readability, the training-free
+default uses answer-to-memory unigram recall:
+τi = |unigrams(at) ∩unigrams(mi)|
+|unigrams(mi)|
+.
+(4)
+Importance then accumulates only after use:
+wimp(mi) ←min(1, wimp(mi) + αfbτidi),
+(5)
+where di discounts shallow or weakly used evidence and
+αfb is a fixed feedback learning rate controlling the update
+step size. This realizes the testing-effect design constraint:
+successful retrieval increases future retrievability (Roediger
+and Karpicke 2006). Counterfactual leave-one-out TRACE
+
+
+is evaluated as an attribution-quality ablation, but the main
+retrieval result uses the inexpensive default above.
+Here di = 1/(ranki + 1) discounts lower-ranked re-
+trieved items, and αfb = 0.30. In autonomous deployment
+(verified-self), updates are gated by answer token confi-
+dence: Equation (5) is applied only when the geometric-mean
+generated token probability satisfies Conf(at | qt, Rt) =
+exp( 1
+T
+PT
+j=1 log Pθ(yj | y<j, qt, Rt)) ≥τconf = 0.80 (oth-
+erwise τi = 0, while exposure count ni still increments).
+Equation (5) is deliberately non-decreasing because multi-
+session memory behaves as a Restless Multi-Armed Bandit
+(RMAB): applying exponential importance decay or nega-
+tive updates prematurely suppresses dormant cross-session
+facts, collapsing multi-hop Recall@5 by 4.60–5.92 percent-
+age points (Appendix E, Table 10). Instead, MEMOIR han-
+dles staleness non-destructively: contradicting facts are re-
+tired reversibly via SUPERSEDE (preventing 82.9% of stale
+retrievals; Appendix H, Table 16), while UCB exploration
+(Equation 7) elevates under-exposed alternatives.
+Retrieval uses RECALL-Q, the training-free substrate on
+which retrospective importance operates. Suppressing the
+(q, mi) arguments for compactness,
+SRQ = Scos (1 + βwrel + δwrec + γwimp)
++ αSbm25 −λDmmr.
+(6)
+Here Scos captures dense semantic similarity, Sbm25 captures
+lexical overlap, wrel and wrec encode normalized relevance
+and recency, and Dmmr penalizes redundancy to preserve
+diversity (Carbonell and Goldstein 1998); β, δ, γ, α, λ are
+coefficients tuned experimentally to balance these signals
+(values in Appendix G, Table 15). The importance term is
+the only component revised from observed answer outcomes;
+the remaining terms provide partially redundant access routes
+so retrieval does not depend on a single cue.
+To ensure the importance multiplier (1 + βwrel + δwrec +
+γwimp) strictly amplifies positive similarity, Scos is clipped
+and min-max normalized to [0, 1] across candidate items,
+and Sbm25, wrel, wrec, Dmmr ∈[0, 1]. In the deployed config-
+uration across all experiments, we set δ = 0 (so δwrec = 0),
+relying on chronological active-store ordering for temporal
+preference and λDmmr for redundancy control (α = 0.3, β =
+0.1, γ = 1.0, λ = 0.05, λu = 0.05).
+Outcome-conditioned importance creates a feedback loop:
+memories already retrieved receive more opportunities to
+gain credit. TRACE-UCB repairs this lock-in with a count-
+based exploration bonus
+bt(mi) = λu
+s
+log(1 + t)
+1 + ni
+,
+(7)
+where t is the total number of queries processed so far and
+λu is a coefficient tuned experimentally to control the explo-
+ration strength (value in Appendix G, Table 15); the bonus
+is largest for under-exposed items and decreases as their re-
+trieval count grows. The final score is
+St(q, mi) = SRQ(q, mi) + bt(mi).
+(8)
+Thus, TRACE supplies exploitation from estimated useful-
+ness, RECALL-Q combines semantic, lexical, temporal, im-
+portance, and diversity signals, and the UCB bonus encour-
+ages under-exposed memories to be tested. This path requires
+no model training and no LLM call when a memory is writ-
+ten.
+3.5
+Closed-Loop Interaction
+The lifecycle mechanisms share one invariant: an item may
+retain retrieval credit only while it retains the evidence that
+earned that credit. TRACE-UCB identifies frequently use-
+ful memories and protects them during consolidation; an
+accepted merge is intended to preserve equivalent support,
+transfers the maximum credit, and redirects co-citation struc-
+ture to the replacement. Under a closure-preserving merge,
+a query answerable through a constituent remains answer-
+able through the merged item, so transferred credit remains a
+valid predictor of usefulness. An uncertified or lossy merge
+can instead inherit credit for evidence it no longer contains,
+corrupting the relationship between wimp and future utility.
+SUPERSEDE therefore retires stale support reversibly and
+transfers only discounted credit because the valid fact has
+changed. Conversely, UCB continues to probe low-exposure
+items, preventing lifecycle decisions from being based only
+on a self-reinforcing retrieval history. An additive DIGEST
+operator is implemented but evaluated separately because
+it synthesizes new session facts without removing source
+memories.
+4
+Experiments and Results
+Experiments examine systems positioning (RQ1), retrospec-
+tive retrieval and exploration (RQ2), attribution validity and
+cost (RQ3), and consolidation safety and lifecycle consis-
+tency (RQ4).
+4.1
+Datasets
+LoCoMo contains 1,986 questions over ten evolving dia-
+logues; after deduplication, 1,905 pairs are evaluated with
+memory-level evidence labels. LongMemEval-S contains
+500 single-query dialogues with session-level evidence. The
+protocols are reported separately because only LoCoMo can
+exercise repeated feedback, whereas LongMemEval-S tests
+cold-start retrieval across a broader set of stores.
+4.2
+Experimental Setup
+All experiments are conducted on LoCoMo and Long-
+MemEval. The primary metric is evidence recall@5 —
+the fraction of annotated supporting memories in the top
+five retrieved items. The RQ1 systems comparison uses
+the full benchmarks, top-15 retrieval, and five independent
+runs; RQ2–RQ4 use 1,905 deduplicated LoCoMo pairs with
+k = 5. Primary LoCoMo inference uses 10,000 bootstrap
+resamples over the ten stores; question-level bootstrap is a
+sensitivity analysis, and leave-one-store-out folds test con-
+sistency. Consolidation is evaluated using fixed-budget, text-
+grounded recall, active-store tokens, and an independent
+model-family audit. For RQ4, ∆r = rpost −rpre is retained
+as a secondary credit-ledger diagnostic. Matched baselines
+use sleep interval 8 and τc = 0.6.
+
+
+Sequential Evaluation Protocol. For multi-session Lo-
+CoMo dialogues, queries q1, . . . , qT are processed sequen-
+tially in dataset order over each shared dialogue store without
+state resets between queries. Crucially, for every query qt,
+top-k retrieval and Recall@5 / QA evaluation strictly pre-
+cede the retrospective TRACE importance update and UCB
+count increment, preventing intra-query leakage.
+Baselines. We compare MEMOIR with LoCoMo-agent (Ma-
+harana et al. 2024), MemoryBank (Zhong et al. 2024), Zep
+(Rasmussen et al. 2025), Mem0/Mem0g (Chhikara et al.
+2025), A-MEM (Xu et al. 2026), MemOS (Li et al. 2025),
+and LiCoMemory (Huang et al. 2026).
+4.3
+RQ1: How Does MEMOIR Position Against
+Established Memory Systems?
+All Llama-block rows use Llama-3.1-70B-Instruct-Turbo.
+On LongMemEval-S, matched MEMOIR obtains 81.20%
+accuracy and 85.10% recall, exceeding LiCoMemory by
+12.00 and 12.71 points. On LoCoMo, it obtains 58.70% ac-
+curacy and 61.20% recall versus LiCoMemory’s 62.99% and
+64.51%, while using 84.6% fewer prompt tokens (0.2k ver-
+sus 1.3k) and reducing query latency from 1.55s to 1.18s.
+MEMOIR is therefore Pareto-efficient within the matched
+Llama block. Under GPT-4o-mini, heavy-extraction systems
+such as LiCoMemory and Mem0g achieve higher QA ac-
+curacy by using write-time LLM calls for structured ex-
+traction or graph construction; MEMOIR instead prioritizes
+zero write-path LLM calls and low token overhead. Its mea-
+sured 6.8ms write latency is separate from Table 1’s query
+latency. LongMemEval-S is a cold-start test and does not
+exercise retrospective updates. Thus, Table 1 supports ef-
+ficiency and deployability rather than universal QA lead-
+ership. Table 2 makes the complementary contribution ex-
+plicit: MEMOIR combines training-free retrieval revision
+with certificate-gated, reversible consolidation and an update
+operator, identifying distinct lifecycle guarantees evaluated
+by RQ2–RQ4.
+4.4
+RQ2: Does Retrospective Attribution Require
+UCB Exploration?
+Table 3 separates credit, exploration, and feedback qual-
+ity using store-level inference. TRACE without UCB gains
+only 0.42 points (CI [−0.12, 0.96], p = .1420; 6/10 posi-
+tive folds). The raw-self UCB condition gains 1.13 points
+(CI [0.21, 2.05], p = .0210; 9/10 folds), a pattern consistent
+with an exploration benefit; however, the direct 0.71-point
+contrast between these rows is not separately tested. Verified
+feedback gains 1.50 points (CI [0.41, 2.59], p = .0082) and
+retains 81.5% of the 1.84-point oracle gain; both are positive
+in all folds. Verified and oracle multi-hop gains are 7.17 and
+8.05 points. The full stack remains 11.92 points above bare
+cosine, while Table 3 reports the matched feedback/UCB
+effects.
+Single-query safety boundary.
+The same gains should not
+be expected on LongMemEval, whose 500 examples each
+construct a fresh, isolated store for one question — retrieval
+counts are zero before that query, so feedback cannot in-
+fluence a later ranking. Under this protocol, cosine reaches
+86.40% context recall and MEMOIR reaches 86.60% af-
+ter disabling the LoCoMo-tuned BM25 term, a +0.20-point
+difference we interpret as a no-harm result rather than a
+cross-benchmark reproduction of the LoCoMo gain. Testing
+TRACE-UCB’s generalization requires benchmarks with re-
+peated queries over an evolving shared store.
+4.5
+RQ3: Do Attribution Signals Track Retrieval
+Success Efficiently?
+We evaluate online-path efficiency and the association
+between attribution scores and retrieval success on one
+NVIDIA RTX 3090 24GB GPU over 1,905 deduplicated
+LoCoMo QA pairs. MEMOIR writes a memory in 6.8ms
+P50 with no write-path LLM call, compared with ap-
+proximately 110ms for write-time extraction baselines (Ta-
+ble 4). Search (k = 5) and lexical TRACE feedback require
+10.5ms and 6.7ms P50, respectively, while counterfactual
+TRACE-CF requires 67.0ms P50. Both attribution signals
+correlate significantly with evidence recall (Table 5): lex-
+ical TRACE achieves r = 0.447 (95% CI [0.412, 0.481],
+p < .0001), while TRACE-CF achieves r = 0.493 (95%
+CI [0.458, 0.527], p < .0001). A paired bootstrap test con-
+firms that TRACE-CF’s +0.046 correlation advantage is
+significant (95% CI [+0.011, +0.081], p = .0128), show-
+ing a stronger association with evidence-recall success than
+surface-form unigram matching, at an approximately ten-
+fold median feedback-latency cost (67.0ms versus 6.7ms).
+To compute query-level association in Table 5, per-memory
+attribution scores τt,i are mean-aggregated over the top-
+k retrieved set Rt and correlated against binary query-
+level evidence-recall success. Lexical TRACE-FB captures
+90.7% of counterfactual TRACE-CF’s Pearson correlation
+(r = 0.447 vs. r = 0.493, p = .0128) at one-tenth the me-
+dian latency (6.7ms vs. 67.0ms P50) and zero LLM calls,
+forming an explicit operational Pareto frontier. Periodic of-
+fline consolidation, executed every eight queries, processes
+multi-framing merge certificates in 2.85s P50 without block-
+ing the online query path.
+4.6
+RQ4: Does Prospective Safety Gating
+Preserve Retrieved Evidence?
+We evaluate certified consolidation over ten LoCoMo stores
+(1,905 QA pairs) in Table 6. Each query uses the token
+count Bq of its no-consolidation top-five context; variants
+are capped at Bq, and inherited identifiers count only when
+their support remains in the capped text (fixed-budget, text-
+grounded Rec@5). The 100 empirical judge-gated certified
+merges reduce active-store tokens by 1.42% while changing
+this metric from 58.82% to 59.08%, an observed +0.26-point
+difference reported descriptively because only ten stores are
+available.
+As shown in Table 6, empirical judge-gated certification
+reduces sufficiency distortion by 87.4% relative to matched
+uncertified merging (ˆϵ = 0.0027 [3/1,120 probes] vs. 0.0214
+[24/1,120 probes]) and eliminates audited factual losses
+(0/100 vs. 18/100, Fisher’s exact p < .0001). The −1.42%
+active-store token reduction reflects LoCoMo’s low natu-
+ral redundancy; forcing higher compression via uncertified
+
+
+LoCoMo
+LongMemEval
+Model
+Method
+TR
+KR
+Acc.
+Rec.
+TR
+KR
+Acc.
+Rec.
+Llama-3.1-70B
+LoCoMo-agent
+4.90 ± 1.42
+3.2 ± 0.2k
+23.63 ± 1.08
+25.50 ± 1.15
+4.51 ± 1.08
+3.5 ± 0.2k
+17.60 ± 1.05
+22.04 ± 1.12
+MemoryBank
+7.13 ± 1.56
+4.4 ± 0.2k
+28.80 ± 0.93
+31.52 ± 0.97
+8.25 ± 1.87
+4.1 ± 0.2k
+36.40 ± 0.96
+39.21 ± 1.01
+MemOS
+3.20 ± 0.96
+2.2 ± 0.2k
+54.10 ± 0.79
+57.53 ± 0.81
+3.15 ± 0.63
+2.6 ± 0.2k
+47.80 ± 0.82
+49.03 ± 0.85
+Mem0
+1.55 ± 0.63
+2.1 ± 0.1k
+53.22 ± 0.74
+57.05 ± 0.70
+1.87 ± 0.58
+2.3 ± 0.1k
+56.80 ± 0.71
+61.21 ± 0.68
+Mem0g
+2.11 ± 0.81
+2.4 ± 0.2k
+55.48 ± 0.72
+59.32 ± 0.69
+2.51 ± 0.92
+2.8 ± 0.2k
+55.40 ± 0.76
+63.09 ± 0.65
+A-MEM
+4.10 ± 1.68
+4.2 ± 0.2k
+43.84 ± 0.91
+49.17 ± 0.89
+4.31 ± 1.26
+4.5 ± 0.2k
+57.40 ± 0.88
+62.18 ± 0.84
+Zep
+5.31 ± 1.94
+3.8 ± 0.2k
+40.30 ± 0.94
+51.05 ± 0.92
+5.22 ± 1.73
+4.1 ± 0.2k
+60.20 ± 0.81
+62.74 ± 0.79
+LiCoMemory
+1.55 ± 0.59
+1.3 ± 0.1k 62.99 ± 0.71 64.51 ± 0.69
+1.62 ± 0.47
+1.6 ± 0.1k
+69.20 ± 0.62
+72.39 ± 0.58
+MEMOIR∗
+1.18 ± 0.50 0.2 ± 0.1k
+58.70 ± 0.92
+61.20 ± 0.88 1.18 ± 0.50 0.2 ± 0.1k 81.20 ± 0.60 85.10 ± 0.55
+GPT-4o-mini
+LoCoMo-agent
+4.72 ± 1.10
+3.3 ± 0.2k
+23.87 ± 1.06
+24.91 ± 1.10
+5.34 ± 1.20
+3.5 ± 0.2k
+16.60 ± 1.02
+21.56 ± 1.09
+MemoryBank
+7.62 ± 1.70
+4.5 ± 0.2k
+31.50 ± 0.92
+33.19 ± 0.96
+7.93 ± 1.80
+4.1 ± 0.2k
+35.40 ± 0.95
+38.06 ± 0.98
+MemOS
+3.96 ± 1.00
+2.2 ± 0.2k
+58.30 ± 0.75
+62.93 ± 0.77
+3.72 ± 0.95
+2.5 ± 0.2k
+51.20 ± 0.78
+52.07 ± 0.81
+Mem0
+1.75 ± 0.60
+2.3 ± 0.1k
+54.68 ± 0.73
+62.31 ± 0.71
+1.89 ± 0.65
+2.3 ± 0.1k
+62.60 ± 0.70
+71.32 ± 0.66
+Mem0g
+2.34 ± 0.80
+2.5 ± 0.2k
+56.96 ± 0.71
+63.14 ± 0.68
+2.41 ± 0.85
+2.9 ± 0.2k
+64.80 ± 0.69
+69.53 ± 0.67
+A-MEM
+4.63 ± 1.50
+4.1 ± 0.2k
+48.59 ± 0.88
+53.82 ± 0.86
+4.52 ± 1.40
+4.3 ± 0.2k
+55.00 ± 0.86
+59.30 ± 0.84
+Zep
+5.92 ± 1.50
+3.7 ± 0.2k
+44.76 ± 0.91
+46.51 ± 0.93
+6.12 ± 1.60
+4.2 ± 0.2k
+58.60 ± 0.83
+61.02 ± 0.80
+LiCoMemory
+1.61 ± 0.50 1.2 ± 0.1k 57.20 ± 0.69 58.09 ± 0.67 1.74 ± 0.55
+1.7 ± 0.1k 73.80 ± 0.60 76.63 ± 0.57
+MEMOIR∗
+2.08 ± 0.75
+1.9 ± 0.1k
+41.23 ± 0.94
+50.91 ± 0.88
+2.15 ± 0.65 0.2 ± 0.1k
+52.50 ± 0.78
+57.20 ± 0.75
+Gemini-1.5-Flash RMM (GTE)†
+–
+–
+–
+–
+–
+–
+70.40
+69.80
+Table 1: Cross-benchmark comparison on full LoCoMo (n = 1,986) and LongMemEval-S (n = 500), using top-15 retrieval,
+the same answer judge, and matched prompt-token accounting within each backbone block. Numeric ± entries report mean ±
+standard deviation over five runs. TR is query latency and KR is prompt-token use. Bold/underline mark the best/second-best
+result strictly within a matched block. ∗The Llama MEMOIR row is the matched Llama-3.1-70B-Instruct-Turbo rerun. †RMM
+uses a different backbone and is excluded from rankings.
+System
+Suff. cert. No retr. LLM Train-free Update op. Reversible
+Mem0 / Zep
+–
+–
+–
+RMM
+–
+–
+–
+–
+LiCoMemory
+–
+–
+–
+–
+Summarize-all
+–
+–
+MEMOIR
+Table 2: Lifecycle-capability positioning. “No retr. LLM”
+denotes that retrieval requires no additional per-query LLM
+call beyond answer generation. This table characterizes sys-
+tem design rather than ranking answer quality.
+merge-and-prune (−7.15% tokens) induces a 62.6% au-
+dit loss rate (385/615 destroyed; Appendix H, Table 17).
+Furthermore, matched 100-operation bridge ablations (Ap-
+pendix H, Table 19) confirm that maximum credit transfer
+(wimp(z) = maxm∈C wimp(m)) yields a statistically signifi-
+cant +0.20 pp recall gain (p = .0210) and a 17.6% relative
+reduction in sufficiency distortion compared to zero-credit
+transfer.
+A cross-model audit records one verdict per accepted
+merge, so the 100 merge-level verdicts, not individual
+model votes, define the binomial bound. It observes 0/100
+losses, giving a one-sided 95% exact Clopper–Pearson up-
+per bound of 2.95%. These results characterize a conser-
+vative retrieval-preservation screen rather than an end-to-
+end answerability guarantee. On LongMemEval, recall re-
+mains 94.60% while store tokens fall by 0.15%. Credit-ledger
+Condition
+∆Rec@5
+pQ
+Store 95% CI
+pS/LOSO+
+No TRACE baseline 58.82% abs.
+–
+–
+–
+Full stack vs. cosine
++11.92 pp
+–
+descriptive
+–
+TRACE, no UCB
++0.42 pp
+.0830 [−0.12, +0.96]
+.1420/6
+UCB, raw self
++1.13 pp
+.0042 [+0.21, +2.05]
+.0210∗/9
+UCB, verified self
++1.50 pp
+.0004 [+0.41, +2.59] .0082∗∗/10
+UCB, oracle
++1.84 pp
+.0002 [+0.52, +3.16] .0078∗∗/10
+MH verified
++7.17 pp
+.0012 [+2.40, +11.94] .0045∗∗/10
+MH oracle
++8.05 pp
+.0020 [+3.12, +12.98] .0038∗∗/10
+Table 3: Retrieval comparisons on 1,905 LoCoMo QA pairs
+from ten stores. The full-stack–cosine row is a descrip-
+tive composite contrast without inferential statistics; the
+remaining deltas use the no-TRACE hybrid baseline. pQ
+is the question-level sensitivity test; store CIs and pS use
+10,000 clustered resamples. The number after “/” is the pos-
+itive leave-one-store-out count. MH = multi-hop. ∗p < .05;
+∗∗p < .01.
+
+
+Stage
+P50
+Tokens
+Cost
+LLM
+Online write
+6.8 ms
+0
+$0.0000
+no
+Search (k = 5)
+10.5 ms
+0.2k
+< $0.0001
+no
+Lexical TRACE
+6.7 ms
+0
+$0.0000
+no
+TRACE-CF (k = 5)
+67.0 ms
+1.1k
+$0.0002
+optional
+Offline sleep
+2.85 s
+1.4k/120
+$0.0003
+async
+Write-time base
+∼110 ms
+0.8k/150
+$0.0008
+yes
+Table 4: Compact lifecycle efficiency profile over 1,905 Lo-
+CoMo QA pairs. Full execution paths, frequencies, and P95
+latency appear in Appendix F, Table 11.
+Signal
+Pearson r (95% CI)
+Spearman ρ
+P50
+Lexical TRACE
+0.447 [0.412, 0.481]
+0.418
+6.7 ms
+TRACE-CF
+0.493 [0.458, 0.527]
+0.465
+67.0 ms
+Paired ∆
++0.046 [0.011, 0.081]
++0.047
++60.3 ms
+Table
+5:
+Association
+between
+attribution
+scores
+and
+evidence-recall success. The paired TRACE-CF advantage
+is significant (p = .0128); aggregation method detailed in
+Appendix F.
+preservation remains directional (∆r = −0.0115, 95% CI
+[−0.0291, +0.0060], p = .2024). The combined effect of
+oracle TRACE-UCB and certified merge operating jointly,
+evaluated at the earlier 20-operation point, is reported in Ap-
+pendix D; because that factorial uses oracle reference-answer
+feedback, it should not be read as evidence about the deployed
+confidence-gated system.
+5
+Limitations
+TRACE-UCB requires repeated queries over a shared store
+and cannot improve cold-start queries. Verified self-feedback
+recovers most of the oracle gain but still depends on cal-
+ibrated self-consistency or judge scores and may reinforce
+irrelevant evidence when the model is confidently wrong.
+Lexical TRACE can miss paraphrases, numbers, and short
+evidence, whereas TRACE-CF incurs substantially higher la-
+tency. Certified merge is an empirical safety gate rather than
+a formal guarantee: unforeseen future evidence may still be
+lost, and 0 losses among 100 audited merges retains a 2.95%
+one-sided 95% upper bound. Its 1.42% active-store reduc-
+tion is also modest and does not represent total storage sav-
+ings because originals are archived for rollback. Results are
+concentrated on ten LoCoMo stores, while LongMemEval
+does not exercise repeated feedback. Future work should
+evaluate additional evolving-store benchmarks, calibration
+under distribution shift, larger human and cross-model au-
+dits, matched-backbone end-to-end QA, privacy-aware ex-
+ploration, calibrated certificates, and reversible pruning that
+provides meaningful capacity reduction without sacrificing
+provenance.
+6
+Conclusion
+MEMOIR frames long-horizon agent memory as a cou-
+pled lifecycle: screen prospectively and attribute retro-
+spectively. On 1,905 LoCoMo QA pairs, the full retrieval
+stack gains 11.92 points over bare cosine. TRACE with-
+out UCB gains a non-significant 0.42 points; UCB with
+raw autonomous feedback gains 1.13 points; confidence-
+gated verified self-feedback gains 1.50 points; and or-
+acle attribution gains 1.84/8.05 overall/multi-hop points,
+with verified and oracle effects positive across all ten
+folds. In matched Llama-3.1-70B experiments, MEMOIR
+reaches 58.70%/61.20% accuracy/recall on LoCoMo and
+81.20%/85.10% on LongMemEval-S at 0.2k tokens and
+1.18 s latency, with a 6.8 ms LLM-free write path. Prospec-
+tively, 100 empirical judge-certified merges reduce active-
+store tokens by 1.42% while raising fixed-budget Rec@5
+from 58.82% to 59.08%, with 0/100 audited losses (one-
+sided 95% exact Clopper–Pearson upper bound ≤2.95%)
+versus 18/100 for uncertified merging. Evidence remains
+concentrated in ten LoCoMo stores, and real-scale SUPER-
+SEDE evaluation is future work. Overall, MEMOIR reduces
+the lifecycle to one closed loop: attribute usefulness after
+use, and certify preservation before compression. Ethics are
+detailed in the Supplementary Material.
+
+
+Policy
+Ops (M/P)
+Store ∆
+FB-TG Rec@5
+Distortion (ˆϵ)
+Audit / 95% Upper
+No consolidation
+0/0
+0.00%
+58.82%
+0.0000
+–
+Uncertified merge
+100/0
+-1.55%
+58.81%
+0.0214
+18/100; ≤25.51%
+Cert. merge (ours)
+100/0
+-1.42%
+59.08%
+0.0027
+0/100; ≤2.95%
+Table 6: Primary ten-store consolidation evaluation (n = 1,905 QA pairs). FB-TG Rec@5 credits inherited identifiers only
+when supporting text remains within the token-capped context. Distortion ˆϵ measures the fraction of 1,120 pre-consolidation
+answerable probes lost after merging. Audit bounds report one-sided 95% exact Clopper–Pearson upper limits.
+References
+Abtahi, S. M.; Rahnema, R.; Patel, H.; Patel, N.; Fekri, M.;
+and Khani, T. 2026. Memanto: Typed semantic memory
+with information-theoretic retrieval for long-horizon agents.
+arXiv preprint arXiv:2604.22085.
+Andrychowicz, M.; Wolski, F.; Ray, A.; Schneider, J.; Fong,
+R.; Welinder, P.; McGrew, B.; Tobin, J.; Pieter Abbeel, O.;
+and Zaremba, W. 2017. Hindsight experience replay. Ad-
+vances in neural information processing systems, 30.
+Carbonell, J.; and Goldstein, J. 1998. The use of MMR,
+diversity-based reranking for reordering documents and pro-
+ducing summaries. In Proceedings of the 21st annual inter-
+national ACM SIGIR conference on Research and develop-
+ment in information retrieval, 335–336.
+Chhikara, P.; Khant, D.; Aryan, S.; Singh, T.; and Yadav, D.
+2025. Mem0: Building production-ready ai agents with scal-
+able long-term memory. arXiv preprint arXiv:2504.19413.
+Craik, F. I. M.; and Lockhart, R. S. 1972. Levels of Process-
+ing: A Framework for Memory Research. Journal of Verbal
+Learning and Verbal Behavior, 11(6): 671–684.
+Ebbinghaus, H. 1885. Über das Gedächtnis: Untersuchun-
+gen zur experimentellen Psychologie. Leipzig: Duncker &
+Humblot.
+Formal, T.; Piwowarski, B.; and Clinchant, S. 2021. Splade:
+Sparse lexical and expansion model for first stage ranking. In
+Proceedings of the 44th International ACM SIGIR Confer-
+ence on Research and Development in Information Retrieval,
+2288–2292.
+Huang, Z.; Tian, Z.; Guo, Q.; Zhang, F.; Zhou, Y.; Jiang, D.;
+Xie, Z.; and Zhou, X. 2026. Licomemory: Lightweight and
+cognitive agentic memory for efficient long-term reasoning.
+In Findings of the Association for Computational Linguistics:
+ACL 2026, 36842–36858.
+Izacard, G.; Lewis, P.; Lomeli, M.; Hosseini, L.; Petroni, F.;
+Schick, T.; Dwivedi-Yu, J.; Joulin, A.; Riedel, S.; and Grave,
+E. 2023. Atlas: Few-shot learning with retrieval augmented
+language models. Journal of Machine Learning Research,
+24(251): 1–43.
+Khattab, O.; and Zaharia, M. 2020. Colbert: Efficient and
+effective passage search via contextualized late interaction
+over bert. In Proceedings of the 43rd International ACM SI-
+GIR conference on research and development in Information
+Retrieval, 39–48.
+Li, Z.; Song, S.; Wang, H.; Niu, S.; Chen, D.; Yang, J.; Xi,
+C.; Lai, H.; Zhao, J.; Wang, Y.; et al. 2025. Memos: An
+operating system for memory-augmented generation (mag)
+in large language models. arXiv preprint arXiv:2505.22101.
+Ma, W.; Feng, X.; Huang, L.; Feng, X.; Ma, Z.; Xu, J.;
+Gao, J.; Hao, J.; He, R.; and Qin, B. 2026.
+Fine-Mem:
+Fine-grained feedback alignment for long-horizon memory
+management. In Proceedings of the 64th Annual Meeting
+of the Association for Computational Linguistics (Volume 1:
+Long Papers), 19666–19684.
+Maharana, A.; Lee, D.-H.; Tulyakov, S.; Bansal, M.; Bar-
+bieri, F.; and Fang, Y. 2024.
+Evaluating very long-term
+conversational memory of llm agents. In Proceedings of the
+62nd Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), 13851–13870.
+Packer, C.; Fang, V.; Patil, S.; Lin, K.; Wooders, S.; and
+Gonzalez, J. 2023. MemGPT: towards LLMs as operating
+systems.
+Park, J. S.; O’Brien, J.; Cai, C. J.; Morris, M. R.; Liang,
+P.; and Bernstein, M. S. 2023. Generative agents: Interac-
+tive simulacra of human behavior. In Proceedings of the
+36th annual acm symposium on user interface software and
+technology, 1–22.
+Rasmussen, P.; Paliychuk, P.; Beauvais, T.; Ryan, J.; and
+Chalef, D. 2025. Zep: a temporal knowledge graph architec-
+ture for agent memory. arXiv preprint arXiv:2501.13956.
+Robertson, S. E.; and Walker, S. 1994. Some simple effec-
+tive approximations to the 2-poisson model for probabilistic
+weighted retrieval. In SIGIR’94: Proceedings of the Sev-
+enteenth Annual International ACM-SIGIR Conference on
+Research and Development in Information Retrieval, organ-
+ised by Dublin City University, 232–241. Springer.
+Roediger, H. L.; and Karpicke, J. D. 2006. Test-Enhanced
+Learning: Taking Memory Tests Improves Long-Term Re-
+tention. Psychological Science, 17(3): 249–255.
+Stern, Y. 2002. What Is Cognitive Reserve? Theory and
+Research Application of the Reserve Concept. Journal of the
+International Neuropsychological Society, 8(3): 448–460.
+Tan, Z.; Yan, J.; Hsu, I.-H.; Han, R.; Wang, Z.; Le, L.; Song,
+Y.; Chen, Y.; Palangi, H.; Lee, G.; et al. 2025. In prospect
+and retrospect: Reflective memory management for long-
+term personalized dialogue agents. In Proceedings of the
+63rd Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), 8416–8439.
+Tulving, E. 1972. Episodic and Semantic Memory. In Tul-
+ving, E.; and Donaldson, W., eds., Organization of Memory,
+381–403. Academic Press.
+Wu, D.; Wang, H.; Yu, W.; Zhang, Y.; Chang, K.-W.;
+and Yu, D. 2024. Longmemeval: Benchmarking chat as-
+sistants on long-term interactive memory. arXiv preprint
+arXiv:2410.10813.
+
+
+Xu, W.; Liang, Z.; Mei, K.; Gao, H.; Tan, J.; and Zhang, Y.
+2026. A-mem: Agentic memory for llm agents. Advances in
+Neural Information Processing Systems, 38: 17577–17604.
+Yan, J.; Shen, Y.; Zhang, W.; Huang, J.; Liu, Z.; Wang, N.;
+Wang, K.; and Lian, S. 2026. HiMPO: Hindsight-Informed
+Memory Policy Optimization for Less-Entangled Credit in
+Long-Horizon Agents. arXiv preprint arXiv:2606.16285.
+Yu, Y.; Yao, L.; Xie, Y.; Tan, Q.; Feng, J.; Li, Y.; and Wu,
+L. 2026. Agentic memory: Learning unified long-term and
+short-term memory management for large language model
+agents. In Proceedings of the 64th Annual Meeting of the
+Association for Computational Linguistics (Volume 1: Long
+Papers), 21457–21483.
+Zhong, W.; Guo, L.; Gao, Q.; Ye, H.; and Wang, Y. 2024.
+Memorybank: Enhancing large language models with long-
+term memory. In Proceedings of the AAAI conference on
+artificial intelligence, volume 38, 19724–19731.
+Zhou, W.; Zhou, X.; Han, S.; Xu, H.; Li, G.; Li, Z.; Xiong,
+F.; and Wu, F. 2026. Are We Ready For An Agent-Native
+Memory System? arXiv preprint arXiv:2606.24775.
+A
+Algorithm
+Algorithm 1 summarizes the full closed-loop procedure ref-
+erenced in the main paper’s Methodology section. Below we
+walk through every function and symbol used in the pseu-
+docode.
+Online path (lines 1–6, executed per query).
+• Line 1: SRQ(qt, m) is the RECALL-Q retrieval score
+(dense similarity, lexical overlap, relevance, importance,
+and the MMR diversity penalty, combined as in the main
+paper’s Methodology); bt(m) is the UCB exploration
+bonus that favors under-exposed memories. In the no-
+tation of main-paper Equation 6, the deployed config-
+uration sets the explicit recency coefficient to δ = 0,
+so δwrec contributes zero. Temporal effects instead en-
+ter through chronological active-store ordering, while
+Dmmr controls redundancy rather than time. TopK se-
+lects the k memories in Mt with the highest combined
+score SRQ(qt, m) + bt(m), forming the retrieved set Rt.
+• Line 2: LLM(qt, Rt) denotes the answer-generation call:
+the backbone language model produces answer at con-
+ditioned on the query and the retrieved memories. For
+the deployed lexical TRACE path, this is the only online
+LLM call. The optional TRACE-CF ablation performs
+additional leave-one-out model-scoring calls after answer
+generation.
+• Lines
+3–5:
+For
+each
+retrieved
+memory
+mi,
+TRACE(at, mi)
+computes
+the
+attribution
+value
+τt,i (via lexical overlap in the training-free default, or
+leave-one-out counterfactual change in the TRACE-CF
+variant) estimating how much mi contributed to at. This
+attribution updates wimp(mi), the memory’s importance
+weight, and increments ni, its retrieval count, which
+together feed both future RECALL-Q scores and the
+UCB bonus.
+• Line 6: Co-citation links record which memories were
+jointly credited within the same answer, supplying a pro-
+posal signal used later during consolidation; the new in-
+teraction is appended to the store so it is available for
+future retrieval.
+Offline path (lines 7–19, executed only during sleep).
+• Line 7: Sleep(t) is a scheduling predicate that is true
+only at periodic offline checkpoints (every eight queries
+in the reported experiments), never during normal query
+handling.
+• Lines 8–12 (MERGE): For each candidate cluster C ⊂
+Mt proposed from embedding similarity and co-citation
+structure, g(C) denotes the merge generator that produces
+a shorter candidate entry z. The merge is applied only if
+all three gates pass: c(C, z) is the fraction of LOSSLESS
+verdicts from the three-framing FaithfulnessJudge ensem-
+ble (Section B); κ(C, z) is retrieval-token coverage, com-
+puted after lowercasing and removing the NLTK English
+stopword list with multiset token counts; and η is the
+hard length ratio bounding |z| relative to the combined
+length of the originals. When accepted, C is replaced
+by z, provenance is preserved, z inherits the maximum
+importance, and its retrieval count is nz = maxm∈C nm.
+• Lines 14–18 (SUPERSEDE): For each ordered conflict
+pair (mo, mn) flagged by the SUPERSEDE proposal
+stage (Section B.1), SupersedeCert(mo, mn) is the frac-
+tion of SUPERSEDES verdicts from the three-framing
+SUPERSEDE judge ensemble (direct replacement, tem-
+poral precedence, adversarial compatibility). The operat-
+ing point is τs = 0.60, so at least two of the three judges
+must return SUPERSEDES. When accepted, the older
+item mo is retired reversibly (marked inactive rather than
+deleted), the newer item mn receives discounted credit,
+and its exposure count becomes nmn ←nmn + nmo.
+• Line 20: The algorithm returns the current answer at and
+the updated store Mt+1, ready for the next query.
+This structure keeps the two lifecycle halves cleanly sep-
+arated by execution context: attribution and importance up-
+dates happen synchronously with every query, while con-
+solidation and supersession are deferred to periodic offline
+sleeps. The deployed lexical path requires no additional LLM
+call on the online write or retrieval path; TRACE-CF is an
+explicitly optional, higher-cost attribution ablation.
+The deployed state-transfer rule prevents consolidation
+from creating an artificially under-exposed replacement. Af-
+ter MERGE, the replacement receives the maximum con-
+stituent retrieval count, nz = maxm∈C nm. After SUPER-
+SEDE, the newer item accumulates the older item’s exposure,
+nmn ←nmn + nmo. Reliability pass/trial counters belong
+only to the reported reliability-bonus ablation and are not
+part of the deployed lexical TRACE-UCB state.
+B
+Consolidation and Update Prompts
+All consolidation judges are conservative by construction.
+The parser reads the first alphabetic token on the first non-
+empty line and accepts only the operation-specific positive
+verdict. Parse failures, exceptions, negated verdicts such as
+
+
+Algorithm 1: MEMOIR Closed-Loop Memory Lifecycle
+Require: Query qt, memory store Mt, sleep predicate Sleep(t)
+Ensure: Answer at and updated store Mt+1
+1: Rt ←TopKm∈Mt[SRQ(qt, m) + bt(m)]
+2: at ←LLM(qt, Rt)
+3: for each mi ∈Rt do
+4:
+τt,i ←TRACE(at, mi); update wimp(mi) and ni
+5: end for
+6: Update co-citation links among jointly credited memories; ap-
+pend the new interaction
+7: if Sleep(t) then
+8:
+for each proposed merge cluster C ⊂Mt do
+9:
+Generate z ←g(C)
+10:
+if c(C, z) ≥τc, κ(C, z) ≥τr, and |z| ≤η P
+m∈C |m|
+then
+11:
+Replace C by z; set wimp(z) ←maxm∈C wimp(m)
+and nz ←maxm∈C nm
+12:
+end if
+13:
+end for
+14:
+for each ordered conflict pair (mo, mn) do
+15:
+if SupersedeCert(mo, mn) ≥τs then
+16:
+Retire mo reversibly; transfer discounted credit; set
+nmn ←nmn + nmo
+17:
+end if
+18:
+end for
+19: end if
+20: return at, Mt+1
+“not lossless,” and any unrecognized output count as rejec-
+tion. Prompt diversity comes from three different framings
+rather than repeated stochastic samples of one prompt.
+Lifecycle operations.
+Certified merge compresses redun-
+dant memories and transfers maximum source credit; SU-
+PERSEDE reversibly retires outdated facts and transfers dis-
+counted credit; DIGEST adds certified session facts without
+deleting sources; summarize-all is retained only as an uncer-
+tified aggressive baseline.
+B.1
+Full Prompt Templates
+The merge generator receives the source entries and the fol-
+lowing instructions: combine them into one shorter entry;
+preserve every unique fact, entity, number, date, qualifier,
+relation, and contradiction; remove only redundant phrasing;
+maintain temporal order; introduce no unsupported infor-
+mation; and output one concise paragraph. A candidate is
+not applied merely because it is shorter. Figure 2 gives the
+three FaithfulnessJudge certification prompts, and Figure 3
+gives the merge-generation prompt and the three application
+guards.
+The certificate score is the fraction of LOSSLESS votes.
+The main operating point uses τc = 0.6, retrieval-token
+coverage τr = 0.45, maximum length ratio η = 0.9, and
+high-credit protection threshold wimp = 0.3. For cover-
+age, source and candidate text are lowercased, tokenized,
+and filtered with the NLTK English stopword list. With
+fC(x) and fz(x) denoting the resulting multiset counts,
+κ(C, z) = P
+x min(fC(x), fz(x))/ P
+x fC(x). This gate
+guards against an entailment-preserving paraphrase becom-
+ing difficult to retrieve lexically. A candidate must pass all
+three gates. A source item at or above the protection thresh-
+old additionally requires a unanimous certificate. Applied
+operations retain source identifiers and judge outputs for
+independent re-auditing. The implementation also supports
+calibration by testing candidate thresholds from strictest to
+most permissive and retaining only thresholds whose one-
+sided Hoeffding upper bound on the accepted-operation loss
+rate remains below a target risk level.
+SUPERSEDE proposal and execution.
+Candidate pairs
+are ordered by timestamp and proposed without an LLM
+when cosine similarity is at least 0.85 and TRIAGE-α detects
+overlapping content with a negation or conflict marker. The
+judge must distinguish a true update from two facts that
+can remain simultaneously valid. Figure 4 gives the three
+SUPERSEDE judge framings.
+Only a certificate meeting τs = 0.60 retires the older item;
+with three judges, this is a two-of-three rule. Retirement
+is reversible: the old item is marked inactive rather than
+deleted, and the record stores both identifiers, timestamps,
+judge verdicts, and the replacement link. Because the content
+changes, only discounted credit is transferred, wimp(mn) ←
+max(wimp(mn), 0.5wimp(mo)), while historical exposure
+is accumulated as nmn ←nmn + nmo.
+Exploratory DIGEST.
+DIGEST is an additive, session-
+level synthesis operator and is not part of the evaluated
+merge-only core. Its generator requests one short factual sen-
+tence per line, including supported cross-entry relationships,
+while forbidding invented facts, names, dates, quantities, or
+relations. Unlike merge, DIGEST never removes its con-
+stituents. Figure 5 gives the complete DIGEST generation
+and faithfulness-certification prompts.
+Uncertified whole-store baseline.
+The summarize-all
+comparator receives every live entry and requests a com-
+pact set of notes preserving important facts, names, numbers,
+dates, and relations. It has no candidate-selection stage, loss-
+less certificate, retrieval-coverage gate, or length-ratio check.
+The operation represents the aggressive endpoint of the com-
+pression axis rather than a MEMOIR component. Because
+it unions the source evidence identifiers onto a small num-
+ber of surviving summaries, recall metrics based only on
+identifier intersection can become artificially optimistic even
+when the retrieved summaries are long or textually incom-
+plete (see Table 21 for the empirical magnitude of this effect).
+We therefore do not treat its raw evidence recall as proof of
+answer preservation without an end-to-end QA check.
+C
+Certificate Behavior Examples
+An accepted four-entry merge about Caroline’s school event,
+transgender journey, LGBTQ support group, and adoption-
+support motivation received certificate score 0.667 and re-
+trieval coverage 0.477. The resulting entry retained the school
+event, the three-year transition timeline, the support group’s
+adoption focus, and its effect on acceptance and confidence.
+In contrast, a greeting-and-small-talk candidate also received
+score 0.667 but only 0.279 retrieval coverage; it was rejected
+because paraphrasing removed too many concrete lexical
+cues such as “kids,” “work,” and “research.” This illustrates
+
+
+FAITHFULNESS_PROMPT — Strict Entailment
+You verify whether a MERGED memory entry preserves ALL factual content of the original
+entries it replaces. This is a strict entailment check.
+A merge is LOSSLESS only if EVERY fact, name, number, date, and relation in EACH original
+entry can still be recovered from the merged entry. If even one detail is dropped,
+changed, or made ambiguous, the merge is LOSSY.
+Original entries:
+{originals}
+Merged entry:
+{merged}
+Answer with exactly one word on the first line: LOSSLESS or LOSSY.
+Answer:
+FAITHFULNESS_PROMPT_CHECKLIST — Per-Item Checklist
+Compare the ORIGINAL memory entries with their MERGED replacement. Work as a checklist:
+for each original entry, list mentally every fact, entity, number, date, and relation, and
+check whether the merged entry still states or implies it.
+Original entries:
+{originals}
+Merged entry:
+{merged}
+If every checklist item is preserved, the verdict is LOSSLESS; if ANY item fails, the
+verdict is LOSSY. Answer with exactly one word on the first line: LOSSLESS or LOSSY.
+Answer:
+FAITHFULNESS_PROMPT_ADVERSARIAL — Find a Lost Fact
+Your job is to FIND A LOST FACT. Below are original memory entries and the merged entry
+that replaced them. Search hard for ANY detail -- a fact, name, number, date, qualifier,
+or relation -- that appears in an original but cannot be recovered from the merged entry.
+Original entries:
+{originals}
+Merged entry:
+{merged}
+If you found even one lost detail, the merge is LOSSY. Only if you genuinely cannot find
+any lost detail is it LOSSLESS. Answer with exactly one word on the first line: LOSSLESS
+or LOSSY.
+Answer:
+Figure 2: Complete FaithfulnessJudge prompt ensemble used for lossless merge certification.
+
+
+Component
+Model / ensemble
+Execution
+Acceptance handling
+MERGE generation
+Llama-3.3-70B-Instruct-Turbo via Together
+One candidate per ordered cluster
+Candidate must pass all three guards
+MERGE certification
+Llama-3.1-8B, three framings
+Temperature 0; one call per framing
+First-token parse; malformed/negated output rejects
+Independent merge audit
+Mistral-7B
+One binary audit per accepted operation
+Malformed or unrecognized output counts as loss
+SUPERSEDE certification
+Llama-3.1-8B, three framings
+Temperature 0; one call per framing
+First-token parse; retirement remains reversible
+DIGEST audit
+Stated 8B/70B diagnostic backbone
+Two faithfulness framings
+Unanimous FAITHFUL required
+Table 7: Prompt execution settings for the compressive certified run. The 70B model generates merge text, while the local 8B
+ensemble certifies it. The SUPERSEDE operating point is τs = 0.60, which requires at least two of three SUPERSEDES votes.
+Provider-default token limits were not retained.
+MERGE_PROMPT — Merge Generation
+You are a memory consolidation agent. Combine the following related memory entries into a
+SINGLE, more concise entry that preserves ALL unique information.
+Rules:
+- Preserve every unique fact, detail, or data point
+- Remove redundant phrasing and repetition
+- Maintain temporal order for events if applicable
+- If entries conflict, preserve both statements and their temporal or conditional
+qualifiers; do not choose a winner
+- The merged entry should be shorter than the sum of inputs
+Entries to merge:
+{entries}
+Write the merged entry (a single concise paragraph):
+MERGE APPLICATION GUARDS
+Applied only if all three gates pass:
+1. c(C,z) ≥τc: the LOSSLESS vote fraction from the FaithfulnessJudge ensemble. The paper
+operating point is τc = 0.6.
+2. κ(C,z) ≥τr: retrieval-token coverage, computed as the fraction of stopword-filtered
+content tokens from the originals that survive in the merged text. The paper operating
+point is τr = 0.45.
+3. |z| ≤η P
+m∈C |m|: the hard length gate, with η = 0.9. It prevents an accepted rewrite from
+increasing memory size.
+Figure 3: Complete merge-generation prompt and the three guards required before replacement.
+why semantic certification and findability are separate gates.
+Figure 6 illustrates both cases.
+The DIGEST certificate also rejected a real generated ex-
+ample that promoted a stray mention of a painting into a stan-
+dalone factual claim. One judge framing accepted the digest
+and the adversarial fabrication framing rejected it, produc-
+ing score 0.5 below the unanimous DIGEST threshold. The
+example demonstrates that synthesis can appear fluent while
+still introducing unsupported relational framing.
+D
+Supplementary Unified Lifecycle
+Evaluation
+Table 8 reports the source-backed 2 × 2 factorial evalua-
+tion testing prospective certification and oracle retrospective
+credit operating in tandem at the original 20-operation con-
+solidation point across 1,905 LoCoMo QA pairs. The oracle
+factor uses reference-answer feedback and must not be inter-
+preted as the deployed confidence-gated system. We evaluate
+the 2×2 consolidation bridge using oracle reference-answer
+credit rather than autonomous self-feedback to strictly iso-
+late consolidation credit-transfer distortion (∆r = −0.0115,
+Table 18; +0.20 pp max-credit transfer gain, Table 19)
+from upstream answer-verification variance. In deployed op-
+eration, confidence-gated TRACE-UCB (τconf = 0.80) au-
+tonomously captures 81.5% of the oracle retrieval improve-
+ment (+1.50 pp vs. +1.84 pp overall; +7.17 pp vs. +8.05
+pp on multi-hop, Table 3) while operating orthogonally to
+the offline certified merge gate (+0.26 pp, Table 17).
+E
+Supplementary RQ2: Retrieval and
+Exploration Details
+The main paper reports the core matched comparisons for
+TRACE and TRACE-UCB. This section verifies robustness
+to within-store dependence and provides broader retrieval-
+
+
+SUPERSEDE_PROMPT — Direct Update
+You decide whether a NEWER memory entry supersedes an OLDER one. “Supersedes” means the
+newer entry updates, corrects, or contradicts the older entry about the SAME fact, so the
+older entry is now outdated and should no longer be used.
+Older entry (recorded earlier):
+{older}
+Newer entry (recorded later):
+{newer}
+The verdict is SUPERSEDES only if they are about the same fact AND the newer entry makes
+the older one outdated. If they describe different facts, or both can be true at once
+(e.g. an additional detail, a different event), the verdict is INDEPENDENT.
+Answer with exactly one word on the first line: SUPERSEDES or INDEPENDENT.
+Answer:
+SUPERSEDE_PROMPT_TIMELINE — Temporal Precedence
+Two memory entries from the same ongoing conversation are shown with their order.
+Determine if the LATER one replaces the EARLIER one.
+Earlier: {older}
+Later: {newer}
+Think of a timeline of facts: does the later entry change the truth of the earlier one (a
+correction, a reversal, an update to a value/status/plan)? If yes answer SUPERSEDES. If
+the earlier entry remains true alongside the later one, answer INDEPENDENT.
+Answer with exactly one word on the first line: SUPERSEDES or INDEPENDENT.
+Answer:
+SUPERSEDE_PROMPT_ADVERSARIAL — Protect Valid History
+Your job is to protect a memory store from losing valid information. Someone proposes
+deleting the OLD entry because the NEW entry allegedly replaces it.
+OLD: {older}
+NEW: {newer}
+Argue against the deletion: is there ANY reading where the old entry is still true and
+useful alongside the new one? If you find one, answer INDEPENDENT. Only if the old entry
+is genuinely contradicted or made obsolete by the new one, answer SUPERSEDES.
+Answer with exactly one word on the first line: SUPERSEDES or INDEPENDENT.
+Answer:
+Figure 4: Complete three-framing SUPERSEDE judge ensemble.
+side ablations. Table 9 reports the store-clustered robustness
+checks, and Table 10 reports the full retrieval-side ablations.
+E.1
+Store-Clustered Robustness
+E.2
+Full Retrieval-Side Ablations
+TRACE without exploration is not significant over the en-
+hanced no-TRACE retriever (p = .083), whereas the UCB
+result is consistent with mitigating feedback-driven expo-
+sure lock-in. The reliability bonus adds a Laplace-smoothed
+success ratio derived from each memory’s pass/trial counts.
+Multi-anchor stores embeddings of queries that previously
+credited an item and retrieves by the maximum similarity
+across its content and credited-query anchors. The spacing
+weight scales a new credit update by the gap since the item’s
+previous credited use. The remaining three mechanisms add
+credit friction: Weibull decay attenuates importance with
+age, CCOMMIT exposes credit only after a fixed attribu-
+tion threshold is met repeatedly, and CORE-DLM limits the
+credited pool through diversity-aware eviction. Reliability,
+multi-anchor, and spacing variants are neutral or negative
+relative to lexical TRACE. The three friction mechanisms
+produce the same boundary failure: each suppresses sparse
+cross-session evidence and causes the largest regression on
+multi-hop questions.
+E.3
+Failure-Oriented Operating Regime Analysis
+To clarify when online retrospective credit improves or de-
+grades subsequent retrieval rankings, we categorize observed
+trajectory dynamics across the ten LoCoMo stores into three
+operating regimes:
+1. Beneficial Multi-Hop Reinforcement: When a cross-
+session bridge memory (e.g., an early mention linking
+a speaker’s relative to a specific city or career transi-
+tion) is surfaced via UCB exploration (λu = 0.05) and
+
+
+Factorial cell
+Oracle
+TRACE-UCB
+Certified merge
+(20-op)
+Rec@5 (%)
+Distortion
+(ˆϵ ↓)
+Active tokens
+Interpretation
+(1) Baseline system
+×
+×
+58.82%
+0.0000
+163,680
+Reference cell
+(2) Consolidation only
+×
+59.06%
+0.0028
+163,216
+Certified safety cell
+(3) Oracle TRACE-UCB only
+×
+60.66%
+0.0000
+163,680
+Oracle feedback
+(4) Oracle TRACE-UCB + merge
+60.88%
+0.0028
+163,216
+Compatibility cell
+Table 8: Source-backed 2 × 2 lifecycle evaluation over 1,905 deduplicated LoCoMo QA pairs across ten shared stores at the
+20-operation consolidation point. The oracle TRACE-UCB cells use reference answers for feedback. Joint activation attains the
+highest point estimate while retaining the certified-merge footprint and distortion. The interaction point estimate is −0.02 pp,
+so the table supports compatibility rather than super-additivity. A deployed confidence-gated factorial was not retained.
+Feedback condition
+∆Rec@5
+Question p
+Store-clustered 95% CI
+Clustered p
+LOSO positive folds
+No TRACE (matched hybrid)
+58.82%
+–
+–
+–
+–
+TRACE without UCB (credit only)
++0.42 pp
+.0830
+[−0.12, +0.96]
+.1420
+6/10
+Raw autonomous self-feedback
++1.13 pp
+.0042
+[+0.21, +2.05]
+.0210
+9/10
+Verified self-feedback (deployed)
++1.50 pp
+.0004
+[+0.41, +2.59]
+.0082
+10/10
+Oracle reference + UCB
++1.84 pp
+.0002
+[+0.52, +3.16]
+.0078
+10/10
+Multi-hop subset (verified self)
++7.17 pp
+.0012
+[+2.40, +11.94]
+.0045
+10/10
+Multi-hop subset (oracle reference)
++8.05 pp
+.0020
+[+3.12, +12.98]
+.0038
+10/10
+Table 9: Store-clustered retrieval robustness across n = 1,905 LoCoMo QA pairs in ten dialogue clusters. Clustered intervals
+and p-values use 10,000 store-level bootstrap resamples. LOSO reports leave-one-store-out fold consistency. Except for the
+baseline row, deltas use the matched no-TRACE hybrid comparator.
+contributes lexical tokens to a high-confidence answer
+(Conf ≥0.80), Equation (5) increments wimp. On subse-
+quent multi-hop queries requiring the same anchor fact,
+the multiplicative boost (1 + γwimp) elevates the mem-
+ory into the top-5 context ahead of superficially simi-
+lar conversational chitchat, driving the +7.17 pp verified
+multi-hop gain in Table 3.
+2. Bounded Irrelevant Exploration: Because bt(mi) =
+λu
+p
+log(1 + t)/(1 + ni) increments ni whenever an
+item is retrieved regardless of whether τt,i > 0, an irrel-
+evant cold memory probed by UCB that fails to support
+the answer receives τt,i = 0 (no importance increase)
+while its exploration bonus immediately contracts from
+ni = 0 →1, preventing repeated false promotion.
+3. Paraphrase Under-Crediting and Confidence-Gate
+Filtering: Unigram TRACE-FB under-credits short nu-
+meric dates or heavily paraphrased evidence where an-
+swer tokens diverge lexically from the source memory; in
+these cases, counterfactual TRACE-CF recovers attribu-
+tion alignment (r = 0.493 vs. 0.447, Table 6) at higher
+latency (67.0 ms vs. 6.7 ms). Conversely, when the gen-
+erator produces a speculative or hallucinated answer, raw
+self-feedback can reinforce distracting memories (+1.13
+pp, 9/10 folds), whereas confidence gating (τconf = 0.80)
+suppresses low-certainty updates, restoring positive gains
+across all 10/10 folds (+1.50 pp, Table 3).
+F
+Supplementary RQ3: Attribution Validity
+and Efficiency
+The main paper reports median latency and the core
+attribution-quality comparison between lexical TRACE and
+TRACE-CF (Table 4, Table 5). This section gives the full
+per-stage latency profile, including P95 percentiles where
+retained, and the complete attribution-validity statistics un-
+derlying that comparison. Table 11 reports P50/P95 latency,
+token cost, and online-LLM requirements for every stage
+of the online and offline paths. Table 12 reports the paired
+Pearson and Spearman correlation statistics between lexical
+TRACE and TRACE-CF referenced in the main text.
+G
+Supplementary Cross-Benchmark and
+Reproducibility Details
+Table 13 reports cross-benchmark consolidation safety, token
+footprints, and evaluation-scope boundaries across LoCoMo
+and LongMemEval-S.
+Table 13 presents the submitted cross-benchmark consol-
+idation profile. On LoCoMo, the 100-operation certified ex-
+tension reduces the active store by 1.42% to 161,356 tokens
+while changing FB-TG Rec@5 from 58.82% to 59.08%. On
+LongMemEval-S, certified merging reduces total store to-
+kens by 0.15% to approximately 508.9k with no observed
+sufficiency distortion (ˆϵ = 0.0000). LongMemEval-S con-
+structs a fresh store for each isolated question and therefore
+evaluates single-query consolidation safety and cold-start re-
+trieval; longitudinal TRACE-UCB feedback is evaluated on
+the ten multi-session LoCoMo dialogue stores. These are
+descriptive cross-benchmark results because matched store-
+clustered inference was not retained for the consolidation
+comparisons.
+LoCoMo retrieval uses ten conversations and dataset-
+native timestamps. The oracle TRACE-UCB result in Table 9
+uses 10,000 store-clustered bootstrap resamples; consolida-
+tion comparisons without a retained store-clustered output
+
+
+Mechanism
+Comparator
+Overall ∆
+Multi-hop ∆
+TRACE without UCB
+No TRACE hybrid
++0.42 pp
+–
+Confidence-gated TRACE-UCB (deployed)
+No TRACE hybrid
++1.50 pp
++7.17 pp
+Oracle TRACE-UCB
+No TRACE hybrid
++1.84 pp
++8.05 pp
+Reliability bonus
+No TRACE hybrid
++0.21 pp
+0.00 pp
+Reliability bonus
+Lexical TRACE
+−0.21 pp
+0.00 pp
+Multi-anchor
+Lexical TRACE
+−2.63 pp
+0.00 pp
+Spacing weight
+Lexical TRACE
+−0.06 pp
+0.00 pp
+Weibull decay
+Lexical TRACE
+−0.28 pp
+−5.92 pp
+CCOMMIT
+Lexical TRACE
+−0.37 pp
+−4.60 pp
+CORE-DLM
+Lexical TRACE
+−0.24 pp
+−5.26 pp
+Table 10: Retrieval-side ablations with explicit comparators. The deployed row uses confidence-gated self-feedback, whereas
+the oracle row uses reference-answer feedback. The two reliability rows show why the same variant can be positive relative to
+no TRACE but slightly negative relative to lexical TRACE.
+Stage
+P50
+P95
+Frequency
+Online LLM use
+Online write
+6.8 ms
+10.5 ms
+Every write
+none
+Search (k = 5)
+10.5 ms
+–
+Every query
+none
+Lexical TRACE
+6.7 ms
+11.5 ms
+Every feedback event
+none
+TRACE-CF (k = 5)
+67.0 ms
+84.5 ms
+Optional attribution ablation
+additional scoring calls
+Offline sleep
+2.85 s
+–
+Every 8 queries
+asynchronous judging
+Write-time extraction baseline
+∼110 ms
+–
+Every write
+required
+Table 11: Lifecycle latency over 1,905 LoCoMo QA pairs. Dashes indicate percentiles not retained in the available timing
+artifact. The zero-additional-call statement applies to the deployed lexical TRACE path, not TRACE-CF.
+Signal
+Pearson r (95% CI)
+Spearman ρ
+P50
+Lexical TRACE
+0.447 [0.412, 0.481]
+0.418
+6.7 ms
+TRACE-CF
+0.493 [0.458, 0.527]
+0.465
+67.0 ms
+Paired ∆
++0.046 [0.011, 0.081]
++0.047
++60.3 ms
+Table 12: Attribution validity and latency. The paired
+TRACE-CF advantage is significant (p = .0128). For each
+query qt, item-level attribution values τt,i are averaged across
+the top-k retrieved set Rt (¯τt = 1
+k
+P
+mi∈Rt τt,i) to compute
+Pearson r and Spearman ρ against query-level evidence-
+recall success over the n = 1,905 QA pairs.
+are labeled descriptive. The retained compression documen-
+tation assigns merge generation to Llama-3.3-70B-Instruct-
+Turbo, certification to local Llama-3.1-8B, and independent
+merge auditing to Mistral-7B. The development path used a
+local RTX 4060, while full GPU-backed local stages used
+an RTX 3090 24GB. Table 1 of the main paper uses the
+published LiCoMemory results for the Llama-3.1-70B and
+GPT-4o-mini baseline blocks.
+G.1
+Computational Resources and Experiment
+Accounting
+Table 14 reports settings supported by the retained documen-
+tation. Aggregate GPU-time, peak-memory, request, token,
+and cost logs were not retained, so no exact totals are re-
+ported. We also avoid rough totals: P50 stage latencies can-
+not be converted into defensible GPU-hours, hosted-token
+counts, or dollar cost without the missing event-level dura-
+tion and provider manifests. Reporting a guessed aggregate
+would be less reproducible than marking it unavailable.
+Core
+local
+certification
+uses
+llama3.1:8b
+through
+Ollama,
+with
+mistral:7b
+used
+for
+in-
+dependent
+merge
+auditing.
+The
+retained
+com-
+pression
+notes
+assign
+merge
+generation
+to
+meta-llama/Llama-3.3-70B-Instruct-Turbo
+through
+Together;
+separately
+labeled
+diagnostics
+also
+use that model and openai/gpt-4o-mini through
+TokenRouter. Certification calls use temperature 0 and one
+call per prompt framing. Retrieval experiments use seed 13;
+same-model accuracy results use five independent repeats
+whose variation comes from generation nondeterminism.
+Exact Python, PyTorch, CUDA, package versions, and the
+final experiment-repository revision were not retained.
+G.2
+Recovered Configuration and Remaining
+Reproduction Gaps
+Table 15 consolidates the recovered settings and author-
+verified final configuration. In the notation of main-paper
+Equation 6, the deployed configuration sets δ = 0, so the
+displayed δwrec term contributes zero. Chronological active-
+store ordering supplies temporal preference outside the scalar
+score, while the MMR term controls redundancy.
+Large-Store Scalability and Index Maintenance. Dur-
+ing online query processing, candidate generation retrieves
+the union of top-Kcand dense (HNSW/FAISS) and BM25
+inverted-index hits before applying exact RECALL-Q and
+UCB rescoring; looking up and updating per-item exposure
+counts ni and scalar weights wimp(mi) requires O(1) hash-
+table access and adds < 0.2 ms overhead. To ensure under-
+
+
+Benchmark
+Experiment /
+policy
+Store
+protocol
+Reported
+Rec@5
+Distortion
+(ˆϵ ↓)
+Store change
+(tokens)
+LoCoMo (n = 1,905)
+Certified merge (100-op extension)
+10 shared
+58.82% →59.08% FB-TG
+3/1,120 (0.0027)
+−1.42% (161,356)
+LongMemEval-S (n = 500)
+Consolidation safety gate
+500 single-QA
+94.60% →94.60%
+0.0000
+−0.15% (508.9k)
+Table 13: Cross-benchmark consolidation safety and token footprints. The LoCoMo row is the primary 100-operation fixed-
+budget, text-grounded (FB-TG) extension reported in the submitted main paper; its distortion entry reports 3 lost probes among
+|P| = 1,120 pre-consolidation answerable probes. LongMemEval-S evaluates single-query consolidation safety on independent
+fresh stores; because it uses one query per store, it tests cold-start retrieval and consolidation preservation, whereas multi-session
+TRACE-UCB feedback is evaluated on LoCoMo.
+Resource / quantity
+Reported value
+Status
+Development hardware
+NVIDIA RTX 4060 (8GB VRAM)
+Recorded
+Full-run GPU
+NVIDIA RTX 3090 (24GB VRAM)
+Recorded
+Local model identifiers
+llama3.1:8b (certification) and mistral:7b (independent merge audit), via Ollama
+Recorded
+Hosted model identifiers
+meta-llama/Llama-3.3-70B-Instruct-Turbo via Together (merge generation and di-
+agnostics); openai/gpt-4o-mini via TokenRouter
+Recorded
+Judge invocation
+Temperature 0; one call per certification framing; conservative first-token parsing
+Recorded
+Primary retrieval workload
+1,905 deduplicated LoCoMo QA pairs across 10 shared stores
+Recorded
+Cross-benchmark workload
+500 LongMemEval-S single-query stores
+Recorded
+Statistical computation
+10,000 store-clustered bootstrap resamples for the oracle TRACE-UCB robustness result; other
+comparisons are labeled descriptive unless a clustered output was retained
+Partial
+Randomness / repeats
+Retrieval seed 13; same-model accuracy uses five independent generation repeats
+Recorded
+Request reuse
+Cache lookup precedes provider invocation; identical cache hits are served locally
+Recorded
+Total local GPU time
+Source duration log not retained
+Unavailable
+Peak allocated GPU memory
+Source allocation log not retained
+Unavailable
+Total hosted-model requests
+Provider-request manifest not retained
+Unavailable
+Total hosted input/output tokens
+Provider-token manifest not retained
+Unavailable
+Total estimated experiment cost
+Billing manifest not retained
+Unavailable
+Software and repository version
+Final experiment-repository revision not retained
+Unavailable
+Runtime package versions
+Exact Python, PyTorch, CUDA, and library versions not retained in the supplied artifact
+Unavailable
+Table 14: Computational setup recoverable from the retained experiment documentation. Aggregate resource and provider-usage
+totals are omitted because their source manifests were not retained.
+Setting / parameter
+Recovered deployed value and specification
+Embedding model
+SentenceTransformer all-MiniLM-L6-v2 (384-dimensional dense vectors)
+RECALL-Q coefficients
+BM25 α = 0.3; MMR λ = 0.1; relevance β = 0.1; importance γ = 1.0; co-citation bonus scale 0.05
+Recency handling
+Main Equation 6 coefficient δ = 0, so δwrec = 0 in the deployed score; active-store ordering supplies temporal
+preference and Dmmr supplies diversity control
+UCB bonus coefficient
+λu = 0.05 with bt(mi) = λu
+p
+log(1 + t)/(1 + ni)
+TRACE feedback update
+Step size αfb = 0.3 and rank discount di = 1/(ranki + 1)
+Confidence gate
+Apply the self-feedback importance update only when answer confidence is at least 0.80
+Co-citation update
+attribution threshold 0.15; edge-rate coefficient 0.05
+Consolidation schedule and guards
+Sleep interval 8; (τc, τr, η) = (0.60, 0.45, 0.90); high-credit protection threshold wimp ≥0.30
+Random seed
+retrieval seed 13
+SUPERSEDE threshold
+τs = 0.60; at least two of three SUPERSEDES judge votes are required for retirement
+Coverage tokenization
+Lowercase tokenization, NLTK English stopwords, and multiset preservation counts
+State transfer (MERGE)
+nz = maxm∈C nm and wimp(z) = maxm∈C wimp(m)
+State transfer (SUPERSEDE)
+nmn ←nmn + nmo and wimp(mn) ←max(wimp(mn), 0.5wimp(mo))
+Table 15: Recovered and author-verified operational configuration. Provider token limits, exact runtime package versions, and
+the final repository revision remain unavailable.
+
+
+exposed memories remain reachable in large stores, UCB
+rescoring operates over the expanded candidate pool prior
+to top-k truncation. During periodic offline sleep (executed
+asynchronously every 8 queries at 2.85 s P50), candidate
+merge clustering restricts pairwise cosine evaluations to en-
+tries sharing co-citation edges or local dense neighborhoods,
+while accepted merges update the dense vector index and
+BM25 posting lists incrementally in O(|C|) time while mark-
+ing archived source records inactive in the provenance ledger.
+H
+Supplementary RQ4: Consolidation Safety
+Details
+The primary submitted RQ4 result is the 100-operation
+certified-merge lineage reported in Table 17. The earlier 20-
+operation runs remain useful for the factorial and category
+diagnostics and occupy a separately labeled legacy panel in
+the same table. DIGEST is evaluated separately because it is
+additive rather than compressive.
+Fixed-budget, text-grounded retrieval.
+For each query q,
+let Bq be the token count of the no-consolidation top-five re-
+trieved context. Each consolidation variant is evaluated after
+capping its top-five context to the same query-specific bud-
+get Bq. An inherited source identifier is credited only when
+the evidence span supporting that identifier remains present
+in the capped retrieved text. We call the resulting measure
+fixed-budget, text-grounded recall@5 (FB-TG Rec@5). The
+retained manuscript record does not include the frozen eval-
+uator manifest specifying the exact token counter, trunca-
+tion order, and support-span matcher; consequently, the 100-
+operation values below are synchronized to the submitted
+main paper but cannot be independently regenerated from
+the files supplied with this workspace.
+For a set P of probes that are answerable before consol-
+idation, sufficiency distortion is the observed fraction that
+become unanswerable after consolidation,
+ˆϵ =
+1
+|P|
+X
+p∈P
+1[Apre(p) = 1 ∧Apost(p) = 0] ,
+(9)
+where Apre and Apost are the experiment’s pre/post an-
+swerability indicators. This estimator is not treated as valid
+for summarize-all because that baseline unions source evi-
+dence identifiers onto summaries. The final accounting uses
+|P| = 1,120 pre-consolidation answerable probes and re-
+ports exact lost-probe numerators in Table 17. The 100-
+operation matched uncertified rate is 24/1120 = 0.02143;
+displayed four-decimal rates use standard rounding.
+H.1
+Primary 100-Operation Consolidation
+Extension
+The submitted main paper reports 100 certified merge opera-
+tions over the same ten LoCoMo stores. Relative to no consol-
+idation, certified merge changes FB-TG Rec@5 from 58.82%
+to 59.08% and reduces the active store from 163,680 to
+161,356 tokens (−1.42%). A different-family auditor records
+one verdict per accepted operation and observes 0/100 losses,
+yielding a one-sided 95% Clopper–Pearson upper bound of
+2.95%. The complete primary and legacy lineages are re-
+ported together in Table 17.
+H.2
+Preliminary 10-Store SUPERSEDE
+Diagnostic
+Table 16 reports a preliminary ten-store SUPERSEDE
+diagnostic evaluating temporal fact updates and stale-
+evidence mitigation. It is separate from the primary 100-
+operation merge evaluation. Across 24 accepted superses-
+sion operations, Rec@5 changes by −0.050 pp (95% CI
+[−0.342, +0.242], p = .7381), and 68 of 82 stale-retrieval
+opportunities are prevented (82.9%).
+H.3
+Core Consolidation Policy Comparison
+Table 17 brings the primary 100-operation lineage together
+with the earlier 20-operation pilot diagnostics in one place,
+so the certified, uncertified, and uncertified-merge-and-prune
+policies can be compared directly against the same no-
+consolidation baseline and the same 1,120-probe distortion
+denominator.
+H.4
+Legacy 20-Operation Per-Category
+Diagnostic
+Figure 7 reports per-category recall changes under the earlier
+20-operation policies; these category results were not rerun
+for the 100-operation extension.
+Certified merge changes overall Rec@5 from 58.82% to
+59.06%, while the uncertified variant reaches 59.52%. The
+uncertified increase is accompanied by substantially larger
+sufficiency distortion, so it is not evidence of safer consoli-
+dation.
+Scope decisions.
+Core certification uses Llama-3.1-8B,
+while the retained compressive-run documentation assigns
+merge generation to Llama-3.3-70B-Instruct-Turbo; sepa-
+rately labeled GPT-4o-mini and Llama-3.3-70B diagnostics
+retain their stated backbones. The hard length gate rejects
+verbose merge candidates and keeps consolidation conser-
+vative. The primary submitted extension uses 100 certified
+operations, −1.42% active tokens, 59.08% FB-TG Rec@5,
+and 0/100 audited losses. Dominated and budget-mode prun-
+ing were independently judged lossy in 83.9% (n = 174)
+and 63.6% (n = 404) of operations, respectively, and are
+excluded from the core. The following 20-operation com-
+parisons are retained only as earlier diagnostics, including
+the aggressive uncertified merge-and-prune run (−7.15% to-
+kens, ˆϵ = 0.0584).
+The complete earlier 20-operation policy rows now ap-
+pear in the explicitly separated legacy panel of Table 17; no
+standalone table duplicates those values.
+H.5
+Credit-Ledger Diagnostic
+Table 18 reports attribution credit-ledger stability over 28
+matched sleep events at the 100-operation scale. The paired
+difference remains directional rather than statistically signif-
+icant.
+H.6
+Bridge Ablations
+Table 19 reports the final ten-store bridge ablations at the
+100-operation scale. Credit protection and co-citation are
+neutral safety filters at this operating point, while maximum
+credit transfer yields the only measurable recall change.
+
+
+Variant
+Rec@5
+∆vs. cert.
+95% CI
+p
+ˆϵ ↓
+Sup. ops.
+Stale prevented
+Independent audit
+Certified merge only
+59.062%
+–
+–
+–
+0.002371
+0
+–
+Merge audit in Table 17
+Certified + SUPERSEDE
+59.012%
+−0.050 pp
+[−0.342, +0.242]
+.7381
+0.002372
+24
+68/82 (82.9%)
+0/24 (0.0%), ≤11.73%
+Table 16: Preliminary ten-store SUPERSEDE diagnostic over n = 1,905 QA pairs. Prevention is measured over 82 total
+stale-retrieval opportunities (68/82 = 82.9%). SUPERSEDE is neutral on aggregate Rec@5 (p = .7381). The audit bound is
+the one-sided 95% Clopper–Pearson upper limit over 24 retirement-level verdicts.
+Variant / policy
+Ops. (M/P)
+Store ∆
+Active tokens
+FB-TG Rec@5
+Non-inf. p
+Distortion †
+Audited loss
+95% upper bound
+Primary 100-Operation Benchmark Lineage (Submitted Main Baseline)
+No consolidation
+0/0
+0.00%
+163,680
+58.82%
+–
+0/1,120 (0.0000)
+–
+–
+Certified merge (primary)
+100/0
+−1.42%
+161,356
+59.08%
+< .0001
+3/1,120 (0.0027)
+0/100 (0.0%)
+≤2.95%
+Uncertified merge (matched)
+100/0
+−1.55%
+161,143
+58.81%
+.0240
+24/1,120 (0.02143)
+18/100 (18.0%)
+≤25.51%
+Uncertified merge+prune
+448/167
+−7.15%
+151,984
+59.52%
+.0085
+65/1,120 (0.05804)
+385/615 (62.6%)
+≤65.84%
+Earlier 20-Operation Pilot Diagnostics (Legacy Evidence)
+Certified merge (20-op pilot)
+20/0
+−0.28%
+163,216
+59.06%
+< .0001
+3/1,120 (0.0027)
+0/20 (0.0%)
+≤13.91%
+Uncertified merge (20-op pilot)
+20/0
+−0.31%
+163,172
+58.85%
+.0120
+20/1,120 (0.01786)
+4/20 (20.0%)
+≤40.10%
+Recency prune (20-op comparison)
+0/20
+−0.29%
+163,205
+58.79%
+.0015
+3/1,120 (0.0027)
+2/20 (10.0%)
+≤28.26%
+Recency prune (28-op full)
+0/28
+−0.40%
+163,025
+58.90%
+.0010
+3/1,120 (0.0027)
+3/28 (10.7%)
+≤25.42%
+Table 17: Consolidation policy comparison over n = 1,905 deduplicated LoCoMo QA pairs in ten shared stores. †Sufficiency
+distortion reports exact lost probes over |P| = 1,120 pre-consolidation answerable probes. Non-inferiority uses the pre-specified
+1.0-pp margin. Bounds are one-sided 95% Clopper–Pearson upper limits. The primary and earlier pilot lineages are separated
+explicitly to prevent cross-scale mixing.
+Variant
+rpre
+rpost
+∆r
+95% CI on ∆r
+Paired p
+Matched sleeps
+Certified merge (primary)
+0.3887
+0.3831
+−0.0056
+[−0.0210, +0.0098]
+–
+28
+Uncertified merge+prune
+0.3809
+0.3639
+−0.0170
+[−0.0385, +0.0045]
+–
+28
+Difference (uncertified −certified)
+–
+–
+−0.0114
+[−0.0282, +0.0054]
+.1820
+28
+Table 18: Attribution credit-ledger stability over 28 matched sleep events evaluated at the 100-operation scale. rpre and rpost
+measure Pearson correlation between item importance and gold-evidence utility before and after sleep. The paired difference is
+directional (p = .1820) and serves as a secondary event-level diagnostic.
+Bridge mechanism
+RA (on)
+RB (off)
+∆R (pp)
+95% CI
+Paired p
+ˆϵA ↓
+ˆϵB ↓
+∆ˆϵ
+Credit protection
+0.5908
+0.5908
++0.00
+[−0.15, +0.15]
+1.0000
+0.0028
+0.0028
+0.0000
+Maximum transfer
+0.5908
+0.5888
++0.20
+[+0.03, +0.37]
+.0210
+0.0028
+0.0034
+−0.0006
+Co-citation proposals
+0.5908
+0.5908
++0.00
+[−0.12, +0.12]
+1.0000
+0.0028
+0.0028
+0.0000
+Table 19: Lifecycle bridge ablations at the 100-operation scale (n = 1,905). R is evidence Rec@5; A/B denote enabled/disabled
+for protection and co-citation, and maximum/zero for transfer. Credit protection and co-citation act as neutral safety filters,
+whereas maximum credit transfer yields a modest recall gain and lower distortion.
+
+
+H.7
+Pilot Sensitivity Sweeps
+Table 20 reports coarse threshold and scheduling sensitivity
+on a two-store pilot.
+Setting
+Rec@5
+ˆϵ
+Tokens
+Merges
+τc = 0.4
+0.6236
+0.00198
+77,105
+4
+τc = 0.6
+0.6236
+0.00198
+77,105
+4
+τc = 0.8
+0.6194
+0
+77,204
+0
+τc = 1.0
+0.6194
+0
+77,204
+0
+Sleep = 4
+0.6262
+0.00178
+77,105
+4
+Sleep = 8
+0.6236
+0.00198
+77,105
+4
+Sleep = 16
+0.6194
+0.00260
+77,158
+2
+Table 20: Two-store sensitivity pilots. These runs document
+coarse threshold and scheduling behavior and are not treated
+as final-scale evidence.
+H.8
+Aggressive Summarization and DIGEST
+Diagnostics
+Table 21 reports the unconditional whole-store summariza-
+tion diagnostic and DIGEST end-to-end accuracy.
+(a) Unconditional whole-store summarization.
+Metric
+No sleep
+Summarize all
+Rec@5
+0.5882
+0.7460
+Full@5
+0.3921
+0.5014
+Context recall
+0.7176
+0.7735
+Top-5 tokens
+143.0
+201.7
+Store tokens
+163,680
+31,688 (−80.6%)
+ˆϵ
+0
+–†
+Probes
+0
+2,663
+(b) DIGEST end-to-end accuracy on one LoCoMo sample (n = 238).
+System
+Backbone
+Accuracy
+Rec@5
+Mem0 (same model)
+8B
+35.75%
+–
+A-MEM (same model)
+8B
+38.27%
+–
+MEMOIR+DIGEST
+8B
+43.28%
+38.90%
+MEMOIR+DIGEST
+70B
+40.76%
+39.46%
+LiCoMemory (live)
+70B
+54.3–54.8%
+–
+Table 21: Supplementary synthesis diagnostics. Panel (a) is
+not treated as a performance claim because evidence iden-
+tifiers are unioned onto summaries while retrieved context
+grows by 41%. †Sufficiency distortion is not comparable for
+summarize-all under identifier-union scoring; the raw esti-
+mator returned zero but violates the metric’s assumptions.
+Panel (b) is a single-sample diagnostic and does not support
+significance claims.
+The unconditional summarize-all baseline reduced total
+store tokens from 163,680 to 31,688, but increased the av-
+erage retrieved top-five context from 143.0 to 201.7 tokens.
+Its apparent Rec@5 increase from 0.5882 to 0.7460 should
+not be read as a reliable consolidation win: the operation
+unions many constituent evidence identifiers onto a few sur-
+viving summaries, allowing identifier-intersection metrics to
+credit a retrieved item even when its text no longer contains
+a compact, extractable answer. This baseline therefore re-
+quires end-to-end QA evaluation or a stricter text-grounded
+evidence metric before it can support a comparative claim.
+I
+Limitations
+TRACE-UCB requires repeated queries over a shared evolv-
+ing store and therefore cannot improve the first query to a
+fresh store. Confidence-gated self-feedback depends on cali-
+brated confidence and can reinforce irrelevant evidence when
+an answer is confidently wrong. Lexical TRACE can miss nu-
+meric, short, and paraphrastic evidence, whereas TRACE-CF
+incurs additional leave-one-out scoring latency. The factorial
+table uses oracle reference feedback and does not establish
+the same joint result for the deployed confidence-gated sys-
+tem.
+Certified merge is an empirical safety gate rather than a
+formal guarantee. The primary extension observes 0 losses
+among 100 audited merges, but its one-sided 95% operation-
+level upper bound remains 2.95%, and operations produced
+within the same store may be statistically dependent. The
+1.42% reduction is an active-store saving rather than a total-
+storage saving because originals are archived for rollback. Ta-
+ble 17 reports the recovered |P| = 1,120 distortion denomi-
+nator and policy-specific lost-probe counts. The preliminary
+SUPERSEDE audit observes 0/24 invalid retirements but re-
+tains an 11.73% one-sided upper bound. The credit-ledger
+comparison is event-level, and its interval crosses zero; it is
+therefore a secondary diagnostic rather than a system-level
+safety guarantee.
+Results
+are
+concentrated
+on
+ten
+LoCoMo
+stores.
+LongMemEval-S uses one question per fresh store and there-
+fore evaluates cold-start retrieval and consolidation preser-
+vation rather than longitudinal feedback. The submitted 100-
+operation values are now synchronized across the main pa-
+per and supplement, but the frozen per-query FB-TG out-
+puts, accepted-operation log, cross-model audit manifest,
+exact environment versions, and final repository revision are
+not present in the supplied workspace. The result therefore
+remains incompletely reproducible until those artifacts are
+archived.
+J
+Ethics Statement
+Long-term agent memory can retain sensitive personal in-
+formation across sessions. Deployments should use encryp-
+tion, access control, retention limits, and data-minimization
+policies. MEMOIR adds a specific fairness risk: if biased,
+harmful, or privacy-sensitive memories repeatedly appear
+in successful trajectories, retrospective importance revision
+may increase their future retrieval probability. This risk is dis-
+tinct from generic memory retention because it arises from
+the feedback loop itself. Practical systems should combine
+MEMOIR with content filters, user-controlled deletion, and
+auditing of high-importance memories.
+
+
+DIGEST_PROMPT — Session-Level Fact Extraction
+You are extracting discrete facts and relationships from a session’s memory entries,
+so each fact is independently answerable rather than buried in a paragraph. This is
+structured extraction, not prose summarization -- similar to writing out (subject,
+relation, object) facts in plain language, one per line.
+Rules:
+- Write one short factual sentence per line for each fact or relationship you can support,
+e.g. “Grandma gave Caroline a necklace.” or “Caroline is from Sweden.”
+- Include facts that require connecting information across multiple entries below (e.g.
+who did what for whom, who gave/received what, who is related to whom), not just facts
+restating a single entry
+- Do not invent any fact, name, number, date, or relation that isn’t supported by the
+entries
+- Prefer named entities and concrete relations over vague restatements
+Entries:
+{entries}
+Write the facts (one short sentence per line):
+DIGEST_FAITHFUL_PROMPT — Hallucination Check
+You verify whether a DIGEST is faithful to its SOURCE memory entries. This is a
+hallucination check, not a completeness check -- the digest does not need to restate
+every source detail, but everything IT states must be supported by (stated in or directly
+inferable from) the sources.
+Source entries:
+{originals}
+Digest:
+{merged}
+Answer with exactly one word on the first line: FAITHFUL or UNFAITHFUL.
+Answer:
+DIGEST_FAITHFUL_PROMPT_ADVERSARIAL — Find a Fabrication
+Your job is to FIND A FABRICATION. Below are source memory entries and a digest that
+summarizes them. Search hard for ANY claim in the digest -- a fact, name, number, date,
+or relation -- that is NOT supported by the sources, even indirectly.
+Source entries:
+{originals}
+Digest:
+{merged}
+If you found even one unsupported claim, the digest is UNFAITHFUL. Only if every claim
+in the digest is genuinely supported is it FAITHFUL. Answer with exactly one word on the
+first line: FAITHFUL or UNFAITHFUL.
+Answer:
+Figure 5: Complete DIGEST generation and faithfulness-certification prompts. DIGEST remains additive-only and outside the
+main method.
+
+
+Figure 6: Certified consolidation examples from LoCoMo. The accepted merge (top) passes retrieval coverage (κ = 0.477 ≥
+τr = 0.45) and transfers credit to the replacement. The rejected merge (bottom) passes semantic certification but fails retrieval
+coverage (κ = 0.279 < τr), so the source memories remain active.
+
+
+Figure 7: Per-category Rec@5 diagnostic at the retained 20-operation point over 1,905 deduplicated LoCoMo questions.
+Annotations report changes from each category’s no-consolidation baseline. Certified merge preserves overall retrieval quality
+with low distortion (ˆϵ = 0.0028), whereas uncertified merge-and-prune obtains larger category changes with substantially higher
+distortion (ˆϵ = 0.0584). No category-level difference is statistically significant.
