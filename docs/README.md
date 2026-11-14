@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-10</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-13</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 34 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 21 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
-    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>2 次</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>8</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>26</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>13</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-11 00:09:13 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-14 00:30:01 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今天筛完 34 篇论文，精读 8 篇、速读 26 篇，重点看主动式常驻智能体与动态图索引。最值得看的是 AutoBuddy 对模拟职场中任务发现与执行的评测（9.0），以及面向标签过滤近邻搜索的动态图索引（9.0）。普通读者可先读这两篇，再顺着速读里的长寿命智能体经验生命周期基准继续看。</p>
+<p>今天完成21篇论文筛选：8篇精读、13篇速读，重点聚焦向量索引自适应与LLM智能体记忆两条主线。最值得看的是满分10.0的《REWEAVE》——面向负载自适应HNSW的在线学习，以及9.0的《Can LLM Agents Organize Their Own Memory?》对智能体自主记忆组织的追问。普通读者可先读这两篇精读，再用VecDBLens、DISCERN和认证ANN检索三篇速读补齐向量数据库诊断、持久记忆与外包检索安全的视角。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -81,9 +81,9 @@
     <strong class="dpr-home-dashboard-count">8 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="AutoBuddy: Evaluating Proactive, Always-On Agents on Task Discovery and Execution in a Simulated Workplace">AutoBuddy: Evaluating Proactive, Always-On Agents on Task Discovery and Execution in a Simulated Workplace</span></li><li><span class="dpr-home-dashboard-paper-title" title="Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search">Dynamic Graph Indexing for Label-Filtered Approximate Nearest Neighbor Search</span></li><li><span class="dpr-home-dashboard-paper-title" title="MAC-Bench: Benchmarking Multi-Agent Collaboration via Interconnected Tasks">MAC-Bench: Benchmarking Multi-Agent Collaboration via Interconnected Tasks</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="REWEAVE: Online Learning for Workload-Adaptive HNSW Indexes">REWEAVE: Online Learning for Workload-Adaptive HNSW Indexes</span></li><li><span class="dpr-home-dashboard-paper-title" title="Can LLM Agents Organize Their Own Memory?">Can LLM Agents Organize Their Own Memory?</span></li><li><span class="dpr-home-dashboard-paper-title" title="Calibrated Early Termination with Bounded Optimality Gaps for Constrained Vector Search">Calibrated Early Termination with Bounded Optimality Gaps for Constrained Vector Search</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>3</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>2</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +91,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">26 篇</strong>
+    <strong class="dpr-home-dashboard-count">13 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Towards Robust Long-Lived Agents: Benchmarking Experience Lifecycles in Evolving Environments">Towards Robust Long-Lived Agents: Benchmarking Experience Lifecycles in Evolving Environments</span></li><li><span class="dpr-home-dashboard-paper-title" title="ArcRAG: Agentic Compositional Retrieval over Knowledge Graphs">ArcRAG: Agentic Compositional Retrieval over Knowledge Graphs</span></li><li><span class="dpr-home-dashboard-paper-title" title="Task-Efficient Agent Evaluation Using Cached Traces">Task-Efficient Agent Evaluation Using Cached Traces</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="VecDBLens: An Evaluatology-Based Framework for Vector Database Diagnosis">VecDBLens: An Evaluatology-Based Framework for Vector Database Diagnosis</span></li><li><span class="dpr-home-dashboard-paper-title" title="DISCERN: Preserve at Write, Resolve at Read for Persistent LLM-Agent Memory">DISCERN: Preserve at Write, Resolve at Read for Persistent LLM-Agent Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="Authenticated Approximate Nearest Neighbor Search in Outsourced Vector Databases">Authenticated Approximate Nearest Neighbor Search in Outsourced Vector Databases</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>14</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>11</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>6</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>4</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>3</strong></span></div>
 </section>
 </div>
 

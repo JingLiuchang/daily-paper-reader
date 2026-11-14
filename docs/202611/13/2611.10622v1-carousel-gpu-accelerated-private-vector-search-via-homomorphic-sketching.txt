@@ -1,0 +1,1989 @@
+CAROUSEL: GPU-Accelerated Private Vector Search via
+Homomorphic Sketching
+Sohaib
+sohaib@ucsb.edu
+UC Santa Barbara
+Divyakant Agrawal
+divyagrawal@ucsb.edu
+UC Santa Barbara
+Amr El Abbadi
+amr@cs.ucsb.edu
+UC Santa Barbara
+Soamar Homsi
+soamar.homsi@us.af.mil
+Air Force Research
+Laboratory
+ABSTRACT
+Vector search on untrusted infrastructure exposes the query embed-
+ding, a faithful summary of the user’s intent. Fully homomorphic
+encryption can hide the query, but existing approaches still require
+a full scan followed by ranking of encrypted scores. Scalable private
+systems avoid encrypted ranking by either sending scores from
+a single cluster to the client or moving the search to the client,
+which must first stream the entire vector index for preprocessing.
+We present Carousel, which instead scores the full corpus under
+encryption and compresses the results for client-side ranking. The
+server scores every vector under encryption, raises the scores to a
+power that preserves their order by magnitude while suppressing
+all but a handful, and compresses the resulting sparse vector into a
+logarithmic number of ciphertexts using homomorphic additions
+alone. Because every vector is scored, Carousel incurs no recall
+loss from discarding candidates. Since clients hold no database-
+dependent state, insertions and deletions take effect immediately at
+the cost of a single vector write. Carousel searches 1 billion vectors
+of BIGANN SIFT1B across multiple GPUs and achieves recall@100
+of 0.9715. At 100 million SIFT vectors, it achieves recall@100 of
+0.9845 with a query latency of 3.735 seconds on a single GPU.
+1
+INTRODUCTION
+Modern information retrieval systems increasingly rely on vector
+similarity search as their principal operation. Documents, images,
+code, and product catalogs are embedded into a high-dimensional
+space in which semantic similarity is inner-product proximity, and
+a query is answered by finding the stored vectors nearest to the
+query’s embedding. Search engines, recommendation systems, and
+retrieval-augmented generation pipelines all depend on this primi-
+tive, and vector databases serving hundreds of millions of embed-
+dings are now routine infrastructure [31]. The first step of every
+such query, however, is to hand the query embedding to the server
+and that embedding is a faithful summary of what the user wants
+to know. This is a privacy risk as search queries reveal sensitive
+personal information such as where they are, what they are doing,
+or what they are living through [5, 13].
+Efficient vector search algorithms [27] typically rely on query
+dependent access patterns, which requires that the query remain in
+plaintext. For a search to be completely private, the server’s actions
+must be completely independent of the query itself. This means the
+server cannot skip over any part of its index, because the decision to
+skip would reveal information about the search i.e. which part of the
+index were not relevant to the query. Private search therefore forces
+a linear scan on every request, and recent literature is organized
+around either paying for that scan or avoiding it by preprocessing.
+Every approach considered so far in the literature costs something
+that the user notices.
+These costs usually appear as either massive communication
+overhead or reduced search accuracy. Systems that offer the strongest
+privacy, where the server learns nothing at all about the query, face
+this tradeoff clearly. For example, Tiptoe [15] suffers from a drop
+in search quality, while PACMANN [33] relies on heavy prepro-
+cessing that requires the server to stream the whole index to the
+client. Even relaxing the privacy guarantees does not solve the
+problem. Wally [6], which uses weaker differential privacy, does
+not improve search quality significantly. Thus, the fundamental
+challenge remains unsolved, providing complete privacy and high
+search accuracy without a heavy communication cost.
+To resolve this challenge, this paper presents Carousel, a GPU-
+accelerated vector search system that achieves complete privacy
+with high search accuracy and low communication overhead. The
+tradeoff prior systems face is not strictly necessary. Rather, it arises
+from how they choose to reduce communication overhead. The fun-
+damental problem is that an exhaustive scan produces a relevance
+score for every document, creating a response far too large for
+transmission. Prior systems (Tiptoe, Wally) address this by pruning
+the database before the query arrives, estimating which documents
+are relevant and this filtering causes loss of accuracy. Carousel
+avoids this by scoring every document and compressing only the
+final answer, discarding nothing before ranking is complete.
+Carousel executes this secure scan using Fully Homomorphic
+Encryption (FHE) [9, 12], which enables the server to perform ad-
+ditions and multiplications directly on ciphertexts. Selecting the
+best matches from the resulting scores, however, requires compar-
+ison, which FHE does not support natively. A single comparison
+must be approximated by a high-degree polynomial, making the
+sort needed to rank even a few hundred encrypted scores cost sec-
+onds [28]. Avoiding this sort leaves the server unable to select the
+top matches, so it would have to return every score for the client to
+rank. To overcome the bottleneck of returning millions of encrypted
+relevance scores, Carousel employs a sketch, a compact summary
+of a large number of vectors that preserves its largest entries for
+later recovery. However, sketching techniques fundamentally rely
+on data sparsity, assuming that the vast majority of entries are near
+zero. A list of relevance scores violates this assumption as most
+documents exhibit a modest, non-zero similarity to the query, and
+even the top matches sit only marginally higher than this baseline.
+To make the score list sparse without altering which documents
+rank highest, we introduce a step called sharpening. The server
+raises every encrypted score to a power, preserving their ordering
+by absolute magnitude. Since all scores fall between -1 and 1, larger
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+arXiv:2611.10622v1  [cs.CR]  7 Nov 2026
+
+
+values shrink far more slowly than smaller ones. After this opera-
+tion, the broad middle of poor-to-modest matches collapses rapidly
+toward zero, while the highest scores retain their magnitude. This
+widens the numerical gap between the top matches and the rest,
+allowing a sketch to compress the results while preserving high
+retrieval accuracy.
+The sketch itself is constructed using only addition, the cheapest
+operation FHE offers. The server compacts the sparse scores into
+a few compact summary rows and returns those in place of the
+millions of initial scores. The client then decrypts the rows and
+recovers the top matches locally. Therefore, every comparison in
+the system occurs on the client after decryption. This ensures that
+the server never has to compare or sort encrypted values, avoiding
+the step that is expensive under encryption.
+The matches the client recovers, however, are positions in the
+index rather than the documents themselves. To fetch the indexed
+data without revealing which the client wants, it uses private infor-
+mation retrieval (PIR), a protocol that allows a client to read an entry
+from a server-held database while the server learns nothing about
+which entry was read [16, 24, 32]. Carousel addresses only the
+ranking step and composes with any PIR scheme for the retrieval
+that follows. The two together form an end-to-end private pipeline,
+the query stays hidden during search, and the retrieved documents
+stay hidden during retrieval.
+Carousel’s design also enables efficient online updates. It main-
+tains a flat array of vectors, without a clustering or graph index to
+update. Insertions append a vector, and deletions zero its coordi-
+nates. When encoded diagonals are cached, only the affected blocks
+need to be refreshed. These changes require no client-side refresh of
+corpus-dependent search metadata. Tiptoe [15] describes support
+for continuous updates by assigning new or modified documents to
+clusters and distributing updated centroids and metadata to clients,
+but does not evaluate update latency or query performance under
+concurrent updates. We evaluate both the cost of insertions and
+deletions and their impact on query latency under sustained update
+workloads.
+We implement Carousel using CKKS [9], a fully homomorphic
+encryption scheme, and support both single- and multi-GPU exe-
+cution. On MS MARCO, Carousel reaches an MRR@100 of 0.303,
+matching a non-private graph index and exceeding Tiptoe at 0.13,
+Wally at 0.18, and Pacmann at 0.266. On SIFT-100M, it achieves re-
+call@10 of 0.9785, compared with 0.90 for Pacmann, and completes
+each query in 3.735 seconds on a single GPU. On BIGANN SIFT1B,
+Carousel searches all 1 billion vectors across multiple GPUs and
+achieves recall@100 of 0.9715.
+Carousel makes the following contributions:
+• A private vector-search design that compresses the answer
+with a sketch rather than pruning the database, matching
+non-private search quality with logarithmic communica-
+tion and cryptographic query privacy.
+• An encrypted pipeline that sparsifies scores through power-
+based sharpening and moves all ranking to the client, avoid-
+ing encrypted comparison.
+• A dynamic, GPU-accelerated implementation that supports
+single-write updates and multi-GPU execution, evaluated
+on SIFT, MS MARCO, and GIST at scales up to 109 vectors.
+Table 1: Notation.
+Sym.
+Meaning
+Sym.
+Meaning
+𝑁
+database vectors
+𝑛
+CKKS ring dimension
+𝑑
+vector dimension
+ℓ
+slots, ℓ= 𝑛/2
+𝑘
+results returned
+𝐿
+levels in the chain
+𝑞, 𝑣𝑖
+query and 𝑖th vector
+Δ
+CKKS scaling factor
+𝑠𝑖
+score of 𝑣𝑖against 𝑞
+𝑝
+sharpening exponent
+𝐵
+blocks, ⌈𝑁/ℓ⌉
+𝑀
+fold matrix
+𝑅
+fold rows returned
+2
+BACKGROUND AND PRELIMINARIES
+2.1
+Private Vector Search
+A vector search index holds a database D = {𝑣1, . . . , 𝑣𝑁} of 𝑁
+vectors in R𝑑, obtained by passing documents, images, or other
+content through a pretrained embedding model. A client holding a
+query vector 𝑞∈R𝑑wants the identifiers of the 𝑘database vectors
+most similar to 𝑞, which for the embedding models used in this
+paper means largest inner product ⟨𝑞, 𝑣𝑖⟩. All vectors are normalized
+to unit length, so the inner product coincides with cosine similarity
+and lies in [−1, 1].
+In the private version of this problem, the server must learn abso-
+lutely nothing about the query, 𝑞. We guarantee this using standard
+semantic security for the query. Our threat model assumes a single
+semi-honest server that follows the protocol, but still attempts to
+deduce the query from its observations.
+Definition 2.1 (Query privacy). Let ViewS∗[C(𝑞)] denote the
+view of a server S∗in its interaction with a client that searches for𝑞.
+A private vector search protocol satisfies query privacy if, for every
+S∗and every pair of queries𝑞0,𝑞1, the distributions ViewS∗[C(𝑞0)]
+and ViewS∗[C(𝑞1)] are computationally indistinguishable.
+The view includes every message the server receives, the mem-
+ory it touches, and the sizes and timing of the responses it returns.
+Definition 2.1 forces all of these to be independent of the query,
+which is the formal statement of the linear scan requirement dis-
+cussed in Section 1. Table 1 collects the notation used throughout.
+2.2
+Fully Homomorphic Encryption
+Fully homomorphic encryption (FHE) allows a server to compute
+on encrypted data without decrypting it. Given an encryption of
+𝑚and public evaluation keys, the server can evaluate a supported
+function 𝑓to obtain an encryption of 𝑓(𝑚), without interacting
+with the key holder. Many practical schemes derive their security
+from the ring learning with errors assumption [26].
+We use CKKS [9], which supports approximate arithmetic on
+real or complex numbers and is well suited to computing similarity
+scores. A fresh ciphertext consists of two polynomials in the ring
+𝑅𝑄= Z𝑄[𝑋]/(𝑋𝑛+ 1), where 𝑛is a power of two and 𝑄is the
+ciphertext modulus. CKKS packs up to ℓ= 𝑛/2 values into the slots
+of a single plaintext polynomial, allowing additions and multipli-
+cations to operate on all slots simultaneously in a SIMD manner.
+During encoding, a scaling factor Δ controls the precision with
+which these values are represented in the integer polynomial ring.
+2
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+Decryption and decoding recover approximate values, and homo-
+morphic operations introduce and propagate numerical errors. The
+encryption parameters must therefore provide sufficient precision
+for the intended computation.
+CKKS supports a bounded number of multiplication stages through
+a modulus chain, 𝑄= 𝑞0𝑞1 · · ·𝑞𝐿. Multiplying two ciphertexts at
+scale Δ produces a ciphertext at scale Δ2. A subsequent rescaling
+operation divides the scale and modulus by one prime, bringing
+the scale back near Δ and consuming one level. The circuit’s mul-
+tiplicative depth, the largest number of sequential multiplication
+stages along any computation path, must therefore fit within the
+available level budget. Longer computations require bootstrapping
+to refresh the ciphertext and restore usable levels, at substantial
+computational cost. We design Carousel to complete its encrypted
+computation within the initial level budget, avoiding bootstrapping
+entirely.
+Table 2 lists all the standard homomorphic operators we use in
+our system, along with their required keys and relative computation
+costs. These costs vary widely and this variation directly shapes how
+we design our pipeline. For example, rotation is highly expensive
+because it relies on key switching, which dominates both runtime
+and memory. Every distinct rotation shift requires the server to
+hold a separate, multi-megabyte evaluation key. In our setup, each
+key is about 10 MB, so minimizing the total number of rotation
+keys is a critical goal. Finally, computation cost scales with the size
+of the ciphertext, meaning it is always cheaper to compute at a
+lower multiplicative level than at a higher one.
+Table 2: Homomorphic operators, the key material each re-
+quires, the levels it consumes, and its relative cost.
+operator
+key
+levels
+cost
+Add(ct, ct/pt)
+—
+0
+negligible
+MulPt(ct, pt)
+—
+0
+low
+Mul(ct0, ct1)
+—
+0
+moderate
+Relin(ct, RK)
+relin.
+0
+high
+Rescale(ct)
+—
+1
+low
+Rot(ct, RKstep)
+one per shift
+0
+high
+Conj(ct, CK)
+conj.
+0
+high
+The asymmetry in computational costs among FHE operators
+introduces two fundamental constraints that shape our system ar-
+chitecture. First, an operator built exclusively from Add and MulPt
+consumes no evaluation keys, adds no depth, and introduces no key
+switching error, which makes it qualitatively cheaper than one that
+uses rotations. Second, comparison is not a native FHE operation.
+Sign, minimum, maximum and argmax must be approximated by
+compositions of high degree polynomials [10], each consuming sev-
+eral levels, which is why selecting the top 𝑘entries of an encrypted
+vector is expensive even for a few hundred candidates [28]. This is
+the reason Carousel performs no comparison under encryption.
+2.3
+Prior Approaches to Private Vector Search
+Private nearest-neighbor search splits into two families. Interactive
+protocols built on secure multi-party computation can exploit an
+index and so avoid touching the whole database, at the price of many
+rounds and of trust assumptions such as non-colluding servers.
+Non-interactive protocols built on homomorphic encryption need
+one round and one server, but must compute over every record.
+Carousel belongs to the second family.
+Private search over a public corpus. Our design directly com-
+pares to existing architectures that hide only the query while relying
+on a public corpus and a single untrusted server. Coeus [1] first
+posed the problem for text, privately scoring Wikipedia articles with
+tf-idf at a cost that does not reach web scale. Tiptoe [15] replaced
+tf-idf with semantic embeddings, reducing private search to private
+nearest-neighbor search, and answered it with a preprocessing-
+friendly linearly homomorphic scheme [16] together with cluster-
+ing to bound the response size. Clustering partitions the corpus
+offline, typically by 𝑘-means, which groups vectors around a set
+of centroids so that each vector belongs to the centroid nearest it.
+At query time the client probes only the cluster whose centroid
+is closest to its query, so the server effectively scores a fraction of
+the corpus rather than all 𝑁. Tiptoe [15] uses
+√
+𝑁clusters, and a
+relevant document outside the probed cluster cannot be retrieved.
+Wally [6] keeps the clustering and relaxes the guarantee instead,
+revealing the probed cluster under differential privacy using cover
+queries routed through an anonymity network. Its overhead falls as
+the concurrent client population grows but it requires an anonymity
+network to strip identifiers and shuffle requests. Pacmann [33]
+moves graph traversal to the client. Starting from an entry node,
+the client repeatedly uses preprocessing PIR [32] to fetch the neigh-
+bor list of the node closest to the query until the search converges.
+This shifts most computation and state to the client and before
+querying, it must stream the entire graph index and store 0.6 GB of
+hints for three million vectors or 2.9 GB for one hundred million.
+Each query also requires 20–30 sequential network rounds. These
+three systems form our baselines.
+Other private nearest-neighbor protocols. Another line of work
+uses interactive multi-party computation (MPC). SANNS [8] com-
+bines distributed oblivious RAM and garbled circuits, while Pan-
+ther [25] reduces communication through batch PIR. Both use a
+single server and prevent the client from learning anything about
+the corpus beyond the search results. Servan-Schreiber et al. [30]
+instead require two non-colluding servers to obtain sublinear com-
+munication. Compass [34] considers a different setting, where the
+client encrypts and uploads its own corpus, protecting it from the
+server. GraSS [21], the first fully homomorphic graph index, still
+takes hours per query on datasets much smaller than ours. Because
+of this cost, prior work viewed fully homomorphic scans as im-
+practical. HANNS [29] also assumes that non-interactive search
+requires a full scan, but lowers its cost by ordering clusters to reduce
+encrypted comparisons and quantizing vectors to reduce storage.
+3
+THE CAROUSEL QUERY PIPELINE
+3.1
+Overview
+The server holds a database of 𝑁vectors 𝑣1, . . . , 𝑣𝑁in R𝑑, and a
+client holds a query 𝑞∈R𝑑. The client wants to retrieve the in-
+dices of the 𝑘database vectors most similar to 𝑞, where similarity
+is the inner product ⟨𝑞, 𝑣𝑖⟩, and must learn them without revealing
+𝑞to the server. Once the indices are retrieved, the client can use
+3
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+PIR techniques to retrieve the corresponding records. All vectors
+are normalised to unit length, so this inner product is the cosine
+similarity and lies in [−1, 1]. Carousel solves this with fully homo-
+morphic encryption where the server computes on the encrypted
+query and the scores stay encrypted as well.
+Carousel answers a query in four stages. The first three run
+on the server under encryption but the last runs on the client after
+decryption.
+• Scan. The server computes the inner product of the en-
+crypted query against every database vector, producing an
+encrypted score 𝑠𝑖= ⟨𝑞, 𝑣𝑖⟩for every 𝑖.
+• Sharpen. The server raises each encrypted score to a power,
+𝑠𝑖↦→𝑠𝑝
+𝑖. This preserves the ranking of the strong matches
+while driving the rest toward zero, turning a dense score
+vector into a sparse one.
+• Fold. The server compresses the sparse scores into 𝑅sum-
+mary rows using a fixed binary matrix 𝑀, needing only
+homomorphic addition: row𝑟= Í
+𝑖𝑀𝑟,𝑖𝑠𝑝
+𝑖.
+• Decode. The client decrypts the 𝑅rows and recovers the
+top-𝑘identifiers locally. Every comparison in the system
+happens here, in plaintext.
+The scores of ℓconsecutive vectors are packed into the slots of
+a single ciphertext. We call such a group of ℓvectors a block, so a
+corpus of 𝑁vectors occupies 𝐵= ⌈𝑁/ℓ⌉blocks. We illustrate the
+pipeline throughout with a corpus of 𝑁= 64 vectors of dimension
+𝑑= 4 and a ciphertext of ℓ= 8 slots, so the similarity scores for a
+given query occupies 𝐵= 8 blocks.
+3.2
+Data Layout
+The client encrypts its query into a single ciphertext. The dimension
+𝑑of a query (and the vectors in the database) is much smaller than
+the number of slots ℓin a ciphertext. Instead of placing the query
+once and leaving the remaining slots empty, the client tiles the
+query across all slots, repeating its 𝑑coordinates ℓ/𝑑times. Figure 1
+shows a query with 𝑑= 4 coordinates and a ciphertext has ℓ= 8
+slots, so the pattern 𝑞0,𝑞1,𝑞2,𝑞3 appears twice where 𝑞𝑖refers to
+the 𝑖-th coordinate of the query vector 𝑞.
+0
+1
+2
+3
+4
+5
+6
+7
+slot
+ct(𝑞)
+𝑞0
+𝑞1
+𝑞2
+𝑞3
+𝑞0
+𝑞1
+𝑞2
+𝑞3
+𝑑′ = 4, ℓ= 8
+copy 0
+copy 1
+slot 𝑗holds 𝑞𝑗mod 𝑑′: ℓ/𝑑′ = 2 copies, and no slot sits idle
+Figure 1: A four-dimensional query packed into a ciphertext
+with eight slots, tiled twice to fill all slots.
+The corpus is laid out to match this tiled query. CKKS multiplies
+two operands slot by slot, so a product is formed only between
+values in corresponding slots. Consider storing the corpus in row-
+major order, with each vector’s 𝑑coordinates placed contiguously
+across slots. Figure 2 shows what this produces where 𝑣𝑖,𝑗refers to
+the 𝑗-th coordinate of the 𝑖-th vector, 𝑣𝑖. Slot 0 holds 𝑞0 against 𝑣0,0,
+slot 1 holds 𝑞1 against 𝑣0,1, and slot 4 holds 𝑞0 against 𝑣1,0. Every slot
+0
+1
+2
+3
+4
+5
+6
+7
+slot
+𝑞0
+𝑞1
+𝑞2
+𝑞3
+𝑞0
+𝑞1
+𝑞2
+𝑞3
+ct(𝑞)
+⊙
+𝑣0,0
+𝑣0,1
+𝑣0,2
+𝑣0,3
+𝑣1,0
+𝑣1,1
+𝑣1,2
+𝑣1,3
+pt(𝑉)
+𝑞0𝑣0,0
+𝑞1𝑣0,1
+𝑞2𝑣0,2
+𝑞3𝑣0,3
+𝑞0𝑣1,0
+𝑞1𝑣1,1
+𝑞2𝑣1,2
+𝑞3𝑣1,3
+product
+sum these four →⟨𝑞, 𝑣0⟩
+sum these four →⟨𝑞, 𝑣1⟩
+Figure 2: Row-major layout. The tiled query multiplies ele-
+mentwise against two vectors laid out in consecutive slots.
+Algorithm 1 Server processing of one block 𝑏
+Require: rotated query RQ[0..𝑑−1], fold matrix 𝑀, row accumu-
+lators rows[0..𝑅−1]
+1: for 𝑘= 0 to 𝑑−1 do
+2:
+DIAG[𝑘] ←Encode(𝑣𝑘)
+⊲Eq. 1
+3: end for
+4: acc ←RQ[0] ⊙DIAG[0]
+5: for 𝑘= 1 to 𝑑−1 do
+6:
+acc ←acc + RQ[𝑘] ⊙DIAG[𝑘]
+7: end for
+⊲acc[𝑖] = ⟨𝑞, 𝑣𝑖⟩for vector 𝑖of the block
+8: for 𝑠= 1 to nsq do
+9:
+acc ←Sqare(acc)
+⊲sharpen: raise scores to 𝑝= 2nsq
+10: end for
+11: for 𝑟= 0 to 𝑅−1 do
+12:
+if 𝑀[𝑟][𝑏] = 1 then
+13:
+rows[𝑟] ←rows[𝑟] + acc
+⊲fold into selected rows
+14:
+end if
+15: end for
+carries a product from a different vector coordinate, and the 𝑑prod-
+ucts belonging to one vector are scattered across 𝑑separate slots.
+Recovering a single inner product would require summing these 4
+slots together, and summing within a ciphertext requires rotations,
+which need rotation keys and are computationally expensive.
+To avoid this limitation, we adapt the Halevi–Shoup diagonal
+representation for homomorphic matrix–vector multiplication [14].
+Instead of storing vectors in row-major order, we build 𝑑plaintext
+diagonals, each containing one coordinate from every vector in the
+block. Diagonal 𝑘is
+diag[𝑘][𝑖] = 𝑣𝑖
+
+(𝑖+𝑘) mod 𝑑
+
+,
+(1)
+so slot 𝑖carries one coordinate of vector 𝑖. The offset by 𝑖staggers
+which coordinate each slot takes, which makes a one-slot shift
+of the query line up with the next diagonal, thus simplifying the
+product and summation operations and avoiding expensive and
+unnecessary rotations. Figure 3 shows all four diagonals of a block
+of eight four-dimensional vectors, each filling all ℓ= 8 slots.
+4
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+𝑣0,0
+𝑣0,1
+𝑣0,2
+𝑣0,3
+𝑣0
+𝑣1,0
+𝑣1,1
+𝑣1,2
+𝑣1,3
+𝑣1
+𝑣2,0
+𝑣2,1
+𝑣2,2
+𝑣2,3
+𝑣2
+𝑣3,0
+𝑣3,1
+𝑣3,2
+𝑣3,3
+𝑣3
+𝑣4,0
+𝑣4,1
+𝑣4,2
+𝑣4,3
+𝑣4
+𝑣5,0
+𝑣5,1
+𝑣5,2
+𝑣5,3
+𝑣5
+𝑣6,0
+𝑣6,1
+𝑣6,2
+𝑣6,3
+𝑣6
+𝑣7,0
+𝑣7,1
+𝑣7,2
+𝑣7,3
+𝑣7
+coord 0
+coord 1
+coord 2
+coord 3
+diag[0]
+𝑣0,0
+𝑣1,1
+𝑣2,2
+𝑣3,3
+𝑣4,0
+𝑣5,1
+𝑣6,2
+𝑣7,3
+diag[1]
+𝑣0,1
+𝑣1,2
+𝑣2,3
+𝑣3,0
+𝑣4,1
+𝑣5,2
+𝑣6,3
+𝑣7,0
+diag[2]
+𝑣0,2
+𝑣1,3
+𝑣2,0
+𝑣3,1
+𝑣4,2
+𝑣5,3
+𝑣6,0
+𝑣7,1
+diag[3]
+𝑣0,3
+𝑣1,0
+𝑣2,1
+𝑣3,2
+𝑣4,3
+𝑣5,0
+𝑣6,1
+𝑣7,2
+0
+1
+2
+3
+4
+5
+6
+7
+Figure 3: Diagonal plaintexts with the first two diagonals
+highlighted.
+3.3
+Encrypted Scan
+Query expansion. The scan needs one copy of the query aligned
+to each of the 𝑑diagonals. The client uploads only one ciphertext,
+so the server produces the rest itself. The uploaded query repeats
+with period 𝑑, so rotating it by one slot advances every slot to the
+next coordinate. The server therefore builds copy 𝑘by rotating the
+uploaded query 𝑘slots, giving RQ[0], . . . , RQ[𝑑−1]. Every copy
+is one further single-slot rotation of the previous one, so the whole
+chain only needs a single rotation key. The expansion runs once
+per query and its output is reused across all 𝐵blocks. This costs
+memory since, the 𝑑rotated copies stay resident for the duration
+of the scan.
+Scoring. Copy 𝑘and diagonal 𝑘now match slot by slot. In slot 𝑖,
+copy𝑘holds𝑞[(𝑖+𝑘) mod 𝑑] and diagonal𝑘holds𝑣𝑖[(𝑖+𝑘) mod 𝑑],
+so their product is a matching pair of coordinates from the same
+vector. Multiplying the two and accumulating over all 𝑑diagonals
+gives one block of scores,
+acc =
+𝑑−1
+∑︁
+𝑘=0
+RQ[𝑘] ⊙DIAG[𝑘],
+(2)
+where ⊙is the slot-wise product of a ciphertext against a plaintext.
+Slot𝑖of acc now holds ⟨𝑞, 𝑣𝑖⟩, the score of the𝑖-th vector of the block.
+Figure 4 shows the four products and their sum on the running
+example.
+This diagonal arrangement allows the system to independently
+accumulate the inner products in parallel. Every product landing
+in a given slot belongs to the same vector, so no slot ever mixes
+contributions from two different vectors. For instance, consider slot
+0 in Figure 4. Across the four products it holds 𝑞0𝑣0,0, 𝑞1𝑣0,1, 𝑞2𝑣0,2
+and 𝑞3𝑣0,3, which are the four terms of ⟨𝑞, 𝑣0⟩. Summing the four
+ciphertexts therefore places ⟨𝑞, 𝑣0⟩in slot 0, and the same holds for
+all other slots for its own vector. Since, no operation moves a value
+between slots, the score of vector 𝑖stays in slot 𝑖for the remainder
+of the pipeline. Since a CKKS slot holds a complex number while
+a score is real, we pack two blocks per ciphertext and separate
+them after the scan with one conjugation, halving the ciphertexts
+scanned at the cost of a conjugation key.
+The scan operation multiplies each plaintext diagonal against
+the query ciphertext. However, CKKS cannot multiply a ciphertext
+directly by a list of numbers. The plaintext must first be converted
+into the number-theoretic transform (NTT) domain, a representa-
+tion required for CKKS multiplication. This transform is applied
+tiled query, rotated (ciphertext)
+diagonal of the 8 vectors (plaintext)
+0
+0
+1
+1
+2
+2
+3
+3
+4
+4
+5
+5
+6
+6
+7
+7
+slot
+𝑞0
+𝑣0,0
+𝑞1
+𝑣1,1
+𝑞2
+𝑣2,2
+𝑞3
+𝑣3,3
+𝑞0
+𝑣4,0
+𝑞1
+𝑣5,1
+𝑞2
+𝑣6,2
+𝑞3
+𝑣7,3
+𝑘= 0
+⊙
+diag0
+𝑞1
+𝑣0,1
+𝑞2
+𝑣1,2
+𝑞3
+𝑣2,3
+𝑞0
+𝑣3,0
+𝑞1
+𝑣4,1
+𝑞2
+𝑣5,2
+𝑞3
+𝑣6,3
+𝑞0
+𝑣7,0
+𝑘= 1
+⊙
+diag1
+𝑞2
+𝑣0,2
+𝑞3
+𝑣1,3
+𝑞0
+𝑣2,0
+𝑞1
+𝑣3,1
+𝑞2
+𝑣4,2
+𝑞3
+𝑣5,3
+𝑞0
+𝑣6,0
+𝑞1
+𝑣7,1
+𝑘= 2
+⊙
+diag2
+𝑞3
+𝑣0,3
+𝑞0
+𝑣1,0
+𝑞1
+𝑣2,1
+𝑞2
+𝑣3,2
+𝑞3
+𝑣4,3
+𝑞0
+𝑣5,0
+𝑞1
+𝑣6,1
+𝑞2
+𝑣7,2
+𝑘= 3
+⊙
+diag3
+Rot(1)
+Rot(1)
+Rot(1)
+Í
+𝑠0
+𝑠1
+𝑠2
+𝑠3
+𝑠4
+𝑠5
+𝑠6
+𝑠7
+acc
+slot 𝑖holds 𝑠𝑖= ⟨𝑞, 𝑣𝑖⟩, all 8 inner products at once
+Figure 4: The scan
+once for every prime in the modulus chain. The resulting represen-
+tation is much larger than the coordinates it came from. We call
+this diagonal encoding. This is a computationally expensive step
+and dominates query latency, so the encoded diagonals are cached
+and reused across queries when they fit in device memory.
+3.4
+Sharpening the Score Vector
+The vector inner products after the scan are not sparse. A large
+number of documents score modestly and the good matches are
+only slightly above them. A linear sketch cannot compress scores
+with this distribution. We therefore reshape it by raising every score
+to a power 𝑝, which the server does by squaring nsq = log2 𝑝times.
+Each squaring costs one level and one relinearisation. Squaring
+contracts every score, but it contracts small scores faster than large
+ones. A score of 0.95 raised to the power 16 becomes 0.44, while
+a score of 0.60 falls to 2.8 × 10−4 and a score of 0.30 to 4.3 × 10−9.
+The gap between the head and the bulk therefore widens by orders
+of magnitude. After nsq squarings only a handful of entries remain
+within a few percent of the peak, and the rest are numerically zero.
+The score vector is now sparse enough for the sketch to compress.
+The operation also preserves the order of the surviving scores,
+so sharpening costs no accuracy in the ranking. This holds for non-
+negative scores. An even power maps −𝑠and 𝑠to the same value,
+so a score close to −1 would survive sharpening and be reported
+as a strong match. In practice this does not arise, because the most
+negative score a query encounters is far smaller in magnitude than
+its largest positive score and the ratio is suppressed by the power 𝑝.
+The exponent depends on the distribution of the cosine scores of
+the corpus. A small 𝑝leaves the bulk uncrushed, and the decoder
+cannot separate the true matches. On the other hand, a large 𝑝drives
+even the strong scores below the noise floor, where they are lost.
+The usable range depends on how cleanly a corpus’s true neighbors
+separate from the bulk, and on the corpus size. The exponent also
+fixes the encryption level, 𝐿enc = nsq + 1, so changing 𝑝changes
+the depth of the modulus chain.
+3.5
+The Fold
+After sharpening, the server holds one ciphertext of scores for each
+of the 𝐵blocks, referred to as block ciphertexts. Only a few entries
+5
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+0
+1
+2
+3
+4
+5
+6
+7
+slot
+ct0
+ct1
+ct2
+ct3
+ct4
+ct5
+ct6
+ct7
+𝜶
+𝑏
+𝑐1
+𝑐2
+𝑐3
+0
+0
+0
+0
+1
+1
+0
+0
+2
+0
+1
+0
+3
+1
+1
+0
+4
+0
+0
+1
+5
+1
+0
+1
+6
+0
+1
+1
+7
+1
+1
+1
+0
+1
+2
+3
+4
+5
+6
+7
+𝜶
+row0 — all ones
+row1 — 𝑐1 = 0
+𝜶
+row2 — 𝑐2 = 1
+𝜶
+row3 — 𝑐3 = 1
+×
+Figure 5: Folding 𝐵= 8 blocks into four rows.
+carry significant magnitude, referred to as heavy items. The client
+only needs to recover the top-k scores, but sending all 𝐵block
+ciphertexts constitutes a significant overhead. The fold compresses
+the 𝐵ciphertexts into a smaller number of ciphertext sketches called
+rows. Each row is a sum of a different subset of blocks. The goal for
+the client is to decrypt the rows and recover only the heavy entries.
+The first row of the fold is the sum of all 𝐵block ciphertexts.
+Slot 𝑖of this row holds the sum of all scores at position 𝑖across all
+𝐵block ciphertexts. Since only a few entries are heavy, the slots of
+larger magnitude in this row are the slots occupied by heavy items.
+The first row therefore identifies all candidate slots that the client
+needs to examine. Once we have identified which slots the heavy
+items come from, the next step is to recover which of the 𝐵block
+ciphertexts contains the heavy item in slot 𝑖.
+The remaining rows identify which block ciphertext contains the
+heavy item. A block index below 𝐵requires 𝑚= ⌈log2 𝐵⌉bits. To
+illustrate the basic construction, assign each block its 𝑚-bit binary
+codeword and create one fold row per bit position. Row 𝑟sums the
+block ciphertexts whose 𝑟-th codeword bit is one, so each block
+is added to a unique combination of rows. These codewords form
+the columns of a binary fold matrix 𝑀, where 𝑀[𝑟][𝑏] = 1 if block
+ciphertext 𝑏is added to row 𝑟. Figure 5 illustrates this uncoded
+construction for 𝐵= 8, which requires three codeword rows in
+addition to row0. Block ciphertext 6 has codeword (0, 1, 1) (LSB
+first) and is therefore added to row2 and row3, but not to row1. A
+heavy item from this block appears in the corresponding pattern
+of rows, allowing the client to recover its block index.
+In the ideal case, a heavy item occupies a given slot in exactly
+one block ciphertext, while every other block ciphertext holds a
+value near zero at that position. The client decrypts the rows and
+inspects row0 to identify the heavy slots. For each candidate slot,
+the client evaluates which of the remaining rows contain a large
+value and which remain near zero. This binary pattern directly
+reconstructs the codeword of the originating block ciphertext. For
+example, consider slot 3 in Figure 5, where all block ciphertexts ex-
+cept block ciphertext 6 hold near-zero values, and block ciphertext
+6 holds a magnitude of 𝛼. Examining slot 3 across the folded rows,
+row0 will contain 𝛼, flagging it as a slot of interest. Extracting the
+values across all rows at this slot yields the vector ⟨𝛼, 0, 𝛼, 𝛼⟩. By
+matching this non-zero pattern to the known codewords, the client
+determines that the item originated from block ciphertext 6.
+The idealised assumption fails due to two reasons. First, the block
+ciphertexts that do not hold the heavy item do not contribute zero.
+Each row sums many block ciphertexts, and every block carries
+a residual bulk left over from sharpening, so a slot that should
+contain a near zero value instead holds the accumulated bulk of
+all the block ciphertexts added into that row, together with the
+encryption noise of CKKS. Therefore the entries are not exact but
+large and small values, and the more block ciphertexts contribute
+to a row, the larger the small values grow. Reading each row as
+an exact bit becomes unreliable due to noise corrupting some of
+the values. Second, two heavy items can occupy the same slot in
+two different block ciphertexts. Their codewords are then added
+together, and the client sees the sum of two codewords rather than
+one. As a result, the collision of two heavy items in the same slot,
+introduces a secondary challenge for the client-side decoding phase.
+The first problem is resolved by replacing standard binary la-
+bels with a more robust codeword assignment. With plain binary
+codewords, two block codewords can differ in a single bit, for ex-
+ample, codewords of blocks ciphertext 4 and 5 differ only in the last
+position. This means a single unreliable row can turn one block’s
+pattern into another’s. The solution is to read the rows not as exact
+bits, but as a pattern to be matched to the nearest codeword. To en-
+sure that this nearest match remains unambiguous under noise, we
+draw the codewords from a code of minimum Hamming distance
+three[20]. Because any two codewords now differ in at least three
+positions, the true codeword stays closest to the observed pattern
+even if one row is completely corrupted. This spacing makes the
+decode robust to the residual bulk and encryption noise.
+Carousel constructs the robust codewords using a randomized
+procedure. It begins with the 𝑚-bit representation of each block ID
+and repeatedly samples a random linear combination of the ID bits,
+appending the resulting bit to every block’s codeword. Sampling
+continues until every pair of codewords has Hamming distance at
+least 3, producing an 𝐿-bit base codeword. Carousel then samples
+𝑟𝑝additional combinations in the same manner and appends them
+as extra measurement bits, yielding a codeword 𝑐(𝑏) of length
+𝐿+ 𝑟𝑝. Each codeword position defines one fold row, so together
+with the all-ones row0, the server returns 𝑅= 1 + 𝐿+ 𝑟𝑝rows.
+The augmented codewords form the columns of 𝑀∈0, 1(𝑅−1)×𝐵.
+Because appending coordinates cannot decrease Hamming distance,
+the augmented code retains a minimum distance of at least 3.
+At any identified candidate slot, the client extracts the corre-
+sponding values from each row to construct an observation vector
+𝑦. This vector is composed of three distinct contributions. First,
+a heavy item of magnitude 𝛼residing in block ciphertext 𝑏con-
+tributes 𝛼exclusively to the rows where its assigned codeword 𝑐(𝑏)
+contains a one, generating a structured component 𝛼𝑐(𝑏). Second,
+because every code row aggregates the residual bulk from its con-
+stituent block ciphertexts, this accumulation introduces a uniform
+baseline offset 𝛽across all rows, represented by the term 𝛽1. Fi-
+nally, the inherent CKKS encryption noise and minor inter-row
+variations in the bulk are absorbed into a single error vector 𝜀. The
+observed vector is therefore formalized as
+𝑦= 𝛼𝑐(𝑏) + 𝛽1 + 𝜀,
+(3)
+which describes a scaled codeword shifted by a constant offset and
+perturbed by noise. Recovering the originating block ciphertext
+thus reduces to determining which valid codeword 𝑐(𝑏) best aligns
+with this observation signal.
+6
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+Algorithm 2 Client decoding of one query
+Require: decrypted rows 𝐶0 . . .𝐶𝑅−1, fold matrix 𝑀, budget 𝐶
+1: cand ←indices of the 𝐶largest entries of 𝐶0
+2: for all 𝑖∈cand do
+3:
+𝑦←(𝐶1[𝑖], . . . ,𝐶𝑅−1[𝑖])
+4:
+˜𝑦←𝑦−mean(𝑦)
+5:
+ˆ𝑏𝑖←arg max𝑏⟨˜𝑦, ˜𝑐(𝑏)⟩2/∥˜𝑐(𝑏)∥2
+6:
+ˆ𝑠𝑖←⟨˜𝑦, ˜𝑐( ˆ𝑏𝑖)⟩/∥˜𝑐( ˆ𝑏𝑖)∥2
+7: end for
+8: return { ˆ𝑏𝑖· ℓ+ 𝑖} ordered by decreasing ˆ𝑠𝑖
+To determine which codeword best aligns with the observation,
+we treat the evaluation of each candidate as a two-parameter fit.
+Assuming the heavy item originated in a specific block ciphertext
+𝑏, the vector 𝑦should approximate 𝛼𝑐(𝑏) + 𝛽1 for some magnitude
+𝛼and offset 𝛽, disregarding the error term 𝜀. For a given codeword,
+the optimal fit is the pair (𝛼, 𝛽) that minimizes the distance to 𝑦.
+The quality of this fit is measured by the residual:
+res(𝑏) = min
+𝛼, 𝛽
+𝑦−𝛼𝑐(𝑏) −𝛽1
+2.
+(4)
+This residual is small only when 𝑐(𝑏) can be scaled and shifted
+to reproduce the observed pattern. The client therefore evaluates
+res(𝑏) for every block ciphertext and selects the candidate with the
+minimum residual. The fitted magnitude 𝛼at that optimal block
+then provides an estimate of the item’s score, allowing the client
+to rank the recovered matches. The block index from the residual
+fit and the slot index from the candidate position together give
+the item’s global identifier, id = 𝑏· ℓ+ 𝑖. This is repeated over the
+candidate slots and ordering by the fitted magnitude yields the top
+matches.
+The second problem, a collision, is when two heavy items occupy
+the same slot in different block ciphertexts. The observation by the
+client is a superposition, 𝑦≈𝛼1𝑐(𝑏1) + 𝛼2𝑐(𝑏2) + 𝛽1 + 𝜀, and the
+single-codeword fit of Equation 4 can match at most one of them.
+A collision is a birthday event over the ℓslots of a block ciphertext.
+It depends on the number of surviving heavy items and the slot
+count, and not on 𝑁or 𝐵, so it does not become more frequent as
+the corpus grows. The rate also remains low since 𝑘≪ℓitems
+survive sharpening. Among the top hundred scores, the expected
+number of colliding pairs in our settings is 0.15 per query, so most
+queries have no collision at all and the few that do, result in at
+most one match. We recover the second item by a second pass over
+the residual. Having fitted the first item’s magnitude 𝛼1 at a slot,
+the client subtracts its contribution 𝛼1𝑐(𝑏1) from the observation
+and refits the remainder against every codeword, excluding the
+block ciphertext already chosen. Subtracting the first item makes
+the second fit informative since, any correlation that survives is
+evidence of a genuinely different source. A second item is accepted
+only when its fitted magnitude is significant compared to the first.
+The residual fit of Equation 4 has a closed form that the client
+can evaluate. In order to minimize the residue over the offset 𝛽, we
+subtract the mean from both 𝑦and the codeword, which removes
+the constant bulk term 𝛽1 and leaves only the block-dependent part.
+Minimising over the magnitude 𝛼is then a projection of the centred
+observation onto the centred codeword. Therefore, the block index
+with smallest residual is the one with largest normalised correlation.
+ˆ𝑏= arg min
+𝑏
+res(𝑏) = arg max
+𝑏
+⟨˜𝑦, ˜𝑐(𝑏)⟩2
+∥˜𝑐(𝑏)∥2 ,
+(5)
+where ˜𝑦and ˜𝑐(𝑏) are the mean-centred observation and codeword.
+The fitted magnitude ˆ𝑠= ⟨˜𝑦, ˜𝑐( ˆ𝑏)⟩/∥˜𝑐( ˆ𝑏)∥2 estimates the item’s
+score. This is a matched filter, correlating the observation against
+each candidate codeword and selecting the largest is the optimal
+linear detector when a single codeword is present [4]. The 𝑟𝑝addi-
+tional rows give the matched filter more measurements, improving
+its robustness to residual bulk and CKKS noise.
+In Algorithm 2, we show the client side decode. It selects can-
+didate slots from 𝐶0, and at each one recovers the block index
+using Equation 5 and its score by the estimated magnitude (𝛼).
+The collision pass (excluded in algorithm 2) extends this without
+any changes. After the first block index is fitted, the client sub-
+tracts ˆ𝑠˜𝑐( ˆ𝑏) from ˜𝑦and applies the same Equation 5 to the residual,
+excluding the block index already chosen.
+3.6
+Updates
+Carousel maintains a flat index which is a array of vectors divided
+into many blocks. These blocks are encoded into diagonals and
+each query reads from these encoded diagonals. Each group of 𝑑di-
+agonals contain coordinates from ℓvectors of the same block. Since,
+a vector contributes one entry to each of its block’s 𝑑diagonals,
+the cost of an update is re-encoding of these 𝑑diagonals.
+Insert. An insert appends the new vector to the array. If the last
+block has available rows, the vector fills the first spare row. Other-
+wise, a new block is allocated for it. Because the vector index and
+the downstream PIR store share a single identifier space, they must
+remain synchronized. The record is appended to the PIR store first,
+and then the new vector is added to the vector index. This ordering
+guarantees that every identifier returned by the search is already
+present in the PIR. Consequently, the underlying PIR scheme must
+support append operations [22, 23]. If the block count 𝐵increases
+after any insertion, the fold matrix 𝑀and the number of rows 𝑅also
+need to be recomputed. Since 𝑀is public and entirely generated by
+a shared seed, the server transmits only the new 𝐵and each client
+regenerates 𝑀locally.
+Delete. A delete zeroes all of the 𝑑coordinates of the target vector.
+A zero vector has inner product zero with every query, so the vector
+scores zero before and after sharpening, and has no effect on the fold
+row. Thus, once the block is re-encoded the index of the vector is
+unreachable. Because the search never exposes the identifier again,
+the matching PIR record does not need to be removed immediately.
+It can be lazily reclaimed later during compaction.
+4
+EVALUATION
+In this section, we evaluate Carousel’s retrieval quality, efficiency,
+scalability, and update performance. We also conduct various abla-
+tion studies to examine its principal tradeoffs, including projection
+width versus retrieval quality and response size versus recall. Finally,
+we compare Carousel with prior private vector-search systems.
+Experimental setup. We run all server-side computations on a
+single NVIDIA RTX 5090 GPU with 32GB of device memory under
+7
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+CUDA 13.2, hosted on a machine with 96GB of RAM, unless other-
+wise noted. Homomorphic evaluation uses Cheddar [11], a CKKS
+library using 32-bit words, with ring degree 65, 536 and scaling
+factor 230. We measure all client-side latencies using a single core
+of an AMD Ryzen 9950X3D processor.
+Datasets and workloads. We evaluate Carousel on four work-
+loads. SIFT-100M [19] contains 108 128-dimensional vectors, which
+is searched at native width. For the multi-GPU evaluation, we use
+the full BIGANN SIFT-1B dataset [19], containing 109 vectors of
+the same dimensionality. MS MARCO [7] contains 3.21 × 106 768-
+dimensional vectors, which we project to 128 and 256 dimensions
+using PCA. GIST1M [18] contains 106 960-dimensional vectors,
+which we project to 256 and 512 dimensions.
+Evaluation metrics. Each configuration is evaluated on 1,000
+queries and we report recall@𝑘, the fraction of the exact top-𝑘
+neighbors appearing in the returned set. For MS MARCO, we ad-
+ditionally report MRR@100, following prior private search sys-
+tems [6, 15, 33]. A query receives a score of 1/𝑗if its ground-truth
+passage appears at rank 𝑗≤100, and zero otherwise. MRR@100
+is the mean of these scores across all queries. Because Carousel
+searches over projected vectors, we distinguish three metrics to
+separate the sources of retrieval loss. The projection ceiling com-
+pares the exact top-𝑘neighbors in the projected space with those in
+the original space, measuring the quality retained after dimension-
+ality reduction alone. Projected recall compares Carousel’s output
+with the exact top-𝑘in the projected space, isolating loss intro-
+duced by the search pipeline. Finally, true recall compares its output
+with the exact top-𝑘in the original, unprojected space, capturing
+the combined end-to-end loss from projection and the encrypted
+pipeline.
+Security of Deployed Parameters. The deployed instance uses
+ring degree 216, a ternary secret of Hamming weight 1024, Gauss-
+ian error of standard deviation 3.2, and evaluation keys modulo
+a product reaching 2610. Under the lattice estimator, the cheapest
+known attack on this configuration costs 2391, above the 256-bit
+category of the homomorphic encryption standard [2, 3].
+4.1
+Retrieval Quality
+Table 3 reports Carousel’s retrieval quality on the three datasets,
+using the native dimensionality for SIFT and and two projected
+dimensionalities each for MS MARCO and GIST. Projected recall
+ranges from 0.9411 to 0.9887, showing that the encrypted pipeline
+recovers at least 94% of the neighbors returned by an exact search
+in the projected space. Moreover, true recall remains close to the
+corresponding projection ceiling, indicating that dimensionality
+reduction, rather than the encrypted pipeline, accounts for most of
+the end-to-end quality loss.
+On SIFT, Carousel searches the native 128-dimensional vectors
+and achieves true recall of 0.9845 at rank 100 and 0.9785 at rank 10.
+On MS MARCO, increasing the projection width from 128 to 256
+raises true recall@100 from 0.6337 to 0.8610 and MRR@100 from
+0.2763 to 0.3031. Exact search over the full 768-dimensional vectors
+achieves an MRR@100 of 0.3125, so Carousel reaches 97.0% of this
+plaintext ceiling.
+GIST exhibits the same projection-width tradeoff. Increasing the
+projected dimension from 256 to 512 improves true recall@100 from
+Table 3: Retrieval quality over 1,000 queries per configura-
+tion.
+SIFT
+MS MARCO
+GIST
+dim. →𝑑
+128
+768→128
+768→256
+960→256
+960→512
+projection ceiling, r@100
+–
+0.6367
+0.8639
+0.8045
+0.9240
+projected r@100
+–
+0.9797
+0.9887
+0.9411
+0.9413
+true r@100
+0.9845
+0.6337
+0.8610
+0.7903
+0.8996
+true r@10
+0.9785
+0.6885
+0.8740
+0.7531
+0.8842
+MRR@100
+–
+0.2763
+0.3031
+–
+–
+0.7903 to 0.8996 and true recall@10 from 0.7531 to 0.8842. Mean-
+while, projected recall remains essentially unchanged at approxi-
+mately 0.94. Thus, the wider projection improves the information
+retained from the original vectors without changing the accuracy
+of the encrypted pipeline.
+4.2
+Query Performance and Scalability
+Table 4 reports the average per-query cost across 1000 queries for
+each evaluated configuration. Carousel supports two execution
+modes depending on whether the encoded database diagonals fit in
+device memory. In the cached mode, the server retains these diago-
+nals and reuses them across queries, removing diagonal encoding
+from the query path. In the recompute mode, the server retains only
+the flat vector array and reconstructs the diagonal encodings for
+every query. The choice between these modes is determined by
+device-memory capacity. MS MARCO and GIST use cached diago-
+nal encodings, achieving server latencies of 0.031–0.045 seconds
+and 0.034–0.057 seconds, respectively. On MS MARCO, server la-
+tency is dominated by the encrypted scan and sharpening stages.
+However on GIST, query expansion accounts for approximately
+half of the total server latency. Query expansion scales with vec-
+tor dimensionality, whereas scanning and sharpening scale with
+dataset size. Because GIST uses equal or higher projected dimen-
+sions but contains fewer vectors than MS MARCO, query expansion
+constitutes a larger fraction of its latency.
+SIFT represents the capacity-limited mode. Since, its encoded
+diagonals require approximately 512 GB and do not fit on our 32 GB
+GPU, Carousel recomputes the diagonal encodings for each query.
+Of its 3.735-second server latency, encoding accounts for 1.993 sec-
+onds or 53.4%, followed by sharpening at 1.083 seconds or 29.0% and
+scanning at 0.553 seconds or 14.8%. Folding adds only 0.097 seconds
+because it requires neither ciphertext rotations nor multiplications.
+Client-side computation remains efficient in all of the configura-
+tions. Building the query takes 18.9–23.3 ms and decrypting and
+decoding the response takes 8.5–12.0 ms across the five configura-
+tions. Queries upload 3.2–5.2 MB and download 8.4–12.6 MB. The
+upload size varies because the corpus-specific sharpening expo-
+nent determines the required multiplicative depth, which in turn
+determines the ciphertext modulus and size.
+Effect of caching. To isolate the benefit of caching, Figure 6 evalu-
+ates both execution modes on three configurations whose encoded
+diagonals fit in device memory. Caching eliminates the encoding
+stage while leaving query expansion, scanning, sharpening, and
+folding unchanged. It reduces server latency from 46.8 ms to 26.2 ms
+on SIFT-1M (the first one million vectors of SIFT), from 211.7 ms
+8
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+Table 4: Per-query cost averaged over 1000 queries.
+SIFT
+MS MARCO
+GIST
+vectors 𝑁
+108
+3.21M
+3.21M
+1M
+1M
+dim. →𝑑
+128
+768→128
+768→256
+960→256
+960→512
+blocks 𝐵
+3052
+99
+99
+31
+31
+cached diagonals (GB)
+512
+10.07
+20.13
+9.66
+19.33
+sharpening exponent (𝑝)
+128
+8
+8
+64
+64
+encode
+1.993
+−−
+−−
+−−
+−−
+query expansion
+0.0078
+0.0063
+0.0125
+0.0151
+0.0303
+scan
+0.553
+0.0116
+0.0191
+0.0083
+0.0162
+sharpening
+1.083
+0.0097
+0.0096
+0.0089
+0.0089
+fold
+0.097
+0.0027
+0.0027
+0.0007
+0.0007
+finalize
+0.0014
+0.0010
+0.0010
+0.0009
+0.0009
+server total (sec)
+3.735
+0.031
+0.045
+0.034
+0.057
+client query build (ms)
+23.31
+19.09
+18.91
+21.77
+22.10
+client decrypt & decode (ms)
+12.01
+9.78
+9.55
+8.50
+8.56
+upload / download (MB)
+5.24/12.58
+3.15/10.49
+3.15/10.49
+4.72/8.39
+4.72/8.39
+eval. keys (MB)
+31.46
+18.88
+18.88
+28.31
+28.31
+to 44.8 ms on MS MARCO, and from 90.3 ms to 33.8 ms on GIST.
+These reductions correspond to speedups of 1.79×, 4.73×, and 2.67×,
+respectively. The improvement is largest on MS MARCO because it
+uses a sharpening exponent of only 𝑝= 8, compared with 𝑝= 128
+on SIFT-1M and 𝑝= 64 on GIST. Since, sharpening requires less
+compute, encoding accounts for 79% of the recomputed latency on
+MS MARCO, compared with 62% on GIST and 45% on SIFT-1M.
+Caching eliminates this stage and thus removes the corresponding
+share of the latency. The cached representations occupy 5.37 GB,
+20.13 GB, and 9.66 GB of device memory, respectively.
+Figure 6: Server latency with recomputed and cached diago-
+nal encodings.
+Scaling corpus size(𝑁). We evaluate how Carousel scales with
+the corpus size 𝑁. Figures 7a and 7b report server latency and
+recall@100 as we vary 𝑁on MS MARCO (cached mode) and SIFT
+(recompute mode).
+On SIFT, server latency grows linearly from 0.343 s at 10M vec-
+tors to 3.735 s at 100M. The decompositions shows that both the
+encoding stage and the combined scan–sharpening–fold stage scale
+proportionally with 𝑁, resulting in a linear growth in end-to-end
+server latency. We observe that, recall depends on the sharpening
+exponent. At 𝑝= 64, recall declines from 0.9883 to 0.9809 as the
+corpus grows to 24.2M vectors, since the accumulated residual bulk
+exceeds what this exponent can suppress. We therefore increase
+the exponent to 𝑝= 128 at 29.0M vectors, as marked by the dashed
+line. Recall subsequently recovers and remains between 0.9829 and
+0.9873 as we scale further towards 100M vectors.
+MS MARCO exhibits the same linear scaling at a fixed exponent
+of 𝑝= 8. With diagonal encodings cached, increasing the corpus
+from 0.328M to 3.21M vectors raises server latency from 17.2 ms to
+44.4 ms and recall from 0.8185 to 0.8610. The server latency consists
+of a fixed component and a component that scales with the corpus:
+query expansion remains constant at 12.4–12.6 ms, whereas the
+scan–sharpening–fold stage grows with 𝑁. Because encoding is
+removed from the query path and query expansion does not scale
+with 𝑁, a 9.80× increase in corpus size raises latency by only 2.58×.
+These results confirm the expected behavior of an exhaustive
+encrypted scan that is server latency scales linearly with 𝑁, while
+retrieval quality remains stable.
+4.3
+Response Size and Recall
+Recall that Section 3.5 constructs a distance-3 base code using
+randomized parity rows and augments it with 𝑟𝑝additional mea-
+surement rows. Although every generated code satisfies the same
+minimum-distance guarantee, its sampled structure can affect the
+matched-filter decoder. We therefore evaluate the variance across
+generated codes and the effect of 𝑟𝑝on retrieval quality.
+Figure 8 shows that the additional rows primarily improve ro-
+bustness across random folding matrices. Without additional rows,
+an unfavorable fold matrix can substantially degrade retrieval qual-
+ity: on GIST, the worst construction achieves 0.481 recall against
+a mean of 0.763. At the deployed setting 𝑟𝑝= 4, the standard de-
+viation decreases by as much as 25.6× relative to 𝑟𝑝= 0, while
+mean recall increases by at most 0.029. Increasing 𝑟𝑝to 8 reduces
+the standard deviation by as much as 217×, but improves mean
+recall by at most 0.0028 beyond 𝑟𝑝= 4. The effect is weakest on
+SIFT, where the longer 𝐿= 19 code already exhibits little variability
+at 𝑟𝑝= 0 and four additional rows improve mean recall by only
+0.0007.
+Therefore, the response contains 𝑅= 1 + 𝐿+ 𝑟𝑝fold rows.
+Carousel packs two fold rows into each CKKS ciphertext by plac-
+ing one in the real component and the other in the imaginary
+component. Each response ciphertext occupies 1.05 MB, giving an
+amortized cost of 0.525 MB per fold row. As a result, the download
+(a) MS MARCO (𝑑= 256)
+(b) SIFT-100M (𝑑= 128)
+Figure 7: Scaling with corpus size. Server latency grows lin-
+early with 𝑁on both datasets. Recall@100 increases with 𝑁
+on MS MARCO and remains stable on SIFT-100M. The dashed
+line marks the change from 𝑝= 64 to 𝑝= 128.
+9
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+Figure 8: Effect of additional random fold rows on true
+recall@100. Each point reports the mean over 20 indepen-
+dently generated folding matrices, with each matrix evalu-
+ated on 1000 queries. Error bars show one standard deviation
+across matrices, and the orange markers denote the deployed
+setting 𝑟𝑝= 4.
+grows in 1.05 MB steps, and the deployed choice 𝑟𝑝= 4 adds 2.1 MB
+to the response.
+4.4
+Updates and Freshness
+Section 3.6 describes Carousel’s update mechanism: insertions ap-
+pend vectors to the database, while deletions zero the corresponding
+rows. Ensuring next-query freshness presents different challenges
+in the cached and recompute modes. We evaluate the update cost
+and behavior under sustained write loads in each mode below.
+Recompute mode. When the encoded diagonals exceed device mem-
+ory capacity, Carousel constructs them on demand for each query.
+Although recomputation increases query latency, it simplifies up-
+dates because each update is an 𝑂(𝑑) write to the flat vector array.
+Because the next query constructs its diagonals directly from this
+array, it automatically observes the updated data without cache
+invalidation or derived-state maintenance. We measure this write
+path against the SIFT-100M database, which contains 100𝑀128-
+dimensional vectors and occupies 25.6 GB. A single insertion takes
+4.00𝜇s, corresponding to 250,000 insertions per second and a dele-
+tion takes 3.25𝜇s, or 308,000 deletions per second. Batching further
+amortizes the write overhead: batches of 10,000 insertions and dele-
+tions complete in 8.8𝜇s and 7.2𝜇s, corresponding to throughputs of
+1.14 and 1.38 billion updates per second, respectively. Concurrent
+updates have little effect on query performance in the recompute
+mode. When the writer is running on a separate CUDA stream,
+SIFT-100M query latency increases from 3.7244s (without updates)
+to 3.7341s at 10000 updates per second and 3.7538 s at 50000 updates
+per second. These increases correspond to overheads of only 0.26%
+and 0.79%, respectively.
+Cached mode. When the encoded diagonals fit in device memory,
+Carousel caches and reuses them across queries. An update can
+therefore make the cached representation of the affected block stale.
+An update can therefore make the cached representation of the
+affected block stale. Append-only insertions only affect the final
+block, whereas random deletions can make blocks throughout the
+dataset stale. To preserve next-query freshness, Carousel marks
+that block as dirty and re-encodes it before it is next read. Because
+each vector contributes to every diagonal of its block, modifying a
+single row requires re-encoding the entire block. This takes 3.35 ms
+on MS MARCO-256 and 3.53 ms on GIST-256. Multiple updates
+to the same block before it is next read coalesce into a single re-
+encoding.
+Figure 9: Server latency under sustained update load in the
+cached mode. Each point reports the mean over 100 queries
+while updates execute concurrently on a separate CUDA
+stream. The dashed lines show the corresponding recom-
+pute baselines.
+Figure 9 shows how refreshing dirty blocks in cached mode
+affects query performance. Without concurrent updates, caching
+reduces server latency from 90.3 to 33.8 ms on GIST and from
+211.7 to 44.8 ms on MS MARCO. At 10 updates per second, cached
+execution remains 2.44× faster on GIST and 4.39× faster on MS
+MARCO. At 100 updates per second, the cached mode remains 1.42×
+and 2.54× faster than the recompute mode on GIST and MS MARCO,
+respectively. As the update rate increases, more blocks become
+dirty between queries and must be re-encoded. GIST reaches the
+recompute baseline near 3,000 updates per second. On MS MARCO,
+the writer saturates at 1,851 updates per second, where cached
+execution remains 1.13× faster than recomputation. Separate batch-
+size measurements indicate that its crossover would occur only near
+3 × 105 updates per second. Thus, lazy re-encoding preserves the
+caching benefit over a wide range of update rates while maintaining
+next-query freshness.
+For write-heavy deployments, Carousel can move re-encoding
+off the query path. Updates accumulate into batches, while a back-
+ground CPU thread performs the encoding. The query thread then
+transfers the re-computed diagonal encodings to the GPU and swaps
+them into the cache. This makes query latency largely independent
+of the update rate. Even at 10,000 updates per second, query latency
+remains nearly unchanged, increasing from 33.8 to 35.1 ms on GIST
+and from 44.8 to 50.3 ms on MS MARCO. This mode trades fresh-
+ness for throughput. Queries continue using the previous cached
+version of an affected block until its replacement is ready, producing
+staleness windows of 1.9 s on GIST and 3.7 s on MS MARCO.
+10
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+4.5
+Multi-GPU Scaling to One Billion Vectors
+Setting. We evaluate Carousel on the full BIGANN SIFT-1B cor-
+pus using ten GPUs. The corpus contains 109 128-dimensional vec-
+tors, which Carousel scans in their native representation without
+projection. We partition these corpus evenly across the ten GPUs,
+assigning 100𝑀vectors to each GPU. Each GPU stores 25.6 GB of
+vectors, with a total corpus size of 256 GB across all 10 GPUs.
+Each GPU receives the same encrypted query and computes
+a partial fold over its shard. The ten partial folds are then added
+homomorphically before a single response is returned. Because
+folding is linear, the aggregated response is equivalent to folding
+the complete corpus, and the client decodes once over all blocks.
+The sharpening exponent used is 𝑝= 128. The diagonal encodings
+are recomputed for every query. The latency and recall results are
+measured over 1,000 queries on the ten-GPU deployment.
+Table 5: SIFT-1B on ten GPUs compared with SIFT-100M on
+one GPU.
+SIFT-1B
+SIFT-100M
+change
+𝑁
+109
+108
+10×
+GPUs
+10
+1
+10×
+fold rows 𝑅
+29
+24
++5
+true recall@100
+0.9715
+0.9845
+−0.0130
+true recall@10
+0.9699
+0.9785
+−0.0086
+recall p10 / median / p95
+0.970 / 0.990 / 1.000
+0.970 / 0.990 / 1.000
+—
+server latency
+3.765 s
+3.735 s
+1.01×
+per shard
+3.735 s
+3.735 s
+1.00×
+query expansion
+0.008 s
+0.008 s
+1.00×
+encode
+1.993 s
+1.993 s
+1.00×
+scan
+0.553 s
+0.553 s
+1.00×
+sharpening (7 squarings)
+1.083 s
+1.083 s
+1.00×
+fold
+0.097 s
+0.097 s
+1.00×
+cross-shard reduction
+0.030 s
+—
+—
+client query build
+23.3 ms
+23.3 ms
+1.00×
+client decrypt and decode
+15.8 ms
+12.0 ms
+1.32×
+client matched filter (𝐶= 2000)
+375 ms
+31 ms
+12.1×
+upload
+5.24 MB (1 ct)
+5.24 MB
+1.00×
+download
+15.73 MB (15 ct)
+12.58 MB
+1.25×
+Results. Table 5 compares SIFT-1B with the single-GPU SIFT-
+100M configuration. Server latency remains nearly constant after
+sharding. The ten-fold larger corpus takes 3.765 s per query, only
+1.01× the SIFT-100M latency, because each GPU processes approxi-
+mately the same number of vectors as the single-GPU SIFT-100M
+configuration. Processing each shard takes 3.735 s, while aggre-
+gating the partial folds adds only 0.030 s. Thus, on the server side,
+scaling from 100 million to one billion vectors requires additional
+hardware rather than additional query latency.
+Communication grows much more slowly than the corpus. The
+upload remains 5.24 MB because the client sends one ciphertext re-
+gardless of 𝑁, and the server generates the remaining rotations. The
+download increases by only 25%, from 12.58 to 15.73 MB, because
+the response contains ⌈𝑅/2⌉ciphertexts, where 𝑅is the number of
+fold rows, and 𝑅grows logarithmically with the number of blocks.
+Consequently, a ten-fold increase in corpus size leaves upload un-
+changed and increases download by only 1.25×. The client com-
+putation increases with corpus size. Query construction remains
+unchanged, while decryption and decoding increase only slightly,
+from 12.0 to 15.8 ms. The matched-filter stage grows more substan-
+tially, from 31 to 375 ms, because it scores candidate slots against
+codewords from ten times as many blocks. This measurement uses
+a single CPU core, and the work can be parallelized across addi-
+tional cores to reduce the latency. On the other hand, reducing the
+number of candidate slots from 𝐶= 2000 to 𝐶= 200 substantially
+lowers the matching cost with negligible loss in recall@10. These
+two options mitigate the dominant client-side computation cost at
+one billion vectors.
+Retrieval quality remains stable even at this scale. True recall@100
+decreases from 0.9845 to 0.9715, while recall@10 decreases from
+0.9785 to 0.9699. The loss is concentrated in a small subset of queries
+as median recall remains 0.990, the 95th percentile remains 1.000,
+and the fraction of queries achieving at least 0.95 recall decreases
+from 97.3% to 95.7%.
+4.6
+Comparison with Prior Systems
+Table 6 compares Carousel with Tiptoe [15], Wally [6], and Pac-
+mann [33] on the public MS MARCO corpus, with NGT [17] in-
+cluded as a non-private quality reference. Tiptoe, Pacmann and
+Carousel hide the client’s query cryptographically, whereas Wally
+reveals the probed cluster and bounds the leakage with differential
+privacy, relying on an anonymization service and a large concur-
+rent client population. We report the performance metrics exactly
+as published by each system on its respective hardware. The only
+exception is Tiptoe because its original paper omits latency for the
+MS MARCO dataset, we use the measurement reported by WALLY.
+Since these evaluations were conducted across highly different hard-
+ware architectures, we report the metrics in their native units and
+refrain from drawing direct performance comparisons. Carousel
+reaches an MRR@100 of 0.303 at 𝑑= 256, the highest among the
+private systems and within 0.007 of NGT. Even at a smaller pro-
+jected dimension of 𝑑= 128, Carousel reaches 𝑀𝑅𝑅@100 of 0.276,
+higher than all prior systems. Its communication (13.6MB) is below
+Tiptoe and Pacmann, but exceeds Wally.
+Tiptoe shares our setting and guarantees: a single semi-honest
+server, a public corpus and a single round protocol. The main dif-
+ference is that while Tiptoe scores all vectors, the client only re-
+trieves one cluster. This affects the quality of retrieval compared
+to Carousel: yielding 0.13 against 0.303. Tiptoe’s clustering also
+requires the client holding 0.61MB of centroid metadata that a
+corpus change invalidates, whereas Carousel’s client holds none.
+WALLY relies on this same clustering idea and suffers from the
+same retrieval quality problem. To escape it, WALLY allows the
+client to make multiple queries to retrieve different clusters. This
+recovers some quality but still remains low compared to Carousel
+(0.18 at 5 queries against 0.303). WALLY’s only advantage is its
+lower communication cost, but this is due to its differential privacy
+approach, which requires a massive anonymity set of 5×105 clients
+to be efficient. Pacmann offers the same cryptographic guarantees
+but executes the search on the client, hiding each access with PIR.
+Therefore, the computational burden falls entirely on the client.
+Furthermore, Pacmann requires a preprocessing phase before any
+query can be issued, where the client streams a 2.7 GB index and
+retains 614 MB of hint state. In addition, each query requires 20 se-
+quential network rounds and 63.2MB of communication. Carousel
+11
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+Table 6: Comparison on MS MARCO (≈3.2M documents), as
+reported by each system. Tiptoe’s cost figures are Wally’s
+simulation. Wally’s ranges cover probing 1 to 5 clusters.
+Tiptoe
+Wally
+Pacmann
+Carousel
+NGT
+Privacy
+crypto
+DP + anon
+crypto
+crypto
+none
+Assumptions
+none
+anon hop,
+5×105 clients
+none
+none
+—
+Rounds
+1
+1
+20
+1
+—
+Offline pass
+none
+none
+2.7 GB
+none
+—
+Client state
+0.61 MB
+0.04 MB
+614 MB
+none
+—
+Comm. (MB)
+17.4
+0.56–2.60
+63.2
+13.6
+—
+Compute
+11.0 core-s
+0.39–1.50 core-s
+0.29 core-s
+0.045 gpu-s
+—
+MRR@100
+0.13
+0.12–0.18
+0.266
+0.303
+0.31
+outperforms Pacmann in retrieval quality (0.303 against 0.266) and
+matches it even when operating at a reduced dimensionality of
+𝑑= 128 (MRR@100: 0.276). Pacmann also evaluates on SIFT, scal-
+ing to 108 vectors with parameters tuned to reach recall@10 of 0.90,
+at a cost of a 60 GB preprocessing download and 3 GB of client hint
+state. Carousel reaches recall@10 of 0.9785 with 5.2 MB of upload
+and 12.6 MB of download per query.
+No prior system evaluates at the billion scale. Tiptoe evaluates
+360 million embeddings on a 45-server cluster, requiring 2.7 sec-
+onds, 56.9 MB of bandwidth, and 68 MB of client-cached metadata.
+Pacmann scales up to 108 vectors, requiring a 60 GB preprocessing
+download and 3 GB of hint state. Projecting Pacmann to 109 vectors
+based on its scaling laws ( ˜𝑂(√𝑛) for hints, linear for preprocessing)
+dictates roughly 10 GB of state and a massive 600 GB download.
+In contrast, Carousel queries 109 vectors in 3.77 seconds on ten
+GPUs, downloading only 15.7 MB with zero client state. None of the
+prior systems evaluate updates to the corpus. Carousel is the only
+system in this comparison that provides full cryptographic guar-
+antees, requires only a single network round, and maintains zero
+corpus-derived client state. Moreover, it achieves higher retrieval
+accuracy than every private baseline while remaining practical at
+the billion scale.
+5
+DISCUSSION AND LIMITATIONS
+Carousel has four main limitations. Two of them are related to
+sharpening and two to deployment. Although ordinary insertions
+and deletions require no client action, changes to the encryption
+parameters require clients to re-upload their evaluation keys. The
+server stores three such keys per client: a multiplication key for
+sharpening, a rotation key for query expansion, and a conjugation
+key for the packing split. When there is change in the sharpening
+exponent 𝑝, it alters the modulus-chain depth and invalidates the
+existing keys. As the corpus grows, folding combines scores from
+more blocks, increasing the accumulated bulk noise that sharpening
+must suppress and potentially requiring a larger 𝑝. Section 4.2
+shows a transition from 𝑝= 64 to 𝑝= 128 beyond 29 million
+vectors, after which 𝑝= 128 remains sufficient through 1 billion
+vectors. This is Carousel’s only nonincremental reconfiguration.
+Across our SIFT scaling experiment, it occurs only once, requires
+no re-indexing, and transfers less than 32 MB of replacement keys
+per client. A second limitation is that sharpening orders scores by
+absolute magnitude rather than signed value. Because the exponent
+is an even power of two, a strongly negative score could become
+heavy and returned as a match. In practice, this issue does not arise,
+as the most negative score a query encounters is consistently much
+smaller in magnitude than its largest positive match. While using
+an odd exponent would preserve the sign, it requires one additional
+ciphertext multiplication and increases the overall multiplicative
+depth. This configuration is omitted as no corpus requires it.
+The remaining constraints are deployment-driven. Device mem-
+ory limits whether encoded diagonals can be cached, forcing larger
+configurations to use recompute mode. Client decoding scales with
+the block count 𝐵and the candidate budget 𝐶, the number of slot
+candidates the client evaluates. Matched-filter latency increases
+from 31 ms at 108 vectors to 375 ms at 109, where it dominates
+client cost. Reducing 𝐶lowers this latency but can reduce recall.
+6
+CONCLUSION
+Carousel shows that single-round private nearest-neighbor search
+with FHE is practical at billion-vector scale. Prior systems avoid
+fully homomorphic evaluation and instead use linearly or some-
+what homomorphic encryption.By using GPU-accelerated CKKS,
+Carousel makes exhaustive FHE scanning practical and acheives
+high recall by not discarding potential candidates. However rank-
+ing those scores still remains expensive, so Carousel introduces
+sharpening and folding to complete the private search pipeline
+efficiently. Carousel also keeps no corpus-derived state on the
+client. The client holds only its keys and a public projection, so
+a change to the corpus invalidates nothing it holds. This makes
+updates practical, whereas prior work in this setting either treats
+them as an open problem or briefly discusses them as an expensive
+operation. Overall, this design achieves the highest retrieval qual-
+ity among private search systems, matching that of a non-private
+index, and is the only one scalable upto a billion vectors. Carousel
+could be applied to a wide range of applications including private
+web search, recommendation, and retrieval-augmented generation.
+ACKNOWLEDGMENTS
+This work was supported by the Air Force Research Laboratory /
+Information and Spectrum Directorate (AFRL/RF), Rome, NY. Any
+statements or claims made in this publication are solely those of
+the authors and do not represent the views or policies of the United
+States Government.
+12
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.
+
+
+REFERENCES
+[1] Ishtiyaque Ahmad, Laboni Sarker, Divyakant Agrawal, Amr El Abbadi, and
+Trinabh Gupta. 2021. Coeus: A System for Oblivious Document Ranking and
+Retrieval. In Proceedings of the 28th ACM Symposium on Operating Systems
+Principles (SOSP). 672–690.
+[2] Martin Albrecht, Melissa Chase, Hao Chen, et al. 2019. Homomorphic Encryption
+Standard. Cryptology ePrint Archive, Paper 2019/939. https://eprint.iacr.org/
+2019/939
+[3] Martin R. Albrecht, Rachel Player, and Sam Scott. 2015. On the Concrete Hardness
+of Learning with Errors. Journal of Mathematical Cryptology 9, 3 (2015), 169–203.
+https://doi.org/10.1515/jmc-2015-0016
+[4] Matthew Aldridge, Oliver Johnson, and Jonathan Scarlett. 2019. Group Testing:
+An Information Theory Perspective. Foundations and Trends in Communica-
+tions and Information Theory 15, 3–4 (2019), 196–392. https://doi.org/10.1561/
+0100000099
+[5] Michael Arrington. 2006. AOL Proudly Releases Massive Amounts of Private
+Data. TechCrunch.
+[6] Hilal Asi, Fabian Boemer, Nicholas Genise, Muhammad Haris Mughees, Tabitha
+Ogilvie, Rehan Rishi, Guy N. Rothblum, Kunal Talwar, Karl Tarbe, Akshay
+Wadia, Ruiyu Zhu, and Marco Zuliani. 2024. Wally: Batched Private Near-
+est Neighbor Search at Scale.
+https://doi.org/10.48550/arXiv.2406.06761
+arXiv:2406.06761v7 [cs.CR] arXiv preprint, version 7, 10 July 2026.
+[7] Payal Bajaj, Daniel Campos, Nick Craswell, Li Deng, Jianfeng Gao, Xiaodong
+Liu, Rangan Majumder, Andrew McNamara, Bhaskar Mitra, Tri Nguyen, Mir
+Rosenberg, Xia Song, Alina Stoica, Saurabh Tiwary, and Tong Wang. 2016. MS
+MARCO: A Human Generated MAchine Reading COmprehension Dataset. arXiv
+preprint arXiv:1611.09268 (2016). https://doi.org/10.48550/arXiv.1611.09268
+[8] Hao Chen, Ilaria Chillotti, Yihe Dong, Oxana Poburinnaya, Ilya Razenshteyn,
+and M. Sadegh Riazi. 2020. SANNS: Scaling Up Secure Approximate 𝑘-Nearest
+Neighbors Search. In 29th USENIX Security Symposium. 2111–2128.
+[9] Jung Hee Cheon, Andrey Kim, Miran Kim, and Yongsoo Song. 2017. Homo-
+morphic Encryption for Arithmetic of Approximate Numbers. In Advances in
+Cryptology — ASIACRYPT 2017. Springer, 409–437.
+[10] Jung Hee Cheon, Dongwoo Kim, Duhyeong Kim, Hun Hee Lee, and Keewoo
+Lee. 2019. Numerical Method for Comparison on Homomorphically Encrypted
+Numbers. In Advances in Cryptology — ASIACRYPT 2019. 415–445.
+[11] Wonseok Choi, Jongmin Kim, and Jung Ho Ahn. 2026. Cheddar: A Swift Fully Ho-
+momorphic Encryption Library Designed for GPU Architectures. In Proceedings
+of the 31st ACM International Conference on Architectural Support for Programming
+Languages and Operating Systems (ASPLOS). https://doi.org/10.1145/3760250.
+3762223
+[12] Craig Gentry. 2009. Fully Homomorphic Encryption Using Ideal Lattices. In
+Proceedings of the 41st Annual ACM Symposium on Theory of Computing (STOC).
+169–178.
+[13] Katie Hafner. 2006. Researchers Yearn to Use AOL Logs, but They Hesitate. The
+New York Times.
+[14] Shai Halevi and Victor Shoup. 2014. Algorithms in HElib. In Advances in Cryp-
+tology – CRYPTO 2014 (Lecture Notes in Computer Science), Juan A. Garay and
+Rosario Gennaro (Eds.), Vol. 8616. Springer, 554–571. https://doi.org/10.1007/978-
+3-662-44371-2_31
+[15] Alexandra Henzinger, Emma Dauterman, Henry Corrigan-Gibbs, and Nickolai
+Zeldovich. 2023. Private Web Search with Tiptoe. In Proceedings of the 29th ACM
+Symposium on Operating Systems Principles (SOSP). Koblenz, Germany, 396–416.
+https://doi.org/10.1145/3600006.3613134
+[16] Alexandra Henzinger, Matthew M. Hong, Henry Corrigan-Gibbs, Sarah Meikle-
+john, and Vinod Vaikuntanathan. 2023. One Server for the Price of Two: Simple
+and Fast Single-Server Private Information Retrieval. In 32nd USENIX Security
+Symposium. 3889–3905.
+[17] Masajiro Iwasaki and Daisuke Miyazaki. 2018. Optimization of Indexing Based
+on 𝑘-Nearest Neighbor Graph for Proximity Search in High-Dimensional Data.
+CoRR abs/1810.07355 (2018).
+[18] Hervé Jégou, Matthijs Douze, and Cordelia Schmid. 2011. Product Quantization
+for Nearest Neighbor Search. IEEE Transactions on Pattern Analysis and Machine
+Intelligence 33, 1 (2011), 117–128. https://doi.org/10.1109/TPAMI.2010.57
+[19] Hervé Jégou, Romain Tavenard, Matthijs Douze, and Laurent Amsaleg. 2011.
+Searching in One Billion Vectors: Re-Rank with Source Coding. In Proceedings
+of the IEEE International Conference on Acoustics, Speech and Signal Processing.
+861–864. https://doi.org/10.1109/ICASSP.2011.5946540
+[20] William H. Kautz and Richard C. Singleton. 1964. Nonrandom Binary Super-
+imposed Codes. IEEE Transactions on Information Theory 10, 4 (1964), 363–377.
+https://doi.org/10.1109/TIT.1964.1053689
+[21] Duhyeong Kim, Yujin Nam, Wen Wang, Huijing Gong, Ishwar Bhati, Rosario
+Cammarota, Tajana S. Rosing, Mariano Tepper, and Theodore L. Willke. 2024.
+GraSS: Graph-based Similarity Search on Encrypted Query. Cryptology ePrint
+Archive, Paper 2024/2012. https://eprint.iacr.org/2024/2012
+[22] Dmitry Kogan and Henry Corrigan-Gibbs. 2021. Private Blocklist Lookups with
+Checklist. In 30th USENIX Security Symposium (USENIX Security 21). USENIX
+Association, 875–892.
+[23] Arthur Lazzaretti and Charalampos Papamanthou. 2024. Single Pass Client-
+Preprocessing Private Information Retrieval. In 33rd USENIX Security Symposium
+(USENIX Security 24). USENIX Association, Philadelphia, PA, 5967–5984.
+[24] Baiyu Li, Daniele Micciancio, Mariana Raykova, and Mark Schultz-Wu. 2024.
+Hintless Single-Server Private Information Retrieval. In Advances in Cryptology
+– CRYPTO 2024 (Lecture Notes in Computer Science), Leonid Reyzin and Douglas
+Stebila (Eds.), Vol. 14928. Springer Nature Switzerland, Cham, 183–217. https:
+//doi.org/10.1007/978-3-031-68400-5_6
+[25] Jingyu Li, Zhicong Huang, Min Zhang, Cheng Hong, Jian Liu, Tao Wei, and
+Wenguang Chen. 2025. Panther: Private Approximate Nearest Neighbor Search
+in the Single Server Setting. In Proceedings of the 2025 ACM SIGSAC Conference
+on Computer and Communications Security (CCS). 365–379. https://doi.org/10.
+1145/3719027.3765190
+[26] Vadim Lyubashevsky, Chris Peikert, and Oded Regev. 2010. On Ideal Lattices
+and Learning with Errors over Rings. In Advances in Cryptology — EUROCRYPT
+2010. Springer, 1–23.
+[27] Yu. A. Malkov and D. A. Yashunin. 2020. Efficient and Robust Approximate
+Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs.
+IEEE Transactions on Pattern Analysis and Machine Intelligence 42, 4 (2020), 824–
+836. https://doi.org/10.1109/TPAMI.2018.2889473
+[28] Federico Mazzone, Maarten Everts, Florian Hahn, and Andreas Peter. 2025. Effi-
+cient Ranking, Order Statistics, and Sorting under CKKS. In 34th USENIX Security
+Symposium. 8541–8558.
+[29] Haowen Pan, Ruiqi Gan, Yunhao Fu, Yintai Sun, Zhou Zhang, Yuxiang Wang,
+Yi Chen, Bo Zhang, Haoyi Zhou, Yongxin Tong, Zhenyu Guan, Jin Dong, and
+Song Bian. 2026. HANNS: Low-Storage Non-Interactive Approximate Private
+Nearest Neighbor Search with Sublinear Comparison Complexity. Cryptology
+ePrint Archive, Paper 2026/1397. https://eprint.iacr.org/2026/1397
+[30] Sacha Servan-Schreiber, Simon Langowski, and Srinivas Devadas. 2022. Private
+Approximate Nearest Neighbor Search with Sublinear Communication. In 43rd
+IEEE Symposium on Security and Privacy (S&P). 911–929.
+[31] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li, Xi-
+angyu Wang, Xiangzhou Guo, Chengming Li, Xiaohai Xu, Kun Yu, Yuxing Yuan,
+Yinghao Zou, Jiquan Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang, Yihua Mo,
+Jun Gu, Ruiyi Jiang, Yi Wei, and Charles Xie. 2021. Milvus: A Purpose-Built Vec-
+tor Data Management System. In Proceedings of the 2021 International Conference
+on Management of Data (SIGMOD). 2614–2627.
+[32] Mingxun Zhou, Andrew Park, Wenting Zheng, and Elaine Shi. 2024. Piano:
+Extremely Simple, Single-Server PIR with Sublinear Server Computation. In 45th
+IEEE Symposium on Security and Privacy (S&P). 4296–4314.
+[33] Mingxun Zhou, Elaine Shi, and Giulia Fanti. 2025. Pacmann: Efficient Private Ap-
+proximate Nearest Neighbor Search. In 13th International Conference on Learning
+Representations (ICLR). 99396–99416.
+[34] Jinhao Zhu, Liana Patel, Matei Zaharia, and Raluca Ada Popa. 2025. Compass:
+Encrypted Semantic Search with High Accuracy. In 19th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI). Boston, MA, 915–938.
+13
+Approved for Public Release on 07 Oct 2026. Distribution Is Unlimited; Case Number: AFRL-2026-4302.

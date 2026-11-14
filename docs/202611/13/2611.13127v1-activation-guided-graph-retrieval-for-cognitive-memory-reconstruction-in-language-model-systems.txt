@@ -1,0 +1,419 @@
+Activation-Guided Graph Retrieval for
+Cognitive Memory Reconstruction in Language Model
+Systems
+Marvin Danig
+Achiral Research
+marvin@achiral.ai
+Architecture and analysis preprint
+November 2026
+Abstract
+Retrieval-augmented language model systems generally select context by query-conditioned relevance. We
+argue that long-lived AI systems require a second operator: activation-conditioned memory availability. We
+specify an architecture in which request and goal cues seed an authorized memory graph, activation and
+fan attenuation allocate a bounded traversal frontier, retrieved entities recursively emit cues, and a typed
+evidence graph is reconstructed before generation. The specification yields five architectural consequences about
+candidate selection, traversal control, graph regularization, evidence reconstruction, and reinforcement. We
+derive implementation-level cost estimates and define ablations, failure conditions, and a reproducible evaluation
+protocol. The central claim is narrowed or falsified if a simpler graph reranker matches full traversal on causal
+and temporal recovery under equal budgets. This architecture-and-analysis preprint reports no benchmark
+measurements. If the claim holds, retrieval returns the evidence path that makes a memory available, not only a
+ranked list.
+1
+Introduction
+Retrieval-augmented generation (RAG) gives language models access to information outside their parameters [4].
+Dense, sparse, hybrid, hierarchical, and graph-based retrievers have substantially improved candidate selection
+and corpus-level synthesis [5, 6]. Persistent agent architectures additionally maintain records across interactions
+[7, 8, 9]. Yet persistence and retrieval do not by themselves define memory availability.
+Let M = {m1, . . . , mn} be stored memory objects and q a request. A conventional retriever ranks objects using a
+query-conditioned score
+sq(mi) = sim(f(q), f(mi)),
+(1)
+where f is an embedding function and sim a similarity measure, possibly fused with lexical, graph, metadata, or
+learned-reranking features. This score answers which objects are relevant to q. It does not fully specify whether an
+object should influence inference now: whether it is current or superseded, repeatedly useful or merely popular,
+direct evidence or model-generated reflection, aligned with the active goal, contradicted by later evidence, or
+inaccessible under policy.
+The motivating case is emergent memory, in which useful context forms through repeated work, reinforcement,
+forgetting, and revision rather than being stored by hand [3]; the architecture applies to long-lived memory graphs
+in general.
+We introduce activation-guided graph retrieval (AGGR) as a stateful control layer over candidate generation and
+graph traversal. We call its output cognitive memory reconstruction: rebuilding, before generation, a typed evidence
+graph of the experience that should shape the answer (Section 3.3). Its target is
+P(mi influences inference now | q, g, Ht, G, π, σi),
+(2)
+1
+arXiv:2611.13127v1  [cs.AI]  9 Nov 2026
+
+
+where g is goal state, Ht is interaction and use history, G is graph structure, π is authorization policy, and σi is
+the epistemic state of memory mi. Section 3.1 operationalizes this target with a runtime score Ai, an auditable
+ranking proxy for this probability rather than a calibrated estimate of it.
+Contributions.
+This paper (i) formalizes the activation-versus-querying distinction (Section 2); (ii) specifies
+activation-guided, fan-aware graph traversal with recursive cue generation (Sections 3.1 and 3.2); (iii) defines
+evidence-graph reconstruction as the retrieval output (Section 3.3); (iv) derives bounded-frontier, context, storage,
+and reinforcement estimates (Section 5); and (v) gives testable hypotheses, ablations, and failure conditions
+(Sections 6 and 7).
+2
+Activation Versus Querying
+Querying and activation are complementary operators over different conditionals. Query relevance can nominate
+candidates. Activation determines availability under system state.
+Dimension
+Query-conditioned retrieval
+Activation-conditioned memory
+Question
+What matches or answers q?
+What experience should influence inference
+now?
+State
+Commonly request-local
+Conditioned on goal, history, graph, policy,
+and epistemic state
+Selection unit
+Passage, document, row, node
+Entity, episode, procedure, edge, path, or
+subgraph
+Time
+Usually static between index updates
+Strengthens, decays, and changes with out-
+comes
+Structure
+Items or neighborhoods
+Budgeted traversal over evidence paths
+Output
+Ranked context items
+Typed, provenance-bearing evidence graph
+Table 1: Querying estimates request relevance; activation controls memory availability.
+The distinction is especially relevant for causal, temporal, procedural, and decision-lineage questions. For “Why
+was Project X canceled?”, lexical or dense retrieval may return the cancellation announcement and semantically
+similar status reports. A memory system may instead need to reconstruct
+account loss →forecast revision →budget reduction →cancellation.
+(3)
+The decisive evidence can be several graph steps away and need not resemble the query. The relevant retrieval unit
+is a path under a goal-conditioned policy, not necessarily a passage under a similarity metric.
+3
+Architecture
+The memory graph G = (V, E) may contain goals, domains, episodes, events, facts, chunks, entities, procedures,
+decisions, sources, and agent actions. Typed edges may encode temporal order, causality, containment, contradiction,
+update, provenance, derivation, similarity, assignment, or dependency.
+At runtime the system:
+1. derives cues from the request, active goal, workflow, and agent state;
+2. resolves authorized seed nodes and generates external-search candidates;
+3. computes activation for candidate memory entities;
+4. allocates a bounded traversal frontier using activation and fan attenuation;
+5. expands graph paths, allowing retrieved entities to emit new cues;
+6. stops under budget, marginal-evidence, contradiction, or coverage criteria;
+7. reconstructs a typed evidence graph with provenance and unresolved gaps;
+8. supplies the evidence graph to generation and records qualified outcomes.
+2
+
+
+Request, goal,
+workflow state
+Authorization
+and seed resolution
+Activation and
+fan-aware scoring
+Budgeted graph
+frontier
+Recursive
+cues and
+path expansion
+Typed evi-
+dence graph
+with provenance
+Language-model
+generation
+Qualified outcome
+and audit signal
+retrieved entities
+emit new cues
+stop
+qualified reinforcement, supersession, decay
+Figure 1: Activation-guided graph retrieval control loop. The self-loop at recursive cues and path expansion is
+Section 3.3’s recursive cue generation: a retrieved entity’s new cues re-enter frontier allocation before the stop
+criteria release the result to evidence reconstruction. Authorization is evaluated before content-bearing activation
+or expansion; only qualified downstream outcomes update future availability.
+Authorization precedes content-bearing scoring and expansion. A node that is relevant but inaccessible must not
+leak content, identity, degree, or score through activation behavior. Concretely: the degree, decay, and co-occurrence
+statistics used in Equations 4–7 are computed over the requester’s authorized subgraph only, so an inaccessible
+neighbor contributes to neither a node’s reported degree nor its activation. Expansion tracks visited nodes per
+traversal and does not re-score or re-expand a node already in the frontier or evidence graph; a cycle in G therefore
+shows up in redundancy accounting (Equation 8) rather than repeated work.
+3.1
+Activation model
+For candidate mi, a minimal base term is
+Bi(t) = log(ni + 1) −di log(∆ti + 1) + βκi,
+(4)
+where ni is a qualified successful-use count, di is a memory-specific decay rate, ∆ti is elapsed time since a qualifying
+event, κi is salience, and β ≥0 weights salience. Equation 4 is an engineering approximation inspired by ACT-R
+base-level activation [1, 2]; it is not a cognitive-equivalence claim.
+A runtime score may combine query relevance, spreading activation, utility, verification, and penalties:
+Ai = ηsq(mi) + Bi(t) +
+X
+j
+WjSji + Ui + Qi −Ci + ϵ.
+(5)
+Here η ≥0 weights query relevance, Sji is the association strength from cue j to memory i and Wj the weight of
+cue j, Ui is task utility, Qi is source or verification authority, Ci penalizes contradiction, staleness, redundancy, or
+policy risk, and ϵ is a noise term, as in ACT-R, which a deterministic implementation may set to zero. Terms may
+be calibrated, learned, or replaced, but their contributions should remain auditable.
+3.2
+Fan-aware traversal
+High-degree cues such as “customer,” “roadmap,” or “incident” are weak discriminators. We regularize their
+traversal influence with
+ϕ(deg(j)) =
+1
+1 + α(deg(j) −1)2 ,
+(6)
+where α ≥0 sets the strength of attenuation, and score the move from cue j to memory i as
+Fij = Wj Sji ϕ(deg(j)) ψ(Ai),
+(7)
+3
+
+
+where Wj and Sji are the cue weight and association strength from Equation 5, and ψ maps activation to traversal
+priority. A path score can be written
+Score(p) =
+X
+(j,i)∈p
+Fij −λ Cost(p) −γ Redundancy(p),
+(8)
+where p is a path of cue-to-memory moves and λ, γ ≥0 weight its cost and redundancy. The exact attenuation
+function is replaceable. The architectural requirement is that graph fan influences frontier allocation rather than
+being ignored.
+3.3
+Recursive cues and evidence reconstruction
+Retrieved entities may introduce cues absent from the request. A cancellation record can activate a budget review;
+the review can activate a forecast; the forecast can activate a customer event. Recursive expansion continues while
+expected marginal evidence exceeds a threshold and the frontier remains within cost and authorization bounds.
+The retrieval product is an evidence graph Ge = (Ve, Ee), not an unordered list. Ge retains selected evidence nodes,
+typed relations, source provenance, retrieval paths, activation contributions, confidence, contradictory branches,
+and unresolved gaps. Generation therefore receives explicit relational support rather than being required to infer
+all causal and temporal structure from adjacent text fragments.
+3.4
+Worked Traversal
+The following illustrates Sections 3.1–3.3 with representative values; no value here is measured.
+Pseudocode.
+frontier ←seed(cues, π)
+visited, evidence ←∅, ∅
+while frontier̸ = ∅and budget remains:
+j ←pop highest-score cue from frontier
+if j ∈visited:
+continue
+visited ←visited ∪{j}
+candidates ←authorized(j, π)
+for i in candidates:
+compute Ai (Eq. 5), Fij (Eq. 7)
+if stop criteria met for i:
+evidence ←evidence ∪{i}; continue
+frontier ←frontier ∪(cues(i) \ visited), scored by Eq. 7
+return evidence graph over evidence, visited, and recorded path scores
+Example.
+Continuing the cancellation scenario of Section 2: the seed cue account loss has deg = 3; with α = 0.5,
+ϕ(deg) = 1/(1 + 0.5 · 22) = 0.33 (Equation 6). It reaches forecast revision with association strength Sji = 0.7
+and cue weight Wj = 1.0, giving Fij = 1.0 × 0.7 × 0.33 × ψ(Ai) ≈0.23 ψ(Ai) (Equation 7). Forecast revision is
+retrieved and, under Section 3.3, emits the cue budget reduction, which in turn emits cancellation; the three hops’
+Fij values are recorded on the path and combined by Equation 8. A query-similarity reranker over the same initial
+candidate pool never introduces forecast revision or budget reduction, since neither shares vocabulary with the
+request; traversal reaches them because account loss and forecast revision emit them as cues after retrieval, not
+because they scored high against the original query. This is the specific contribution of recursive cue generation
+over propagating activation across a fixed, already-seeded neighborhood: the set of reachable nodes grows with
+what has already been retrieved, not only with graph distance from the original cues.
+4
+Architectural Consequences
+The following consequences are argued from the specified architecture. They are not empirical performance claims.
+4
+
+
+C1: Similarity is a candidate signal, not a complete memory policy. Query relevance omits goal state, use
+history, epistemic status, and path-dependent availability unless those variables are explicitly added.
+C2: Activation is most consequential as traversal control. Reranking a fixed top-k pool cannot recover
+evidence excluded by initial candidate generation. Activation-guided expansion can allocate retrieval budget to
+graph paths whose downstream evidence is not query-similar.
+C3: Fan attenuation is graph regularization. Without degree-sensitive attenuation, generic high-degree cues
+can dominate expansion. Fan weighting reduces their frontier share while preserving them as routing signals.
+C4: Evidence reconstruction changes the retrieval contract. Returning typed relations, provenance, and
+unresolved gaps moves causal and temporal structure from implicit generation-time inference into an auditable
+retrieval artifact.
+C5: Reinforcement is a feedback-control problem. If retrieval increases future activation, false positives
+can become self-reinforcing. Updates must depend on qualified outcomes, and supersession must reduce authority
+without destroying lineage.
+5
+Analytic Estimates
+All estimates in this section are implementation-level bounds under stated assumptions, not benchmark measure-
+ments.
+5.1
+Traversal
+Naive breadth expansion with branching factor b and depth h visits O(bh) nodes in the worst case; b here denotes
+a configured cap on neighbors expanded per node, not an empirical average, since an average bounds only the
+expected case, not the worst case. Suppose activation retains at most L frontier nodes per depth and expands at
+most b neighbors from each. Scoring examines at most hLb candidate transitions. Maintaining a size-L frontier
+with a heap yields
+Ttraverse = O(hLb log L),
+(9)
+with O(hLb) possible under linear-time bounded selection or bucketed scores. Memory for the active frontier is
+O(Lb) if each depth is processed incrementally. Activation does not eliminate graph-search cost; it supplies a
+stateful pruning policy.
+These bounds cover frontier selection and scoring only. If cue extraction (Section 3.3) calls a language model to
+derive cues from a newly retrieved entity, each such call adds its own latency and token cost on top of Ttraverse; a
+deterministic, non-model cue extractor keeps the stated bound exact, and a model-assisted extractor should be
+measured separately against it rather than assumed to fall within the same bound.
+5.2
+Context and storage
+Flat retrieval of k chunks averaging c tokens costs approximately kc context tokens. If the evidence graph retains
+|Ve| node summaries averaging u tokens, |Ee| edge labels averaging ℓtokens, and ρ provenance tokens per node,
+then
+Tcontext ≈|Ve|(u + ρ) + |Ee|ℓ.
+(10)
+This quantity is not necessarily smaller than kc. The proposed benefit is higher evidence density and explicit
+relational support; evaluation must report both support coverage and token cost.
+For |V | memory entities and |E| relations, graph storage is O(|V | + |E|). Activation metadata adds O(|V |) state
+plus optional access-history storage. A compressed or windowed event history is necessary if raw histories grow
+without bound.
+5
+
+
+5.3
+Reinforcement
+For the |Ve| retrieved entities, post-retrieval metadata updates require O(|Ve|) writes and can be asynchronous.
+The computational cost is small relative to model inference. The statistical risk is not: updating on retrieval alone
+implements a popularity loop. Qualified reinforcement should use later citation, confirmation, successful action, or
+consistency evidence.
+6
+Evaluation and Falsification
+We propose matched-model comparisons among (1) lexical retrieval, (2) dense or hybrid top-k, (3) graph retrieval
+without activation, (4) activation reranking over a fixed pool, (5) activation-guided traversal with recursive cues and
+evidence reconstruction, and (6) a write-time consolidated-notes baseline: a periodically rewritten, LLM-authored
+summary with a link index, built independently of query-time graph traversal. Anthropic reports such a system
+improving an internal evaluation’s aggregate score from 53% (search alone) to 61% (search plus the consolidated
+notes) while reducing token cost, giving the falsification test in this section a named, public baseline to beat rather
+than only a hypothetical reranker [12].
+Tasks should require evidence structure: organizational why-questions, decision-history reconstruction, incident
+postmortems, temporal supersession, commitment recall, procedural next-action selection, and contradiction
+detection. Primary metrics are answer accuracy, evidence-node recall, causal-edge F1, temporal-order accuracy,
+contradiction recall, provenance completeness, stale-memory false-positive rate, and confidence calibration. Systems
+should also report latency, graph operations, context tokens, and human audit time.
+Ablations remove base activation, goal state, fan attenuation, recursive cue generation, epistemic weighting, evidence
+reconstruction, reinforcement, and pre-retrieval authorization. The central claim is narrowed or falsified if a simpler
+graph reranker matches full traversal on causal and temporal recovery under equal model, evidence, and cost
+budgets.
+Reproducibility protocol.
+Each comparison should publish the corpus snapshot or a synthetic generator,
+graph-construction rules, authorization policy, cue extractor, activation parameters, random seeds, model and
+prompt versions, traversal traces, retrieved evidence graphs, token and graph-operation counts, and per-task outputs.
+Statistical reporting should include paired confidence intervals, effect sizes, calibration error, and failure-case strata
+rather than aggregate accuracy alone. No benchmark dataset, implementation, or measured result is released with
+this architecture preprint; the protocol above defines the minimum artifact bundle for any subsequent empirical
+claim.
+7
+Limitations, Failure Modes, and Scope
+Limits of this paper.
+The paper reports no measurements, so every benefit claimed for AGGR is a hypothesis
+until the evaluation in Section 6 is run. Equations 4 and 5 are engineering approximations whose weights are
+uncalibrated; a deployment that sets them poorly can make activation worse than plain similarity. The architecture
+also assumes a memory graph whose nodes and typed edges are mostly correct: if extraction labels a budget review
+as caused by a cancellation it merely preceded, traversal will reconstruct a confident but wrong causal chain.
+Failure modes.
+Activation creates state and therefore path dependence:
+• Popularity lock-in. Frequently retrieved memories can crowd out rare but decisive evidence, as when a much-cited
+status report keeps outranking the single customer email that explains a cancellation.
+• Stale authority. Recency and repetition can preserve an obsolete decision. A pricing policy revised last quarter
+can keep its authority if the supersession edge carries too little weight.
+• Reflection laundering. Model-generated summaries can acquire the authority of direct observations when lineage
+is lost, so an agent’s guess about why a deal stalled is later retrieved as fact.
+• Fan overcorrection. Strong attenuation can suppress broad cues that are genuinely diagnostic; for an outage
+question, “incident” may be the one cue that matters.
+6
+
+
+• Goal capture. An incorrect active goal steers traversal away from relevant evidence. A goal set to “renewal” can
+hide the support tickets that explain a churned account.
+• Permission leakage. Scoring an inaccessible node before authorization can reveal that it exists, for example when
+a restricted HR record changes the ranking another user sees.
+• Audit overload. An evidence graph can be inspectable in principle but too large to review in practice, such as a
+decision lineage of hundreds of nodes behind a one-line answer.
+Mitigations require source lineage, explicit supersession, qualified reinforcement, authorization before scoring,
+calibrated stopping rules, and exposure of score contributions and path histories.
+The architecture is unlikely to justify its overhead for short-lived factual question answering over a small, stable
+corpus. Its intended regime is long-lived agents and organizations where experience, goals, evidence authority, and
+access policy change over time.
+8
+Related Work and Claim Boundary
+ACT-R establishes activation, spreading activation, declarative chunks, and procedural cognition [1, 2]. RAG
+establishes retrieval from non-parametric stores for generation [4]. GraphRAG and RAPTOR establish graph-
+and hierarchy-structured retrieval [5, 6]. Generative Agents, MemGPT, and temporal knowledge-graph memory
+establish persistent agent-memory mechanisms [7, 8, 9].
+Closer to this proposal, SYNAPSE models agent memory as a graph in which relevance emerges from spreading
+activation with lateral inhibition and degree-based attenuation, and reports gains on temporal and multi-hop recall
+[10]. Its activation step shares the fan-effect and degree-attenuation framing used here, but it runs a fixed number of
+propagation steps from lexical and dense-retrieval anchors and returns a ranked list of nodes; retrieved nodes do not
+introduce new cues, and no authorization step precedes scoring. HippoRAG similarly recovers multi-hop evidence
+from a knowledge graph, using Personalized PageRank from query-linked nodes rather than cue-driven traversal,
+and also returns a ranked list [13]. A-MEM organizes agent memory through LLM-driven note construction, link
+generation, and periodic memory evolution [11]; memory organization, not retrieval-time control, is its central
+problem. SYNAPSE and HippoRAG, like this proposal, treat retrieval-time activation and multi-hop recovery as
+central, but neither lets a retrieved node introduce a new cue, neither authorizes before scoring, and both return a
+ranked list rather than a typed evidence graph.
+We do not claim these components independently. What is new is the ordered runtime combination: activation
+that decides which memories become available rather than which records match, fan-aware traversal with recursive
+cues, evidence-graph reconstruction before inference, and reinforcement only after qualified outcomes. Each part
+has precedent; the combination is the contribution.
+9
+Conclusion
+Querying asks which stored objects match a request. Activation determines which prior experiences and evidence
+paths should be allowed to shape present behavior. The distinction turns retrieval from a stateless ranking step
+into a memory-control problem involving goals, history, graph structure, epistemic authority, authorization, and
+feedback. The architecture yields design consequences and tractable cost bounds; whether it improves model
+behavior is an empirical question with clear baselines, ablations, and falsification criteria.
+Declarations
+Author contributions.
+Marvin Danig conceived the architecture, developed the analytic specification, and
+wrote the manuscript.
+Funding.
+This research received no external funding.
+Competing interests.
+The author is affiliated with Achiral Research. Certain aspects of the described architecture
+may be covered by patent applications associated with Achiral.
+7
+
+
+Data, code, and materials availability.
+This paper reports an architecture and analytic results and therefore
+introduces no experimental dataset or benchmark code. A companion essay, revision record, and future artifact
+links are maintained at achiral.ai/research/activation-guided-graph-retrieval.
+Ethics and limitations.
+The proposed system can amplify stale, biased, or incorrectly authorized memory if
+activation and reinforcement are poorly calibrated. Section 7 states the principal limitations and failure modes;
+deployment requires provenance, access-control testing, outcome-qualified updates, and auditable retrieval traces.
+References
+[1] Anderson, J. R. and Lebiere, C. The Atomic Components of Thought. Lawrence Erlbaum Associates, 1998.
+[2] Anderson, J. R., Bothell, D., Byrne, M. D., Douglass, S., Lebiere, C., and Qin, Y. An integrated theory of the
+mind. Psychological Review, 111(4):1036–1060, 2004. doi:10.1037/0033-295X.111.4.1036.
+[3] Danig, M. Emergent Memory Systems. Achiral, 2026. achiral.ai/blog/emergent-memory-systems.
+[4] Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V., Goyal, N., Küttler, H., Lewis, M., Yih, W.-t.,
+Rocktäschel, T., Riedel, S., and Kiela, D. Retrieval-Augmented Generation for Knowledge-Intensive NLP
+Tasks. Advances in Neural Information Processing Systems, 33:9459–9474, 2020. arXiv:2005.11401.
+[5] Edge, D., Trinh, H., Cheng, N., Bradley, J., Chao, A., Mody, A., Truitt, S., Metropolitansky, D., Ness, R.
+O., and Larson, J. From Local to Global: A Graph RAG Approach to Query-Focused Summarization. 2024.
+arXiv:2404.16130.
+[6] Sarthi, P., Abdullah, S., Tuli, A., Khanna, S., Goldie, A., and Manning, C. D. RAPTOR: Recursive
+Abstractive Processing for Tree-Organized Retrieval. International Conference on Learning Representations,
+2024. arXiv:2401.18059.
+[7] Park, J. S., O’Brien, J. C., Cai, C. J., Morris, M. R., Liang, P., and Bernstein, M. S. Generative Agents:
+Interactive Simulacra of Human Behavior. In Proceedings of the 36th Annual ACM Symposium on User
+Interface Software and Technology, 2023. doi:10.1145/3586183.3606763.
+[8] Packer, C., Wooders, S., Lin, K., Fang, V., Patil, S. G., Stoica, I., and Gonzalez, J. E. MemGPT: Towards
+LLMs as Operating Systems. 2023. arXiv:2310.08560.
+[9] Rasmussen, P., Paliychuk, P., Beauvais, T., Ryan, J., and Chalef, D. Zep: A Temporal Knowledge Graph
+Architecture for Agent Memory. 2025. arXiv:2501.13956.
+[10] Jiang, H., Chen, J., Pan, Y., Chen, L., You, W., Zhou, Y., Zhang, R., Sikora, A., Zhao, L., Abate, Y., and
+Liu, T. SYNAPSE: Empowering LLM Agents with Episodic-Semantic Memory via Spreading Activation. 2026.
+arXiv:2601.02744.
+[11] Xu, W., Liang, Z., Mei, K., Gao, H., Tan, J., and Zhang, Y. A-MEM: Agentic Memory for LLM Agents. 2025.
+arXiv:2502.12110.
+[12] Anthropic. The components of agent memory. 2026. anthropic.com.
+[13] Gutiérrez, B. J., Shu, Y., Gu, Y., Yasunaga, M., and Su, Y. HippoRAG: Neurobiologically Inspired Long-
+Term Memory for Large Language Models. Advances in Neural Information Processing Systems, 2024.
+arXiv:2405.14831.
+8

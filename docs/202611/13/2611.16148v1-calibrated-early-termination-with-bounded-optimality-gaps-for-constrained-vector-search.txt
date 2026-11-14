@@ -1,0 +1,2063 @@
+Calibrated Early Termination with Bounded
+Optimality Gaps for Constrained Vector Search
+Xinyu Zhang1, Jingze Li1, Baihua Zheng2, Weiwei Sun1∗
+1Fudan University, Shanghai, China
+2Singapore Management University, Singapore
+{zhangxinyu, jingzeli20, wwsun}@fudan.edu.cn, bhzheng@smu.edu.sg
+Abstract—Vector search over learned embeddings is the re-
+trieval layer of recommendation and retrieval-augmented gen-
+eration, and many applications cap how many answer items
+one category may contribute. Graph indexes answer a query by
+best-first traversal, and where it stops determines both its cost
+and whether its answer is exact. We study early termination
+for such constrained k-nearest-neighbor (k-NN) queries, with
+plain k-NN as a special case, and seek the cheapest stopping
+rule whose answer is exact with probability at least 1 −ε.
+Learned early-termination methods instead target average recall,
+which does not guarantee exact answers. Multiple testing can
+calibrate any parameterized stopping rule to our target, but
+it cannot tell how much a better rule with the same risk and
+observations would save. Answering this needs a lower bound
+on the optimum of a rule family too large to enumerate, valid
+for the query population rather than only for the sample. Our
+key idea is to declare the observations a rule may use and to
+consider every rule monotone in them. Risk-constrained stopping
+then becomes a linear program over an order polytope, whose
+Lagrangian minimizers form a nested chain of staircase rules
+computed exactly by dynamic programming. Fixed-sequence
+binomial tests along this chain calibrate our rule, CaST, whose
+failure probability is at most ε with confidence 1−δ. Lagrangian
+weak duality bounds the optimum of the declared class from
+below at all risk levels at once, without a union bound over the
+rules. The ratio of CaST’s cost to this bound limits its distance
+from the best rule of the class. On two datasets of one million
+items each, CaST replayed on logged searches costs at most
+1.132× the class optimum for risk levels from 0.03 to 0.10, at
+95% joint confidence per setting. Larger savings thus need a rule
+outside the class. At a common risk target on held-out queries,
+CaST is faster than every other calibrated rule we time, which
+take 4.8% to 45.5% more mean time.
+Index Terms—Vector search, approximate nearest neighbor
+search, constrained queries, graph index, early termination,
+calibration, optimality gap
+I. INTRODUCTION
+Vector search over learned embeddings underlies recom-
+mendation and retrieval-augmented generation. Graph indexes
+such as HNSW [1] and DiskANN [2] answer a query by
+best-first traversal, iteratively exploring points based on their
+proximity to the query. However, because these graphs are
+sparsified heuristically and the search terminates once its
+bounded candidate list no longer improves, termination itself
+provides no guarantee that the exact answer has been found.
+Many applications also constrain the answer. For example, a
+product search should not return too many variants from the
+same category, and a retrieval pipeline should not draw too
+∗Corresponding author: Weiwei Sun
+q
+w
+x
+u
+v
+γ1, γ2
+γ2
+γ1
+γ1
+Early stop
+X: not observed
+Extra visits
+k = 2, κ = 1
+γ1
+γ2
+After 2 visits
+w
+x
+After 3 visits
+u
+w
+Visit
+Item
+Categories
+Dist. rank
+γ1 slot
+γ2 slot
+Note
+1
+w
+γ1, γ2
+3
+w
+may take either slot
+2
+x
+γ2
+4
+w
+x
+full but wrong
+3
+u
+γ1
+1
+u
+w
+exact, w moved
+4
+v
+γ1
+2
+u
+w
+v rejected
+Fig. 1. A constrained 2-NN query with one slot per category (κ = 1). An
+item’s tag lists its categories, and each answer item fills the slot of one of
+them. The search visits w, x, u, v in that order, so stopping after two visits
+returns {w, x}, which has k = 2 items but is incorrect. Visiting u moves
+w to the γ2 slot and yields the exact answer {u, w}. This happens at the
+completion time X, which the search cannot observe while it runs.
+many passages from any single source. We study constrained
+k-nearest-neighbor (k-NN) queries, in which every item carries
+a set of categories and the answer must admit an assignment of
+each answer item to one of its categories such that no category
+receives more than κ items [3], [4]. The greedy algorithm
+examines items in increasing order of distance to the query,
+selecting an item whenever the selected items, including the
+new one, can still be assigned to categories without violating
+the capacity constraints, until k items are selected. To return
+this answer with certainty, a graph search must visit every
+answer item and determine when no unvisited item can change
+the result (Fig. 1).
+Where the search stops thus determines the trade-off be-
+tween search efficiency and answer correctness. Our objec-
+tive is a stopping rule that minimizes the expected search
+cost while ensuring that, for a query drawn from the query
+distribution, the returned answer is exact with probability at
+least 1 −ε, i.e., with risk at most ε. A fixed visit budget is
+inefficient because the number of graph visits required to reach
+the exact answer, which we call the query’s completion time,
+varies substantially across queries. On an HNSW graph for the
+Amazon (arXiv) dataset, the budget calibrated to risk ε = 0.05
+is 6,781 (5,978) visits, i.e., 7.1× (5.8×) the median completion
+time over 10,000 evaluation queries. Learned early-termination
+methods, such as LAET [5] and DARTH [6], instead predict
+arXiv:2611.16148v1  [cs.DB]  12 Nov 2026
+
+
+when to stop, but they target average recall, and high average
+recall does not guarantee a high probability of returning
+the exact constrained answer. On the same graphs, DARTH,
+configured for a target average recall of 0.95, returns the exact
+constrained answer for only 71% (68%) of queries.
+Finding the minimum-cost stopping rule and quantifying
+how close a given rule is to optimal pose three challenges.
+First, the stopping time is data-dependent: the rule decides
+when to stop based on the search trajectory observed so far.
+Consequently, guarantees established at individual prediction
+points do not necessarily hold at the selected stopping time.
+Second, the completion time is unknown at run time. More-
+over, under the cap of 215=32,768 visits, between 0.10% and
+0.58% of the Amazon and arXiv queries, depending on the
+dataset and graph, never complete, so no rule can return their
+exact answer. Third, quantifying the optimality gap requires a
+lower bound on the minimum expected cost over an enormous
+class of rules, which contains approximately e266 deterministic
+rules in our setting. The lower bound must hold for the
+underlying query population, rather than merely for the finite
+evaluation sample drawn from it.
+Existing methods provide partial solutions to the first
+challenge but do not address the optimality-gap problem.
+LAET [5], DARTH [6] and DARTH+ [7] learn stopping
+predictors and tune them using validation queries; DARTH+
+reports recall coverage at individual prediction points, but this
+coverage does not necessarily extend to the data-dependent
+stopping point. ConANN [8] and Learn-then-Test [9] control
+the risk of a selected parameter. Such calibration resolves
+the first challenge for any parameterized rule, and for a fair
+comparison we apply it to every baseline in our experiments.
+None of these methods provides a lower bound on the min-
+imum achievable expected cost: a calibrated rule meets the
+risk target, but how much cheaper a rule with the same
+risk and observations could be remains unknown. The same
+challenge of quantifying the optimality gap under statistical
+risk constraints arises in calibrated early-exit methods for
+language models and classifiers [10], [11].
+Our key idea is to make this question well posed by fixing
+what a stopping rule may observe and restricting it to a natural
+monotone class. At each checkpoint, our engine exposes a
+stopping interface: the running minimum of a learned score
+(low when the answer is likely complete), discretized into
+buckets, together with a flag recording whether k answer
+items have been selected. A rule is monotone if, whenever
+it stops on an observation, it also stops on every observation
+that indicates completion more strongly. This class contains
+the common threshold, cap, and budget rules aligned to the
+interface. With randomized rules allowed, risk-constrained
+stopping over the class becomes a linear program over an
+order polytope, whose Lagrangian minimizers form a nested
+chain of deterministic staircase rules, i.e., rules whose score
+threshold varies monotonically across checkpoints.
+This chain addresses all three challenges. First, fixed-
+sequence tests along the chain count failures at the actual
+stopping point, and thus bound the failure probability of the
+returned answer despite the adaptive stopping time. Second,
+the completion time enters only offline, through the labeled
+samples, i.e., sample queries whose completion times are com-
+puted from their exact answers, and the deployed rule reads
+nothing but the interface. Third, the same linear program yields
+a population lower bound on the class optimum via Lagrangian
+weak duality and empirical-Bernstein bounds, without a union
+bound over the rules of the class. Our technical novelty lies
+in exploring the structure of the monotone class to obtain this
+lower bound. The ratio of the calibrated cost to the lower
+bound is a data-dependent optimality-gap bound within the
+class, which holds end-to-end, from the fitted score to the
+returned answer. At risk ε = 0.05 on one graph per dataset,
+eight other rules calibrated to the same target spend 6.2% to
+70.6% more visits than our calibrated staircase, which lies
+within 1.087× of the lower bound with 87.5% confidence.
+The bound covers only rules restricted to the interface: a
+clairvoyant rule that knows each query’s completion time
+is 2.8× to 3.3× cheaper than the empirical class optimum
+on the evaluation queries, which upper-bounds what richer
+observations could gain at these checkpoints. We evaluate in-
+memory search on a single machine with unfiltered traversal
+for queries drawn i.i.d. from the distribution of the labeled
+samples.
+Our contributions are as follows.
+• We show that risk-constrained early termination over a
+declared interface is a linear program over an order poly-
+tope, whose optima mix at most two nested staircases.
+Its Lagrangian minimizers form a nested chain computed
+exactly by dynamic programming in O(J(B + 1)2) time
+per multiplier.
+• We calibrate the chain into our rule, CaST, by fixed-
+sequence exact binomial tests, which bound the failure
+probability of the returned answer by ε with confidence
+1 −δ. We also give a lower bound on the class-optimal
+cost that holds simultaneously for all risk levels. Together
+they yield an end-to-end optimality-gap bound within the
+declared class.
+• On two datasets of one million items each, CaST costs at
+most 1.132 times the class optimum at risk levels from
+0.03 to 0.10, at confidence 95%, and this near-optimality
+carries over to most further sample splits, workloads and
+indexes. At a common risk target of 0.05 on held-out
+queries, CaST is faster than every other calibrated rule
+we time, which take 4.8% to 45.5% more mean time.
+II. RELATED WORK
+a) Early termination for vector search: LAET [5] pre-
+dicts, after a fixed amount of search, how much further search
+a query needs and scales the prediction by a tuned factor,
+and Tao [12] predicts it from static features of the query.
+DARTH [6] predicts the current recall of an HNSW search
+with gradient-boosted trees, calls the predictor at adaptive
+intervals, and stops once the prediction reaches a declared tar-
+get. DARTH+ [7] replaces the point prediction by a quantile-
+regression lower bound on recall, whose coverage at each
+
+
+prediction point is measured on test queries. Ada-ef [13] sets
+the list size of HNSW per query from a model of the distances
+between the query and the data, so that a target recall is
+met. Patience in Proximity [14] stops once the top-k answer
+has not changed for a number of steps. Terminus [15] stops
+a disk-based search once recent I/Os add little utility, and
+E2E [16] learns when to terminate a filtered search. These
+methods choose their stopping parameter by its average effect
+on validation queries. Adaptive Beam Search [17] stops on a
+distance-based condition that provably returns an approximate
+nearest neighbor on navigable graphs, which bounds the
+distance of the answer rather than how often it is incomplete.
+b) Guarantees for approximate search: ConANN [8]
+uses conformal risk control [18] to choose how many IVF
+clusters each query probes, so that the expected false-negative
+rate stays below a target. Li et al. [19] test a finished HNSW
+search and fall back to an exact recovery, Auncel [20] meets
+a per-query error bound through an error profile, and AD-
+Sampling [21] ends distance computations by hypothesis tests.
+These methods control the quality of the result, and our work
+bounds the cost of the calibrated rule relative to the best rule
+of a declared class at the same risk.
+c) Risk control and constrained stochastic programs:
+Risk-controlling prediction sets [22] and Learn-then-Test [9]
+control the risk of a selected parameter, and fixed-sequence
+testing is one of the instruments of the latter. Calibrated
+early exit applies such tests to the depth at which a language
+model or a classifier stops [10], [11]. Sample approximations
+of chance-constrained programs yield feasible solutions and
+statistical bounds on the optimal value [23], [24], from which
+Monte Carlo bounding estimates optimality gaps [25]. Our
+calibration and lower bound are of these kinds, and what
+we add is structure: an order polytope whose Lagrangian
+minimizers form a nested chain, which yields a lower bound
+along the whole cost-risk frontier.
+d) Diverse and constrained nearest-neighbor search:
+Query result diversification trades relevance against mutual
+dissimilarity [26]. Diverse similarity search caps the answer
+items per category, with graph indexes for one category per
+item [27] or color bucketing over black-box indexes [28]. With
+several categories per item, capping the number of members
+of each category gives a family that is not a matroid in
+general, and finding a feasible answer of a given size is NP-
+hard [29]. The assignment constraint we use keeps the matroid
+structure [3], [4]. For filtered vector search, the single-category
+case of our constraint, Filtered-DiskANN [30], NHQ [31]
+and ACORN [32] design predicate-aware graph indexes and
+searches. We take the search as given and decide when it stops,
+so our results apply to any search that visits items one at a
+time and maintains their greedy answer.
+e) Early stopping in query processing and optimal stop-
+ping: Instance-optimal aggregation stops a top-k scan over
+sorted lists [33], probabilistic pruning drops candidates that
+are unlikely to qualify [34], and PAC nearest-neighbor queries
+stop on the distance distribution of the query [35]. A graph
+search offers neither a proof that the answer is final nor
+a distance model, so our rule is calibrated on samples. In
+optimal stopping, martingale duality bounds the best stopping
+rule for an unconstrained objective by simulation [36], [37],
+and our bound covers a risk-constrained objective over the
+declared class with a finite-sample guarantee. Mixing two
+nested staircases is the analogue for one risk constraint.
+III. PROBLEM FORMULATION
+A. Constrained nearest neighbors and graph search
+Let V = {1, . . . , N} be a set of items. Each item v has
+an embedding xv ∈Rd of unit norm and a set of categories
+c(v) ⊆C, which may be empty. A query q ∈Rd ranks the
+items by the distance d(q, xv) = 1 −⟨q, xv⟩, with ties broken
+by item index. Capacities κ : C →Z≥1 bound how many
+answer slots each category may fill.
+Definition 1 (Feasible answer). A set S ⊆V is feasible if
+there is an assignment ϕ : S →C with ϕ(v) ∈c(v) for every
+v ∈S and |ϕ−1(γ)| ≤κ(γ) for every γ ∈C.
+Each answer item thus represents one of its categories, and
+no category is represented more than κ times. For example,
+with κ ≡1, two items that both carry the categories {γ1, γ2}
+may both be returned, one representing γ1 and the other γ2.
+This is the semantics of a result page with one section per cat-
+egory, where each item appears in one section and each section
+shows at most κ items. The feasible sets are the independent
+sets of a transversal matroid [38]. For A ⊆V, let Greedy(A)
+scan A in increasing distance and add an item when fewer than
+k items are kept and adding it preserves feasibility. The exact
+constrained answer is S⋆(q) = Greedy(V), and we assume
+that k does not exceed the rank of the matroid, which holds
+in all our settings. The feasible sets of at most k items form
+a matroid, so S⋆(q) is a feasible set of k items with the least
+total distance [38], made unique by the order of the scan. Two
+common queries are special cases. Unconstrained k-NN gives
+every item one shared category with capacity k. Attribute-
+filtered k-NN [30], [32] gives the items that pass the filter one
+shared category with capacity k and the others none.
+A graph search visits items one at a time by a best-first
+traversal of a proximity graph from an entry point. Each visit
+computes one distance. Let At be the set of items visited
+after t visits. The search maintains Greedy(At) exactly as
+visits arrive, and stopping after t visits returns it. Visits arrive
+out of distance order, so a new item may displace a farther
+member of the answer. Our engine keeps the answer with one
+assignment and decides each new item by an alternating-path
+search between answer items and category slots, and its cost
+is part of every reported latency. Whether the returned answer
+is exact then depends only on which items have been visited,
+as the following lemma shows. It lets us express the failure of
+a stopping rule through a single completion time.
+Lemma 1. If S⋆(q) ⊆A, then Greedy(A) = S⋆(q).
+Every item outside A is rejected by the scan over V, because
+every item that scan keeps belongs to S⋆(q) ⊆A. By induction
+over the distance order, both scans therefore hold the same kept
+
+
+Offline
+X known
+FIT
+SEL
+CAL
+EVAL
+HOLD
+Score model
+Bucket edges
+zj = (bj, aj)
+Exact DP per λ
+b
+j
+a = 0
+b
+j
+a = 1
+nested chain, λ1 < λ2 < λ3
+Fixed-sequence
+tests
+ε
+∅
+ˆfm
+Bounds
+ε
+L
+U
+gap ≤U/L
+Held out
+final check
+timing
+λ1, . . . , λK
+Online
+X never seen
+q
+Graph search
+J checkpoints
+sj →min →bj
+flag aj
+zj = (bj, aj)
+2J thresholds
+j
+a = 0
+a = 1
+0
+β0(0)
+β0(1)
+...
+...
+...
+J−1 βJ−1(0) βJ−1(1)
+bj ≤βj(aj)
+Stop
+return
+answer
+yes
+no: next checkpoint
+score model, edges
+ˆ
+fm as table
+Fig. 2. Overview of the approach. FIT fixes the score model and the buckets of the declared interface. The monotone class yields a linear program over an
+order polytope, and SEL computes its nested chain of staircases. CAL selects ˆfm by fixed-sequence tests, and EVAL bounds its cost and the class optimum,
+which gives the ratio on the joint confidence event. Online, the search reads only the interface and a table of 2J thresholds.
+items at every item of A and make the same decision on it. We
+define the completion time X(q) = min{t : S⋆(q) ⊆At}, with
+X(q) = ∞when no such t exists. By the lemma, stopping
+after t visits returns the exact answer if and only if t ≥X(q).
+The matroid structure gives more: a visited member of the
+exact answer is never displaced.
+Lemma 2. For every A ⊆V, S⋆(q) ∩A ⊆Greedy(A).
+Let s ∈S⋆(q) ∩A, and work in the matroid truncated to rank
+k. Every item nearer than s lies in the closure of the members
+of S⋆(q) nearer than s, and s does not. The items that the
+scan over A keeps before s therefore cannot span s, so the
+scan keeps s. Hence the recall |Greedy(At)∩S⋆(q)|/k of the
+returned answer equals the fraction of S⋆(q) visited, and it
+never decreases. A recall target ρ ∈(0, 1] is missed exactly
+when t < Xρ(q), the visit at which ⌈ρk⌉members of S⋆(q)
+have been visited. Every result below thus holds with Xρ in
+place of X = X1, and we report exactness and ρ = 0.9.
+B. Checkpoints and cost
+A stopping rule acts at J checkpoints, defined by a grid of
+visit counts g0 < g1 < · · · < gJ−1. An expansion removes
+the closest unexpanded candidate from the list and visits its
+unvisited neighbors. Checkpoint j is the first expansion at
+which the number of visits reaches gj, and cj denotes the
+number of visits at that moment. If the search ends before
+it reaches gj, checkpoint j and all later ones are placed at
+its end, with cj equal to the final number of visits. One
+expansion adds at most ∆visits, where ∆is the maximum
+out-degree of the graph (∆= 64 for our graphs). Hence
+0 < c0 ≤· · · ≤cJ−1 ≤H = gJ−1 + ∆on every trajectory,
+and H bounds the cost of every rule. Stopping at checkpoint
+j fails exactly when cj < X(q).
+C. Declared interface and monotone rules
+A rule observes the search only through a declared interface.
+A score model, fit once on separate queries, maps the trajectory
+up to checkpoint j to a score sj ∈[0, 1], where a low score in-
+dicates that the answer is likely complete. Let mj = mini≤j si
+be its running minimum. Fixed edges e1 < · · · < eB−1 map
+mj to the bucket bj = |{i : ei ≤mj}| ∈{0, . . . , B −1},
+with the same edges at every checkpoint. The flag aj ∈{0, 1}
+records whether the current answer holds k items. The rule
+observes zj = (bj, aj) ∈Z = {0, . . . , B −1} × {0, 1}.
+Along every trajectory, bj is nonincreasing in j and aj is
+nondecreasing in j. The bucket cannot rise because mj is
+a running minimum and the edges are fixed. The flag cannot
+fall because Greedy(At) holds min(k, r(At)) items, where r
+is the matroid rank, which never decreases as items are visited.
+Definition 2 (Monotone stopping rules). A rule is a sequence
+f = (fj)j<J of maps fj : Z →[0, 1] with fJ−1 ≡1 and
+fj(b, a) ≤fj′(b′, a′)
+whenever j ≤j′, b ≥b′, a ≤a′. (1)
+For each query, the rule draws ξ ∼Unif[0, 1] once, indepen-
+dently of the search trajectory, and stops at the first checkpoint
+T with fT (zT ) ≥ξ. We write MZ for the set of all rules.
+A monotone rule stops earlier when the running minimum
+of the score is lower and when the answer is full, and its
+stopping probability does not decrease from one checkpoint to
+the next. Because zj moves upward in the order of (1) along
+every trajectory, fj(zj) is nondecreasing in j, and P(T ≤j |
+trajectory) = fj(zj). The cost and the risk of a rule are
+C(f) = E
+
+cT
+
+,
+R(f) = P
+ cT < X
+
+,
+(2)
+where the expectation is over the query distribution and ξ.
+Given a risk level ε ∈[0, 1], the problem is
+OPTZ(ε) = min{ C(f) : f ∈MZ, R(f) ≤ε }.
+(3)
+
+
+Waiting until the last checkpoint minimizes the risk on every
+trajectory, so (3) is feasible if and only if r0 = P(X >
+cJ−1) ≤ε. We set OPTZ(ε) = +∞otherwise.
+The class MZ contains the common practical rules once
+their parameters are aligned to the interface. These include
+a threshold on the running minimum of the score at a bucket
+edge, the same threshold with a cap at a checkpoint, and a fixed
+budget at a checkpoint. Every statement below is relative to
+the declared interface. Rules that read other trajectory features
+lie outside MZ, and we compare against them in experiments.
+D. Samples and confidence
+We use five disjoint samples of queries, each consisting of
+independent draws from the query distribution. FIT trains the
+score model and sets the bucket edges, SEL fits the candidate
+rules, CAL calibrates them, and EVAL computes the bounds.
+HOLD, which no fitting or calibration step reads, serves a
+final check and the timing. Probability statements are over
+the draws of CAL and EVAL and over the stopping draws,
+conditional on FIT and SEL. Refitting the score or the chain
+therefore requires new CAL and EVAL samples. Each setting,
+a dataset searched on one graph, carries its own statements
+at a joint level 1 −αL −αU −δ, and statements of different
+settings are not joint. Here δ, αU and αL are the error levels
+of the calibration, of the upper bound on cost and of the lower
+bound on the optimum. Fig. 2 summarizes the approach.
+IV. THE STRUCTURE OF MONOTONE STOPPING
+Both quantities in (2) are expectations at a stopping time, so
+their linearity in f is not immediate. The following proposition
+shows that they are affine. It turns (3) into a linear program,
+and every result below builds on this form.
+Proposition 1 (Affine representation). For every f ∈MZ,
+C(f) = E cJ−1 −P
+j<J−1 E
+
+fj(zj) (cj+1 −cj)
+
+,
+R(f) = r0 + P
+j<J−1 E
+
+fj(zj) 1{cj < X ≤cj+1}
+
+.
+The proof telescopes the stopping probabilities P(T ≤j |
+trajectory) = fj(zj). Stopping at checkpoint j instead of j +1
+saves cj+1 −cj visits, and it causes a failure exactly when the
+answer completes between the two checkpoints. On a sample,
+the empirical version of (3) is therefore a linear program in
+the variables fj(z), with the monotonicity (1) as difference
+constraints and one risk constraint.
+A. Order polytope and staircase rules
+The linear program has (J −1)|Z| free variables, and
+nothing so far prevents its optimum from being fractional in
+every coordinate. The next theorem shows that the region of
+monotone rules, before the risk constraint is imposed, is an
+order polytope [39], and this fixes the form of optimal rules.
+It justifies the staircase form of the deployed rule and shows
+why exhaustive search over deterministic rules is out of reach.
+Let ⪯be the product order on cells u = (j, b, a) in (1).
+Theorem 1 (Order polytope). Let P = {x ∈[0, 1](J−1)×Z :
+xu ≤xv for all u ⪯v}.
+(a) Every vertex of P is a 0/1 vector. Hence every linear
+objective over MZ is minimized by a deterministic rule.
+(b) The
+deterministic
+rules
+are
+exactly
+the
+staircases
+fj(b, a) = 1{b ≤βj(a)} with βj(a) ∈{−1, . . . , B−1},
+βj(a) ≤βj+1(a), βj(0) ≤βj(1) and βJ−1 ≡B −1.
+(c) If (3) is feasible, some optimum is a staircase or a
+mixture (1−θ)f −+θf + of two staircases with f −≤f +
+in every coordinate.
+(d) The number of staircases is NZ =
+ B+J−1
+J−1
+ B+J
+J−1
+
+/J.
+For (b), a 0/1 point of P is the indicator of an up-set, which
+thresholds describe. For (a), every x ∈P equals
+R 1
+0 1{x ≥
+u} du, and every level set 1{x ≥u} is a 0/1 point of P. For
+(c), the risk constraint cuts P by one half-space, so every new
+vertex lies on an edge of P. The two endpoints of an edge of an
+order polytope are comparable, that is, one is at most the other
+in every coordinate. Indeed, if the up-sets F and G of two
+staircases are incomparable, then 1F + 1G = 1F ∪G + 1F ∩G,
+so the segment between 1F and 1G shares its midpoint with
+another segment of P and is not an edge. For (d), staircases
+correspond to plane partitions in a (J −1) × 2 × B box,
+which MacMahon’s box formula counts [40]. A staircase stops
+as soon as the bucket of the running minimum is at most a
+threshold, and the threshold grows with the checkpoint and
+is larger once the answer is full. With the interface of our
+experiments, J = 100 and B = 100, so ln NZ ≈266.
+B. Lagrangian chain
+For λ ≥0, let g(λ) = minf∈MZ
+
+C(f)+λR(f)
+
+. A lower
+bound on OPTZ must hold at every risk level a user may
+choose. The lemma below reduces all risk levels to the values
+g(λ), and our lower bound uses only its first part.
+Lemma 3 (Duality). For all ε ∈[0, 1] and λ ≥0, OPTZ(ε) ≥
+g(λ) −λε. If ε ≥r0, equality holds for some finite λ, and
+ε 7→OPTZ(ε) is convex, nonincreasing and piecewise linear
+on [r0, 1].
+The inequality holds because every feasible f satisfies C(f) ≥
+C(f)+λ(R(f)−ε) ≥g(λ)−λε. The equality is strong duality
+of the finite linear program, which needs no interior point and
+so also holds at ε = r0.
+Theorem 1 still leaves about e266 staircases. The next
+theorem shows that the staircases relevant to (3) form a single
+chain indexed by the multiplier. This makes calibration a
+one-dimensional search, and it lets one dynamic program per
+multiplier evaluate g(λ) exactly. Identify a staircase with the
+up-set S of cells (j, b, a) at which it stops. By Proposition 1,
+its Lagrangian value is const + P
+u∈S θu(λ) with
+θ(j,b,a)(λ) = −E
+
+(cj+1 −cj)1zj=(b,a)
+
++ λ E
+
+1cj<X≤cj+11zj=(b,a)
+
+(4)
+for j < J −1, which is nondecreasing in λ. Stopping in cell
+(j, b, a) saves the visits counted by the first term and adds the
+risk counted by the second, priced at λ.
+Theorem 2 (Nested chain). Let ¯S(λ) be the union of all
+minimizers of the Lagrangian value over staircases.
+
+
+Algorithm 1 Exact chain element for one multiplier
+Require: coefficients θ(j,b,a)(λ) on a sample of n queries,
+stored as the integers 215n θ(j,b,a)(λ) −1
+1: Πj,a(p) ←P
+b<p θ(j,b,a) for p = 0, . . . , B
+▷stop in
+buckets b < p
+2: D−1 ≡0
+3: for j = 0, . . . , J −2 do
+4:
+Dj(p0, p1)
+←
+Πj,0(p0)
++
+Πj,1(p1)
++
+minp′
+0≤p0, p′
+1≤p1, p′
+0≤p′
+1 Dj−1(p′
+0, p′
+1) for p0 ≤p1
+5: end for
+6: return the staircase that attains minp0≤p1 DJ−2(p0, p1)
+by backtracking, with βj(a) = pa −1 at layer j and
+βJ−1 ≡B −1
+(a) ¯S(λ) is itself a minimizer.
+(b) If λ < λ′, then ¯S(λ′) ⊆¯S(λ). The sets ¯S(λ) form a
+chain along which the cost weakly decreases and the
+risk weakly increases as λ decreases.
+(c) Let ¯S(λ+) = limµ↓λ ¯S(µ), which exists because the
+chain is finite. For every ε ≥r0 and a dual optimal
+multiplier λ⋆, OPTZ(ε) is attained by ¯S(λ⋆+) or by a
+mixture of ¯S(λ⋆) and ¯S(λ⋆+).
+(d) Statements (a) to (c) also hold for the empirical distri-
+bution of any sample.
+Up-sets are closed under union and intersection, and the
+Lagrangian value is modular in S, so the minimizers form
+a lattice [41]. Since every θu is nondecreasing in λ, a larger
+multiplier can only remove cells from the maximal minimizer.
+For part (c), let λ⋆> 0. Both ¯S(λ⋆) and ¯S(λ⋆+) minimize
+the Lagrangian at λ⋆, and the risk coefficients are nonnegative,
+so the smaller set has the smaller risk. The risk of ¯S(λ⋆+)
+is the right derivative of the concave function g at λ⋆and
+that of ¯S(λ⋆) the left one, so dual optimality of λ⋆makes
+them bracket ε. By Lemma 3, the mixture that meets ε with
+equality is then optimal. If λ⋆= 0, then ¯S(0+) is a feasible
+rule of minimum cost. Part (d) holds because these arguments
+use only expectations. The ingredients of Theorems 1 and 2
+are classical: order polytopes [39], lattices of minimizers [41],
+maximum closure [42], whose parametric form has nested
+solutions [43], and the level sets of isotonic regression [44].
+What is new is that risk-constrained stopping over a declared
+monotone interface has this structure.
+Algorithm 1 computes a chain element. The pair (p0, p1) =
+(βj(0) + 1, βj(1) + 1) encodes the staircase at checkpoint j,
+and the constraints p′
+0 ≤p0, p′
+1 ≤p1 and p0 ≤p1 are exactly
+the order constraints of Theorem 1(b). Evaluating the returned
+staircase on θu(λ) and adding EcJ−1 + λr0 gives g(λ). Two-
+dimensional prefix minima give O(J(B + 1)2) time per mul-
+tiplier. Visit counts are integers and we round every multiplier
+to an integer, so the coefficients nθu(λ) are integers and the
+program is exact at each evaluated multiplier. An integer grid
+of multipliers need not recover every element of the chain or
+the exact SEL frontier. To return the maximal minimizer, the
+program uses the integer coefficients 215nθu(λ) −1. Since
+215 exceeds the number 2B(J −1) of free cells, this keeps
+the original optimum and, among its minimizers, selects the
+one with the most stopping cells. The interface with 200
+buckets uses 217. On SEL, the program and a general linear-
+programming solver give the same value to within 10−4 visits
+at the two multipliers we compared in each setting.
+V. CALIBRATION AND THE OPTIMALITY-GAP BOUND
+The chain gives the shape of good rules, but it is fit on SEL
+and its risk there is optimistic. This section turns the chain
+into a rule with a risk guarantee and bounds how far that rule
+can be from the class optimum.
+A. Calibration along the chain
+We fix a sequence of candidates on SEL and select among
+them on CAL. The sequence starts with the rule that waits for
+the last checkpoint. It continues with the chain elements ¯S(λ)
+for a grid of multipliers in decreasing order, so each candidate
+is cheaper and riskier than the one before. For candidate k, let
+Sk count the CAL queries on which it fails. The calibration
+accepts candidate k if P
+ Bin(ncal, ε) ≤Sk
+
+≤δ, stops at the
+first rejection, and returns the last accepted candidate. When
+the first candidate is rejected, it returns no rule. The next
+theorem gives the risk half of the bound for this selection.
+Theorem 3 (Fixed-sequence calibration [9]). Let the can-
+didate sequence be
+fixed before CAL is drawn. Then
+P
+ a rule ˆf is returned and R( ˆf) > ε
+
+≤δ.
+Let k⋆be the first candidate in the sequence whose risk
+exceeds ε. Returning any candidate with risk above ε requires
+accepting k⋆, and that event has probability at most δ because
+Sk⋆is binomial with a success probability above ε. The
+argument needs neither nested candidates nor independent
+tests. The test counts the failures of each candidate at its
+actual stopping point, so it applies to randomized candidates
+as well. Each query then has one stopping draw ξ, independent
+across queries and shared by all candidates. The nested chain
+makes the fixed order natural, because each candidate then
+stops wherever its predecessor stops and possibly earlier.
+B. A lower bound on the class optimum at every risk level
+The optimality-gap bound needs a denominator that bounds
+the population optimum from below, at every risk level a
+user may pick after seeing the results. The following theorem
+provides it. For a rule f and a query i, let W λ
+i (f) =
+Eξ
+
+cT + λ1{cT < Xi}
+
+∈[0, H + λ] be its Lagrangian value
+and Qλ
+i (f) = Eξ
+
+(cT + λ1{cT < Xi})2
+its second moment.
+Both are affine in f by the argument of Proposition 1. Let c
+W λ
+and bQλ be their averages over the n EVAL queries.
+Theorem 4 (Simultaneous lower bound). Let n ≥2. Fix the
+interface, multipliers 0 ≤λ1 < · · · < λK and levels αk ∈
+(0, 1) with P
+k αk = αL before EVAL is drawn. Let ηk =
+p
+2 ln(2/αk)/(n −1), ζk = 7(H + λk) ln(2/αk)/(3(n −1)),
+and let ℓk be any value with
+ℓk ≤min
+f∈P
+h
+c
+W λk(f) −ηk
+q
+bQλk(f) −c
+W λk(f)2
+i
+−ζk.
+
+
+Then, with probability at least 1 −αL, simultaneously for all
+ε ∈[0, 1],
+OPTZ(ε) ≥L(ε) = max
+n
+0, max
+k
+ ℓk −λkε
+o
+.
+(5)
+For each k, fix a population minimizer f ⋆
+k of the Lagrangian
+at λk, which is a staircase by Theorem 1(a). The empirical
+Bernstein bound of Maurer and Pontil [45] applied to the fixed
+rule f ⋆
+k bounds g(λk) from below by its sample mean minus
+a variance term and a range term. For a deterministic rule, the
+sample variance equals
+n
+n−1( bQ−c
+W 2), and the minimum over
+P can only be smaller. A union bound over k and Lemma 3
+at every ε complete the proof. The bound needs no uniform
+convergence over MZ, because only the fixed rules f ⋆
+k enter
+the concentration step. Each multiplier contributes one line
+ℓk −λkε, and L is their upper envelope, so a single bound
+covers the whole frontier.
+The objective inside the minimum is convex in (c
+W, bQ),
+because
+p
+Q −W 2 is concave, so we compute ℓk by Kelley’s
+cutting-plane method. Every cut is an affine minorant of this
+objective for all values of its two parameters C0 and s > 0,
+by W 2 ≥2C0W −C2
+0 and √v ≤(v + s2)/(2s). Slopes
+computed in floating point, with a negative coefficient of bQ,
+thus give valid cuts once the intercept is recomputed exactly.
+Each master value is the weak-duality value of the solver’s
+multipliers. One iteration suffices for each ℓk in our runs, with
+at most 0.07 visits between the objective and the master value
+at the returned point. The reported ℓk are rounded down and
+every Um is rounded up.
+C. End-to-end optimality-gap bound
+The corollary below states the guarantee for a grid of risk
+levels with one calibrated rule per level.
+Corollary 1 (Optimality-gap bound along the frontier). Let
+E = {ε1, . . . , εM}, and fix F candidate sequences before
+CAL is drawn. For each m, calibrate every sequence at level
+δ/(FM), let ˆfm be any rule they return, selected by any
+procedure that may read CAL but not EVAL, and let Um be the
+empirical Bernstein upper bound [45] on C( ˆfm), computed at
+level αU/M from the per-query costs on EVAL averaged over
+the stopping draw. With probability at least 1 −αL −αU −δ,
+for every m with a returned rule and L(εm) > 0,
+R( ˆfm) ≤εm
+and
+C( ˆfm)
+OPTZ(εm) ≤
+Um
+L(εm).
+Given FIT, SEL and CAL, each returned rule is fixed with
+respect to EVAL. The corollary follows from a union bound
+over the FM calibration events, the upper bounds and the
+event of Theorem 4. Every returned rule of every sequence
+has risk at most εm on the joint event, so the selection among
+them needs no further correction. The rule, the upper bound
+and the lower bound use disjoint data except that Um and
+L share EVAL, which the union bound allows. The ratio is
+computed after calibration, so it bounds the gap of the returned
+rule a posteriori at the stated level.
+Every step after FIT runs offline on logged trajectories, and
+the deployed rule is a table of 2J thresholds βj(a).
+D. Size of the bound
+Corollary 1 is data dependent, so it promises no number
+before the samples are seen. Such a number would depend on
+the local slope of the frontier, on estimation on SEL and on the
+spacing of the candidates. The next result gives a worst-case
+rate that no method can remove.
+Proposition 2 (Unavoidable margin). Fix 0 < δ < 1/4,
+ε ∈(0, 1) and a positive integer D, and put Λ = D/ε.
+Consider workloads with two checkpoints, a constant interface
+and a last checkpoint that never fails, so that a feasible rule
+exists. There is n0(ε, δ) such that, for every n ≥n0 and every
+procedure that always returns a rule of MZ from n labeled
+queries with risk at most ε with probability at least 1 −δ on
+each such workload, some such workload, whose frontier has
+left derivative −Λ at ε, satisfies, with probability at least 1/2,
+C( ˆf) −OPTZ(ε) ≥Λ
+8
+r
+ε(1 −ε) log(1/(4δ))
+n
+.
+Proof sketch. A rule is an early-stop probability t, with risk pt
+and cost a+D(1−t) when a query completes between the two
+checkpoints with probability p. Let d be one quarter of the root
+above. Safety at p = ε+d gives ˆt ≤ε/(ε+d) with probability
+at least 1 −δ. Since n kl(ε, ε + d) ≤1
+8 log 1
+4δ < kl( 1
+2, 1 −δ),
+data processing keeps this event at probability at least 1/2
+under p = ε, where it costs at least Dd/(2ε) more than the
+optimum. In the local regime with fixed M and a chance
+proportional to δ that the rule fails the test, the calibration
+margin has the same leading dependence on n, the local
+variance and small δ. Its constant is about ten times larger.
+At ε = 0.05, n = 40,000 and the level δ/(2M) = 0.05/18,
+the acceptance cutoff lies about 0.003 below ε, whereas the
+bound divided by Λ is about 0.0003. The next lemma bounds
+what the spacing of the multipliers costs.
+Lemma 4 (Multiplier interval). Let f −and f + minimize an
+empirical Lagrangian at λhi ≥λlo ≥0, with empirical risks
+r−< r+. A mixture with empirical risk r = r−+ θ(r+ −r−)
+costs at most (λhi −λlo)θ(1 −θ)(r+ −r−) more than the
+empirical optimum [
+OPTZ(r) at risk r.
+Proof. Optimality at the two multipliers gives bC(f −) ≤
+[
+OPTZ(r)+λhi(r−r−) and bC(f +) ≤[
+OPTZ(r)+λlo(r−r+).
+Weighting them by 1 −θ and θ and adding gives the claim,
+since the cost is affine in the mixture. The whole gap need
+not lie within a constant of the best possible, because a
+deterministic chain can stay coarse even with infinite data.
+VI. EXPERIMENTS
+The experiments ask how close CaST is to the best rule of its
+class and whether richer policies outside the class are cheaper.
+They also ask whether the saving holds in time, on held-out
+queries, on other workloads and indexes, under a query shift
+and after index updates.
+
+
+TABLE I
+DATASET STATISTICS. EACH DATASET HAS ITS OWN QUERIES, WITH THE
+SAME SAMPLE SIZES: FIT 2,500, SEL 20,000, CAL 40,000, EVAL
+120,000 AND, FOR AMAZON AND ARXIV, HOLD 20,000.
+Categories per item
+Dataset
+Base items
+Dim.
+Categories
+Max
+Mean
+Amazon
+1,000,000
+384
+2,648
+2
+1.98
+arXiv
+1,000,000
+384
+176
+10
+1.74
+YFCC-10M
+9,791,295
+192
+1,000
+296
+5.54
+YouTube-8M
+1,000,000
+1,024
+3,862
+21
+3.01
+A. Experiments Setup
+1) Datasets: We use four public corpora (Table I). Amazon
+is the Sports and Outdoors category of Amazon Reviews
+2023 [46], where the categories of an item are the second-level
+node and the leaf of its category path. arXiv is a metadata
+snapshot,1 where the categories are the subject classes of
+a paper. Both are embedded with all-MiniLM-L6-v2 [47].2
+YFCC-10M is the filtered-search dataset of the NeurIPS’23
+Big-ANN competition [48], with CLIP [49] embeddings of
+YFCC100M images [50]. Its categories are the 1,000 most
+frequent tags, and we also use its 200,000 official queries
+without their tag predicates. YouTube-8M [51] holds video
+features, with machine-generated entity labels as categories.
+The main workload asks for k = 10 items with capacity
+κ ≡1 on Amazon and arXiv. There the constrained answer
+differs from the unconstrained top 10 for 98.6% and 98.2%
+of queries, against about 70% on YouTube-8M and 4.4% on
+YFCC-10M. For Amazon and arXiv, one random permutation
+of the pool selects the base, 2,500 FIT queries and 200,000 fur-
+ther queries, which are split at random into SEL, CAL, EVAL
+and HOLD. We model the pool as independent draws from
+an item distribution, the query distribution of our guarantees,
+so the base and the five samples are independent samples of
+it. Exact constrained answers are computed by a full scan.
+Between 0.10% and 0.58% of EVAL queries of the main
+workload do not complete within 32,768 visits.
+Thirteen further settings test the breadth of the method.
+On graph A of Amazon and arXiv, they raise the capacity
+to κ ≡2, drop the constraint, which gives plain k-NN, or
+query with only the titles of the 200,000 further items, split
+again at random. Two run the main workload on a Vamana
+graph of each dataset. On YFCC-10M and YouTube-8M, they
+ask constrained and unconstrained queries with k = 10, and
+YFCC-10M also constrained official queries. Each workload
+has its own exact answers, logs and samples of the same sizes,
+without HOLD for the title settings, YFCC-10M and YouTube-
+8M.
+2) Metrics: Cost is the mean number of bottom-layer visits.
+The upper-layer descent adds about 170 distances per query
+to every rule, and latency includes it. Risk is the fraction
+of queries whose returned answer differs from the exact
+1https://huggingface.co/datasets/librarian-bots/arxiv-metadata-snapshot
+2https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+constrained answer, or, for a recall target ρ, holds fewer than
+⌈ρk⌉of its members. Latency is the mean over queries of the
+median wall-clock time of five passes, including the evaluation
+of features and models. The optimality-gap bound is the ratio
+Um/L(εm), and 1 means optimal within the class.
+3) Compared methods: The compared rules fall into four
+groups, all calibrated by the same test on CAL.
+The first group reads the same seven features on the same
+FIT queries, which isolates the value of the staircase shape.
+Level stops when the running minimum of the score falls
+below a threshold, the stopping principle of DARTH applied
+to our score, and Level+cap adds a visit cap chosen on SEL.
+Both read the score at a finer resolution than zj. LAET-style
+regresses the logarithm of the completion time at a checkpoint
+chosen on SEL, as LAET does, and stops at a multiple of the
+prediction. Fixed uses one visit budget.
+The second group ports DARTH and DARTH+ [7] into
+our engine, with recall measured against the exact constrained
+answer. DARTH uses the authors’ eleven answer features, re-
+gressor settings and adaptive intervals, trained on 10,000 SEL
+queries. Its recall target is calibrated to 0.9942 on Amazon and
+0.9939 on arXiv, above every target its authors evaluate. At
+the literal targets 0.90 and 0.95, the port reaches mean recalls
+of 0.908 and 0.956 to 0.959, the average-recall goal DARTH
+is designed for. DARTH+ adds eight query statistics and stops
+on a learned lower quantile of the recall, with its level chosen
+on unused SEL queries. Its code is not public, so we port it
+from the paper. We check only that the engine evaluates the
+fitted forests as scikit-learn does.
+The third group tunes the search. List size runs the traversal
+with a list of ef entries, replayed from the logged traversal as
+the top-ef prefix of the longer list. On the 160,000 CAL and
+EVAL queries of each main setting, native runs at the selected
+list size differ from the replay in the visits of at most two
+queries and the exactness of two. Post-filtering the final list
+of the same traversal, the usual two-stage approach, is exact
+only when List size is, by Lemma 1. Distance-adaptive adapts
+Adaptive Beam Search [17]: it stops once the answer is full
+and the next candidate is farther than 1 + γ times the k-th
+distance of the answer. They are calibrated over 46 list sizes
+from 8,192 down to 10 and over 129 values of γ from 2 down
+to 0, 246 on YFCC-10M. Ada-ef [13] looks up a list size from
+a Gaussian model of the distances of the query, with success
+meaning the exact answer. Patience [14] stops once the answer
+is full and unchanged for a calibrated number of visits.
+The fourth group holds richer learned policies, which test
+whether the restriction to MZ costs much. By Longstaff-
+Schwartz style backward induction [52], gradient-boosted
+models estimate the further cost of continuing and the chance
+that it turns a failure into an exact answer. A policy stops when
+the former exceeds λ′ times the latter. The fully fitted policy
+reads the seven features, the score and its running minimum
+on all of SEL. The cross-fitted policy fits each half of SEL on
+the other half, and the declared-state policy reads only zj.
+4) Implementation details: Index and interface. Amazon
+and arXiv are each indexed by two HNSW graphs [1] (degree
+
+
+TABLE II
+VISITS AND OPTIMALITY-GAP BOUND ON EVAL, ON GRAPH A UNLESS A ROW NAMES ANOTHER GRAPH. FEWEST VISITS PER ROW IN BOLD, SECOND
+FEWEST UNDERLINED. THE FIRST FOUR ROWS ARE THE MAIN WORKLOAD, TIMED ON HOLD FOR GRAPH A. BELOW THEM, EVERY RATIO ABOVE ONE IS
+SIGNIFICANT AT LEVEL 0.025/102. U/L IS ROUNDED UP, ITS MAXIMUM OVER THE LEVELS FROM 0.03 TO 0.10, ON YFCC-10M FROM 0.05.
+Ratio to CaST (as 1.000) at ε = δ = 0.05 ↓
+Frontier rule
+Workload
+Fixed
+LAET-style
+Level
+Level+cap
+List size [1]
+Dist.-adaptive [17]
+CaST visits↓
+U/L max↓
+U/L at 0.05↓
+Exact answer
+Amazon, A
+1.634
+1.381
+1.184
+1.076
+1.751
+1.139
+4,155
+1.112
+1.087
+Amazon, B
+1.596
+1.340
+1.169
+1.075
+1.710
+1.112
+4,255
+1.128
+1.075
+arXiv, A
+1.576
+1.326
+1.161
+1.113
+1.507
+1.410
+3,798
+1.082
+1.064
+arXiv, B
+1.551
+1.306
+1.097
+1.037
+1.482
+1.387
+3,861
+1.098
+1.083
+Amazon, κ ≡2
+1.617
+1.339
+1.267
+1.080
+1.779
+1.151
+2,239
+1.181
+1.105
+Amazon, unconstrained
+1.900
+1.471
+1.563
+1.103
+1.578
+0.973
+897
+1.154
+1.146
+arXiv, κ ≡2
+1.476
+1.311
+1.110
+1.027
+1.482
+1.220
+2,164
+1.083
+1.071
+arXiv, unconstrained
+1.598
+1.258
+1.098
+1.024
+1.410
+0.998
+1,461
+1.106
+1.064
+Amazon, Vamana
+1.452
+1.250
+1.350
+1.262
+1.567
+1.123
+4,394
+1.098
+1.070
+arXiv, Vamana
+1.518
+1.257
+1.074
+1.039
+1.578
+1.404
+3,707
+1.110
+1.084
+Amazon, title queries
+1.639
+1.337
+1.213
+1.089
+1.689
+1.137
+5,330
+1.111
+1.081
+arXiv, title queries
+1.623
+1.279
+1.118
+1.093
+1.453
+1.151
+7,370
+1.114
+1.094
+YFCC-10M, tags
+1.279
+1.082
+1.115
+1.086
+1.141
+1.166
+16,306
+1.372
+1.372
+YFCC-10M, unconstrained
+1.288
+1.073
+1.133
+1.123
+1.051
+1.214
+16,198
+1.364
+1.364
+YFCC-10M, official vectors
+1.313
+1.090
+1.132
+1.132
+1.016
+1.133
+16,034
+1.177
+1.177
+YouTube-8M, entities
+1.799
+1.295
+1.294
+1.144
+1.388
+1.190
+3,126
+1.103
+1.083
+YouTube-8M, unconstrained
+1.893
+1.335
+1.261
+1.133
+1.457
+1.136
+2,309
+1.150
+1.150
+Recall target ρ = 0.9, main workload
+Amazon, A
+1.554
+1.249
+1.059
+1.018
+1.725
+1.395
+1,929
+1.105
+1.081
+Amazon, B
+1.580
+1.245
+1.080
+1.030
+1.754
+1.419
+1,897
+1.093
+1.068
+arXiv, A
+1.565
+1.184
+1.057
+1.038
+1.535
+1.748
+1,800
+1.106
+1.058
+arXiv, B
+1.584
+1.204
+1.050
+1.046
+1.552
+1.767
+1,779
+1.075
+1.055
+parameter 32, construction list 200), built with two indepen-
+dent random draws of the insertion levels. We call them graphs
+A and B, and a dataset with a graph a setting. YFCC-10M
+and YouTube-8M have one such graph each. Amazon and
+arXiv also have a Vamana graph built with the DiskANN
+reference implementation [2], with out-degree 64, construction
+list 200 and α = 1.2. The search is a best-first traversal with
+a list of 8,192 entries that maintains the greedy constrained
+answer of the visited items. As in HNSW, it ends when the
+closest unexpanded candidate is farther than all 8,192 kept
+entries. The rule acts at J = 100 checkpoints on a geometric
+grid from 64 to 32,768 visits, so H = 32,832. The score
+model is a gradient-boosted classifier (at most 200 iterations,
+31 leaves), trained on FIT to predict whether the answer is
+already complete, and the score is one minus its predicted
+probability. Its seven features at a checkpoint describe the
+visits, the distance of the candidate about to be expanded and
+the size of the answer. They add the k-th distances of the
+answer and of the unconstrained top k, and the logarithm and
+the fraction of visits since the answer changed. Its running
+minimum is bucketed at the 99 percentiles of the FIT scores
+pooled over all checkpoints, so B = 100.
+Calibration. Our rule is calibrated in two ways. For the
+frontier results, we apply Corollary 1 with M = 9 risk levels,
+0.01 to 0.08 and 0.10, δ = 0.05 and F = 2 candidate
+sequences. Each calibration thus runs at level δ/(2M) and
+returns the frontier rule of its level. The two sequences are
+the chain and the mixture sequence, optimal solutions of
+program (3) on SEL at 40 fixed multiples of ε, both fixed
+before CAL is read, and we report the chain. The levels and
+the reporting range from 0.03 to 0.10 were set before these
+calibrations, and development read CAL only to compare the
+two sequences, which F = 2 covers. A bound at 0.01 from an
+earlier version of the method, on the same EVAL, was known
+and partly motivated this floor, so we report 0.01 and 0.02
+as well. The bounds use αU = 0.025, split evenly over the
+M cost bounds, and αL = 0.05, split evenly over K = 9
+multipliers, so each setting carries a joint level of 87.5%. The
+multipliers are the negated slopes of the SEL frontier at the
+nine levels. The ratios of the four main settings and of Table II
+use exact rational arithmetic. Ratios at other confidence levels,
+samples or interfaces use floating point with a relative margin
+of 10−6. For the comparison with the other rules, every rule,
+ours included, is calibrated by the same fixed-sequence test
+on CAL at ε = 0.05 and δ = 0.05. Unless stated otherwise,
+comparisons and timings use this rule, and every bound U/L
+is that of the frontier rule. Offline, the dynamic programs on
+SEL, the calibration on CAL and the bounds on EVAL take
+12 to 13 minutes per setting on one server.
+Timing. Latency is measured on one pinned core of a 16-
+core desktop processor, with the passes in rotated order. A
+timing window is one such session. Ratios are formed within
+a window only, because the staircase moves by up to 3.9%
+between the first three windows and by 9% in the fourth. The
+list size is calibrated to ef = 662 and 319 on Amazon and
+arXiv, and to 627 and 314 on a finer grid in the third window.
+
+
+TABLE III
+MEAN LATENCY, VISITS AND FAILURE RATE (%) ON THE 20,000 HOLD
+QUERIES OF GRAPH A, EVERY RULE CALIBRATED AT ε = δ = 0.05. RATIO
+IS A RULE’S LATENCY OVER OURS WITHIN A TIMING WINDOW. BEST IN
+BOLD, SECOND UNDERLINED. FAIL, NOT RANKED, STAYS BELOW 5.26,
+WHERE AN EXACT BINOMIAL TEST AT LEVEL 0.05 REJECTS THE TARGET.
+Amazon
+arXiv
+Rule
+µs↓Visits↓Fail Ratio↓
+µs↓Visits↓Fail Ratio↓
+Fixed
+1,715
+6,789 4.74
+1.440
+1,446
+5,987 4.49
+1.402
+LAET-style [5]
+1,532
+5,735 5.02
+1.286
+1,298
+5,039 4.87
+1.258
+Level
+1,398
+4,930 5.04
+1.174
+1,192
+4,370 4.91
+1.155
+Level+cap
+1,285
+4,475 5.19
+1.079
+1,127
+4,210 4.82
+1.092
+DARTH [6]
+1,725
+6,693 5.10
+1.448
+1,292
+5,106 4.83
+1.252
+CaST (ours)
+1,191
+4,166 5.07
+1.000
+1,032
+3,780 4.96
+1.000
+Second timing window
+List size [1]
+1,740
+7,289 4.78
+1.413
+1,273
+5,715 4.51
+1.239
+Level+cap
+1,336
+4,475 5.19
+1.085
+1,124
+4,210 4.82
+1.093
+CaST (ours)
+1,231
+4,166 5.07
+1.000
+1,028
+3,780 4.96
+1.000
+Third timing window
+DARTH [6]
+1,725
+6,693 5.10
+1.455
+1,265
+5,106 4.83
+1.254
+DARTH+ [7]
+1,658
+6,331 4.86
+1.398
+1,270
+5,088 4.72
+1.260
+List size [1]
+1,620
+6,969 5.06
+1.366
+1,264
+5,644 4.59
+1.254
+Patience [14]
+1,480
+5,826 4.54
+1.249
+1,222
+5,108 4.23
+1.212
+Dist.-adaptive [17] 1,243
+4,728 5.10
+1.048
+1,312
+5,289 4.89
+1.301
+Level+cap
+1,283
+4,475 5.19
+1.082
+1,103
+4,210 4.82
+1.094
+CaST (ours)
+1,186
+4,166 5.07
+1.000
+1,008
+3,780 4.96
+1.000
+Fourth timing window, beside other processes
+Curve (in class)
+1,275
+4,410 4.83
+1.058
+1,166
+4,025 5.00
+1.061
+Level+cap
+1,321
+4,475 5.19
+1.096
+1,185
+4,210 4.82
+1.078
+CaST (ours)
+1,205
+4,166 5.07
+1.000
+1,099
+3,780 4.96
+1.000
+Significantly slower means that a one-sided paired bootstrap
+test at the 2.5% level rejects a ratio of at most one. In the third
+and fourth windows, every such result holds after a Bonferroni
+correction within the window. The level 0.025/102 of Table II
+uses a normal approximation with the bootstrap standard error.
+Deployed rule. Calibration and the bounds use outcomes
+computed offline from logged trajectories. On 10,000 EVAL
+queries of Amazon and arXiv, the online stopping point of
+each rule checked equals the offline one on all but at most five
+queries, and exactness always agrees. For our rule at ε = 0.05
+on graph A, under either calibration, the stopping point differs
+on 1 of the 30,000 EVAL and HOLD queries of Amazon and
+on none of arXiv. An exact one-sided binomial bound at level
+0.05 then limits the probability p that the deployed rule and its
+offline replay differ to 0.016%. The deployed rule therefore has
+risk at most ε+p and cost at most Um+Hp. At 0.05 this raises
+the ratio by at most 0.004, at a joint level lowered by 0.05. Our
+public repository (https://github.com/zhangshea/CaST) holds
+the code and documents all implementation details, including
+how the random draws were made.
+B. Experimental Results and Analysis
+1) Overall comparison:
+a) Near-optimality: CaST stays close to the best rule
+of its class. From 0.03 to 0.10, the maximum bound U/L
+of each setting ranges from 1.082 to 1.128 at joint level
+87.5% (Fig. 3(a)), so CaST costs at most 1.128 times the class
+optimum. At 95%, with δ = 0.02, αU = 0.01 and αL = 0.02,
+0.01
+0.02
+0.03
+0.04
+0.05
+0.06
+0.07
+0.08
+0.10
+Risk level "
+1.0
+1.1
+1.2
+1.3
+U=L
+1.57
+0.01
+0.05
+0.10
+Risk level "
+3k
+4k
+6k
+8k
+12k
+Mean visits (log)
+Amazon, graph A
+0.01
+0.05
+0.10
+Risk level "
+arXiv, graph A
+(a)
+(b)
+Amazon, A
+Amazon, B
+arXiv, A
+arXiv, B
+Lower bound L(")
+Empirical optimum
+CaST (ours)
+Fig. 3.
+Near-optimality on EVAL of the frontier rule, calibrated at level
+δ/(2M). (a) Optimality-gap bound U/L (lower is better, and 1 is optimal
+within the class), rounded up and holding jointly over the nine levels at 87.5%
+per setting. (b) Cost-risk frontier of graph A. The lower bound L(ε) holds
+for all risk levels at once, the empirical class optimum is solved exactly on
+EVAL, and each marker is the mean visits of our rule at one risk level.
+these maxima rise by at most 0.004, to 1.132, and the rule
+calibrated at 0.05 stays the same. These bounds are for the rule
+replayed on the logged searches. The failure rate on EVAL
+stays at 75% to 97% of the target in every setting. On the
+frontier of graph A in Fig. 3(b), the rule stays close to both
+the empirical optimum and the lower bound from 0.03 upward.
+At 0.02 the ratio is 1.076 to 1.161 across the four settings, and
+at 0.01 it is 1.124 to 1.572, the largest on Amazon graph B.
+Over other samples, the maximum at 87.5% stays at
+most 1.223. With three further disjoint FIT samples of 2,500
+queries on graph A, each defining its own interface and class,
+it is 1.085 to 1.142. Over ten further random splits of SEL,
+CAL and EVAL on graph A, with FIT and HOLD fixed, it is
+1.094 to 1.223 on Amazon and 1.070 to 1.165 on arXiv. Its
+medians are 1.145 and 1.100, against 1.112 and 1.082 on the
+reported split, which thus lies on the favorable side. In every
+split the failure rate stays below the target at all nine levels.
+Little remains to be gained within the class. On the joint
+event, no rule of the class with risk at most 0.05 saves more
+than a fraction 1 −L/U of the cost of our rule, 6.0% to 8.0%
+by setting. Over the 28 pairs of setting and level from 0.03 to
+0.10, the cost bound, the lower bound and the displacement
+of the risk budget take 72.5% to 94.2% of the gap U −L. The
+rule against the empirical frontier takes 4.7% to 24.2% and
+the multiplier grid at most 4.5%. At 0.01 on Amazon graph
+B, the mixture sequence lowers the ratio to 1.32 and moves
+the other three settings by at most 0.03.
+Outside the class, a clairvoyant rule stops at the first
+checkpoint after completion and spends the risk budget on
+the queries of largest avoidable cost. At 0.05 it is 2.8 to 3.3
+times cheaper than the empirical class optimum, which caps
+what any richer interface could save on the same checkpoints.
+
+
+0.01
+0.03
+0.05
+0.07
+0.10
+Risk level "
+1.0
+1.5
+2.0
+Visits over ours
+Amazon, graph A
+CaST (ours)
+0.01
+0.03
+0.05
+0.07
+0.10
+Risk level "
+arXiv, graph A
+CaST (ours)
+Fixed
+List size
+LAET-style
+Dist.-adaptive
+Level
+DARTH
+Level+cap
+DARTH+
+Fig. 4. Visits of each compared rule over ours on the 120,000 EVAL queries
+of graph A of the main workload, every rule calibrated at each risk level at
+δ/(2M) like the frontier rule, not at δ = 0.05 as in Table II.
+Against the clairvoyant rule, U/L bounds the loss of our rule
+within the interface on the joint event, and this in-sample
+factor estimates the loss of the interface. When the first is
+near one, only a rule outside the class can help, through new
+observations or a non-monotone use of the same ones.
+b) Workload breadth: The near-optimality and the
+saving in visits carry over to most further settings. Outside
+YFCC-10M, the ratio in Table II stays at most 1.181 at every
+level from 0.03 to 0.10, and at most 1.110 on the two Vamana
+graphs. Title queries need 1.28 and 1.94 times the visits of
+item queries at 0.05, yet refit on them the ratio stays at most
+1.114. At ε = 0.05 our rule is the cheapest in eleven of the
+thirteen settings. In the other two, unconstrained Amazon and
+arXiv, the distance-adaptive rule, which was designed for plain
+k-NN, is 2.7% and 0.2% cheaper at a similar failure rate.
+On YFCC-10M, 3.9% of the queries do not complete within
+32,768 visits, so we evaluate the levels from 0.05 to 0.10 only.
+There the ratio is 1.364 and 1.372 at 0.05, just above this
+share, and it falls to 1.124 and 1.125 at 0.10. On 10,000 EVAL
+queries of YFCC-10M with tags, the first group takes 1.2% to
+22.7% more time than our rule. The list size takes 12.1% less,
+at 0.18 µs per visit against our 0.24 µs on the list of 8,192.
+With a list of 2,048, chosen among four sizes without reading
+CAL and with both bounds split over the four, our staircase is
+within 1% of the list size in time. Its bound is 1.402 at 0.05
+and 1.129 at 0.10. On the main workload, the same change
+makes our rule 1.2% and 2.2% slower on HOLD. With k = 50,
+15.8% and 30.2% of the queries of Amazon and arXiv do not
+complete within the horizon, above every evaluated risk level.
+c) Recall target: Under the recall target ρ = 0.9, our
+rule is again the cheapest, and every other rule of Table II
+is significantly costlier at ε = 0.05. By Lemma 2, the pipeline
+applies with the completion time X0.9 and a score model
+retrained on the new label. On the main workload, the ratio
+stays at most 1.106 at every level from 0.03 to 0.10, and at 0.05
+the staircase needs less than half of its exact-answer visits. On
+graph A, DARTH and DARTH+, which predict recall, spend
+1.23 to 1.60 times our visits under the same test.
+d) Cost and latency at a common risk target: At ε =
+0.05, our rule has the lowest mean latency in every timing
+window. On the 20,000 HOLD queries, every other calibrated
+rule takes significantly more mean time than ours, by 4.8%
+to 45.5% (Table III). The saving in visits carries over to end-
+to-end time, and the stopping check of the staircase, score
+model included, takes 7.5% and 7.1% of its query time. At 16
+threads, our throughput over that of each rule of the third
+window is 1.07 to 1.66, within 0.06 of the visit ratio, so
+the saving holds under load. These savings are in the mean.
+The distance-adaptive rule and, on Amazon, Level+cap have a
+lower median. In the third window, our 99th percentile is 3,423
+and 3,417 µs, above the list size (2,670 and 1,811), Patience
+(3,033 and 2,682) and, on arXiv, Level+cap (2,449).
+In visits, our rule is the cheapest at every level on graph
+A (Fig. 4). On graph B, the six rules of Table II calibrated the
+same way spend at least 2.5% more visits at every level from
+0.02 upward, so the advantage does not hinge on the chosen
+risk level. Cheaper rules appear only at 0.01 on Amazon graph
+B, where the distance-adaptive rule spends 0.80 times our
+visits and Level and Level+cap 0.84 times. On graph A, the
+gap to Fixed is largest at 0.01. One budget for all queries must
+reach the (1 −ε)-quantile of the completion time, while the
+staircase stops each query by its own progress.
+The saving does not come from failing more often.
+Interpolated to equal EVAL failure rates from 0.03 to 0.08,
+the first group still spends 1.04 to 1.68 times our visits and
+the distance-adaptive rule 1.08 to 1.44 times. Patience, swept
+over its parameter, spends 1.17 to 1.40 times, and DARTH
+and DARTH+ on graph A 1.28 to 1.63 times. On all EVAL
+queries, Patience and DARTH+ spend 1.32 to 1.52 times our
+visits wherever we run them, each significantly more. Ada-ef
+passes the test only with its table built on all of SEL, at 1.49
+to 1.81 times our visits.
+The staircase shape explains part of our saving over
+Level+cap. At ε = 0.05 on Amazon, the calibrated staircase
+stops only in buckets up to 20 until 702 visits and then relaxes
+its threshold step by step. On arXiv it never stops before 1,318
+visits. Level keeps one threshold for the whole search and
+Level+cap adds a single cap, so neither can follow such a
+profile. A threshold curve of the class with an offset, a break
+point, a slope, a flag gap and a cap can follow it. Fit on SEL
+and calibrated by the same test, it spends 0.976 to 1.074 times
+our visits over ten random splits per setting, at failure rates
+within 0.3 points. Its median per setting is 1.012 to 1.053, and
+it recovers a median of 41% to 85% of the gap to Level+cap.
+The rest of this gap comes from long queries, where the
+thresholds of the chain rise faster than the single slope of the
+curve. On HOLD, the curve of the reported split takes 5.8%
+and 6.1% more mean time than ours, within 0.004 of its visit
+ratio. The reported split favors our rule only on Amazon graph
+A, where its EVAL visit ratio of 1.059 exceeds all ten.
+e) Held-out check: On the held-out queries, no test
+rejects the risk target of the frontier rule in any setting or
+at any level. In each of the four settings, the rule at ε = 0.05,
+calibrated at level δ/(2M), fails on at most 995 of the 20,000
+HOLD queries. An exact binomial test at level 0.05/4 would
+need 1,071 failures to reject the target. At all nine levels, fixed
+before HOLD was read, a joint test of the 36 pairs of setting
+and level at level 0.05/36 each rejects none. Recomputed on
+
+
+0.01
+0.03
+0.05
+0.07
+0.10
+Risk level "
+0.8
+0.9
+1.0
+1.1
+1.2
+Failure rate over "
+Amazon, graph A
+0.01
+0.03
+0.05
+0.07
+0.10
+Risk level "
+1.0
+1.5
+2.0
+2.5
+arXiv, graph A
+Title queries
+Target "
+Replace 5%
+Replace 1%
+Insert 5%
+Insert 1%
+Recalibrated
+Test rejects
+Fig. 5. Failure rate over the target on EVAL of graph A after a change of the
+queries or the index. Lines are the frontier rule calibrated before the change,
+markers filled where an exact binomial test at level 0.05/9 rejects the target.
+The band is the range over the five changes after recalibration, which returns
+a rule except for title queries at 0.01 and keeps all within the target.
+HOLD alone, a sixth the size of EVAL, the bound is at most
+1.217 from 0.03 to 0.10 and 1.897 at 0.01. In every setting,
+the Maurer-Pontil lower bound on the mean HOLD cost at
+level 0.05/4 stays below U. When the rule of Table III fails,
+most of its answers miss exactly one of the ten members, at
+0.7% and 0.4% more total distance on average.
+f) Query shift and index updates: When a query shift
+or an index update breaks the risk target, recalibration on
+new CAL queries restores it at every level where the chain
+returns a rule. The guarantees hold for queries drawn like the
+samples, and text queries can follow another distribution [53].
+In Fig. 5, we query graph A with only the titles of the CAL
+items and of 40,000 EVAL items, while the base items embed
+their full text. We also insert 1% or 5% new items in hnswlib,
+or replace as many base items in place. Title queries complete
+later, and replacement prunes the bottom layer, whose mean
+degree falls by 10% and 25%. The rules calibrated before these
+changes thus stop too early, and a one-sided exact binomial
+test at level 0.05/9 rejects the target at 43 of the 54 levels of
+the title queries and the two replacements. Inserts leave the
+rules within the target.
+Recalibration uses 40,000 CAL queries labeled and logged
+after the change, and the chain returns no rule only for title
+queries at 0.01. The guarantee needs only this step, since the
+test holds for any candidate sequence fixed before CAL is
+drawn. The recalibrated rule spends 0.92 to 1.03 times the vis-
+its of a full refit on FIT, SEL and CAL samples logged on the
+updated index, so the old chain stays efficient. Without labels,
+a Kolmogorov-Smirnov distance on the stopping checkpoints
+of 1,000 queries, thresholded for 5% false alarms, flags 54%
+to 100% of the title and replacement batches. It does not test
+the risk, so an alarm still calls for new labeled CAL queries.
+The official queries of YFCC-10M give a second shift,
+where the constraint changes the answer of 1.6% of the
+queries. Rules calibrated on held-out queries keep the target
+at all five levels on the official EVAL queries at 2.0% to 2.8%
+higher cost. With all samples from the official queries, the
+ratio is 1.177 at 0.05 and 1.084 at 0.10.
+g) Sample size and labeling cost: Labels are cheap, and
+a quarter of the CAL queries costs at most 5.6% more
+visits. Per 10,000 sampled queries over one million items, the
+exact answers and logged trajectories take under 5 seconds on
+one GPU and 50 to 90 seconds on one 32-core server. With
+10,000 instead of 40,000 CAL queries, the rule at ε = 0.05
+spends 2.3% to 5.6% more visits, and with 30,000 instead of
+120,000 EVAL queries its ratio grows by 0.036 to 0.044. A
+deployment that needs no bound uses only FIT, SEL and CAL,
+62,500 queries.
+2) Ablation study:
+a) Richer learned policies: The strongest richer policy,
+the fully fitted one, is at most 0.5% cheaper than our
+rule and at most 5.4% costlier, with a median of 1.6%
+more over four settings and seven risk levels. These policies
+and ours fit the same SEL queries, are calibrated on one half
+of CAL at level δ/M and are compared on the other half.
+Per setting, the cross-fitted and declared-state policies cost
+a median of 1.6% to 3.5% and 1.2% to 2.8% more. The
+advantage of the class is consistent with sample efficiency.
+When SEL shrinks from 20,000 to 5,000 queries, the out-of-
+sample Lagrangian value of the class changes by at most 1%.
+Over the same change, the gap of the cross-fitted policy to the
+class in this value, before any calibration, grows from between
+5.6% and 7.2% to between 18.6% and 26.7%.
+b) Interface and lower bound: The results do not hinge
+on a tuned interface, and bounding all risk levels at once
+loses at most 0.4%. On graph A we vary the three parameters
+of the interface, with 40, 60 or 200 buckets, J = 50 or 25,
+or a logistic-regression score. The rule calibrated at ε = 0.05
+then costs between 0.8% less and 2.5% more than with the
+main interface, and the ratio stays at most 1.134 at every level
+from 0.03 to 0.10. With the checkpoint and the flag alone, the
+empirical class optimum at 0.05 is 58% and 51% higher on
+Amazon and arXiv, yet its bound of 1.098 and 1.099 is about
+as small as that of the main interface. The bound therefore
+measures what remains within a class, and only the cost ranks
+classes. From 0.03 to 0.10, a lower bound for one risk level
+only lies within 0.4% of the Lagrangian bound for all levels.
+VII. CONCLUSION
+Declaring the interface of a stopping rule turns early termi-
+nation into a problem with structure. Over a monotone class,
+risk-constrained stopping is a linear program over an order
+polytope, and its Lagrangian minimizers form a nested chain
+of staircases that dynamic programming computes exactly.
+This structure yields both a calibrated rule and a lower bound
+on the class optimum, and their ratio is a data-dependent
+optimality-gap bound within the declared class. In our experi-
+ments, the rule replayed on logged searches stays within 1.132
+of the class optimum at the risk levels 0.03 to 0.08 and 0.10,
+at confidence 95%. Larger savings thus need a rule outside the
+class. At a common risk target, our rule also has a lower mean
+latency than every other calibrated rule we time. We measure
+in-memory search on one machine with unfiltered traversal
+and fixed k and capacities. The guarantees hold for queries
+drawn like the samples, so a query shift or an index update
+calls for recalibration.
+
+
+REFERENCES
+[1] Y. A. Malkov and D. A. Yashunin, “Efficient and robust approxi-
+mate nearest neighbor search using hierarchical navigable small world
+graphs,” IEEE Transactions on Pattern Analysis and Machine Intelli-
+gence, vol. 42, no. 4, pp. 824–836, 2020.
+[2] S. Jayaram Subramanya, F. Devvrit, H. V. Simhadri, R. Krishnaswamy,
+and R. Kadekodi, “DiskANN: Fast accurate billion-point nearest neigh-
+bor search on a single node,” in Advances in Neural Information
+Processing Systems (NeurIPS), vol. 32, 2019.
+[3] T. Sönmez and M. B. Yenmez, “Affirmative action in India via vertical,
+horizontal, and overlapping reservations,” Econometrica, vol. 90, no. 3,
+pp. 1143–1176, 2022.
+[4] S. Ando and Y. Yokoi, “Ranking and rank aggregation with matroid
+prefix constraints,” arXiv:2607.07153v2, 2026, to appear in ISAAC
+2026.
+[5] C. Li, M. Zhang, D. G. Andersen, and Y. He, “Improving approximate
+nearest neighbor search through learned adaptive early termination,” in
+Proceedings of the 2020 ACM SIGMOD International Conference on
+Management of Data, 2020, pp. 2539–2554.
+[6] M. Chatzakis, Y. Papakonstantinou, and T. Palpanas, “DARTH: Declar-
+ative recall through early termination for approximate nearest neighbor
+search,” Proceedings of the ACM on Management of Data, vol. 3, no. 4,
+pp. 1–26, 2025.
+[7] ——, “DARTH+: Approximate nearest neighbor search with declarative
+recall and quality guarantees,” HAL preprint hal-05566027, 2026.
+[8] S. Horchidan, F. Zeiher, H. Boström, and P. Carbone, “ConANN:
+Conformal approximate nearest neighbor search,” Proceedings of the
+VLDB Endowment, vol. 19, no. 1, pp. 29–42, 2025.
+[9] A. N. Angelopoulos, S. Bates, E. J. Candès, M. I. Jordan, and L. Lei,
+“Learn then test: Calibrating predictive algorithms to achieve risk
+control,” The Annals of Applied Statistics, vol. 19, no. 2, pp. 1641–1662,
+2025.
+[10] T. Schuster, A. Fisch, J. Gupta, M. Dehghani, D. Bahri, V. Tran, Y. Tay,
+and D. Metzler, “Confident adaptive language modeling,” in Advances
+in Neural Information Processing Systems (NeurIPS), vol. 35, 2022, pp.
+17 456–17 472.
+[11] M. Jazbec, A. Timans, T. H. Veljkovi´c, K. Sakmann, D. Zhang, C. A.
+Naesseth, and E. Nalisnick, “Fast yet safe: Early-exiting with risk con-
+trol,” in Advances in Neural Information Processing Systems (NeurIPS),
+vol. 37, 2024, pp. 129 825–129 854.
+[12] K. Yang, H. Wang, B. Xu, W. Wang, Y. Xiao, M. Du, and J. Zhou,
+“Tao: A learning framework for adaptive nearest neighbor search using
+static features only,” arXiv:2110.00696, 2021.
+[13] C. Zhang and R. J. Miller, “Distribution-aware exploration for adaptive
+HNSW search,” Proceedings of the ACM on Management of Data, vol. 4,
+no. 1, pp. 1–27, 2026.
+[14] T. Teofili and J. Lin, “Patience in proximity: A simple early termination
+strategy for HNSW graph traversal in approximate k-nearest neighbor
+search,” in Advances in Information Retrieval, 47th European Confer-
+ence on Information Retrieval (ECIR), ser. Lecture Notes in Computer
+Science, vol. 15574, 2025, pp. 401–407.
+[15] J. Lu, A. Cidon, and M. J. Freedman, “When enough is enough: Rank-
+aware early termination for vector search,” in Proceedings of Machine
+Learning and Systems (MLSys), 2026, oral presentation.
+[16] W. Xia, M. Yang, W. Li, and W. Wang, “E2E: Efficient filtered AKNN
+search via adaptive termination,” in Proceedings of the 32nd ACM
+SIGKDD Conference on Knowledge Discovery and Data Mining V.2
+(KDD), 2026, pp. 5602–5613.
+[17] Y. Al-Jazzazi, H. Diwan, J. Gou, C. Musco, C. Musco, and T. Suel,
+“Distance adaptive beam search for provably accurate graph-based
+nearest neighbor search,” in Advances in Neural Information Processing
+Systems (NeurIPS), vol. 38, 2025, pp. 110 958–110 987.
+[18] A. N. Angelopoulos, S. Bates, A. Fisch, L. Lei, and T. Schuster,
+“Conformal risk control,” in The Twelfth International Conference on
+Learning Representations (ICLR), 2024.
+[19] M. Li, R. Mittal, S. Rana, S. Shetiya, G. Das, and N. Koudas, “HNSW
+with accuracy guarantees using graph spanners,” arXiv:2607.02338,
+2026.
+[20] Z. Zhang, C. Jin, L. Tang, X. Liu, and X. Jin, “Fast, approximate vector
+queries on very large unstructured datasets,” in 20th USENIX Symposium
+on Networked Systems Design and Implementation (NSDI), 2023, pp.
+995–1011.
+[21] J. Gao and C. Long, “High-dimensional approximate nearest neighbor
+search: with reliable and efficient distance comparison operations,”
+Proceedings of the ACM on Management of Data, vol. 1, no. 2, pp.
+137:1–137:27, 2023.
+[22] S. Bates, A. Angelopoulos, L. Lei, J. Malik, and M. I. Jordan,
+“Distribution-free, risk-controlling prediction sets,” Journal of the ACM,
+vol. 68, no. 6, pp. 43:1–43:34, 2021.
+[23] J. Luedtke and S. Ahmed, “A sample approximation approach for opti-
+mization with probabilistic constraints,” SIAM Journal on Optimization,
+vol. 19, no. 2, pp. 674–699, 2008.
+[24] W. Wang and S. Ahmed, “Sample average approximation of expected
+value constrained stochastic programs,” Operations Research Letters,
+vol. 36, no. 5, pp. 515–519, 2008.
+[25] W.-K. Mak, D. P. Morton, and R. K. Wood, “Monte Carlo bounding
+techniques for determining solution quality in stochastic programs,”
+Operations Research Letters, vol. 24, no. 1–2, pp. 47–56, 1999.
+[26] M. R. Vieira, H. L. Razente, M. C. N. Barioni, M. Hadjieleftheriou,
+D. Srivastava, C. Traina, and V. J. Tsotras, “On query result diversifi-
+cation,” in Proceedings of the 27th IEEE International Conference on
+Data Engineering, 2011, pp. 1163–1174.
+[27] P. Anand, P. Indyk, R. Krishnaswamy, S. Mahabadi, V. C. Raykar,
+K. Shiragur, and H. Xu, “Graph-based algorithms for diverse similarity
+search,” in Proceedings of the 42nd International Conference on Ma-
+chine Learning (ICML), ser. Proceedings of Machine Learning Research,
+vol. 267, 2025, pp. 1483–1504.
+[28] J. Chen, S. D. Nagawanshi, S. Xie, H. Xu, A. Zhou, and S. Zhou, “Fast
+diverse nearest neighbor search,” in Advances in Neural Information
+Processing Systems (NeurIPS), poster, 2026.
+[29] L. E. Celis, D. Straszak, and N. K. Vishnoi, “Ranking with fairness
+constraints,” in 45th International Colloquium on Automata, Languages,
+and Programming (ICALP), ser. LIPIcs, vol. 107, 2018, pp. 28:1–28:15.
+[30] S. Gollapudi, N. Karia, V. Sivashankar, R. Krishnaswamy, N. Begwani,
+S. Raz, Y. Lin, Y. Zhang, N. Mahapatro, P. Srinivasan, A. Singh, and
+H. V. Simhadri, “Filtered-DiskANN: Graph algorithms for approximate
+nearest neighbor search with filters,” in Proceedings of the ACM Web
+Conference 2023 (WWW), 2023, pp. 3406–3416.
+[31] M. Wang, L. Lv, X. Xu, Y. Wang, Q. Yue, and J. Ni, “An efficient
+and robust framework for approximate nearest neighbor search with
+attribute constraint,” in Advances in Neural Information Processing
+Systems (NeurIPS), vol. 36, 2023, pp. 15 738–15 751.
+[32] L. Patel, P. Kraft, C. Guestrin, and M. Zaharia, “ACORN: Performant
+and predicate-agnostic search over vector embeddings and structured
+data,” Proceedings of the ACM on Management of Data, vol. 2, no. 3,
+pp. 1–27, 2024.
+[33] R. Fagin, A. Lotem, and M. Naor, “Optimal aggregation algorithms for
+middleware,” Journal of Computer and System Sciences, vol. 66, no. 4,
+pp. 614–656, 2003.
+[34] M. Theobald, G. Weikum, and R. Schenkel, “Top-k query evaluation
+with probabilistic guarantees,” in Proceedings of the 30th International
+Conference on Very Large Data Bases (VLDB), 2004, pp. 648–659.
+[35] P. Ciaccia and M. Patella, “PAC nearest neighbor queries: Approximate
+and controlled search in high-dimensional and metric spaces,” in Pro-
+ceedings of the 16th International Conference on Data Engineering,
+2000, pp. 244–255.
+[36] L. C. G. Rogers, “Monte Carlo valuation of American options,” Math-
+ematical Finance, vol. 12, no. 3, pp. 271–286, 2002.
+[37] M. B. Haugh and L. Kogan, “Pricing American options: A duality
+approach,” Operations Research, vol. 52, no. 2, pp. 258–270, 2004.
+[38] J. Oxley, Matroid Theory, 2nd ed.
+Oxford University Press, 2011.
+[39] R. P. Stanley, “Two poset polytopes,” Discrete & Computational Geom-
+etry, vol. 1, no. 1, pp. 9–23, 1986.
+[40] P. A. MacMahon, Combinatory Analysis.
+Cambridge University Press,
+1916, vol. II.
+[41] D. M. Topkis, “Minimizing a submodular function on a lattice,” Oper-
+ations Research, vol. 26, no. 2, pp. 305–321, 1978.
+[42] J.-C. Picard, “Maximal closure of a graph and applications to combina-
+torial problems,” Management Science, vol. 22, no. 11, pp. 1268–1272,
+1976.
+[43] G. Gallo, M. D. Grigoriadis, and R. E. Tarjan, “A fast parametric max-
+imum flow algorithm and applications,” SIAM Journal on Computing,
+vol. 18, no. 1, pp. 30–55, 1989.
+[44] R. E. Barlow, D. J. Bartholomew, J. M. Bremner, and H. D. Brunk,
+Statistical Inference under Order Restrictions.
+John Wiley & Sons,
+1972.
+
+
+[45] A. Maurer and M. Pontil, “Empirical Bernstein bounds and sample
+variance penalization,” in Proceedings of the 22nd Annual Conference
+on Learning Theory (COLT), 2009.
+[46] Y. Hou, J. Li, X. Fu, Z. He, A. Yan, X. Chen, and J. McAuley, “Bridging
+language and items for retrieval and recommendation: Benchmarking
+LLMs as semantic encoders,” in Proceedings of the 64th Annual Meeting
+of the Association for Computational Linguistics (Volume 1: Long
+Papers), 2026, pp. 3251–3265.
+[47] N. Reimers and I. Gurevych, “Sentence-BERT: Sentence embeddings
+using Siamese BERT-networks,” in Proceedings of the 2019 Conference
+on Empirical Methods in Natural Language Processing and the 9th In-
+ternational Joint Conference on Natural Language Processing (EMNLP-
+IJCNLP), 2019, pp. 3980–3990.
+[48] H. V. Simhadri, M. Aumüller, M. Douze, D. Baranchuk, A. Ingber,
+E. Liberty, G. Williams, B. Landrum, M. Manohar, M. Karjikar,
+L. Dhulipala, M. Chen, Y. Chen, R. Ma, K. Zhang, Y. Cai, J. Shi,
+W. Zheng, Y. Chen, J. Yin, and B. Huang, “Results of the Big ANN:
+NeurIPS’23 competition,” in Advances in Neural Information Processing
+Systems 38 (NeurIPS 2025), Datasets and Benchmarks Track, 2025.
+[49] A. Radford, J. W. Kim, C. Hallacy, A. Ramesh, G. Goh, S. Agarwal,
+G. Sastry, A. Askell, P. Mishkin, J. Clark, G. Krueger, and I. Sutskever,
+“Learning transferable visual models from natural language supervi-
+sion,” in Proceedings of the 38th International Conference on Machine
+Learning (ICML), ser. Proceedings of Machine Learning Research, vol.
+139, 2021, pp. 8748–8763.
+[50] B. Thomee, D. A. Shamma, G. Friedland, B. Elizalde, K. Ni, D. Poland,
+D. Borth, and L.-J. Li, “YFCC100M: The new data in multimedia
+research,” Communications of the ACM, vol. 59, no. 2, pp. 64–73, 2016.
+[51] S. Abu-El-Haija, N. Kothari, J. Lee, P. Natsev, G. Toderici, B. Varadara-
+jan, and S. Vijayanarasimhan, “YouTube-8M: A large-scale video clas-
+sification benchmark,” arXiv:1609.08675, 2016.
+[52] F. A. Longstaff and E. S. Schwartz, “Valuing American options by
+simulation: A simple least-squares approach,” Review of Financial
+Studies, vol. 14, no. 1, pp. 113–147, 2001.
+[53] M. Chen, K. Zhang, Z. He, Y. Jing, and X. S. Wang, “RoarGraph: A
+projected bipartite graph for efficient cross-modal approximate nearest
+neighbor search,” Proceedings of the VLDB Endowment, vol. 17, no. 11,
+pp. 2735–2749, 2024.

@@ -1,0 +1,2769 @@
+REWEAVE: Online Learning for Workload-Adaptive HNSW
+Indexes
+Minghao Li
+University of Toronto
+Toronto, Canada
+Nick Koudas
+University of Toronto
+Toronto, Canada
+Raghav Mittal
+The University of Texas At Arlington
+Arlington, USA
+ABSTRACT
+Vector databases rely on Hierarchical Navigable Small World
+(HNSW) indexes for similarity search, but a graph built from
+data alone can be poorly matched to a skewed or changing query
+workload. We present REWEAVE (Reward-Guided Rewiring
+of Vector Graphs), an online index-maintenance method that
+learns edge utility from query feedback and periodically rewires
+the bottom layer within the original per-node degree cap. The
+method supports sparse exact-neighbor feedback combined
+with self-labels, and standard HNSW serving without learning
+overhead once adaptation is disabled.
+Under explicit assumptions we prove value-estimation and
+graph-stabilization guarantees. Under stationary skew, REWEAVE
+improves held-out recall by up to 23.3 percentage points over
+HNSW. In comparisons with query-aware baselines on up to
+100M vectors, it achieves up to 3.3× NGFix’s query throughput at
+recall@100 of 0.80. On Amazon-ESCI with query drift, it increases
+stream recall@100 from 0.745 to 0.979 with 34% fewer search
+distance computations than frozen HNSW. These results illustrate
+the potential to improve retrieval quality and reduce search
+effort within an existing graph-degree budget, while incurring
+additional work during adaptation.
+1
+INTRODUCTION
+Approximate nearest-neighbor (ANN) search underpins vector
+databases [40], retrieval-augmented generation [27], recom-
+mendation [12], and similarity joins [33]. Graph indices lead
+the recall-latency frontier; HNSW [35] routes queries through
+progressively denser proximity-graph layers. These indices
+are built from the corpus alone, although the query workload
+determines which edges are useful.
+Workload-adaptive [19] and workload-optimized database
+systems [39, 41] adapt physical design to the queries they serve.
+Learned indices such as ALEX and the PGM-index similarly
+demonstrate the value of updatable, learning-augmented struc-
+tures [11, 13]. For graph ANN, this motivates using query feedback
+to decide which edges occupy the index’s degree budget.
+Query workloads can differ substantially from the indexed data.
+Under stationary skew, a fixed, nonuniform query distribution con-
+centrates on a small region of the data manifold [9, 21]. A retrieval-
+augmented generation system, for example, may index an entire
+knowledge base but serve many queries about a few topics. Un-
+der drift, interests move the query mass over time, and previously
+useful edges can lose value. In both regimes, a corpus-built graph
+may spend its degree budget on rarely traversed edges while miss-
+ing useful links, reducing recall or increasing search effort.
+Adding edges incurs storage, distance-evaluation, and cache
+costs. We therefore keep the per-node out-degree cap 𝑀fixed
+GIST-1M
+T2I-10M
+0
+10
+20
+Recall@100 gain (pp)
++16.3
++23.3
+Figure 1: Held-out Recall@100 gain over frozen HNSW,
+same degree cap (§10.3).
+and learn which destinations serve the workload within that
+budget. Existing approaches adapt entry points without changing
+edges [38], build query-aware graphs offline [9, 21, 47], choose
+among existing edges [12], or incrementally repair or construct
+graphs from query neighborhoods [17, 50]. None of these methods
+mutate the graph under a fixed budget while providing a regret
+guarantee against an explicit in-budget benchmark.
+Our analysis separates learning to navigate a given graph from
+discovering and selecting its edges. This distinction connects adap-
+tation cost to the supply of useful candidates, while our evaluation
+measures recall and serving cost under stationary skew and drift.
+We propose REWEAVE (Reward-Guided Rewiring of Vector
+Graphs), which learns to reallocate a fixed per-node degree budget
+to the query workload while serving queries. REWEAVE treats
+navigation as an online learning problem: each outgoing edge is
+a possible search move, whose reward measures its usefulness
+on the query. We call this adaptive procedure the learner: it
+chooses search moves, updates edge scores from query feedback,
+and selects edges at rewiring batches. It executes a five-step
+loop (Figure 2): navigate, assign reward, update values, collect
+candidates, and rewire.
+Figure 1 shows the recall gains workload-driven rewiring can
+achieve within the original degree budget. They motivate our anal-
+ysis of when feedback reliably identifies useful edges and how ex-
+ploration and graph adaptation contribute to learning cost.
+Mixed exact/self feedback reduces labeling cost and can recover
+the exact-reference graph under per-edge bias and margin condi-
+tions (§9). Once learning stops, the adapted index serves with stan-
+dard HNSW and no learning overhead. Our core contributions are:
+• A formulation and five-step algorithm for workload-
+adaptive
+HNSW,
+combining
+edge-reward
+learning,
+bounded candidate pools, and degree-preserving rewiring.
+• Conditional estimation and graph-stabilization guarantees,
+plus a regret decomposition against a value-greedy graph-
+and-policy benchmark with logarithmic UCB routing cost
+and extensions to changing workloads.
+arXiv:2611.16060v1  [cs.DB]  11 Nov 2026
+
+
+• An evaluation of navigation, reward, and candidate-
+generation
+choices,
+together
+with
+mixed
+exact/self
+feedback and standard HNSW serving after adaptation.
+Code artifacts will be released upon paper acceptance.
+2
+BACKGROUND AND PROBLEM
+FORMULATION
+2.1
+HNSW and the greedy walk
+HNSW [35] stores the corpus 𝑋= {𝑥1, . . . ,𝑥𝑛} ⊂R𝑑at layer 0 and
+geometrically sparser subsets at higher layers. With construction
+parameter 𝑀HNSW, the usual degree caps are 2𝑀HNSW at layer 0
+and 𝑀HNSW above. Throughout, 𝑀= 2𝑀HNSW denotes the layer-0
+cap; experiments report 𝑀HNSW explicitly. Let 𝑁out(𝑢) be the set
+of outgoing neighbors of node 𝑢. A distance-ranked single walk
+starts at 𝑠and repeatedly visits the closest outgoing neighbor that
+is strictly closer to the query than the current node, stopping when
+no such neighbor exists. Upper-layer descent supplies the layer-0
+entry. Standard HNSW serving uses its extended search list of size
+𝑒𝑓search; our analyzed training walk accepts at most 𝐻edges per
+query. All distance and score ties use a fixed deterministic rule.
+2.2
+Online setting and feedback budgets
+Queries 𝑞1, . . . ,𝑞𝑇arrive sequentially. Our stationary analysis as-
+sumes independent draws from an arbitrary distribution D; un-
+der drift, draws are independent with phase-specific distributions.
+These distributions need not be uniform: they may be skewed and
+have correlated vector coordinates. Independence concerns suc-
+cessive queries. Let 𝑁𝑘(𝑞) be the true top-𝑘set and 𝐴(𝑞) the re-
+turned set. Recall is Recall𝑘(𝑞) = |𝐴(𝑞)∩𝑁𝑘(𝑞)|/𝑘. Serving a query
+means searching the current graph and returning 𝐴(𝑞) to the ap-
+plication. After returning the answer, the learner uses a feedback
+neighbor set 𝐿(𝑞) to update edge scores and propose edges for later
+queries. With exact feedback, 𝐿(𝑞) = 𝑁𝑘(𝑞); with self-feedback,
+𝐿(𝑞) = 𝐴(𝑞), reusing the search’s own answer as its label set (§9).
+For a directed edge (𝑢, 𝑣), 𝑢is the source node and 𝑣the destina-
+tion node. Exact-feedback availability is distinct from the number
+of edge rewards recorded:
+• Out-list full information scores every current out-edge of
+each visited node, costing𝑂(𝑀) membership tests per visit. The
+stronger universe-scoring regime scores all candidates in a fixed
+comparison universe, including nonedges; it supports the full-
+information analysis identified in §8.
+• Bandit feedback records rewards only on accepted edges:
+edges selected by navigation to move to a neighbor closer to
+the query than the current node. Direct endpoint or recall
+credit costs 𝑂(1) per accepted edge. A buffered nonedge
+receives no bandit observation merely by being proposed.
+Exact neighbor search can use certification methods [29, 30]. The
+analysis of direct endpoint and recall rewards uses exact labels; §9
+handles mixed feedback under reward-specific conditions.
+2.3
+State, action, reward, and edge value
+Each query is one search episode. Before query 𝑡, the learner’s
+graph 𝐺𝑡and edge scores reflect preceding queries and remain
+fixed during the search. A navigation policy 𝜋specifies how the
+search chooses its next outgoing edge, using the query and in-
+formation available at the current node; it may randomize these
+choices. Write 𝜋𝑡for the learner’s policy on query 𝑡. For a graph
+𝐺and policy 𝜋, let V𝐺,𝜋(𝑞) denote the visited nodes and 𝑃𝐺,𝜋(𝑞)
+the ordered sequence of accepted directed edges. We omit the sub-
+scripts when the graph and policy are clear. No destination node is
+accepted twice. For a single path, 𝑃(𝑞) = ((𝑢0,𝑢1), . . . , (𝑢𝑚−1,𝑢𝑚)),
+𝑚≤𝐻. The endpoint reward is
+𝑟end(𝑢, 𝑣,𝑞) = 1[𝑣∈𝑁𝑘(𝑞)].
+(1)
+For a fixed graph and policy (𝐺, 𝜋), its visit-conditional value is
+𝑄𝐺,𝜋
+vis (𝑢, 𝑣) = Pr[𝑣∈𝑁𝑘(𝑞) | 𝑢∈V𝐺,𝜋(𝑞)].
+(2)
+It measures how often the destination 𝑣is a true neighbor among
+queries visiting 𝑢. During learning, we estimate an edge’s reward
+value from the queries on which the feedback rule evaluates it (§5).
+2.4
+The bounded candidate pool
+At time 𝑡, node 𝑢stores its current out-neighbor set 𝑁out,𝑡(𝑢) and
+two proposal buffers. The neighbor buffer 𝐵𝑛𝑛,𝑡(𝑢) collects pro-
+posed destinations for edges from 𝑢, using the feedback neighbor
+sets 𝐿(𝑞) of queries visiting 𝑢. When exact feedback provides the
+true top-𝑘set, 𝐿(𝑞) = 𝑁𝑘(𝑞), the missed-neighbor buffer 𝐵𝑚𝑖𝑠𝑠,𝑡(𝑢)
+retains proposals from true neighbors that the search did not exam-
+ine. Section 6 specifies their update rules. These sets form the can-
+didate pool P𝑡(𝑢) = 𝑁out,𝑡(𝑢) ∪𝐵𝑛𝑛,𝑡(𝑢) ∪𝐵𝑚𝑖𝑠𝑠,𝑡(𝑢) of size at most
+𝐶≥𝑀. This bounds storage for the current pool, not the number
+of distinct candidates encountered over time. For analysis, define
+U(𝑢) as a fixed finite set of possible destination nodes for edges
+from 𝑢. It contains every candidate that can enter 𝑢’s pool during
+learning and excludes 𝑢itself, so Ð
+𝑡P𝑡(𝑢) ⊆U(𝑢) ⊆𝑋\ {𝑢}.
+This comparison universe specifies the alternatives against which
+we assess rewiring, including candidates not stored at the same
+time. Retaining reward statistics for candidates removed from the
+pool requires storage beyond the𝐶current entries; §8 accounts for
+this history separately.
+2.5
+Benchmark and learning objectives
+We measure learning progress against a reference graph and navi-
+gation policy that use fixed edge-value references directly. They
+obey the same degree cap and accept only distance-improving
+moves. For any graph and policy (𝐺, 𝜋), the collected endpoint
+reward and its expectation are
+𝜌(𝑞;𝐺, 𝜋) =
+∑︁
+(𝑢,𝑣)∈𝑃𝐺,𝜋(𝑞)
+1[𝑣∈𝑁𝑘(𝑞)],
+𝑅(𝐺, 𝜋) = E[𝜌(𝑞;𝐺, 𝜋)].
+Here 0 ≤𝜌≤min{𝐻,𝑘}; 𝜌/𝑘need not equal returned-set recall,
+because the search can examine useful points without accepting
+their edges.
+A credit rule 𝑟specifies the numerical reward 𝑟(𝑒,𝑞) assigned
+to an edge 𝑒for query 𝑞. Endpoint credit rewards an edge whose
+destination is a true neighbor; recall credit assigns the completed
+search’s recall to each traversed edge (§5). The rule therefore de-
+termines which aspect of search usefulness the edge scores learn
+2
+
+
+EVERY B QUERIES
+B TIMES → STEP 1
+1
+Navigate
+A value‑guided walk picks the 
+distance‑improving next hop
+2
+Assign reward
+Evaluate feedback to generate per‑edge 
+rewards for the traversed path
+0 
+1
+3
+Update values
+The reward folds into the edge’s running 
+estimate, which converges to its true 
+value
+4
+Collect candidates
+Returned and the closest missed 
+neighbours seed two small per‑node 
+buffers
+5
+Rewire
+Every B queries each node keeps its M 
+highest‑valued edges, respecting the degree 
+budget
+u
+Figure 2: REWEAVE as an online loop of five steps.
+to reflect. For each candidate edge (𝑢, 𝑣), let 𝜃𝑟(𝑢, 𝑣) be a fixed ref-
+erence value for its average credit under rule 𝑟. These values de-
+fine a stable ranking for comparison: the benchmark uses them
+directly, while the learner ranks edges using estimates built from
+query feedback. Section 8.1 specifies how much an edge’s condi-
+tional mean reward may vary around its reference as the graph
+and policy adapt.
+Let 𝐺†
+𝑟retain the top min{𝑀, |U(𝑢)|} candidates by 𝜃𝑟at each
+node. Its policy 𝜋†
+𝑟always chooses the highest-𝜃𝑟improving out-
+edge. This benchmark’s expected collected endpoint reward per
+query is 𝑅†
+𝑟= 𝑅(𝐺†
+𝑟, 𝜋†
+𝑟). The subscript 𝑟is suppressed when the
+reward rule is fixed. These local value rankings need not maximize
+collected reward or recall over all degree-𝑀graphs. Changing from
+endpoint to recall credit changes the reference graph and policy,
+while 𝑅continues to measure collected endpoint reward. The ex-
+tension to searches that explore several routes uses its own refer-
+ence policy and edge values (§4.3).
+We study three tasks: estimating the edge reward references
+𝜃𝑟(𝑢, 𝑣), replacing outgoing edges while keeping at most 𝑀per
+node, and adapting these choices as the query distribution changes.
+With 𝑅𝑡= 𝜌(𝑞𝑡;𝐺𝑡, 𝜋𝑡), expected regret is the deterministic quan-
+tity
+Reg(𝑇) = 𝑇𝑅† −
+𝑇∑︁
+𝑡=1
+E[𝑅𝑡].
+This is the benchmark’s expected total endpoint reward over 𝑇
+queries minus the learner’s.
+3
+THE REWEAVE ALGORITHM
+Algorithm 1 implements the five steps of Figure 2 for a single path.
+It starts from 𝐺0 with neighbor count 𝑘, degree and pool caps 𝑀,𝐶,
+rewire interval 𝐵, and path cap 𝐻(lines 1–2). Each edge stored in
+the current candidate pool receives score 𝑄0 and evaluation count
+zero; proposal buffers start empty. An optional beam variant can
+explore several routes within a training query (§4.3).
+For each query, upper-layer descent chooses the entry node 𝑢
+(lines 3–4). The set vis records visited nodes, and 𝑃records ac-
+cepted edges in order. A node is examined when the search com-
+putes its distance to the query; denote the set of these nodes by
+Xeval(𝑞𝑡). A node is visited when it is the entry node or the destina-
+tion of an accepted edge. Examining a node therefore need not add
+it to vis. The answer 𝐴(𝑞𝑡) retains the 𝑘closest examined nodes, or
+all examined nodes if fewer than𝑘are available, using the fixed dis-
+tance tie rule. Lines 6–10 rank the current node’s out-edges, select
+the first destination closer to the query, append that edge to 𝑃, and
+continue from its destination. The walk stops when no out-edge
+improves distance or |𝑃| = 𝐻(lines 5, 8).
+Line 12 serves this answer before feedback or graph updates.
+The learner then obtains feedback 𝐿(𝑞𝑡), assigns rewards under
+the chosen credit rule, and updates scores and counts (lines 13–
+15). Bandit feedback evaluates accepted edges; out-list full infor-
+mation evaluates all current out-edges at visited nodes. Line 16
+then updates the proposal buffers for visited nodes using the feed-
+back, including missed-neighbor proposals when exact labels are
+available. New candidates start at (𝑄0, 0); proposing an edge does
+not count as observing its reward.
+Every 𝐵queries, lines 17–21 change the graph. For each node,
+they unite current out-edges with both proposal buffers, retain at
+most 𝐶candidates including current outgoing neighbors, and in-
+stall the best at most 𝑀by score. Distance from the node, then
+ID, break ties. Steps 1–4 run for every query; Step 5 runs every 𝐵
+queries. The scores updated in Step 3 influence navigation on the
+next query. The proposals collected in Step 4 influence the graph
+at the next rewiring batch, whose out-lists remain in use until an-
+other batch. The guide accompanying Algorithm 1 links each step
+to its pseudocode lines and detailed treatment.
+Universe-scoring extends reward updates to all U(𝑢) at each
+visited node, at 𝑂(|U(𝑢)|) cost. The retained-evidence guarantees
+in §8 require keeping reward statistics and counts across graph and
+pool evictions. Under bandit feedback, testing buffered nonedges
+requires a separate trial mechanism.
+3.1
+Multi-layer integration
+Only layer 0 is adapted. Upper layers retain their distance-based
+routing and seed the training walk or beam. After training,
+frozen serving uses standard HNSW search on the resulting
+graph without value-update overhead. The analysis compares
+training searches with the reference graph and policy of §2.5; the
+experiments measure the resulting index’s serving performance.
+3
+
+
+Algorithm 1 REWEAVE, layer 0 (single path).
+1: Input: graph 𝐺0; query stream; 𝑘, 𝑀,𝐶, 𝐵, 𝐻; navigation rule;
+reward rule; prior 𝑄0.
+2: Initialize stored candidate scores to 𝑄0, evaluation counts to 0,
+and proposal buffers to empty.
+3: for 𝑡= 1, 2, . . . do
+Step 1: Navigation (§4)
+4:
+𝑢←upper-layer descent; vis ←{𝑢}; 𝑃←[ ]
+5:
+while |𝑃| < 𝐻do
+6:
+Rank 𝑁out,𝑡(𝑢) by the rule of §4
+7:
+𝑣←first ranked neighbor with dist(𝑞𝑡, 𝑣) < dist(𝑞𝑡,𝑢)
+8:
+if no such 𝑣exists then break
+9:
+end if
+10:
+Append (𝑢, 𝑣) to 𝑃; add 𝑣to vis; 𝑢←𝑣
+11:
+end while
+12:
+Serve 𝐴(𝑞𝑡) ←up to 𝑘closest nodes in Xeval(𝑞𝑡)
+Step 2: Reward assignment (§5)
+13:
+Obtain 𝐿(𝑞𝑡) after serving the answer
+14:
+Assign rewards to the pairs permitted by the feedback bud-
+get
+Step 3: Value estimation (§5.4)
+15:
+Update their scores and counts by (4) or discounting
+Step 4: Candidate generation (§6)
+16:
+Update 𝐵𝑛𝑛and 𝐵𝑚𝑖𝑠𝑠from vis and the feedback
+Step 5: Rewiring (§7)
+17:
+if 𝑡mod 𝐵= 0 then
+18:
+for each node 𝑢do
+19:
+Form P𝑡(𝑢) = 𝑁out,𝑡(𝑢) ∪𝐵𝑛𝑛,𝑡(𝑢) ∪𝐵𝑚𝑖𝑠𝑠,𝑡(𝑢)
+20:
+Retain at most𝐶pool entries, including current out-
+going neighbors
+21:
+Set 𝑁out,𝑡+1(𝑢) to the best min{𝑀, |P𝑡(𝑢)|} entries
+by score, then distance from 𝑢, then ID
+22:
+end for
+23:
+end if
+24: end for
+Guide to the five steps.
+Step and section
+Lines
+Output
+1. Navigation (§4)
+4–12
+Answer
+𝐴(𝑞𝑡),
+accepted
+edges 𝑃, visited nodes vis
+2. Reward assignment (§5)
+13–14
+Per-edge reward observations
+3. Value estimation (§5.4)
+15
+Updated scores and counts
+4. Candidate generation (§6)
+16
+Updated proposal buffers
+5. Rewiring (§7)
+17–23
+Updated outgoing-edge lists
+4
+STEP 1: NAVIGATION
+Step 1 (Algorithm 1, lines 4–12) uses the current graph and scores
+to return an answer and the search records used by Steps 2–4. Nav-
+igation favors high-reward edges while testing uncertain alterna-
+tives: an early low estimate can otherwise prevent a useful edge
+from receiving more feedback. We use 𝜖-greedy or UCB ranking,
+following the first distance-improving edge in either order. Strict
+distance improvement prevents cycles. The optional beam variant
+(§4.3) explores several routes at a time.
+4.1
+𝜖-greedy Ranking
+For query 𝑡, let b
+𝑄𝑡−1(𝑢, 𝑣) be the score of edge (𝑢, 𝑣) computed
+from earlier feedback (updates are in §5.4). Let 𝜖𝑡∈[0, 1] be the
+exploration probability. At each visited node, with probability 1−𝜖𝑡,
+order its out-edges by decreasing score, breaking ties by distance to
+the query and then ID. With probability𝜖𝑡, use a uniformly random
+order instead. Either way, follow the first edge whose destination
+is closer to the query than the current node; stop if none exists.
+We use 𝜖𝑡= min{1,𝑐𝜖/√𝑡}, where 𝑐𝜖> 0 controls the amount
+of exploration. Random ordering becomes less frequent as more
+queries arrive. Each visited node makes a fresh independent choice
+using the same 𝜖𝑡for that query. Random ordering treats all im-
+proving edges equally, giving each an exploration-selection proba-
+bility of at least 𝜖𝑡/𝑀at that visit. Repeated sampling also requires
+queries to visit the node while the edge is present and improving.
+4.2
+Optimistic (UCB) Ranking
+For a current out-edge 𝑒= (𝑢, 𝑣), let 𝑁𝑡−1(𝑒) count its reward ob-
+servations before query 𝑡, and b
+𝑄𝑡−1(𝑒) be their mean. For direct
+endpoint or recall rewards in [0, 1], upper confidence bound (UCB)
+navigation ranks edges by
+𝑈𝑡(𝑒) = b
+𝑄𝑡−1(𝑒) +
+√︁
+2 log(𝑡∨2)/𝑁𝑡−1(𝑒),
+where 𝑡∨2 = max{𝑡, 2} and log is the natural logarithm. The
+empirical mean favors edges that have earned high rewards. The
+square-root term is an exploration bonus for sampling uncertainty:
+fewer observations provide less evidence and produce a larger
+bonus. This lets an uncertain edge compete with one whose
+observed mean is higher.
+At fixed 𝑡, four times as many observations halve the bonus.
+As evidence accumulates, the ranking therefore relies less on the
+uncertainty allowance. Conversely, if an edge’s count stays un-
+changed, the slowly growing log(𝑡∨2) term raises its bonus as
+queries arrive. The bonus affects which edge is tried; score updates
+still use the recorded rewards.
+Set 𝑈𝑡(𝑒) = +∞when 𝑁𝑡−1(𝑒) = 0, giving unobserved current
+edges priority if they improve distance. Navigation follows the first
+improving edge in index order. This rule ranks only current out-
+edges; a buffered nonedge must first be installed before navigation
+can select it. Under suitable assumptions detailed in §8, we show
+that the routing contribution to regret is 𝑂(log𝑇).
+4.3
+Beam Navigation (Width 𝑊)
+The single-path walk commits to one next node at each step. Beam
+navigation is an optional training variant that keeps several search
+routes active, allowing a query to explore different parts of the
+graph and collect feedback on more edges. The frontier is the set of
+visited nodes whose out-edges are ranked at the current step. The
+beam width 𝑊is the maximum number of nodes in this set.
+In the experimental variant, each frontier node proposes its
+top-𝑏distance-improving neighbors under the chosen ranking
+rule. Here 𝑏is the branch factor, which limits proposals from one
+node. We pool and rank these proposals, then accept up to 𝑊
+destinations to form the next frontier. Each destination node is
+accepted at most once per query: if several frontier nodes propose
+the same neighbor, only one proposal is accepted, avoiding
+4
+
+
+repeated work and duplicate credit. For example, with 𝑊= 4 and
+𝑏= 2, a full frontier proposes at most eight edges, from which at
+most four distinct destinations form the next frontier.
+A wider beam gathers feedback along more routes at the cost
+of extra distance evaluations. §10.2 compares UCB with 𝑊= 1
+and 𝑊= 64 to measure the recall effect. This choice affects train-
+ing navigation; frozen serving uses standard HNSW on the learned
+graph.
+The beam analysis uses all improving out-edges to unvisited des-
+tinations, applying the per-source cap 𝑏during acceptance instead
+of truncating proposals before pooling. Its guarantees concern this
+variant, with at most 𝐻total acceptances per query; §8 identifies
+the scope of the extended analysis.
+5
+STEPS 2 AND 3: REWARD AND VALUE
+ESTIMATION
+Step 2 (Algorithm 1, lines 13–14) combines the completed search
+with its feedback label set 𝐿(𝑞). This credit assignment records a
+numerical reward for each edge receiving feedback to reflect its
+usefulness on that query. The chosen reward rule 𝑟specifies the
+value 𝑟(𝑒,𝑞) assigned to edge 𝑒= (𝑢, 𝑣) for query 𝑞. Sections 5.1
+and 5.2 define direct endpoint and recall credit; §5.3 describes
+ways to credit earlier edges for later search steps. These are
+choices within Step 2. Step 3, value estimation (line 15), then com-
+bines recorded rewards into the edge scores used by navigation
+and rewiring; §5.4 gives its update rules.
+Let 𝐺be the layer-0 graph and 𝜋the navigation policy, which
+specifies how the search chooses outgoing edges. The feedback
+rule determines which edges receive reward observations; we call
+these edges evaluated. Holding 𝐺, 𝜋, and the feedback rule fixed,
+the expected recorded reward of an edge is
+𝑄𝐺,𝜋
+𝑟
+(𝑒) = E[𝑟(𝑒,𝑞) | 𝑒is evaluated],
+(3)
+whenever that edge has positive probability of being evaluated.
+The expectation averages over queries and navigation randomness,
+conditional on the edge receiving feedback. For example, bandit
+feedback averages over queries whose search accepts the edge. As
+the graph and policy adapt, the queries evaluating an edge can
+change, so this average may change even under a fixed query dis-
+tribution. For our guarantees, §8.1 states the assumption limiting
+this variation around the fixed reference 𝜃𝑟(𝑒) introduced in §2.5.
+5.1
+The Binary Endpoint Reward
+The endpoint reward in (1) is 1 when an edge’s destination 𝑣be-
+longs to the true top-𝑘set 𝑁𝑘(𝑞), and 0 otherwise. It measures
+whether that individual edge leads directly to a true neighbor.
+Under bandit feedback (§2.2), only traversed edges in 𝑃(𝑞) re-
+ceive observations. Both 0 and 1 increment the evaluation count
+and enter the score update; an untraversed edge receives no up-
+date. The expected reward in (3) therefore measures how often 𝑣
+is a true neighbor among queries whose search traverses (𝑢, 𝑣).
+With out-list full information, we score every current outgoing
+edge of each visited node, including edges the search did not fol-
+low. For fixed 𝐺and 𝜋, the average for (𝑢, 𝑣) therefore includes
+all queries that visit 𝑢, giving 𝑄𝐺,𝜋
+vis (𝑢, 𝑣) in (2). These queries can
+differ from those that traverse the edge, so the two feedback rules
+need not produce the same expected reward.
+Endpoint reward gives positive credit only for reaching a true
+neighbor. For example, a path whose three destinations lie outside,
+inside, and inside 𝑁𝑘(𝑞) receives rewards 0, 1, 1. The first edge re-
+ceives zero even if it is needed to reach the two useful nodes after
+it. This limitation motivates the recall reward described next.
+5.2
+The Recall Reward
+The recall reward gives an edge credit for participating in a search
+that returns useful results. After query 𝑞completes, compute
+Recall𝑘(𝑞), the fraction of its true top-𝑘neighbors present in the
+returned result. Assign this same value to every traversed edge:
+𝑟rec(𝑒,𝑞) = Recall𝑘(𝑞) for all 𝑒∈𝑃(𝑞).
+For example, if the search returns 80% of the true neighbors, ev-
+ery traversed edge receives reward 0.8. This includes an intermedi-
+ate edge whose destination lies outside 𝑁𝑘(𝑞) and would therefore
+receive zero endpoint reward. Recall credit can consequently re-
+ward earlier steps along a successful route. Because all traversed
+edges receive the same value, it does not distinguish their individ-
+ual contributions to the result.
+Only traversed edges receive observations. For fixed 𝐺and 𝜋,
+(3) therefore measures average recall over searches traversing 𝑒.
+The estimation guarantees require the conditional-mean, retained-
+evidence, and coverage conditions of §8.1 for these recall rewards.
+5.3
+Assigning Credit for Later Search Steps
+Within Step 2 (Algorithm 1, line 14), two credit-assignment vari-
+ants give earlier edges credit for useful results reached later in the
+search. Both start from the endpoint or recall reward 𝑟(𝑒,𝑞) and
+change the observation used to update the edge score.
+Let 𝛾∈[0, 1) be the discount factor for later search steps. A re-
+ward one step later has weight 𝛾, two steps later has weight 𝛾2,
+and so on. Setting 𝛾= 0 uses only the current edge’s base reward;
+larger values give more weight to later rewards. This discount ap-
+plies within a query; §5.4 separately describes how old evidence is
+downweighted across queries. We consider Monte Carlo (MC) and
+temporal-difference (TD) credit, denoted MC(𝛾) and TD(𝛾).
+Monte Carlo (MC) credit uses the rewards actually recorded dur-
+ing the completed search. For a path of 𝑚accepted edges 𝑒𝑖=
+(𝑢𝑖,𝑢𝑖+1), 𝑖= 0, . . . ,𝑚−1, assign edge 𝑒𝑖the discounted return
+𝑍(𝛾)
+𝑖
+=
+𝑚−1
+∑︁
+𝑗=𝑖
+𝛾𝑗−𝑖𝑟(𝑒𝑗,𝑞).
+This return sums its own reward and the weighted rewards of all
+later edges. For the endpoint rewards 0, 1, 1 in §5.1, choosing 𝛾=
+0.8 gives the first edge credit 0 + 0.8 + 0.82 = 1.44, although its
+own endpoint reward is zero. We use this return as the observation
+𝑌𝑡(𝑒𝑖) in the estimator of §5.4. All returns can be computed in𝑂(𝑚)
+time by processing the path backward.
+For beam navigation, order 𝑃(𝑞) by frontier step and then by
+acceptance order within that step. MC uses this ordered sequence.
+Later entries may come from different branches, so the return in-
+cludes later accepted-edge rewards even when those edges are not
+descendants of the credited edge.
+5
+
+
+Temporal-difference (TD) credit uses the current edge’s reward
+and an estimate of the reward available after reaching its destina-
+tion. For an accepted edge (𝑢, 𝑣), its update target is
+𝑟(𝑢, 𝑣,𝑞) + 𝛾
+max
+𝑤∈𝑁out,𝑡(𝑣)
+b
+𝑄(𝑣,𝑤).
+Here 𝑁out,𝑡(𝑣) is the current set of outgoing neighbors of 𝑣; the
+maximum selects the largest score among those outgoing edges.
+The continuation term is zero when the search terminates, and
+out-lists remain fixed during the query. Step 3 uses this target as
+𝑌𝑡(𝑢, 𝑣) in the estimator of §5.4. Using learned scores inside the
+target is called bootstrapping: TD uses an estimated continuation,
+whereas MC uses the observed later rewards. Computing the max-
+imum costs 𝑂(𝑀) per update.
+These variants can produce values larger than 1. For base
+rewards in [0, 1], MC returns are at most (1 −𝛾)−1; endpoint
+rewards give the tighter bound min{𝑘, (1−𝛾)−1} because accepted
+destination nodes do not repeat, including in a beam. TD scores
+remain in [0, (1 −𝛾)−1] when initialized there and updated by
+convex averages. For a chosen credit range [0, 𝑅max], keep the
+prior on that scale and multiply the UCB bonus in §4.2 by 𝑅max.
+Scaling the bonus specifies an exploration rule; guarantees also
+require the conditional-mean assumptions for the chosen credit.
+The regret bounds for base rewards in §8 do not cover TD’s
+bootstrapped targets. The estimation result in §9 covers bounded
+MC returns with running means under the conditional-mean,
+retained-evidence, and coverage assumptions specified there.
+5.4
+Running Means and Time-Indexed
+Discounting
+Step 3 (Algorithm 1, line 15) takes the reward observations
+assigned in Step 2 and updates each evaluated edge’s score and
+count using running means or discounting. These scores guide
+the next query and rewiring batch. The input 𝑌𝑡(𝑒) is 𝑟(𝑒,𝑞𝑡) for
+direct endpoint or recall credit, the return 𝑍(𝛾)
+𝑖
+for MC, or the
+bootstrapped target for TD (§5.3). Let 𝐼𝑡(𝑒) indicate whether 𝑒is
+evaluated on query 𝑡, so 𝑁𝑡(𝑒) = Í
+𝑠≤𝑡𝐼𝑠(𝑒) for retained evidence.
+If 𝑒is evaluated with reward 𝑌𝑡(𝑒), set
+b
+𝑄𝑡(𝑒) = b
+𝑄𝑡−1(𝑒) + 𝑌𝑡(𝑒) −b
+𝑄𝑡−1(𝑒)
+𝑁𝑡−1(𝑒) + 1
+,
+𝑁𝑡(𝑒) = 𝑁𝑡−1(𝑒) + 1. (4)
+Unobserved entries are unchanged. Thus the first observation re-
+places 𝑄0, and subsequent scores are exact running means. The
+update weight depends on that edge’s observation count, so well-
+sampled edges change less after one new reward. Query 𝑡uses
+scores from preceding queries. An endpoint prior is 𝑄0 = 𝑘/𝑛; it
+provides initialization, not evidence of a candidate’s quality.
+Under query-workload drift, the query distribution changes over
+time, so older observations can become less representative. A run-
+ning mean weights all rewards equally, so a large history can slow
+adaptation. Time-indexed discounting favors recent queries.
+Choose a forgetting factor 0 < 𝜆< 1: an observation received
+𝑗queries ago has weight 𝜆𝑗. A value close to 1 retains older ev-
+idence longer; a smaller value emphasizes more recent feedback.
+For each edge 𝑒, maintain a discounted reward sum 𝑆𝜆
+𝑡(𝑒) and a
+discounted observation count 𝑁𝜆
+𝑡(𝑒). Initialize both to zero and,
+after each query 𝑡, update
+𝑆𝜆
+𝑡(𝑒) = 𝜆𝑆𝜆
+𝑡−1(𝑒) + 𝐼𝑡(𝑒)𝑌𝑡(𝑒),
+𝑁𝜆
+𝑡(𝑒) = 𝜆𝑁𝜆
+𝑡−1(𝑒) + 𝐼𝑡(𝑒),
+b
+𝑄𝜆
+𝑡(𝑒) = 𝑆𝜆
+𝑡(𝑒)/𝑁𝜆
+𝑡(𝑒).
+The ratio is a weighted average of recorded rewards; at zero count,
+use 𝑄0. Both statistics decay with every arriving query, including
+those that do not evaluate 𝑒. An implementation can apply this
+decay when the entry is next accessed by multiplying both statis-
+tics by 𝜆raised to the number of elapsed queries. If no new ob-
+servation arrives, numerator and denominator shrink by the same
+factor, so the score stays fixed. The declining count nevertheless re-
+duces the evidence supporting that score. The forgetting timescale
+is𝑂(1/(1−𝜆)) queries, while storage remains constant per retained
+edge.
+Discounted UCB combines these estimates with an exploration
+bonus based on the discounted observation count. When an edge
+goes unobserved, its count decays and its bonus increases, encour-
+aging the search to revisit edges whose values may have changed.
+Its analysis under changing workloads is among the extensions
+identified in §8.
+6
+STEP 4: CANDIDATE GENERATION
+After serving each query, Step 4 (Algorithm 1, line 16) updates the
+two proposal buffers of §2.4, using visited nodes from Step 1 and
+feedback 𝐿(𝑞) from Step 2. A proposed destination 𝑣at node 𝑢rep-
+resents the possible edge (𝑢, 𝑣). At the next batch, proposals join
+current outgoing neighbors in P𝑡(𝑢) and compete by score for se-
+lection in Step 5. Capacity 𝐶counts distinct destinations in this
+union, so a node appearing in both buffers occupies one pool en-
+try. Keeping the current outgoing neighbors leaves at most 𝐶−
+|𝑁out,𝑡(𝑢)| entries for distinct new destinations. The allocation be-
+tween proposal buffers must respect this shared budget; the graph-
+stabilization guarantee separately requires the candidate availabil-
+ity stated in §8.1.
+6.1
+The Neighbor Buffer
+The neighbor buffer 𝐵𝑛𝑛(𝑢) stores recent feedback neighbors of
+queries that visit 𝑢. We use destinations in 𝐿(𝑞), excluding 𝑢itself,
+to insert new candidates and refresh existing entries. The buffer
+follows a least-recently-used (LRU) rule: when space is needed, it
+replaces the entry least recently inserted or refreshed.
+Exact feedback supplies candidates from all true top-𝑘neigh-
+bors, including missed ones; self-feedback supplies the returned
+nodes, as defined by 𝐿(𝑞) in §2.2.
+6.2
+The Missed-Neighbor Buffer
+Exact feedback also identifies useful destinations that the search
+missed. Among the true top-𝑘neighbors outside Xeval(𝑞), the
+examined-node set defined in §3, we select the one closest to
+𝑞, when such a neighbor exists. We insert this destination into
+the missed-neighbor buffer 𝐵𝑚𝑖𝑠𝑠(𝑢) at every visited node 𝑢,
+proposing a direct edge from that node to the missed neighbor.
+This buffer tracks proposals generated specifically by missed
+results within the bounded candidate storage. A destination may
+6
+
+
+occur in both buffers: 𝐵𝑛𝑛records it as a recent feedback neighbor,
+while 𝐵𝑚𝑖𝑠𝑠records its role in a missed search result. Rewiring
+considers the destination once, using its shared edge score.
+7
+STEP 5: BUDGET-PRESERVING REWIRING
+Step 5 (Algorithm 1, lines 17–23) uses the scores from Step 3
+and proposals from Step 4 to rebuild outgoing-edge lists every 𝐵
+queries. For node 𝑢, combine its current outgoing neighbors and
+the two proposal buffers, retaining at most 𝐶distinct candidates,
+including the current ones. The shared capacity 𝐶is enforced as
+in §6; at most 𝑀≤𝐶candidates become outgoing edges.
+Rank the candidates in P𝑡(𝑢) by their edge scores b
+𝑄(𝑢, 𝑣), break-
+ing ties first by distance from 𝑢and then by node ID. Install edges
+to the best min{𝑀, |P𝑡(𝑢)|} destinations, using scores from §5.4.
+The resulting outgoing-edge list is used until the next batch. Sort-
+ing costs 𝑂(𝐶log𝐶) per node per rewiring batch, and selecting at
+most 𝑀destinations preserves the degree cap.
+Optional reverse proposals let selecting (𝑢, 𝑣) propose (𝑣,𝑢) at
+node 𝑣. The recipient ranks it by its own score b
+𝑄(𝑣,𝑢), subject to
+the same pool and degree caps and top-𝑀selection. The stabiliza-
+tion conditions in §8.1 apply with or without these proposals when
+the fixed comparison universes include every possible directed pro-
+posal. They require retained evidence and coverage for that uni-
+verse; reverse proposals alone do not establish these conditions.
+Inserting reciprocal edges after top-𝑀selection would bypass the
+rule used by the guarantee.
+8
+THEORETICAL ANALYSIS
+The analysis explains when feedback can identify a stable graph
+and how quickly navigation learns to use it. We focus on UCB,
+whose exploration adapts to the evidence for each edge. The com-
+parison uses the value-greedy benchmark of §2.5, a fixed corpus,
+and the finite universes of §2.4. Let 𝑉◦contain every node where
+the learner or reference policy can choose an edge, and let 𝐾=
+Í
+𝑢∈𝑉◦|U(𝑢)| count all compared pairs, including rarely visited
+nodes. Retaining their reward statistics requires 𝑂(𝐾) storage; 𝐻
+caps total accepted edges per query.
+Appendix A provides proofs and finite-sample bounds for §8–
+§9, analyses of universe-scoring, 𝜖-greedy, discounted UCB under
+workload changes, and the full-proposal beam.
+8.1
+When Learned Values Support Reliable
+Decisions
+The three assumptions control reward variation, separation
+between competing choices, and the supply of evidence and
+candidates for rewiring.
+Assumption 1 (Bounded conditional means). Queries are inde-
+pendent from a fixed D. Write F𝑡−1 for the complete preceding his-
+tory. Each evaluated pair 𝑒records one reward 𝑌𝑡(𝑒) ∈[0, 1] per
+query; 𝐼𝑡(𝑒) indicates that evaluation. There are fixed references
+𝜃𝑟(𝑒) ∈[0, 1] and 𝜅≥0 such that
+|E[𝑌𝑡(𝑒) | F𝑡−1, 𝐼𝑡(𝑒) = 1] −𝜃𝑟(𝑒)| ≤𝜅
+whenever evaluation has positive conditional probability. For out-
+list full information, evaluation requires that the edge is present
+and its source is visited; universe-scoring evaluates every com-
+pared edge at a visited source. Bandit feedback evaluates accepted
+edges.
+This gives each edge a fixed reference for learning while allow-
+ing its observed reward mean to change as navigation adapts. The
+tolerance 𝜅bounds variation in the conditional mean, rather than
+sampling noise that vanishes with more observations. The assump-
+tion is required separately for the chosen endpoint or recall reward.
+Assumption 2 (Separate selection margins). Let 0 < Δset, Δnav ≤
+1. At every node with |U(𝑢)| > 𝑀, the 𝑀-th largest reference
+value exceeds the (𝑀+1)-th largest by at least Δset > 2𝜅. For single-
+path navigation on𝐺†, every nonempty set of improving out-edges
+that can occur has a unique highest-reference edge, separated from
+every other by at least Δnav > 2𝜅. Put 𝑔set = Δset −2𝜅and 𝑔nav =
+Δnav −2𝜅.
+The set margin protects the choice of outgoing edges; the nav-
+igation margin protects the choice among edges that improve dis-
+tance for the current query. Each of two compared means can move
+toward the other by𝜅, reducing their separation by at most 2𝜅. The
+positive remaining gap (𝑔set or𝑔nav) therefore preserves their order
+once each estimate’s sampling error is below half that gap. For ex-
+ample, a reference gap of 0.20 with 𝜅= 0.03 leaves a gap of 0.14
+for sampling to distinguish.
+Assumption 3 (Coverage for graph stabilization). Every pair in
+the comparison universes is evaluated infinitely often, its reward
+statistics and observation count are retained even when it is re-
+moved from the graph or candidate pool, and every edge of 𝐺† is
+present in its source node’s pool at every sufficiently late batch.
+Continued evaluation and retained evidence support accurate
+estimates; eventual candidate availability lets rewiring install the
+reference edges. For retained running means, Assumption 1, the
+set margin, and Assumption 3 yield almost-sure stabilization at 𝐺†.
+The navigation margin is used separately for the routing bound in
+§8.2.
+8.2
+The Main Guarantee and Its Practical
+Implications
+To separate candidate discovery from navigation, let 𝐷𝑇
+=
+Í
+𝑡≤𝑇Pr(𝐺𝑡≠𝐺†) count graph mismatch in expectation, compar-
+ing outgoing-edge lists on 𝑉◦. Comparing the learner’s search and
+the reference search on the same query gives
+|Reg(𝑇)| ≤𝐻𝐷𝑇+ 𝐻E[𝐽𝑇],
+(5)
+where 𝐽𝑇counts queries on which 𝐺𝑡matches 𝐺† on 𝑉◦but the
+accepted path differs from the path taken by 𝜋†. Each different tra-
+jectory can change collected reward by at most 𝐻. The absolute
+bound also permits the learner to outperform this specified bench-
+mark. The central result controls the second term.
+Theorem 1 (UCB navigation). Under Assumption 1 and the
+navigation margin of Assumption 2, use the UCB index of §4.2 with
+retained running-mean evidence. Then
+|Reg(𝑇)| ≤𝐻𝐷𝑇+ 𝑂
+𝐾log(𝑇∨2)
+𝑔2nav
+
+,
+7
+
+
+where the constant suppresses the fixed episode cap 𝐻. The routing
+term allows nodes to be visited arbitrarily rarely.
+The routing term quantifies the cost of learning to use the bench-
+mark graph. An uncertain edge may initially receive a high index,
+but accepting it also supplies an observation. After enough such
+observations, its confidence bonus is too small to displace a better
+improving edge, except on rare estimation errors. This limits cu-
+mulative routing mistakes to logarithmic growth. Rarely available
+edges are charged only when a routing choice involving them oc-
+curs. The proof counts the first different choice in each query, so
+it does not assume that a local reward gap bounds the loss along
+the remaining trajectory.
+The graph term is the cost of adapting the index: candidate dis-
+covery, evaluation, retention, and rewiring determine when refer-
+ence edges are available and selected. We bound 𝐷𝑇independently
+of𝑇under the conditional-mean and set-margin conditions of §8.1,
+with retained evidence, all reference edges available at every batch,
+and a uniform positive lower bound on each compared pair’s con-
+ditional evaluation probability per query.
+Combined with Theorem 1, this gives an 𝑂(log𝑇/𝑇) difference
+in average expected training reward for fixed problem parameters.
+More generally, 𝐷𝑇
+= 𝑜(𝑇) suffices: the expected fraction of
+queries using a different graph tends to zero, so the average
+reward difference also vanishes. These results explain how
+adaptation and exploration costs amortize over a stationary
+workload. The comparison uses the graph and policy benchmark
+of §2.5; frozen HNSW serving is evaluated empirically in §10.
+9
+SELF-SUPERVISED FEEDBACK WITH
+SPARSE EXACT LABELS
+To reduce the cost of exact-neighbor labels, we combine occasional
+exact feedback with self-labels: the returned set 𝐴(𝑞) serves as the
+label set 𝐿(𝑞) (§2.2). In this two-rate feedback scheme, each query
+uses exact feedback with probability 𝑝∈[0, 1], independently
+of the history, query, and search randomness, and self-feedback
+otherwise. Both modes evaluate the same completed-search edges
+and update the same running means; exact labels can also supply
+missed-neighbor proposals. Expected additional feedback cost is
+𝑝𝑐ex+(1−𝑝)𝑐self per query, where 𝑐ex and 𝑐self include each mode’s
+label-search and processing costs.
+For bounded, nonnegative rewards, suppose each mode’s mean,
+conditional on prior history and evaluation of edge 𝑒, stays within
+𝜅𝑗of a fixed reference 𝜃𝑗(𝑒), for 𝑗∈{ex, self}, as in §8.1. Here
+𝜃ex and 𝜃self play the role of 𝜃𝑟for the two feedback modes; 𝜅𝑗
+is the corresponding conditional-mean tolerance. The shared em-
+pirical score b
+𝑄estimates the mixed reference 𝜃𝑝defined below.
+With reward sums and counts retained across rewiring and evic-
+tion, every infinitely evaluated edge’s running mean has almost-
+sure asymptotic error at most 𝜅𝑝= 𝑝𝜅ex + (1 −𝑝)𝜅self about 𝜃𝑝=
+𝑝𝜃ex + (1 −𝑝)𝜃self.
+Recovering the exact-reference graph. Let 𝑏label
+=
+sup𝑒|𝜃self (𝑒) −𝜃ex(𝑒)| measure the largest per-edge disagreement
+between feedback references, and let Δex,set be the minimum gap
+between selected and excluded edges under 𝜃ex, over nodes with
+a selection boundary. Under the preceding conditions, if every
+compared edge in the fixed finite universes of §2.4 is evaluated
+Dataset
+Description
+# vectors Dim. Metric
+Amazon-ESCI
+shopping product embeddings
+1.44M 384 cosine
+GIST-1M
+deep image features
+1M 960
+ℓ2
+T2I-10M
+Text2Image multimodal embed-
+dings
+10M 200 cosine
+T2I-100M
+first 100M of Text2Image-1B
+100M 200 cosine
+Table 1: Datasets. Amazon-ESCI is used only for drift (§10.8);
+T2I-100M only for query-aware baselines (§10.7).
+infinitely often and the exact-reference top-𝑀edges are available
+at every sufficiently late batch, the graph stabilizes almost surely
+at that exact-reference graph whenever
+2[𝜅𝑝+ (1 −𝑝)𝑏label] < Δex,set.
+(6)
+Thus sparse exact feedback can preserve the selected edges when
+estimation tolerance and self-label disagreement remain below the
+separation between competing edges. For fixed references, increas-
+ing 𝑝reduces the self-label contribution (1 −𝑝)𝑏label at the cost of
+more exact feedback.
+In the label-efficiency experiment (§10.6), both modes record
+self-labeled MC(0.8) rewards, while exact labels supply candidate
+proposals; this isolates the proposal benefit of exact feedback.
+10
+EXPERIMENTAL EVALUATION
+10.1
+Experiment Overview
+We ablate REWEAVE’s three design axes (navigation, reward,
+candidate generation) in isolation (§10.2) and jointly (§10.3),
+study workload locality (§10.4), convergence (§10.5) and label
+efficiency (§10.6), compare against HNSW [35], NGFix [17],
+NAP [9], CORAL [50], and CleanANN [57] (§10.7), and test drift
+on real shopping queries (§10.8). Datasets are in Table 1; the
+baseline comparison also runs on T2I-100M to test scale, and
+other 1M-scale benchmarks behave consistently.
+Workload 1: Static. A stationary stream concentrated on a set
+of query basins, stressing cross-basin routing. We cluster each
+dataset with HDBSCAN1 and take the median-density cluster C
+(density (median𝑥∈C dist𝑘(𝑥; C))−1, dist𝑘the 𝑘th-NN distance
+within C). Each query is 𝑞= 𝑥+ 𝜉, 𝑥∈C sampled uniformly,
+𝜉∼N  0, (𝜎diam(C))2𝐼/𝑑 in dimension 𝑑, with disjoint seeds for
+training and test. We average 𝜎∈{0.10, 0.25, 0.50} over 3 seeds
+each (§10.4 varies 𝜎up to 1) and, unless noted, use 1000 training
+and 100 test queries with exact ground truth.
+Remark 1. Unless otherwise stated, experiments with partial ex-
+act feedback use recall reward and 𝐵𝑚𝑖𝑠𝑠on exact-labeled queries,
+and self-labeled MC(0.8) on the remaining queries (§9). The label-
+efficiency experiment (§10.6) uses self-labeled MC(0.8) through-
+out and exact neighbors for 𝐵𝑚𝑖𝑠𝑠. In the comparisons with NG-
+Fix, NAP, CORAL and CleanANN (§10.7, §10.8), REWEAVE, NGFix,
+NAP and CORAL use the IDs returned by the serving ANN search
+as self-labels; CleanANN uses no labels.
+Workload 2: Drift. Real Amazon ESCI shopping queries [44], sam-
+pled with replacement from the base-query pools within category
+clusters, with category switches (§10.8). We construct workloads
+because no public vector-search trace carries timestamps, and the
+production trace available to us cannot be released.
+1https://github.com/TutteInstitute/fast_hdbscan
+8
+
+
+Navigation §4
+Reward assignment §5
+Candidate pool §6
+𝜖-greedy
+endpoint (𝛾=0)
+𝐵𝑛𝑛
+UCB(1)
+Recall reward
+𝑩𝒏𝒏+ 𝑩𝒎𝒊𝒔𝒔
+UCB(64)
+MC(0.8), MC(0.1)
+TD(0.8), TD(0.1)
+Table 2: REWEAVE design space. First row: reference setting;
+highest-recall method in §10.3 in bold for each column.
+All code is C++ on hnswlib2, run on an Intel Xeon Ice Lake
+3.5 GHz with 247 GB memory; T2I-100M runs use a cluster node
+with 480 GB memory allocated. Defaults: HNSW 𝑀HNSW=32,
+𝑒𝑓construction=200, 𝑒𝑓search=100, 𝑘=100; rewiring every 𝐵=100
+queries; pool cap 𝐶=128 including incumbents, in all experiments;
+prior 𝑄0 = 𝑘/𝑛. UCB with beam width 𝑊is UCB(𝑊) (𝑊=64 for
+every beam run), with branch cap 𝑏=32; discounted rewards are
+MC(𝛾) or TD(𝛾).
+Protocol and costs. Each online query is searched and its answer
+served first; recall is measured on that served answer, and only
+then does the query’s feedback update the edge values and, every 𝐵
+queries, the graph. No query is re-searched. Recall is always scored
+against exact brute-force ground truth, whatever label the learner
+sees. End-to-end cost charges search, value updates, label genera-
+tion, rewiring, drift-detector maintenance and graph synchroniza-
+tion. Distance computations count every query–vector distance
+evaluated while serving.
+10.2
+Isolated Axes Testing
+Each ablation fixes two axes at the reference setting (first row of
+Table 2: 𝜖-greedy with 𝑐𝜖=2, endpoint reward, 𝐵𝑛𝑛only) and varies
+the third; beams use 𝑊=64.
+Navigation rule. In Figure 3(a), UCB(64) beats the second-best
+UCB(1) by 6.2 points on GIST-1M and 5.3 on T2I-10M at the final
+checkpoint: a wide beam exposes more useful routing edges. This
+comparison changes beam width while keeping UCB ranking, so it
+measures the value of width; we isolate the learned values below.
+UCB(1) stays slightly above 𝜖-greedy, as optimism targets uncer-
+tain edges rather than random ones.
+Reward assignment. We compare recall reward, discounted bi-
+nary reward (𝛾∈{0.8, 0.1}, MC or TD backups) and endpoint re-
+ward (§5.1) with out-list full information.
+variant
+GIST-1M
+T2I-10M
+TD(0.8)
+0.813
+0.676
+TD(0.1)
+0.810
+0.677
+Endpoint (full information)
+0.807
+0.647
+Table 3: Recall@100 at the end of training
+for reward variants not plotted.
+Every
+rule
+lifts
+recall above
+the
+frozen
+graph (GIST-
+1M
+0.772,
+T2I-10M
+0.605;
+Fig-
+ure 3(b), Table 3), and differences between rules are small next to
+that lift. Only recall beats the endpoint reward on both datasets
+(0.819 vs. 0.816; 0.688 vs. 0.678). The larger discount wins under
+MC (0.814/0.682 vs. 0.810/0.675) and under TD on GIST-1M,
+plausibly because it propagates downstream success to upstream
+routing edges so they are not replaced. Full information ends 2.9
+2https://github.com/nmslib/hnswlib
+0
+1000
+2000
+0.80
+0.85
+0.90
+Recall@100
+0.77
+GIST-1M
+0
+1000
+2000
+0.65
+0.70
+0.75
+0.60
+T2I-10M
+0
+1000
+2000
+0.78
+0.80
+0.82
+0.84
+Recall@100
+0.77
+GIST-1M
+0
+1000
+2000
+0.63
+0.66
+0.69
+0.61
+T2I-10M
+0
+1000
+2000
+0.78
+0.80
+0.82
+0.85
+Recall@100
+0.77
+GIST-1M
+0
+1000
+2000
+0.64
+0.68
+0.72
+0.60
+T2I-10M
+(a) navigation rule
+(b) reward assignment
+(c) candidate generation
+query index t
+UCB(64)
+UCB(1)
+ε-greedy
+ε-greedy (endpoint, Bnn)
+recall(1)
+MC(0.1)
+MC(0.8)
+Bnn only
+Bnn + Bmiss
+Figure 3: Isolated ablations: GIST-1M (left), T2I-10M (right).
+points below TD(0.8) on T2I-10M while changing the most edges.
+Unless otherwise stated, we use recall reward with exact labels
+and MC(0.8) with self-labels (Remark 1).
+Candidate generation. Adding 𝐵𝑚𝑖𝑠𝑠to 𝐵𝑛𝑛(Figure 3(c)) gains 4.7
+points on GIST-1M and 3.0 on T2I-10M at the final checkpoint, by
+re-injecting true neighbors the search missed.
+Are the learned values needed? The candidate pool already car-
+ries structural information without any learning, so we hold nav-
+igation (UCB(64)), binary endpoint reward, candidate pool (𝐵𝑛𝑛)
+and entry point fixed and change only the score that ranks each
+node’s pool at rewire time: the learned b
+𝑄(𝑢, 𝑣) versus a uniformly
+random order. The proposal policy is identical for the two rankers;
+under GT labels, 𝐵𝑛𝑛can contain true neighbors, so this compari-
+son tests ranking within the same informed pool. Labels are either
+exact (GT) or the serving index’s own top-𝑘(self); the endpoint
+reward is 𝑟(𝑢, 𝑣,𝑞) = 1[𝑣∈𝐿(𝑞)], where 𝐿(𝑞) is the selected label
+set, while test recall is always scored against exact ground truth.
+Figure 4 reports the mean over 3 seeds after 1000 training queries.
+The learned ranking improves recall@100 over random in all four
+settings: by 0.063 (GT) and 0.072 (self) on GIST-1M, and by 0.212
+(GT) and 0.169 (self) on T2I-10M. With self labels, learned ranking
+reaches 0.877 on GIST-1M and 0.753 on T2I-10M, compared with
+random ranking’s 0.805 and 0.584 and frozen HNSW’s 0.772 and
+0.605, respectively. With GT labels, learned ranking reaches 0.893
+and 0.763; random ranking reaches 0.830 and 0.552.
+10.3
+Combined Axes Testing
+We sweep the three design-space axes jointly to expose interac-
+tions. The Cartesian product of the reference setting and the best
+observed variant from §10.2 on each axis gives 23 = 8 combined
+9
+
+
+endpoint, GT
+endpoint, self
+0.775
+0.800
+0.825
+0.850
+0.875
+0.900
+0.925
+final test recall@100
++0.063
++0.072
+GIST-1M
+endpoint, GT
+endpoint, self
+0.55
+0.60
+0.65
+0.70
+0.75
++0.212
++0.169
+T2I-10M
+frozen
+q
+random
+Figure 4: Final test recall@100, learned (b
+𝑄) vs. random 𝐵𝑛𝑛
+ranking (binary endpoint reward, GT/self labels, 3 seeds).
+Numbers: learned minus random; dashed: frozen HNSW.
+0.6
+0.8
+1.0
+0.772
+0.816
+0.827
+0.855
+0.851
+0.896
+0.917
+0.910
+0.935
+GIST-1M
+0.00
+0.25
+0.50
+0.75
+1.00
+pre-train
+HNSW
+-greedy
+UCB(W=64)
+0.604
+0.696
+0.726
+0.726
+0.736
+0.753
+0.804
+0.752
+0.837
+T2I-10M
+Recall@100 (Test Queries)
+endpoint = 0
+recall( = 1)
+Bnn only
+Bnn+Bmiss
+mean
+median
+Figure 5: Converged recall@100 across navigation, reward
+and candidate-pool combinations.
+REWEAVE variants, reported as eight learned cells in Figure 5; the
+boxes show per-query recall distributions at 𝑘= 100.
+On both datasets the dominant factor is navigation: with reward
+and candidate pool fixed, switching from 𝜖-greedy to UCB(64) lifts
+mean held-out recall by +3 to +10 points across the cells. The other
+two axes matter conditional on navigation. Under𝜖-greedy, adding
+𝐵𝑚𝑖𝑠𝑠is the larger intervention on GIST-1M, raising mean recall
+by 2.5–4 points while the reward choice moves recall by at most a
+point; on T2I-10M the two are comparable at 1–3 points each. 𝐵𝑚𝑖𝑠𝑠
+gain shrinks under the beam—roughly halving on GIST-1M and
+surviving only in the recall-reward cell on T2I-10M—because the
+wider beam already examines and rewires toward many of the true
+neighbors 𝐵𝑚𝑖𝑠𝑠would inject. The reward axis shows the opposite
+conditioning: it is amplified under UCB(64), where recall raises the
+cells by ∼2.5 points on GIST-1M and 5 to 8.5 points on T2I-10M.
+The best cell on both datasets is UCB(64) with recall reward and
+𝐵𝑛𝑛+𝐵𝑚𝑖𝑠𝑠, which raises mean recall over HNSW by 16.3 points on
+GIST-1M and 23.3 points on T2I-10M.
+10.4
+Locality of Workload
+We vary the Workload 1 noise scale 𝜎∈{0.10, 0.25, 0.50, 1.00} (in
+units of diam(C)), training the best variant (bold in Table 2) on
+500 queries per tier (Figure 6). The lift shrinks monotonically with
+spread, from +0.120 to +0.028 on GIST-1M and to nearly zero on
+T2I-10M: with less query overlap, reinforced edges are reused less
+often. Recall never falls below the frozen baseline.
+0
+1
+2
+3
+4
+5
+0.7
+0.8
+0.9
+Recall@100
+GIST-1M
+0
+1
+2
+3
+4
+5
+0.4
+0.6
+T2I-10M
+# training queries (hundreds)
+=10%
+=25%
+=50%
+=100%
+Figure 6: Test query recall on different 𝜎-value tiers.
+0
+1000
+2000
+3000
+10
+3
+|Qt
+Qt
+B|
+0
+1000
+2000
+3000
+103
+104
+edge edits
+query index t
+GIST-1M
+T2I-10M
+Figure 7: Value drift (left) and edge modifications per rewire
+(right).
+10.5
+Algorithm Convergence
+Figure 7 tracks value drift, the mean absolute per-edge change in b
+𝑄
+between consecutive rewires, averaged over all edge and candidate
+entries scored at both rewires (entries added or evicted in between
+are excluded), and edges added per rewire (𝐵=100) for the best vari-
+ant. Drift falls several fold after an initial rise; additions drop from
+tens of thousands to about a thousand per rewire. Both curves still
+decline at the end.
+10.6
+Two-rate Feedback Evaluation
+0.01 0.02
+0.05 0.1
+0.2
+0.5
+1
+exact-probe rate  p
+0
+50
+100
+Recovered gain (%)
+GIST-1M
+T2I-10M
+p = 0
+Figure 8: Recall gain
+from exact probes with
+self-labeled MC(0.8).
+We vary the exact-probe rate 𝑝
+while using self-labeled MC(0.8)
+on every query. Exact neigh-
+bors populate 𝐵𝑚𝑖𝑠𝑠on an in-
+dependent Bernoulli(𝑝) fraction
+of queries, isolating the contri-
+bution of exact feedback to can-
+didate proposals. Let R𝑠(𝑝) de-
+note held-out recall for seed 𝑠af-
+ter 1000 training queries; Figure 8
+plots 100 R𝑠(𝑝)−R𝑠(0)
+R𝑠(1)−R𝑠(0) , the fraction of recall gain from probing every
+query (𝑝= 1) over no exact probes (𝑝= 0) recovered. The horizon-
+tal axis uses a log scale for 𝑝> 0; the dotted line marks 𝑝= 0. The
+denominator is the additional recall obtained by supplying exact
+neighbors to 𝐵𝑚𝑖𝑠𝑠on every query, relative to self-feedback alone.
+Curves show mean ± SEM over five GIST-1M seeds and two T2I-
+10M seeds: 𝑝=0.1 recovers about 55% of this gain on GIST-1M and
+𝑝=0.5 about 73% on T2I-10M; no exact probes gives 0% and probing
+every query gives 100% by definition.
+10.7
+System Level Comparison
+We first profile training cost, then compare with query-aware
+methods under the adaptation schedules specified below.
+Training cost. A single-thread profile with ANN labels (2 passes
+over 1k training queries; Figure 9) shows score updates take <1%,
+and time goes to rewiring on GIST-1M (66%, pruning over 960-d
+distances) and traversal on T2I-10M (76%). Rewiring is per-node,
+10
+
+
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+Time per training query (ms)
+GIST-1M
+T2I-10M
+9.4 ms
+16.2 ms
+Traversal
+ANN labeling
+Score update
+Rewire
+Figure 9: Time per training query of REWEAVE with ANN
+labels (single thread).
+so it parallelizes: on GIST-1M (20 rewires) it takes 19.6 s on one
+thread and 4.5 s on 8, bounded by the serial edge-apply step (2.8 s);
+a concurrent search thread loses about half as many queries.
+Comparison with query-aware baselines. We select as baselines
+methods that incrementally augment a graph index to adapt to
+an out-of-distribution query distribution or to improve graph
+search quality. NGFix [17] repairs graph defects using query-
+neighborhood information and supports online construction. Our
+implementation applies its repairs in batches. Our NAP baseline
+applies RoarGraph’s Neighborhood-Aware Projection [9] as
+query-neighborhood augmentation of the fixed HNSW3, linking
+each past query’s nearest neighbors. We evaluate this NAP compo-
+nent, not the complete RoarGraph index-construction and search
+pipeline. We evaluate the full CORAL workflow [50], including
+coverage-aware adaptive pruning, fully neighborhood-aware
+projection, and targeted connectivity enhancement, updated
+every 100 queries. Our CleanANN baseline applies CleanANN’s
+guided bridge building [57] to the fixed HNSW after every training
+query, linking nodes at selected depths of that query’s search
+tree under RobustPrune (𝛼=1.2); we evaluate this component,
+not CleanANN’s full dynamic-update index. All start from the
+same HNSW (𝑀HNSW=32; 𝑒𝑓construction=200) and retain the 64-edge
+layer-0 cap. REWEAVE uses 𝑊=64, a 64-entry neighbor buffer
+𝐵𝑛𝑛beside the 64 incumbents (𝐵𝑚𝑖𝑠𝑠is unused under self-labels),
+and 𝐵=100; training uses 1k queries. NGFix, NAP, CORAL
+and REWEAVE use the serving ANN search’s returned IDs as
+self-labels; CleanANN uses no labels. All five share the same
+degree cap. We run this comparison on GIST-1M, T2I-10M and,
+to test scale, T2I-100M. We measure recall@100 against the exact
+top-100 neighbors and single-thread QPS over 𝑒𝑓search ∈[10, 800]
+on a held-out set of 100 test queries.
+REWEAVE has the highest QPS over nearly the whole recall
+range (Figure 10): at recall@100 0.80, 2.1× NGFix on T2I-10M and
+3.3× on GIST-1M. On T2I-100M it leads from recall@100 0.75 to
+∼0.92, with ∼1.3× NGFix’s QPS at 0.80, and meets NGFix at the
+top of its range. CleanANN stays close to frozen HNSW: it mainly
+adapts the graph to an out-of-distribution query distribution,
+which need not raise recall or QPS for a skewed in-distribution
+workload. REWEAVE also adapts online within the degree budget
+without storing queries. In the drift comparison, NGFix, NAP,
+CORAL and CleanANN process new queries in batches during
+shared adaptation windows (§10.8).
+3RoarGraph implementation: https://github.com/matchyc/RoarGraph
+.7
+.8
+.9
+100
+300
+1k
+3k
+QPS
+GIST1M
+.6
+.7
+.8
+.9
+300
+1k
+3k
+T2I10M
+.6
+.7
+.8
+.9
+200
+500
+1k
+T2I100M
+Recall@100
+Frozen HNSW
+REWEAVE
+NGFix
+NAP
+CORAL
+CleanANN
+Figure 10: QPS vs. recall@100 on 100 held-out test queries af-
+ter 1k self-labeled training queries. NAP: RoarGraph projec-
+tion; CORAL: full method; CleanANN: guided bridge build-
+ing.
+10.8
+ESCI Drift Workload
+ESCI [44] product-search queries are labeled with 14 categories
+from Amazon’s browse-node taxonomy [1] (keyword and title
+matching, falling back to the nearest centroid) and embedded
+with an ESCI-tuned MiniLM [36] (unit normalized).
+The stream visits five random categories in order, clothing (A),
+electronics (B), home_kitchen (C), books_media (D) and baby_kids
+(E), 5k queries each, then returns to A for 5k queries (30k total).
+Within each category cluster, we sample with replacement from
+its base-query pool and use the stored embeddings directly. The
+returning A segment samples from the same pool as the first A seg-
+ment, so queries may repeat within and across those segments. We
+run three seeds; within a seed every method sees the same stream.
+Baselines are frozen HNSW, NGFix, NAP, full CORAL and
+CleanANN (§10.7), starting from the same HNSW (inner product,
+𝑀HNSW=16,
+𝑒𝑓construction=200),
+searched
+with
+𝑘=𝑒𝑓search=100.
+REWEAVE, NGFix, NAP and CORAL all use the top-100 IDs
+returned by the serving ANN search as self-labels, CleanANN
+uses no labels, and all share a layer-0 degree cap of 32. Exact
+ground truth is used to evaluate recall. Let ANN𝑘det (𝑞) be the de-
+tector’s 𝑘det=100 returned neighbor IDs. After adaptation, it fixes
+𝑆ref = Ð
+𝑞∈Wref ANN𝑘det (𝑞) from reference window Wref until the
+next adaptation ends. It feeds 𝑧(𝑞) = | ANN𝑘det (𝑞) \ 𝑆ref |/𝑘det to
+ADWIN [5], triggering on increased mean novelty. All methods
+share adaptation windows ending when the mean absolute
+edge-value update over a 100-query window falls below 0.5, after
+which 𝑆ref is refreshed. Baselines update every 100 queries in
+those windows. QPS includes serving search, self-label processing,
+adaptation, detector maintenance and graph synchronization.
+Baselines replay the shared adaptation windows and share
+the same detector overhead (0.047𝑠over 30𝑘queries) for fair
+accounting. Figure 11 shows seed 1 of the three seeds in Table 4.
+QPS uses 500-query windows; recall uses 100-query windows.
+REWEAVE and NGFix lift recall from ∼0.75 to 0.97–1.0 in
+each adaptation window (Figure 11, Table 4); NAP, full CORAL
+and CleanANN achieve stream recall of 0.842, 0.875 and 0.813,
+respectively. REWEAVE needs 34% fewer distance computations
+than frozen HNSW and 29% fewer than NGFix. Table 4 reports
+total adaptation time: 4.6 s for REWEAVE and 5.3 s for NGFix.
+Peak resident memory is within 51 MiB of frozen HNSW for every
+11
+
+
+5k
+10k
+QPS
+A
+B
+C
+D
+E
+A
+0
+5000
+10000
+15000
+20000
+25000
+30000
+# queries
+0.8
+0.9
+1.0
+Recall@100
+Frozen HNSW
+REWEAVE
+NGFix
+NAP
+CORAL
+CleanANN
+Figure 11: ESCI drift stream, A–E then back to A (seed 1). QPS
+includes search, adaptation, detector and sync time. Gray:
+adaptation windows; dashed: category switches.
+Method
+Stream R@100
+Return R@100
+Dist./q
+Adapt. (s)
+ΔMem. (MiB)
+Frozen HNSW
+0.745
+0.741
+1823
+–
+–
+REWEAVE
+0.979
+0.993
+1207
+4.6
++51
+NGFix
+0.970
+0.979
+1700
+5.3
++10
+NAP
+0.842
+0.887
+1452
+1.1
++7.2
+CORAL
+0.875
+0.905
+1285
+1.1
++1.3
+CleanANN
+0.813
+0.802
+1582
+4.2
+≈0
+Table 4: ESCI drift stream with a returning segment (30k
+queries, mean of 3 seeds; std ≤0.014). Stream/Return R@100:
+over all queries / the first 1k returning A queries. Dist./q: dis-
+tance computations per query; Adapt.: total adaptation time;
+ΔMem.: peak memory minus Frozen HNSW’s (≈6.94 GiB).
+Policy
+Stream R@100
+Return R@100
+Adapting
+QPS
+never
+0.745
+0.741
+0%
+5830
+detector
+0.979
+0.993
+19.8%
+1460
+always
+0.987
+0.996
+100%
+195
+oracle
+0.974
+0.980
+5.2%
+2228
+Table 5: REWEAVE adaptation policies on the ESCI drift
+stream; setup and metrics as in Table 4. Adapting: share of
+queries adapted on. QPS includes search, adaptation (with
+label search) and sync time.
+method. All methods keep the degree cap and add at most 0.05%
+edges.
+When to adapt. Table 5 compares four policies: never, always,
+the detector above, and an oracle that starts at each switch and
+stops when the recall gain over the last interval falls below 5% of
+the gain since the switch. The detector adapts on 19.8% of queries
+and comes within 0.008 stream and 0.003 return R@100 of always
+adapting, at 7.5× its QPS (1460 vs. 195). The oracle adapts on 5.2%
+of queries and reaches 1.5× the detector’s QPS (2228), with stream
+recall lower by 0.005 and return recall lower by 0.013 (1.3 per-
+centage points). Compared with frozen HNSW, the detector raises
+stream R@100 from 0.745 to 0.979 and return R@100 from 0.741
+to 0.993, while throughput falls from 5830 to 1460 QPS, about four-
+fold.
+11
+RELATED WORK
+HNSW [35], NSG [14], and disk/memory hybrids such as
+DiskANN [49], SPANN [10] and HM-ANN [45] are the domi-
+nant vector search indices; surveys confirm their lead on the
+recall–latency frontier [34, 51]. All build the graph from the
+data alone and do not revisit it for the query workload. Learned
+indices [11, 13, 23] apply learning to other access patterns.
+Workload-adaptive databases have transformed modern data
+management [8, 20, 43]. These include cost-driven index selection
+and "what-if" optimization utilities [6, 7, 52].
+Methods that tune ANN search behavior [28, 38] modify traver-
+sal path rather than the topology. Several query-aware approaches
+build graphs from sampled queries before deployment [9, 18, 21,
+47]; query-hardness measures [53] guide such construction. OOD-
+DiskANN [21] and CDMG [56] adapt an entire index to an out-of-
+distribution query workload, but build it as a whole rather than
+updating the graph incrementally as queries arrive.
+NGFix [17] guides graph repairs around difficult queries and
+supports online graph construction. CORAL [50] incrementally
+constructs cross-modal graphs via coverage-aware adaptive
+pruning, Fully Neighborhood-Aware Projection (FNAP), and
+targeted connectivity enhancement. REWEAVE learns edge
+values from exact/self feedback to select candidates within a
+fixed degree budget. Streaming indices [31, 48, 54, 55] maintain
+the graph under data insertion and deletion, an orthogonal
+form of dynamism. Filtered ANN [16, 42, 58] adapts to predicate
+constraints, not query workloads.
+Reinforcement learning has been applied at the retrieval appli-
+cation layer (query reformulation [37]); routing on a proximity
+graph has been learned for recommendation [12] and made proba-
+bilistic [32], but these choose among existing edges rather than re-
+allocating the degree budget, and offer no regret guarantee. Mean-
+while, we utilize stochastic approximation [24, 46], finite-armed
+bandits and the UCB1 analysis [2, 25, 26], sleeping bandits, where
+only a changing subset of choices is available at each decision [22],
+and switching/non-stationary bandits [3, 4, 15].
+12
+CONCLUSION
+Under retained evidence, conditional-mean control, and candidate
+coverage, the learned graph stabilizes at a reward-specific
+value-greedy graph. Our regret bounds distinguish routing error
+from graph mismatch. Mixed-feedback estimation further gives
+sufficient bias and margin conditions for agreement with the
+exact-reference graph. Future work will focus on extending
+this framework for disk resident indexes which raise important
+challenges for IO optimizations.
+REFERENCES
+[1] Amazon. 2026. Creators API Documentation. https://affiliate-program.amazon.
+com/creatorsapi/docs/ Accessed 2026.
+[2] Peter Auer, Nicolò Cesa-Bianchi, and Paul Fischer. 2002. Finite-time Analysis
+of the Multiarmed Bandit Problem. Machine Learning 47, 2–3 (2002), 235–256.
+https://doi.org/10.1023/A:1013689704352
+[3] Peter Auer, Pratik Gajane, and Ronald Ortner. 2019. Adaptively Tracking the
+Best Bandit Arm with an Unknown Number of Distribution Changes. In Proc.
+Conf. Learning Theory (COLT) (PMLR), Vol. 99. 138–158.
+[4] Omar Besbes, Yonatan Gur, and Assaf Zeevi. 2014.
+Stochastic Multi-Armed-
+Bandit Problem with Non-stationary Rewards. In Advances in Neural Informa-
+tion Processing Systems (NIPS). 199–207.
+12
+
+
+[5] Albert Bifet and Ricard Gavaldà. 2007.
+Learning from Time-Changing Data
+with Adaptive Windowing. In Proceedings of the 2007 SIAM International Con-
+ference on Data Mining (SDM). SIAM, 443–448.
+https://doi.org/10.1137/1.
+9781611972771.42
+[6] Surajit Chaudhuri and Vivek R. Narasayya. 1997. An Efficient, Cost-Driven In-
+dex Selection Tool for Microsoft SQL Server. In Proceedings of the 23rd Interna-
+tional Conference on Very Large Data Bases (VLDB). Morgan Kaufmann, 146–155.
+[7] Surajit Chaudhuri and Vivek R. Narasayya. 1998. AutoAdmin “What-If” Index
+Analysis Utility. In Proceedings of the 1998 ACM SIGMOD International Confer-
+ence on Management of Data. ACM, 367–378.
+[8] Surajit Chaudhuri and Vivek R. Narasayya. 2007. Self-Tuning Database Systems:
+A Decade of Progress. In Proceedings of the 33rd International Conference on Very
+Large Data Bases (VLDB). VLDB Endowment, 3–14.
+[9] Meng Chen, Kai Zhang, Zhenying He, Yinan Jing, and X. Sean Wang. 2024.
+RoarGraph: A Projected Bipartite Graph for Efficient Cross-Modal Approxi-
+mate Nearest Neighbor Search. Proc. VLDB Endow. 17, 11 (2024), 2735–2749.
+https://doi.org/10.14778/3681954.3681959
+[10] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li,
+Mao Yang, and Jingdong Wang. 2021.
+SPANN: Highly-efficient Billion-scale
+Approximate Nearest Neighbor Search. In Advances in Neural Information Pro-
+cessing Systems (NeurIPS).
+[11] Jialin Ding, Umar Farooq Minhas, Jia Yu, Chi Wang, Jaeyoung Do, Yinan Li,
+Hantian Zhang, Badrish Chandramouli, Johannes Gehrke, Donald Kossmann,
+David Lomet, and Tim Kraska. 2020. ALEX: An Updatable Adaptive Learned
+Index. In Proc. ACM SIGMOD Int. Conf. Management of Data (SIGMOD). 969–
+984. https://doi.org/10.1145/3318464.3389711
+[12] Chao Feng, Defu Lian, Xiting Wang, Zheng Liu, Xing Xie, and Enhong Chen.
+2022. Reinforcement Routing on Proximity Graph for Efficient Recommenda-
+tion. ACM Trans. Inf. Syst. 41, 1 (2022), 1–27. https://doi.org/10.1145/3512767
+[13] Paolo Ferragina and Giorgio Vinciguerra. 2020.
+The PGM-index: A Fully-
+Dynamic Compressed Learned Index with Provable Worst-Case Bounds. Proc.
+VLDB Endow. 13, 8 (2020), 1162–1175. https://doi.org/10.14778/3389133.3389135
+[14] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019.
+Fast Approxi-
+mate Nearest Neighbor Search With The Navigating Spreading-out Graph. Proc.
+VLDB Endow. 12, 5 (2019), 461–474. https://doi.org/10.14778/3303753.3303754
+[15] Aurélien Garivier and Eric Moulines. 2011.
+On Upper-Confidence Bound
+Policies for Switching Bandit Problems. In Algorithmic Learning Theory (ALT)
+(LNCS), Vol. 6925. Springer, 174–188. https://doi.org/10.1007/978-3-642-24412-
+4_16
+[16] Siddharth Gollapudi, Neel Karia, Varun Sivashankar, Ravishankar Krish-
+naswamy, Nikit Begwani, Swapnil Raz, Yiyong Lin, Yin Zhang, Neelam Ma-
+hapatro, Premkumar Srinivasan, Amit Singh, and Harsha Vardhan Simhadri.
+2023. Filtered-DiskANN: Graph Algorithms for Approximate Nearest Neigh-
+bor Search with Filters. In Proc. ACM Web Conference (WWW). https://doi.org/
+10.1145/3543507.3583552
+[17] Zhiyuan Hua, Qiji Mo, Zebin Yao, Lixiao Cui, Xiaoguang Liu, Gang Wang, Zijing
+Wei, Xinyu Liu, Tianxiao Tang, Shaozhi Liu, and Lin Qu. 2026. Dynamically
+Detect and Fix Hardness for Efficient Approximate Nearest Neighbor Search.
+In Proceedings of the ACM SIGMOD International Conference on Management of
+Data (SIGMOD). Code: https://github.com/yuhuifishash/NGFix.
+[18] Qiang Huang, Jianlin Feng, Yikai Zhang, Qiong Fang, and Wilfred Ng. 2015.
+Query-Aware Locality-Sensitive Hashing for Approximate Nearest Neighbor
+Search. Proceedings of the VLDB Endowment 9, 1 (2015), 1–12.
+[19] Stratos Idreos, Martin L. Kersten, and Stefan Manegold. 2007. Database Crack-
+ing. In Proc. Biennial Conf. Innovative Data Systems Research (CIDR). 68–78.
+[20] Stratos Idreos, Stefan Manegold, Harumi A. Kuno, and Goetz Graefe. 2011. Merg-
+ing What’s Cracked, Cracking What’s Merged: Adaptive Indexing in Main-
+Memory Column-Stores. Proceedings of the VLDB Endowment 4, 9 (2011), 585–
+597.
+[21] Shikhar Jaiswal, Ravishankar Krishnaswamy, Ankit Garg, Harsha Vardhan
+Simhadri, and Sheshansh Agrawal. 2022. OOD-DiskANN: Efficient and Scalable
+Graph ANNS for Out-of-Distribution Queries. arXiv preprint arXiv:2211.12850
+(2022).
+[22] Robert Kleinberg, Alexandru Niculescu-Mizil, and Yogeshwer Sharma. 2010. Re-
+gret Bounds for Sleeping Experts and Bandits. Machine Learning 80, 2–3 (2010),
+245–272. https://doi.org/10.1007/s10994-010-5178-7
+[23] Tim Kraska, Alex Beutel, Ed H. Chi, Jeffrey Dean, and Neoklis Polyzotis. 2018.
+The Case for Learned Index Structures. In Proc. ACM SIGMOD Int. Conf. Man-
+agement of Data (SIGMOD). 489–504. https://doi.org/10.1145/3183713.3196909
+[24] Harold J. Kushner and G. George Yin. 2003. Stochastic Approximation and Re-
+cursive Algorithms and Applications (2nd ed.). Springer.
+[25] Tze Leung Lai and Herbert Robbins. 1985. Asymptotically Efficient Adaptive
+Allocation Rules. Advances in Applied Mathematics 6, 1 (1985), 4–22.
+https:
+//doi.org/10.1016/0196-8858(85)90002-8
+[26] Tor Lattimore and Csaba Szepesvári. 2020. Bandit Algorithms. Cambridge Uni-
+versity Press.
+[27] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir
+Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen tau Yih, Tim Rock-
+täschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-Augmented Gener-
+ation for Knowledge-Intensive NLP Tasks. In Advances in Neural Information
+Processing Systems (NeurIPS).
+[28] Conglong Li, Minjia Zhang, David G. Andersen, and Yuxiong He. 2020. Im-
+proving Approximate Nearest Neighbor Search through Learned Adaptive Early
+Termination. In Proceedings of the 2020 ACM SIGMOD International Conference
+on Management of Data. ACM, 2539–2554.
+https://doi.org/10.1145/3318464.
+3380600
+[29] Ke Li, Leong Hou U, and Shuo Shang. 2025. App2Exa: Accelerating Exact kNN
+Search via Dynamic Cache-Guided Approximation. In Proc. Int. Joint Conf. Ar-
+tificial Intelligence (IJCAI). 3045–3053. https://doi.org/10.24963/ijcai.2025/339
+[30] Minghao Li, Raghav Mittal, Sanjivni Rana, Suraj Shetiya, Gautam Das, and Nick
+Koudas. 2026. HNSW with Accuracy Guarantees Using Graph Spanners. arXiv
+preprint arXiv:2607.02338 (2026).
+[31] Dawei Liu, Bolong Zheng, Ziyang Yue, Fuhao Ruan, Xiaofang Zhou, and Chris-
+tian S. Jensen. 2025. Wolverine: Highly Efficient Monotonic Search Path Repair
+for Graph-Based ANN Index Updates. Proceedings of the VLDB Endowment 18,
+7 (2025), 2268–2280. https://doi.org/10.14778/3734839.3734860
+[32] Kejing Lu, Chuan Xiao, and Yoshiharu Ishikawa. 2024. Probabilistic Routing for
+Graph-Based Approximate Nearest Neighbor Search. In Proc. Int. Conf. Machine
+Learning (ICML) (PMLR), Vol. 235. 33177–33195.
+[33] Wei Lu, Yanyan Shen, Su Chen, and Beng Chin Ooi. 2012. Efficient Processing
+of k Nearest Neighbor Joins Using MapReduce. In Proc. VLDB Endow., Vol. 5.
+1016–1027. https://doi.org/10.14778/2336664.2336674
+[34] Le Ma, Ran Zhang, Yikun Han, Shirui Yu, Zaitian Wang, Zhiyuan Ning,
+Jinghan Zhang, Ping Xu, Pengjiang Li, Ziyue Qiao, Wei Ju, Chong Chen,
+Dongjie Wang, Kunpeng Liu, Pengyang Wang, Pengfei Wang, Yanjie Fu,
+Chunjiang Liu, Yuanchun Zhou, and Chang-Tien Lu. 2026.
+A Comprehen-
+sive Survey on Vector Database: Storage and Retrieval Technique, Challenge.
+arXiv:2310.11703 [cs.DB] https://arxiv.org/abs/2310.11703
+[35] Yury A. Malkov and Dmitry A. Yashunin. 2020.
+Efficient and Robust Ap-
+proximate Nearest Neighbor Search Using Hierarchical Navigable Small World
+Graphs. IEEE Transactions on Pattern Analysis and Machine Intelligence 42, 4
+(2020), 824–836. https://doi.org/10.1109/TPAMI.2018.2889473
+[36] Metarank. 2023. esci-MiniLM-L6-v2.
+https://huggingface.co/metarank/esci-
+MiniLM-L6-v2 Hugging Face model.
+[37] Rodrigo Nogueira and Kyunghyun Cho. 2017. Task-Oriented Query Reformula-
+tion with Reinforcement Learning. In Proc. Conf. Empirical Methods in Natural
+Language Processing (EMNLP). 574–583. https://doi.org/10.18653/v1/D17-1061
+[38] Yutaro Oguri and Yusuke Matsui. 2024. Theoretical and Empirical Analysis of
+Adaptive Entry Point Selection for Graph-based Approximate Nearest Neighbor
+Search. arXiv preprint arXiv:2402.04713 (2024).
+[39] Matthaios Olma, Manos Karpathiotakis, Ioannis Alagiannis, Manos Athanas-
+soulis, and Anastasia Ailamaki. 2017. Slalom: Coasting Through Raw Data via
+Adaptive Partitioning and Indexing. Proceedings of the VLDB Endowment 10, 10
+(2017), 1106–1117. https://doi.org/10.14778/3115404.3115415
+[40] James Jie Pan, Jianguo Wang, and Guoliang Li. 2024. Survey of Vector Database
+Management Systems. The VLDB Journal 33, 5 (2024), 1591–1615. https://doi.
+org/10.1007/s00778-024-00864-x
+[41] Andrew Pavlo, Gustavo Angulo, Joy Arulraj, Haibin Lin, Jiexi Lin, Lin Ma,
+Prashanth Menon, Todd C. Mowry, Matthew Perron, Ian Quah, Siddharth San-
+turkar, Anthony Tomasic, Skye Toor, Dana Van Aken, Ziqi Wang, Yingjun Wu,
+Ran Xian, and Tieying Zhang. 2017. Self-Driving Database Management Sys-
+tems. In Proc. Biennial Conf. Innovative Data Systems Research (CIDR).
+[42] Zhencan Peng, Miao Qiao, Wenchao Zhou, Feifei Li, and Dong Deng. 2025. Dy-
+namic Range-Filtering Approximate Nearest Neighbor Search. Proceedings of the
+VLDB Endowment 18, 10 (2025), 3256–3268.
+https://doi.org/10.14778/3748191.
+3748193
+[43] Eleni Petraki, Stratos Idreos, and Stefan Manegold. 2015. Holistic Indexing in
+Main-Memory Column-Stores. In Proceedings of the 2015 ACM SIGMOD Interna-
+tional Conference on Management of Data. 1153–1166. https://doi.org/10.1145/
+2723372.2723719
+[44] Chandan K. Reddy et al. 2022. Shopping Queries Dataset: A Large-Scale ESCI
+Benchmark for Improving Product Search. In SIGIR.
+[45] Jie Ren, Minjia Zhang, and Dong Li. 2020. HM-ANN: Efficient Billion-Point
+Nearest Neighbor Search on Heterogeneous Memory. In Advances in Neural In-
+formation Processing Systems (NeurIPS).
+[46] Herbert Robbins and Sutton Monro. 1951. A Stochastic Approximation Method.
+The Annals of Mathematical Statistics 22, 3 (1951), 400–407. https://doi.org/10.
+1214/aoms/1177729586
+[47] Jiancheng Ruan, Tingyang Chen, Renchi Yang, Xiangyu Ke, and Yunjun Gao.
+2025. Empowering Graph-based Approximate Nearest Neighbor Search with
+Adaptive Awareness Capabilities. In Proc. ACM SIGKDD Conf. Knowledge Dis-
+covery and Data Mining (KDD). 2444–2454.
+https://doi.org/10.1145/3711896.
+3736930
+13
+
+
+[48] Aditi Singh, Suhas Jayaram Subramanya, Ravishankar Krishnaswamy, and Har-
+sha Vardhan Simhadri. 2021. FreshDiskANN: A Fast and Accurate Graph-Based
+ANN Index for Streaming Similarity Search. arXiv preprint arXiv:2105.09613
+(2021).
+[49] Suhas Jayaram Subramanya, Fnu Devvrit, Harsha Vardhan Simhadri, Ravis-
+hankar Krishnaswamy, and Rohan Kadekodi. 2019. DiskANN: Fast Accurate
+Billion-point Nearest Neighbor Search on a Single Node. In Advances in Neural
+Information Processing Systems (NeurIPS).
+[50] Shixin Wan, Guoyu Hu, Yifan Wu, Ke Chen, and Lidan Shou. 2026. CORAL:
+Cross-modal Vector Retrieval via Incremental Graph Construction at Scale.
+arXiv preprint arXiv:2610.11230 (2026).
+[51] Mengzhao Wang, Xiaoliang Xu, Qiang Yue, and Yuxiang Wang. 2021. A Com-
+prehensive Survey and Experimental Comparison of Graph-Based Approxi-
+mate Nearest Neighbor Search. Proc. VLDB Endow. 14, 11 (2021), 1964–1978.
+https://doi.org/10.14778/3476249.3476255
+[52] Xiaoying Wang, Wentao Wu, Vivek R. Narasayya, and Surajit Chaudhuri. 2026.
+Evaluating the Practical Effectiveness of LLM-Driven Index Tuning with Mi-
+crosoft Database Tuning Advisor. Proceedings of the VLDB Endowment (Aug.
+2026). VLDB 2026.
+[53] Zeyu Wang, Qitong Wang, Xiaoxing Cheng, Peng Wang, Themis Palpanas, and
+Wei Wang. 2024.
+Steiner-Hardness: A Query Hardness Measure for Graph-
+Based ANN Indexes.
+Proc. VLDB Endow. 17, 13 (2024), 4668–4682.
+https:
+//doi.org/10.14778/3704965.3704974
+[54] Haike Xu, Magdalen Dobson Manohar, Philip A. Bernstein, Badrish Chan-
+dramouli, Richard Wen, and Harsha Vardhan Simhadri. 2025. In-Place Updates
+of a Graph Index for Streaming Approximate Nearest Neighbor Search. arXiv
+preprint arXiv:2502.13826 (2025).
+[55] Song Yu, Shengyuan Lin, Shufeng Gong, Yongqing Xie, Ruicheng Liu, Yijie Zhou,
+Ji Sun, Yanfeng Zhang, Guoliang Li, and Ge Yu. 2025. A Topology-Aware Local-
+ized Update Strategy for Graph-Based ANN Index. Proceedings of the VLDB
+Endowment 19, 3 (2025), 495–508. https://doi.org/10.14778/3778092.3778108
+[56] Qiang Yue, Mengzhao Wang, Xiaoliang Xu, Cheng Long, Yuxiang Wang, and
+Jiahui Wang. 2026. Efficient and Robust Out-Of-Distribution Vector Similarity
+Search with Cross-Distribution Monotonic Graph. Proceedings of the ACM on
+Management of Data 4, 1 (2026), 1–29. https://doi.org/10.1145/3786643
+[57] Ziyu Zhang, Yuanhao Wei, Joshua Engels, and Julian Shun. 2026. CleanANN:
+Efficient Full Dynamism in Graph-based Approximate Nearest Neighbor Search.
+In Proceedings of the 38th ACM Symposium on Parallelism in Algorithms and
+Architectures (SPAA). https://doi.org/10.1145/3816782.3819219
+[58] Chaoji Zuo and Dong Deng. 2023.
+ARKGraph: All-Range Approximate K-
+Nearest-Neighbor Graph. Proceedings of the VLDB Endowment 16, 10 (2023),
+2645–2658. https://doi.org/10.14778/3603581.3603601
+A
+OBSERVATION MODEL, ESTIMATION, AND
+STABILIZATION
+We use the definitions and assumptions of §8. In particular, 𝐾
+counts fixed node–candidate pairs over all possible decision
+nodes, not the size of one instantaneous pool. In particular,
+𝐾≤|𝑉◦|𝐶holds only when every entire universe has size at most
+𝐶, rather than merely each current pool. All probabilities include
+query and navigation randomness. The comparison graph and
+policy are (𝐺†, 𝜋†) for the selected credit rule. Rewards used for
+estimation are denoted 𝑌𝑡(𝑒), the Step 2 observations specified in
+§5.4; collected endpoint reward is 𝑅𝑡. The proofs below do not
+equate either quantity with returned-set recall.
+A.1
+A common concentration argument
+Fix an edge 𝑒and suppress it in this subsection. Let 𝐼𝑡indicate its
+evaluation on query 𝑡, and let 𝜇𝑡= E[𝑌𝑡| F𝑡−1, 𝐼𝑡= 1] whenever
+that event has positive probability. Give 𝜇𝑡any value in [0, 1] oth-
+erwise. This conditional expectation is a function of the preceding
+history; it integrates over the current query and the selection event.
+The indicator 𝐼𝑡need not be independent of the reward. Since the
+reward lies in [0, 1], conditional Hoeffding’s lemma, first given 𝐼𝑡
+and then given F𝑡−1, gives for every real 𝑧
+E
+h
+𝑒𝑧𝐼𝑡(𝑌𝑡−𝜇𝑡)−𝑧2𝐼𝑡/8 | F𝑡−1
+i
+≤1.
+(7)
+On 𝐼𝑡= 0 the integrand is 1; on 𝐼𝑡= 1 its conditional expectation
+is at most 1. Consequently
+𝑀𝑡(𝑧) = exp
+ 
+𝑧
+∑︁
+𝑠≤𝑡
+𝐼𝑠(𝑌𝑠−𝜇𝑠) −𝑧2𝑁𝑡/8
+!
+is a nonnegative supermartingale starting at 1.
+At the𝑚th evaluation, the usual exponential bound (or optional
+stopping of 𝑀𝑡) yields
+Pr
+ 
+1
+𝑚
+𝑚
+∑︁
+𝑗=1
+(𝑌(𝑗) −𝜇(𝑗))
+ ≥𝑥, 𝑚evaluations occur
+!
+≤2𝑒−2𝑚𝑥2.
+(8)
+The qualification avoids conditioning the probability on a random
+sampling event. When evaluations are infinite almost surely it can
+be omitted. We will also use the following bound for random sam-
+ple counts:
+Pr
+
+∃𝑡: 𝑁𝑡≥𝑚, |b
+𝑄𝑡−𝜃𝑟| > 𝜅+ 𝑥
+
+≤2𝑒−2𝑚𝑥2.
+(9)
+Indeed, Assumption 1 bounds the average conditional mean within
+𝜅of 𝜃𝑟. On a positive deviation in (9), use 𝑧= 4𝑥: then 𝑀𝑡(𝑧) ≥
+𝑒2𝑁𝑡𝑥2 ≥𝑒2𝑚𝑥2. The maximal inequality for a nonnegative super-
+martingale bounds this event by 𝑒−2𝑚𝑥2. Apply the same argument
+with 𝑧= −4𝑥and add. This proof permits adaptive graph changes,
+stopping, and observation times; it does not substitute a random
+count into a fixed-count inequality. Under Assumption 1 and the
+set margin of Assumption 2, with retained running means, fix a
+failure probability 𝛿∈(0, 1) and put
+𝑚set =
+ 8
+𝑔2
+set
+log 2𝐾
+𝛿
+
+.
+(10)
+Taking 𝑥= 𝑔set/4 and 𝑚= 𝑚set in (9), then unioning over 𝐾pairs,
+gives the following simultaneous guarantee: with probability at
+least 1 −𝛿, every pair’s score is within 𝜅+ 𝑔set/4 of its reference
+whenever its count is at least 𝑚set. On this event, a batch with that
+many observations of every compared pair selects𝐺† whenever all
+target edges are available. The event is unconditional; it does not
+condition on the counts reaching the threshold. This is an observa-
+tion requirement per pair; the queries needed to obtain those ob-
+servations depend on coverage. Halving the effective margin mul-
+tiplies the sufficient evidence by roughly four. The unknown ref-
+erence margins and conditional-mean tolerance prevent treating
+this bound as an empirical stopping certificate.
+For completeness, if Pr(𝐼𝑡= 1 | F𝑡−1) ≥𝑝𝑡for deterministic
+𝑝𝑡∈[0, 1], then, with 𝐴𝑡= Í
+𝑠≤𝑡𝑝𝑠,
+Pr(𝑁𝑡< 𝐴𝑡/2) ≤𝑒−𝐴𝑡/8.
+(11)
+To see this, for𝑧> 0 condition successively on the history to obtain
+E𝑒−𝑧𝑁𝑡≤exp(−(1 −𝑒−𝑧)𝐴𝑡). Markov’s inequality with 𝑧= log 2
+proves a stronger exponent than −𝐴𝑡/8. No independence between
+successive evaluation events is needed.
+A.2
+Evaluation coverage
+Lemma A.1 (Evaluation coverage). An edge is evaluated in-
+finitely often almost surely on the event Í
+𝑡Pr(𝐼𝑡(𝑒) = 1 | F𝑡−1) =
+∞. For single-path 𝜖-greedy, the evaluation probability is at least
+14
+
+
+𝜖𝑡𝛽𝑡(𝑒)/𝑀, where 𝛽𝑡(𝑒) is the conditional probability that the cur-
+rent out-edge leads from a visited source node to a destination node
+closer to the query, before the episode cap is reached.
+Proof. The conditional Borel–Cantelli lemma gives
+{𝐼𝑡(𝑒) = 1 infinitely often}
+=
+(∑︁
+𝑡
+Pr(𝐼𝑡(𝑒) = 1 | F𝑡−1) = ∞
+)
+a.s.
+For an improving current out-edge at a visited source node before
+the cap, the single-path exploration coin is independent of the pre-
+ceding route. A uniform permutation puts that edge first among
+the improving edges with probability at least 1/𝑀. Integrating over
+the event defining 𝛽𝑡(𝑒) gives the stated lower bound. It only ap-
+plies while the edge is a current out-edge. Neither absolute con-
+tinuity of the workload nor positive visitation at each finite time
+supplies a uniform lower bound on 𝛽𝑡(𝑒).
+The distinction matters even on a fixed graph. Let the entry be
+10, with chain 10 →9 →8 →7 and an additional exit to 0 at each
+chain node, and draw 𝑞uniformly near 0, with 𝑘= 1. Endpoint ex-
+ploitation always prefers the exit, including initially by distance
+tie-breaking. Reaching 7 requires three exploratory choices and
+has probability (𝜖𝑡/2)3 = Θ(𝑡−3/2). Its sum is finite, so 7 is vis-
+ited only finitely often almost surely. This is why coverage is an
+explicit condition, rather than a consequence of a finite graph or a
+decaying exploration schedule.
+□
+A.3
+Value estimation
+Theorem A.1 (Value estimation). Under Assumption 1, an in-
+finitely evaluated edge whose running-mean evidence is retained sat-
+isfies lim sup𝑡|b
+𝑄𝑡(𝑒) −𝜃𝑟(𝑒)| ≤𝜅almost surely. For fixed 𝑚≥1 and
+𝛿∈(0, 1), the probability that its 𝑚th observation occurs and the re-
+sulting error exceeds𝜅+
+√︁
+log(2/𝛿)/(2𝑚) is at most𝛿. The statements
+apply to endpoint and recall credit with their respective conditional
+means; exact convergence is guaranteed when 𝜅= 0.
+Proof. The update in (4) uses step size 1/𝑚on the𝑚th recorded
+observation. Induction gives b
+𝑄= 𝑚−1 Í
+𝑗≤𝑚𝑌(𝑗); the first update
+removes the unobserved prior. Taking 𝑥=
+√︁
+log(2/𝛿)/(2𝑚) in (8)
+proves the finite-sample assertion. For each rational 𝑥> 0, the
+tail is summable in 𝑚, so Borel–Cantelli gives 𝑚−1 Í
+𝑗≤𝑚(𝑌(𝑗) −
+𝜇(𝑗)) →0 almost surely. The average of the conditional means
+stays within 𝜅of 𝜃𝑟. On an infinitely evaluated edge, 𝑁𝑡→∞,
+proving the limsup bound. No assertion of independence of the
+recorded rewards is needed, even when 𝜅= 0. The argument ap-
+plies equally to bounded endpoint and recall credit when their own
+conditional means satisfy the assumption.
+□
+A.4
+Graph stabilization
+Proposition A.1 (Graph stabilization). Under Assumption 1,
+the set margin of Assumption 2, and Assumption 3, batched top-𝑀
+rewiring eventually selects 𝐺† permanently, almost surely. If all tar-
+get edges are available at every batch and every compared edge has
+conditional evaluation probability at least 𝜈> 0 on every query,
+then the expected total number of queries on a different graph is
+𝑂(𝐵+ 𝐾/(𝜈𝑔2
+set)).
+Proof. There are 𝐾< ∞compared pairs. Under Assumption 3,
+Theorem A.1 implies that, almost surely, after a finite time all their
+errors are smaller than 𝜅+𝑔set/4. If 𝑎belongs to the reference top-
+𝑀set at a node and 𝑏does not, then
+b
+𝑄(𝑎) −b
+𝑄(𝑏) > Δset −2𝜅−𝑔set/2 = 𝑔set/2 > 0.
+At the next sufficiently late batch all target edges are available, so
+the selection is exactly the reference set. Incumbents remain in the
+pool, and subsequent estimates preserve this ordering. If the uni-
+verse has at most 𝑀entries, availability alone ensures all of them
+are retained. This proves stabilization without a graph-dependent
+best-response map.
+For the quantitative assertion, assume every target is available
+at every batch and every compared pair has evaluation probabil-
+ity at least 𝜈. At query 𝑡, (11) gives Pr(𝑁𝑡(𝑒) < 𝜈𝑡/2) ≤𝑒−𝜈𝑡/8.
+Combining this with (9), with 𝑥= 𝑔set/4, gives
+Pr |b
+𝑄𝑡(𝑒) −𝜃𝑟(𝑒)| > 𝜅+ 𝑔set/4 ≤𝑒−𝜈𝑡/8 + 2𝑒−𝜈𝑡𝑔2
+set/16.
+A union bound over 𝐾edges bounds an incorrect rewire at 𝑡=
+𝑗𝐵. Charge the first 𝐵queries directly, and at most 𝐵subsequent
+queries to each incorrect batch. Since Í
+𝑗≥1 𝑒−𝑎𝑗𝐵≤1/(𝑎𝐵),
+𝐷∞≤𝐵+ 8𝐾
+𝜈+ 32𝐾
+𝜈𝑔2
+set
+= 𝑂
+
+𝐵+
+𝐾
+𝜈𝑔2
+set
+
+.
+(12)
+The formula uses 𝑔set ≤1, as may be assumed for rewards in [0, 1].
+Universes without a selection boundary need no estimation test.
+This bounds the expected number of incorrect-graph queries di-
+rectly; it does not infer an expected stabilization time from almost-
+sure convergence. The hypotheses can be supplied by universe-
+scoring with uniform visitation to source nodes or by additional
+probes, whose observation and computational costs are part of the
+feedback regime. Traversal-only sampling of a permanently fixed
+graph cannot satisfy infinite coverage of excluded edges.
+□
+Remark A.1 (Reverse proposals). Proposition A.1 also applies
+when selecting (𝑢, 𝑣) proposes (𝑣,𝑢), provided the fixed finite
+universes include every possible directed proposal and the
+recipient uses its own score, pool cap, and top-𝑀selection. The
+proof depends on accurate ordering and target availability, so
+this proposal source leaves the argument unchanged under the
+same mean, margin, retained-evidence, and coverage conditions.
+Reverse proposals do not themselves supply coverage or a faster
+rate. Each configuration uses its own references and comparison
+graph if these change with the proposal process. Forcing recip-
+rocal edges after selection can displace reference edges and is
+outside the guarantee.
+B
+STATIONARY ROUTING REGRET
+All stationary routing bounds assume Assumption 1 and the navi-
+gation margin of Assumption 2, with complete running-mean ev-
+idence retained. The set margin is used when applying (12). We
+retain the graph-mismatch term throughout.
+B.1
+Coupling and the regret decomposition
+Run the comparator on the learner’s current query, with the same
+entry rule and episode cap, and write 𝑅†
+𝑡= 𝜌(𝑞𝑡;𝐺†, 𝜋†). Its fixed
+15
+
+
+graph and policy give E[𝑅†
+𝑡] = 𝑅† regardless of the learner’s his-
+tory. On 𝐺𝑡= 𝐺†, the accepted paths agree until a first different
+choice. If no difference occurs, collected endpoint rewards are iden-
+tical. Otherwise their difference in absolute value is at most 𝐻.
+Thus
+E
+∑︁
+𝑡≤𝑇
+(𝑅†
+𝑡−𝑅𝑡)
+ ≤
+∑︁
+𝑡≤𝑇
+E|𝑅†
+𝑡−𝑅𝑡| ≤𝐻𝐷𝑇+ 𝐻E[𝐽𝑇],
+which proves (5). A first difference on the correct graph is a choice
+of a strictly lower-reference improving edge, by the navigation
+margin. Charge only this first difference in each query. This avoids
+assuming a local immediate-reward gap also bounds downstream
+loss. It also counts every node where either policy can choose
+an outgoing edge, not just an intersection of visitation supports.
+Equality of graphs here and in 𝐷𝑇concerns their out-lists on 𝑉◦;
+rows that can never be used by either policy are irrelevant.
+B.2
+Full-information routing
+Theorem B.1 (Full information). With endpoint universe-
+scoring at every visited source node and greedy navigation,
+|Reg(𝑇)| ≤𝐻𝐷𝑇+ 𝑂(𝐾/𝑔2
+nav). Under the quantitative coverage
+condition of Proposition A.1, this is bounded independently of 𝑇by
+𝑂(𝐵+ 𝐾/(𝜈𝑔2
+set) + 𝐾/𝑔2
+nav).
+Proof. Fix a node 𝑢. Under universe-scoring, each 𝑒= (𝑢, 𝑣) in
+its universe has exactly𝑚observations after𝑚visits to𝑢, irrespec-
+tive of whether the edge was installed. If all its scores are within
+𝜅+𝑔nav/4 of their references, greedy ranking chooses the reference-
+best improving edge whenever the graph is correct. The initial visit
+is charged directly. For 𝑚≥1, before the (𝑚+ 1)st visit, the prob-
+ability of a score error large enough to permit a different choice is
+at most 2|U(𝑢)|𝑒−𝑚𝑔2nav/8 by (8). The bound is unconditional and
+includes the event that this visit occurs. Each 𝑚is charged at most
+once at this node. Summing over visits and nodes gives
+E[𝐽𝑇] ≤
+∑︁
+𝑢
+2|U(𝑢)|
+1 −𝑒−𝑔2nav/8 ≤2𝐾(1 + 8/𝑔2
+nav).
+Use (5) for the first assertion and (12) for the second. Scoring only
+current out-edges does not give equal sample counts for all com-
+pared candidates and is not the feedback regime of this theorem.
+□
+B.3
+𝜖-greedy routing
+Theorem B.2 (𝜖-greedy). Let 𝜖𝑡= min{1,𝑐𝜖/√𝑡}. Suppose for
+constants 𝑎,𝐴,𝑑> 0 and every reference out-edge 𝑒, Pr(𝑁𝑡−1(𝑒) <
+𝑎√𝑡) ≤𝐴𝑒−𝑑√𝑡for all sufficiently large 𝑡. Then |Reg(𝑇)| ≤𝐻𝐷𝑇+
+2𝑐𝜖𝐻2√
+𝑇+ 𝑂(1), where the constant depends on 𝐾,𝑎,𝐴,𝑑,𝑔nav and
+the initial prefix. On a fixed benchmark graph, a uniform positive
+lower bound on 𝛽𝑡(𝑒) in Lemma A.1 suffices for this sample-count
+condition.
+Proof. Each query has at most 𝐻navigation choices. The prob-
+ability that any exploration coin fires is at most 𝐻𝜖𝑡; charging 𝐻
+for the resulting trajectory difference yields
+𝐻2 ∑︁
+𝑡≤𝑇
+𝜖𝑡≤2𝑐𝜖𝐻2√
+𝑇.
+On the correct graph with no exploration, a different choice re-
+quires an inaccurate score of a reference out-edge. For each such
+edge, the sample-count hypothesis and (9) bound its probability by
+𝐴𝑒−𝑑√𝑡+ 2𝑒−𝑎𝑔2nav
+√𝑡/8,
+apart from the stated finite initial prefix. Both series are summable:
+for 𝑐> 0, Í
+𝑡≥1 𝑒−𝑐√𝑡≤1 + 2/𝑐2. Union over at most 𝐾reference
+out-edges and charge 𝐻per different query. This gives the finite
+identification term in the theorem. In particular, the proof does not
+bound exploitation mistakes by samples of the suboptimal edge
+alone; both compared scores must be accurate.
+On a fixed 𝐺†, if 𝛽𝑡(𝑒) ≥𝛽> 0 for each reference edge,
+Lemma A.1 implies a deterministic cumulative lower bound
+Í
+𝑠<𝑡Pr(𝐼𝑠(𝑒) = 1 | F𝑠−1) ≥𝑐0
+√𝑡for all sufficiently large 𝑡, where
+𝑐0 > 0 depends on 𝛽,𝑐𝜖, 𝑀. Applying (11) with these deterministic
+per-query lower bounds verifies the sample-count hypothesis.
+Uniform eligibility is an additional geometric/visitation condition,
+not implied by the workload having a density.
+□
+B.4
+Proof of Theorem 1
+For 𝑡≥2, consider the event that every observed edge estimate
+satisfies
+|b
+𝑄𝑡−1(𝑒) −𝜃𝑟(𝑒)| ≤𝜅+
+√︁
+2 log𝑡/𝑁𝑡−1(𝑒).
+(13)
+For fixed observation count𝑚≤𝑡−1, (8) bounds its failure for one
+edge by 2𝑡−4. Union over counts and edges gives failure probability
+at most 2𝐾𝑡−3. Hence the expected number of queries on which
+(13) fails is 𝑂(𝐾).
+On a correct-graph query satisfying (13), let 𝑣be the first
+wrongly selected destination node and 𝑤the reference-best
+improving neighbor of the common source node. If 𝑤has positive
+count, its index is at least 𝜃𝑟(𝑢,𝑤) −𝜅; at zero count its index is
+infinite. If
+𝑁𝑡−1(𝑢, 𝑣) ≥32 log(𝑇∨2)/𝑔2
+nav,
+then its index is at most 𝜃𝑟(𝑢, 𝑣) + 𝜅+ 𝑔nav/2, strictly smaller than
+the lower bound for 𝑤. Therefore every charged wrong choice on
+a good query has count below this threshold. Each such choice
+increments that edge’s count, so at most the threshold rounded up
+can be charged to a given edge over the entire horizon. Counts
+acquired on other queries only help. Summing over 𝐾edges and
+adding the 𝑂(𝐾) bad-confidence queries proves
+E[𝐽𝑇] = 𝑂(𝐾log(𝑇∨2)/𝑔2
+nav).
+Apply (5). The comparison is with the best currently improving
+edge on the reference graph. A gap from the maximum over the
+entire pool would not justify the index comparison. The argument
+is an explicit adaptation of the UCB counting method [2, 22]; it
+does not assume the rewards or their availability are independent
+across queries.
+B.5
+Average collected reward
+Corollary B.1 (Average collected reward). If 𝐷𝑇= 𝑜(𝑇)
+and the relevant routing theorem applies, then 𝑇−1 Í
+𝑡≤𝑇E[𝑅𝑡] →
+𝑅†. Its absolute error is bounded by the corresponding theorem di-
+vided by 𝑇. For 𝐷𝑇= 𝑂(1) the rates are 𝑂(1/𝑇), 𝑂(𝑇−1/2), and
+𝑂(log𝑇/𝑇).
+16
+
+
+Proof. By definition,
+𝑇−1 ∑︁
+𝑡≤𝑇
+E[𝑅𝑡] −𝑅†
+ = |Reg(𝑇)|/𝑇.
+The absolute bounds above and 𝐷𝑇= 𝑜(𝑇) imply convergence; in-
+serting 𝐷𝑇= 𝑂(1) gives the three displayed rates. No sign assump-
+tion about regret is needed. Without a rate for 𝐷𝑇, an almost-sure
+eventual graph match implies 𝐷𝑇/𝑇→0 by bounded convergence
+and Cesàro averaging, but does not supply the faster rates.
+□
+C
+DISCOUNTED ESTIMATION AND
+DYNAMIC REGRET
+Let Υ𝑇count distribution changes through query 𝑇, and 𝑖(𝑡)
+denote query 𝑡’s phase. Phase 𝑖has references 𝜃𝑟,𝑖, comparator
+(𝐺†
+𝑖, 𝜋†
+𝑖), and reward 𝑅†
+𝑖. Define Reg𝑑(𝑇) = Í𝑇
+𝑡=1(𝑅†
+𝑖(𝑡) −E[𝑅𝑡])
+and 𝐷𝑑
+𝑇= Í𝑇
+𝑡=1 Pr(𝐺𝑡≠𝐺†
+𝑖(𝑡)). Discounted statistics are retained
+across rewires and evictions.
+For endpoint or recall rewards in [0, 1], use the discounted esti-
+mates and observation counts of §5.4 to define the index
+𝑈𝜆
+𝑡(𝑒) = b
+𝑄𝜆
+𝑡−1(𝑒) +
+√︃
+8ℓ𝑇/𝑁𝜆
+𝑡−1(𝑒),
+ℓ𝑇= log(2𝐾𝑇3),
+(14)
+with index +∞at zero count. Here 𝑇≥2 is the planned query
+horizon. The theorem below specifies the range of the forgetting
+factor used by the analysis.
+Theorem C.1 (Discounted UCB). Suppose Assumption 1 holds
+within each phase, with common 𝜅and finite universes, and the nav-
+igation margin of Assumption 2 gives a uniform 𝑔nav > 0. For 𝑇≥2,
+use 𝜆= 1 −𝜂, 1/𝑇≤𝜂≤1/2, and the discounted-UCB index (14).
+Then
+|Reg𝑑(𝑇)| ≤𝐻𝐷𝑑
+𝑇+ 𝑂
+𝐾(𝑇𝜂+ 1)ℓ𝑇
+𝑔2nav
++ Υ𝑇log(8/(𝑔nav𝜂))
+𝜂
+
+.
+With a supplied change budget, choosing𝜂= min{1/2,
+√︁
+(Υ𝑇+ 1)/𝑇}
+gives a e
+𝑂(
+√︁
+(Υ𝑇+ 1)𝑇) routing term for fixed 𝐾,𝑔nav. Here e
+𝑂sup-
+presses logarithmic factors. No minimum phase length is required. If
+there are no changes, ordinary UCB retains the stronger stationary
+logarithmic bound.
+We prove Theorem C.1 using the zero initialization of §5.4.
+Write 𝜂= 1 −𝜆, 𝑔= 𝑔nav, and ℓ= ℓ𝑇. Each edge records at most
+one observation per query, so 𝑁𝜆
+𝑡−1(𝑒) ≤1/𝜂≤𝑇.
+C.1
+Weighted concentration
+Fix a deterministic query index 𝑡and an edge 𝑒. For 𝑠< 𝑡put
+𝑤𝑠= 𝜆𝑡−1−𝑠and
+𝑍=
+∑︁
+𝑠<𝑡
+𝑤𝑠𝐼𝑠(𝑒)(𝑌𝑠(𝑒) −𝜇𝑠(𝑒)),
+𝑁=
+∑︁
+𝑠<𝑡
+𝑤𝑠𝐼𝑠(𝑒),
+𝑉=
+∑︁
+𝑠<𝑡
+𝑤2
+𝑠𝐼𝑠(𝑒) ≤𝑁.
+Applying (7) with deterministic multiplier 𝑤𝑠at query 𝑠yields
+E exp(𝑧𝑍−𝑧2𝑉/8) ≤1. Peel 1 ≤𝑁≤𝑇into bins 𝑣≤𝑁< 2𝑣,
+𝑣= 1, 2, 4, . . .. On a bin, the event 𝑍≥
+√
+8ℓ𝑁implies 𝑍≥𝑥=
+√
+8ℓ𝑣
+and 𝑉< 2𝑣. Markov’s inequality with 𝑧= 2𝑥/𝑣bounds its proba-
+bility by exp(−𝑧𝑥+𝑧2(2𝑣)/8) = 𝑒−8ℓ. The same holds for −𝑍. Union
+over bins, 𝐾pairs, and at most 𝑇query indices shows that, except
+on an event of probability at most 𝑇−2,
+
+b
+𝑄𝜆
+𝑡−1(𝑒) −
+Í
+𝑠<𝑡𝑤𝑠𝐼𝑠(𝑒)𝜇𝑠(𝑒)
+𝑁𝜆
+𝑡−1(𝑒)
+ ≤
+√︃
+8ℓ/𝑁𝜆
+𝑡−1(𝑒)
+(15)
+simultaneously for all 𝑡,𝑒with 𝑁𝜆
+𝑡−1(𝑒) ≥1. Indeed the union
+bound is 2𝐾𝑇(1 + ⌈log2𝑇⌉)(2𝐾𝑇3)−8 ≤𝑇−2 for 𝐾≥1,𝑇≥2. This
+proof accommodates evaluation events depending on the query
+and on previous graph changes. It controls a self-normalized
+weighted sum; an unweighted fixed-count inequality would not
+suffice.
+C.2
+Old evidence and low-count choices
+If the current phase starts at query 𝑏, the total pre-phase weight
+before serving query 𝑡is at most 𝜆𝑡−𝑏/𝜂. Let
+𝜏𝜂=
+log(8/(𝑔𝜂))
+𝜂
+
+.
+At most Υ𝑇𝜏𝜂queries lie within this many queries of a breakpoint.
+On any other query the pre-phase weight is at most 𝑔/8, because
+𝜆𝑚≤𝑒−𝜂𝑚. There is no pre-phase weight in the initial phase. If
+𝑁𝜆
+𝑡−1(𝑒) ≥1, the conditional-mean average in (15) is therefore
+within𝜅+𝑔/8 of the current phase’s reference: current-phase obser-
+vations contribute bias at most 𝜅, and old observations contribute
+at most their weight divided by 𝑁. We do not claim this for arbi-
+trarily small counts.
+On such a nontransient, correct-graph query satisfying (15), let
+𝑒be the first wrongly selected edge and 𝑒★the best available edge.
+If 𝑒★has discounted count at least 1, then 𝑈𝜆
+𝑡(𝑒★) ≥𝜃𝑟,𝑖(𝑒★) −
+𝜅−𝑔/8. If its count is below 1, its radius exceeds 1 (or its index is
+infinite), so this lower bound still holds. A selected edge with
+𝑁𝜆
+𝑡−1(𝑒) ≥ℎ:= 128ℓ/𝑔2
+has radius at most 𝑔/4 and index at most 𝜃𝑟,𝑖(𝑒) + 𝜅+ 5𝑔/8. The
+reference gap is at least 2𝜅+𝑔, so this is strictly less than 𝑒★’s index.
+Thus every charged mistake on a nontransient good query selects
+an edge with count below ℎ.
+There is a deterministic bound on these selections. Partition the
+horizon into blocks of length 𝐿𝜂= ⌈1/𝜂⌉. Since 𝜆≥1/2, 𝜆𝐿𝜂≥1/8.
+If an edge has already been evaluated 𝑚times within the current
+block, its discounted count is at least 𝑚/8. Consequently there are
+at most ⌈8ℎ⌉+ 1 selections with count below ℎfor that edge in the
+block. There are at most 𝑇𝜂+ 1 blocks, giving
+#{selected edges with 𝑁𝜆
+𝑡−1 < ℎ} ≤𝐾(⌈8ℎ⌉+ 1)(𝑇𝜂+ 1).
+(16)
+This bound allows sleeping edges, multiple observations on differ-
+ent edges within an episode, and changing graphs. It uses neither
+persistent availability nor permanent identification of an optimal
+arm.
+C.3
+Completion of Theorem C.1
+Apply the coupling of Appendix B.1 against each phase’s graph
+and policy. Graph-mismatch queries cost at most 𝐻𝐷𝑑
+𝑇. Transient
+queries cost at most 𝐻Υ𝑇𝜏𝜂. The complement of the event (15)
+contributes at most 𝐻𝑇·𝑇−2 = 𝐻/𝑇in expectation. All remaining
+first differences are charged to (16). Substitution gives exactly
+the bound in Theorem C.1, suppressing fixed 𝐻in its 𝑂(·) terms.
+17
+
+
+For 𝜂= min{1/2,
+√︁
+(Υ𝑇+ 1)/𝑇}, the terms 𝑇𝜂+ 1 and (Υ𝑇+ 1)/𝜂
+are 𝑂(
+√︁
+(Υ𝑇+ 1)𝑇); the remaining factors are logarithmic for
+fixed positive gaps and fixed 𝐾. Transients from short phases can
+overlap; their union is still bounded by Υ𝑇𝜏𝜂, so no minimum
+phase length is needed.
+This argument follows the discounting principle of [15], but
+proves the required concentration and counting steps for the
+present conditional-mean observation model. In particular, it
+does not apply a running-mean stabilization proposition to an
+estimator with fixed forgetting, nor infer accuracy of a ratio from
+small old numerator and denominator masses.
+C.4
+A sufficient bound on dynamic graph
+mismatch
+The graph term can also be controlled under stronger feedback.
+Suppose every phase’s target edges are available at each batch in
+that phase, every compared pair is evaluated with conditional prob-
+ability at least𝜈> 0 per query, and the set margins have a common
+effective lower bound 𝑔set > 0. Suppose further that
+𝜂≤
+𝜈𝑔2
+set
+8192ℓ𝑇
+.
+(17)
+Then, with 𝜏set = ⌈log(8/(𝑔set𝜂))/𝜂⌉,
+𝐷𝑑
+𝑇= 𝑂 (Υ𝑇+ 1)(𝜏set + 𝐵) + 1.
+(18)
+These are sufficient conditions, not consequences of LRU candidate
+buffers.
+To prove the claim, take the most recent 𝐿𝜂= ⌈1/𝜂⌉queries
+before each decision. Outside an initial prefix of length 𝜏set and
+an equally long prefix after each change, these queries are in the
+current phase. Equation (11), applied to this deterministic interval,
+shows that they contain at least𝜈𝐿𝜂/2 observations of each pair ex-
+cept with probability 𝑒−𝜈𝐿𝜂/8. Their discount weights are at least
+1/8, so 𝑁𝜆≥𝜈𝐿𝜂/16. Condition (17) makes this at least 512ℓ𝑇/𝑔2
+set,
+and the radius in (15) is at most 𝑔set/8. Old evidence contributes
+at most 𝑔set/8 by the preceding transient calculation. Hence ev-
+ery score is within 𝜅+ 𝑔set/4 of its current reference. Union over
+all pairs and all deterministic time indices bounds the count fail-
+ures by 𝐾𝑇𝑒−𝜈𝐿𝜂/8 ≤𝑇−2 under (17); the weighted concentration
+failures are already at most 𝑇−2. Outside these events every subse-
+quent batch selects the correct graph. A phase therefore incurs at
+most 𝜏set + 𝐵mismatched queries, and failures contribute at most
+2/𝑇in expectation. The argument also applies to scores at a batch
+after the current query is recorded by shifting the deterministic
+index by one. This proves (18).
+For fixed 𝐾,𝜈,𝑔set,𝑔nav, 𝐵, the tuning of Theorem C.1 gives the
+full e
+𝑂(
+√︁
+(Υ𝑇+ 1)𝑇) dynamic-regret bound whenever (17) holds.
+The condition explicitly states the memory needed relative to
+sampling frequency and the rewiring margin.
+D
+BEAM EXTENSION
+The analyzed beam exposes all improving out-edges of the fron-
+tier whose destinations are unvisited. It scans these proposals in
+score order, accepting an edge when its destination is new and its
+source has contributed fewer than𝑏accepted edges at that frontier
+step. The scan stops at𝑊acceptances for the next frontier or 𝐻ac-
+ceptances in the query. Thus 𝑏limits accepted edges per source,
+whereas the experimental variant in §4.3 limits proposals before
+pooling. For 𝜖-greedy, with probability 𝜖𝑡the first slot samples uni-
+formly from all eligible proposals before the scan; UCB scans in-
+dices directly. This lets another edge from a source compete when
+a preferred destination was accepted from a different source. With
+𝑊= 1, the rule reduces to single-path navigation.
+For this rule, let𝐺†
+𝑊select the top min{𝑀, |U(𝑢)|} candidates at
+each 𝑢by beam references 𝜃𝑟,𝑊, and 𝜋†
+𝑊scan feasible proposals in
+that order. Put 𝑅†
+𝑊= 𝑅(𝐺†
+𝑊, 𝜋†
+𝑊), Reg𝑊(𝑇) = 𝑇𝑅†
+𝑊−Í𝑇
+𝑡=1 E[𝑅𝑡],
+and 𝐷𝑇,𝑊
+= Í𝑇
+𝑡=1 Pr(𝐺𝑡
+≠𝐺†
+𝑊), with 𝐺𝑡, 𝑅𝑡from the beam
+learner and graph equality on 𝑉◦. The formal extension uses the
+full-proposal feasible scan, total episode cap 𝐻, and retained
+running-mean evidence. The observation model and concentra-
+tion arguments are unchanged, since each pair is recorded at
+most once per query. No ordering of beam visitation relative to
+single-path visitation is assumed.
+D.1
+Reserved-slot coverage
+Lemma D.1 (Reserved-slot coverage). Conditional on an edge
+being an improving, unvisited out-edge of a frontier node, before
+the episode cap, its reserved-slot acceptance probability is at least
+𝜖𝑡/(𝑊𝑀). Infinite evaluation follows when the resulting conditional
+probabilities have divergent sum, as in Lemma A.1.
+Proof. Before any proposal is accepted at a frontier step, there
+are at most 𝑊𝑀improving proposals with unvisited destination
+nodes. If the reserved-slot coin fires, each has probability at least
+1/(𝑊𝑀) of being chosen first. It is then feasible because no source
+node has yet used its branch quota and no destination node has
+yet been accepted at that step. Thus, conditional on eligibility, the
+acceptance probability is at least 𝜖𝑡/(𝑊𝑀). Integrating over eli-
+gibility and applying conditional Borel–Cantelli proves the claim
+whenever the cumulative conditional probabilities diverge. Sam-
+pling only from a locally truncated proposal list would not estab-
+lish this bound for an edge omitted from that list.
+□
+D.2
+UCB beam navigation
+Theorem D.1 (UCB beam). Assume the beam rewards satisfy As-
+sumption 1. For some 2𝜅< Δ𝑊≤1, every pair of distinct proposals
+that can compete in its feasible scan has reference separation at least
+Δ𝑊. With 𝑔𝑊= Δ𝑊−2𝜅, |Reg𝑊(𝑇)| ≤𝐻𝐷𝑇,𝑊+ 𝑂(𝐾log(𝑇∨
+2)/𝑔2
+𝑊). This bounds erroneous selections, not total acceptances of
+every edge below its source node’s maximum.
+Proof. Couple the two beams on the same query. On the
+correct graph, their frontiers and accepted edges coincide up to
+the first difference. At its frontier step, the accepted prefix also
+coincides. The remaining feasible proposals therefore coincide:
+the same destination nodes are unvisited, the same quotas at
+each source node remain, and the same number of frontier
+slots is free. Let 𝑒★be the highest-reference feasible proposal
+and 𝑒the first different proposal selected by UCB. The feasible
+scan ensures 𝑈𝑡(𝑒) ≥𝑈𝑡(𝑒★), while the beam margin ensures
+𝜃𝑟,𝑊(𝑒★) −𝜃𝑟,𝑊(𝑒) ≥Δ𝑊.
+18
+
+
+The confidence event (13) and the threshold argument of Ap-
+pendix B.4, with 𝑔𝑊in place of 𝑔nav, show that either a confidence
+event fails or 𝑁𝑡−1(𝑒) < 32 log(𝑇∨2)/𝑔2
+𝑊. The selected proposal is
+accepted and observed, so each charge increments its count. There
+are at most 𝑂(𝐾log(𝑇∨2)/𝑔2
+𝑊) charged first differences in ex-
+pectation. Collected rewards differ by at most 𝐻after a difference,
+giving the theorem’s absolute regret bound and graph-mismatch
+term.
+The proof compares whole feasible scans. It does not call ev-
+ery edge below its source node’s largest mean suboptimal: sev-
+eral edges from one source node can correctly occupy different
+acceptance slots. Nor does it assume a cardinality-only multiple-
+play problem when quotas at source nodes and duplicate destina-
+tion nodes impose additional constraints. The same first-difference
+comparison, together with (15) and (16), proves the discounted ex-
+tension claimed in Remark D.1.
+□
+Remark D.1.
+Estimation and stabilization apply to the beam
+under their stated observation and availability conditions. The
+discounted-UCB proof also applies to this feasible scan using 𝑔𝑊
+and the same total episode cap 𝐻. Width alone does not establish
+coverage, a navigation gap, or a beam-versus-path advantage;
+these are not consequences of multiplying constants by 𝑊.
+E
+SELF-SUPERVISED AND MIXED FEEDBACK
+E.1
+Aggregate endpoint-label bias
+Use the examined-node set Xeval(𝑞) defined in §3, and assume at
+least 𝑘nodes are examined. Self-labels are the returned set 𝐴(𝑞) =
+top𝑘Xeval(𝑞), using consistent distance ties. For a fixed graph 𝐺
+and policy 𝜋, let e𝑅(𝐺, 𝜋) be the expected total endpoint reward
+using these self-labels, and let 𝑅(𝐺, 𝜋) use exact labels on the same
+search. Write 𝑔(𝐺, 𝜋) = E[1−Recall𝑘(𝑞)] for the expected fraction
+of true neighbors missed.
+Lemma E.1 (Self-feedback bias). For the fixed graph, policy,
+and common search above, |e𝑅(𝐺, 𝜋) −𝑅(𝐺, 𝜋)| ≤𝑘𝑔(𝐺, 𝜋).
+Proof. Let 𝐴= 𝐴(𝑞), 𝐵= 𝑁𝑘(𝑞), and 𝑆be the set of accepted
+destination nodes. Since destination nodes do not repeat, e𝜌(𝑞) =
+|𝑆∩𝐴| and 𝜌(𝑞) = |𝑆∩𝐵|. Their difference is |𝑆∩(𝐴\𝐵)|−|𝑆∩(𝐵\𝐴)|.
+Both counts lie in [0,𝑘−|𝐴∩𝐵|], because |𝐴| = |𝐵| = 𝑘. Thus
+|e𝜌(𝑞) −𝜌(𝑞)| ≤𝑘−|𝐴∩𝐵| = 𝑘(1 −Recall𝑘(𝑞)).
+Taking expectations and applying |E𝑍| ≤E|𝑍| proves the bound. If
+the two feedback sources change the current trajectory, this com-
+parison does not apply. The bound is aggregate; conditioning on a
+rare edge evaluation can magnify bias, so it does not imply a bound
+on |𝜃self (𝑒) −𝜃ex(𝑒)|.
+□
+E.2
+Mixed-feedback estimation and graph
+recovery
+Theorem E.1 (Mixed-feedback estimation and graph
+recovery). Let 𝑟ex and 𝑟self be the rewards the two feedback modes
+would assign to an evaluated edge on the same completed search,
+both bounded by 𝑅max and nonnegative. Select exact feedback
+with probability 𝑝, independently of the history and current-query
+randomness, while keeping the search and evaluated edges fixed.
+For each mode 𝑗∈{ex, self}, suppose the mean reward, conditional
+on the prior history and evaluation of edge 𝑒, stays within 𝜅𝑗of a
+fixed reference value 𝜃𝑗(𝑒), the mode-specific counterpart of 𝜃𝑟(𝑒)
+in Assumption 1. Retain accumulated reward sums and observation
+counts across rewiring and eviction, and use running-mean scores.
+Define the mixed reference and tolerance
+𝜃𝑝= 𝑝𝜃ex + (1 −𝑝)𝜃self,
+𝜅𝑝= 𝑝𝜅ex + (1 −𝑝)𝜅self.
+Every infinitely evaluated edge satisfies lim sup𝑡|b
+𝑄𝑡(𝑒) −𝜃𝑝(𝑒)| ≤
+𝜅𝑝almost surely. Over the fixed finite comparison universes of §2.4,
+suppose every compared edge is evaluated infinitely often, the top-𝑀
+edges by 𝜃𝑝are available at every sufficiently late batch, and their
+set margin Δ𝑝,set > 2𝜅𝑝. This margin is the minimum gap between
+selected and excluded reference values over nodes with a selection
+boundary. Then the graph stabilizes almost surely at 𝐺†
+𝑝, the graph
+selecting those edges.
+For exact-reference recovery, let 𝑏label = sup𝑒|𝜃self (𝑒) −𝜃ex(𝑒)|,
+and let Δex,set be the corresponding set margin under 𝜃ex. Under the
+same estimation hypotheses, suppose every compared edge is evalu-
+ated infinitely often and the top-𝑀edges by𝜃ex are available at every
+sufficiently late batch. If (6) holds, the graph stabilizes almost surely
+at the exact-reference graph selecting these edges. These replace the
+mixed-reference margin and availability requirements.
+Expected additional feedback cost per query is 𝑝𝑐ex + (1 −𝑝)𝑐self,
+where 𝑐ex and 𝑐self are the respective expected feedback-mode costs,
+including any label search.
+Proof. Fix an evaluated pair and let 𝑍𝑡be the exact-feedback
+flag. By the stated independence and common evaluation event,
+𝑌𝑡= 𝑍𝑡𝑟ex,𝑡+ (1 −𝑍𝑡)𝑟self,𝑡,
+E[𝑌𝑡| F𝑡−1, 𝐼𝑡= 1] = 𝑝𝜇ex,𝑡+ (1 −𝑝)𝜇self,𝑡.
+The latter mean lies within 𝜅𝑝of 𝜃𝑝. Scaling the common concen-
+tration argument by 𝑅max proves the almost-sure estimation claim.
+Let 𝜏𝑚(𝑒) be the 𝑚th observation time and b
+𝑄[𝑚](𝑒) its score. For
+fixed 𝑚≥1 and 𝛿∈(0, 1), (8) gives
+Pr
+ 
+𝜏𝑚(𝑒) < ∞,
+|b
+𝑄[𝑚](𝑒) −𝜃𝑝(𝑒)| > 𝜅𝑝+ 𝑅max
+√︁
+log(2/𝛿)/(2𝑚)
+!
+≤𝛿.
+The stabilization argument of Appendix A.4 applies with
+𝜃𝑝,𝜅𝑝, Δ𝑝,set in place of the corresponding single-source quantities.
+No independence between different edges of the same query is
+required. Evidence must not be reset at each re-entry.
+For agreement with the exact reference, the triangle inequality
+gives
+lim sup
+𝑡
+|b
+𝑄𝑡(𝑒) −𝜃ex(𝑒)| ≤𝜅𝑝+ (1 −𝑝)𝑏label.
+Condition (6) separates every exact-reference selected edge
+from every excluded edge in empirical score, once estimates are
+sufficiently accurate. Infinite evaluation of every compared pair
+makes these inequalities eventual simultaneously. Availability
+of the exact-reference edges at every sufficiently late batch then
+gives the claimed graph. Comparison with a separate 𝑝
+= 1
+learner requires common references and that learner’s own
+hypotheses; different proposal histories can otherwise induce
+different conditional values.
+19
+
+
+Finally, conditioning on the feedback branch gives expected cost
+𝑝𝑐ex + (1−𝑝)𝑐self by total expectation. This includes any additional
+teacher search. A 𝑝-thinning of exact flags does not by itself give a
+graph-learning time proportional to 1/𝑝, because candidate avail-
+ability, evaluation frequencies, and the remaining margin also mat-
+ter.
+□
+The theorem covers endpoint and recall rewards (§5) and
+bounded MC returns (§5.3), under its stated hypotheses; endpoint
+MC(0.8) permits 𝑅max = 5.
+20
