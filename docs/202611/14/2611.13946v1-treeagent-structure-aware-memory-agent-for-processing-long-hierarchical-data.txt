@@ -1,0 +1,1723 @@
+TreeAgent: Structure-Aware Memory Agent for Processing
+Long Hierarchical Data
+Wei Gu1, 3
+Weiwei Qi1
+Jiajun Tang1
+Tianhang Zheng1, 2, †
+Bo Chen3
+Zhibo Zhang3
+Jinfei Liu1, 2
+Kui Ren1, 2
+1The State Key Laboratory of Blockchain and Data Security, Zhejiang University
+2Hangzhou High-Tech Zone (Binjiang) Institute of Blockchain and Data Security
+3Alibaba Group
+†Corresponding author: zthzheng@zju.edu.cn
+Abstract
+Practical Web applications increasingly require agents to interpret
+long conversations or documents. As the data length goes beyond
+the context windows of base large language models (LLMs), recent
+research proposes memory agents to process the input segment
+by segment and retain information from previous segments within
+a bounded memory. However, existing memory agents typically
+divide the input into flat token segments without preserving its
+structure or recording its hierarchy, leading to three limitations
+when processing structured data such as API responses or HTML
+documents. First, fixed-length token segmentation can separate
+the fields belonging to the same structured record, breaking their
+inherent relationships. Second, individual segments lack hierar-
+chical information, making their structural context and positions
+unclear. Third, successive memory updates may discard the de-
+tails from earlier necessary sibling records for reasoning on later
+segments. To address these limitations, we propose TreeAgent, a
+structure-aware agent that uses the input hierarchy to guide both
+segment-wise context processing and access to past information.
+Specifically, TreeAgent constructs segments from complete subtrees
+and groups of adjacent sibling subtrees to preserve local structural
+relationships. We provide theoretical guarantees on segment counts
+to guide token budget selection toward matching the segment count
+of fixed-length segmentation. We further attach structural paths to
+the segments for the agent to identify their ancestors and hierar-
+chical positions. We also introduce residual memory links from the
+segments of low-level children to the segments of high-level par-
+ents, enabling direct information flows beyond successive memory
+updates. We evaluate TreeAgent with four representative memory
+agents on eight retrieval and aggregation tasks. The inputs are
+derived from real-world application data in JSON, HTML, YAML,
+and JavaScript and range from 8K to 1M tokens. TreeAgent im-
+proves the average score across the four datasets for all four agents,
+with 3.61% performance gain on average. Our code is available at
+https://github.com/ZJU-LLM-Safety/TreeAgent.
+Keywords
+Memory agents, hierarchical data, structure-aware processing, long-
+context reasoning
+1
+Introduction
+Large language model (LLM) agents have made significant advances
+across diverse domains in recent years [18, 26, 41, 47, 49]. As these
+agents process increasingly long inputs, the input length can exceed
+the context windows of their underlying models [32]. To address
+this over-length issue, recent research has introduced memory
+agents, which process the input segment by segment and continu-
+ally update a bounded memory to retain relevant information for
+subsequent reasoning. Memory agents have demonstrated strong
+performance on question-answering tasks involving documents far
+longer than the LLMs’ native context windows [42, 48].
+However, when processing long structured data such as API
+responses and HTML documents in Web applications[5, 52], exist-
+ing memory agents exhibit the following three limitations. First,
+existing methods typically split the input into fixed-length token
+segments, which can separate related fields within the same record,
+so associations already represented in the original structure may
+need to be reconstructed across segments. Second, existing mem-
+ory agents process each segment without an explicit indication of
+its position in the input hierarchy. Without this information, the
+agent may form incorrect associations between segments, leading to
+flawed subsequent reasoning [5, 17]. Third, successive updates and
+compression of bounded memory may discard information needed
+for subsequent reasoning across segments and records [36, 42].
+To address these limitations, we propose TreeAgent, a structure-
+aware agent that uses the input hierarchy to guide both segment-
+wise processing and access to historic information. TreeAgent pre-
+serves complete subtrees or groups of adjacent sibling subtrees
+within a segment whenever the token budget permits, making their
+local structural relationships available within a single memory up-
+date. Starting from the entire input tree, TreeAgent recursively
+applies this segmentation strategy to its subtrees whenever the
+current tree exceeds the token budget. Grouping adjacent sibling
+subtrees reduces the number of small segments that would other-
+wise be emitted separately. However, preserving subtree bound-
+aries can still leave unused capacity, producing more segments than
+fixed-length segmentation at the same token budget. We analyze
+the optimality of greedy sibling grouping and establish the budget
+needed to compensate for unused capacity within a sibling sequence.
+Based on the theoretical guarantees derived from this analysis, we
+adjust the token budget to keep the segment count close to that
+of fixed-length segmentation. Each segment is augmented with a
+structural path that explicitly links its local content to the enclosing
+structure, enabling the agent to interpret the current input within
+its hierarchical context for reasoning across related segments.
+TreeAgent further introduces residual memory links to bring
+fine-grained information from historic memory into reasoning at
+higher levels. During segment-wise processing, TreeAgent saves the
+memory after each segment and uses the parent–child relationships
+in the original input to link historic memories associated with
+1
+arXiv:2611.13946v1  [cs.AI]  10 Nov 2026
+
+
+Gu et al.
+previously processed children to the final segment of their parent.
+When processing this segment, the agent retrieves information
+relevant to the question from the linked memory states and uses it
+together with the current segment and its structural path to update
+memory. In this way, relevant details retained in historic memory
+can bypass intermediate memory updates and be integrated directly
+during processing at higher levels of the hierarchy, supporting
+comparison and aggregation across records.
+We evaluate TreeAgent with four representative memory agents:
+MemAgent, InfMem, MemReread, and ReMemR1. The evaluation
+uses structured inputs derived from real-world application data
+in JSON, HTML, YAML, and JavaScript. Input lengths range from
+8K to 1M tokens. Across these formats, we assess eight retrieval
+and aggregation tasks that require locating values and reasoning
+about their structural relationships. The tasks include retrieving
+multiple fields from one record, retrieving fields across records,
+counting matching records, identifying frequent values, and find-
+ing numerical extrema. For each agent, we compare TreeAgent
+with its corresponding fixed-length segmentation baseline while
+keeping the model parameters and existing memory update and
+answering procedures unchanged. The baselines retain each agent’s
+native retrieval, rereading, or callback operations when available,
+allowing the comparisons to assess the benefit of TreeAgent within
+the existing workflows. TreeAgent improves each agent’s average
+score across the four datasets, with a mean gain of 3.61% over the
+corresponding baselines. Sequential ablations show that structural
+paths and residual memory provide further improvements beyond
+structural segmentation alone.
+Our contributions are summarized as follows:
+(1) We propose TreeAgent, a structure-aware agent that par-
+titions long hierarchical inputs into subtree sections and
+equips each section with an explicit structural path, preserv-
+ing local structural relationships and hierarchical context
+throughout recurrent memory processing.
+(2) We introduce residual links in TreeAgent to directly trans-
+mit historic evidence relevant to the question from low-level
+child subtrees to high-level parents, mitigating information
+loss across successive memory updates.
+(3) We evaluate TreeAgent on retrieval and aggregation tasks
+over long structured inputs derived from real-world appli-
+cation data. Comparative experiments with four representa-
+tive memory agents and component ablations demonstrate
+its effectiveness across diverse structured formats.
+2
+Preliminaries
+Recurrent Memory Agents. Given an input 𝑥and a query 𝑞, an
+ordered sequence of segments 𝑠1, . . . ,𝑠𝑇is constructed from the
+input, where 𝑇denotes the number of segments. Segmentation de-
+termines which parts of the input are read together at each step. The
+agent processes these segments sequentially and updates its mem-
+ory after each one. At step 𝑡, the agent receives an observation 𝑜𝑡,
+comprising the current segment 𝑠𝑡and any additional context, and
+combines it with the query 𝑞and previous memory𝑚𝑡−1 to produce
+the updated memory state 𝑚𝑡. Let A denote the agent workflow
+and 𝜃the model parameters. The memory update is expressed as
+𝑚𝑡= UA,𝜃(𝑞,𝑚𝑡−1,𝑜𝑡).
+(1)
+Different memory agents instantiate this interface through their
+respective workflows, with recurrent memory constrained by the
+corresponding agent’s memory budget [36, 42].
+Fixed-length Segmentation. Given the agent’s tokenizer 𝜏and a
+segment content budget𝐶, fixed-length segmentation partitions the
+token sequence 𝜏(𝑥) into consecutive segments in input order. Each
+segment contains 𝐶tokens, except possibly the last. We refer to the
+baseline using this segmentation strategy as Flat. The number of
+segments it produces for input 𝑥at budget 𝐶is
+𝑇flat(𝑥,𝐶) =
+ |𝜏(𝑥)|
+𝐶
+
+,
+(2)
+where |𝜏(𝑥)| denotes the number of input tokens. The budget 𝐶
+applies only to segment content, excluding the query, memory, and
+additional context. For a given agent, 𝜏is fixed and its dependence
+is omitted from the segment count notation.
+Let 𝑐A
+𝑡
+denote any additional context supplied by the existing
+agent workflow at step 𝑡, with𝑐A
+𝑡
+= ∅when none is supplied. Under
+Flat, the current segment and this additional context together form
+the observation supplied to the agent’s memory update:
+𝑜Flat
+𝑡
+= (𝑠𝑡,𝑐A
+𝑡).
+(3)
+3
+TreeAgent: A Structure-Aware Agent for
+Reasoning over Hierarchical Data
+TreeAgent uses the input hierarchy to organize both the content of
+each observation and access to historic evidence (Figure 1). Struc-
+tural sectioning keeps fitting subtrees intact and groups adjacent
+siblings to control the section count. Structural paths identify where
+each section belongs, while residual memory links make memo-
+ries associated with processed children available when the final
+segment of their parent is processed. Together, these components
+supply local content, its hierarchical context, and relevant historic
+evidence to the agent’s existing memory update procedure.
+3.1
+Sectioning Hierarchical Inputs
+TreeAgent favors complete subtrees when constructing sections
+so that fields within each retained subtree are available together
+during a single memory update.
+Tree Representation. Let T (𝑥) = (𝑉, 𝐸,𝑟) denote the tree rep-
+resenting the hierarchical structure of 𝑥, where 𝑟is the root, 𝐸
+specifies parent–child relations, and siblings retain their original
+document order. For each node 𝑣∈𝑉, tok(𝑣) denotes the token
+count of the complete serialization of the subtree rooted at 𝑣. For
+API responses represented in JSON, objects and arrays form in-
+ternal nodes, and scalar fields form leaves. The same abstraction
+applies to HTML, YAML, and static JavaScript when their parsers
+expose corresponding hierarchical relations.
+A section may contain a single subtree rooted at a node 𝑣, which
+we call a subtree section. To better utilize the section budget, adjacent
+sibling subtrees may also be grouped into a sibling section.
+Section Construction. Algorithm 1 constructs an ordered section
+list S𝐵(𝑥) by retaining subtrees that fit within budget 𝐵. For a
+larger internal node, it groups adjacent child subtrees in document
+order while their combined serialization fits within 𝐵, recursively
+2
+
+
+TreeAgent: Structure-Aware Memory Agent
+1
+Part I: Structure-aware Sectioning
+Hierarchical input
+Tree-guided sections
+Content + tree location
+{} JSON
+</>HTML
+≡YAML
+JS JavaScript
+Illustrative API: hotels[0]
+hotel_id: H17
+rooms: [{price: 120, ...},
+... {price: 155.1, ...}, ...]
+Flat
+ID: H17
+price: 155.1
+Cheapest room for 2 guests in H17?
+root
+hotels
+hotel[0]
+hotel[1]
+hotel_id
+rooms
+hotel_id
+rooms
+Keep fitting
+subtrees
+Group adjacent
+siblings
+Split oversized
+subtrees
+Candidate budgets
+price: 120, capacity: 1
+$.hotels[0].rooms[0]
+price: 180, capacity: 2
+$.hotels[0].rooms[1]
+price: 155.1, capacity: 2
+$.hotels[0].rooms[3]
+…
+2
+Part II: Structure-aware Observation Construction
+Residual memory links
+Current section
+Query-guided retrieval
+Observation
+Same-parent siblings
+rooms
+parent still open
+room[0]
+room[1]
+…
+room[3]
+price: 155.1
+capacity: 2
+...
+$.hotels[0].rooms[3]
+Cumulative snapshots at subtree completion
+Top-k
+Lexical overlap
+Matching spans
+price / capacity
+room[0]: 120 / 1
+room[1]: 180 / 2
+room[2]: 200 / 4
+Section content
+Tree location
+Retrieved spans
+Host context
+3
+Part III: Recurrent Memory Integration
+Original memory update
+Save after update
+After all sections
+For completed paths
++
++
+Query
+Previous memory
+Observation
+Memory agent
+Updated memory
+Reuse for later siblings
+Next section
+Answer generation
+Record links
+Past evidence
+Sibling comparison
+Compatible
+MemAgent
+InfMem
+MemReread
+ReMemR1
+Optional GRPO (InfMem-4B)
+Figure 1: Overview of TreeAgent, showing how an observation is constructed and used in a segment-wise memory update.
+Each observation 𝑜𝑡combines the current structural section, its path, and spans relevant to the query retrieved from historic
+memory states through residual memory links. The memory-agent block represents the agent’s original workflow, including
+its internal actions and stopping behavior. After processing each section, TreeAgent saves the updated memory. Parent–child
+relations determine which saved states are linked and accessed by later updates.
+partitioning any child that exceeds the budget. Oversized leaves are
+split into consecutive text spans within 𝐵at boundaries permitted
+by the input format, except those whose syntax must remain intact.
+The indivisible leaves are retained even when they exceed 𝐵.
+Structure Preservation. Let 𝐾𝐵(𝑣) be the number of sections to
+which the source content of subtree 𝑣is assigned. Algorithm 1
+preserves document order and satisfies
+tok(𝑣) ≤𝐵
+=⇒
+𝐾𝐵(𝑣) = 1.
+(4)
+If an ancestor of 𝑣is retained, its section contains all of 𝑣. Otherwise,
+recursion reaches 𝑣and retains it either alone or within a sibling
+group. Thus, fields within a subtree that fits the budget appear
+together in one observation, making their local relations available
+within a single memory update.
+Grouping Adjacent Siblings. Emitting each fitting subtree sep-
+arately can leave much of the section budget unused. Grouping
+adjacent siblings uses this capacity while retaining their common
+parent context and document order. For the section-count analy-
+sis, consider an ordered tree whose leaf units have positive integer
+lengths at most 𝐵. Let𝑤(𝑣) be the sum of the lengths of the leaves in
+its subtree; subtree and sibling-group lengths are additive. A feasi-
+ble partition covers these units exactly once, in order, using subtree
+or sibling sections of length at most 𝐵. Under this model, greedy
+grouping minimizes the section count among feasible partitions.
+Consider a sequence of fitting siblings with lengths 𝑤1, . . . ,𝑤𝑚.
+Let 𝐷(𝑖) be the minimum number of sections needed for the suffix
+beginning at 𝑖without splitting its subtrees, with 𝐷(𝑚+ 1) = 0.
+Deleting a prefix cannot increase this minimum, so 𝐷(𝑖) is nonin-
+creasing in 𝑖. If the longest prefix fitting within 𝐵ends at 𝑗, then
+𝐷(1) = 1 + min
+1≤𝑘≤𝑗𝐷(𝑘+ 1) = 1 + 𝐷(𝑗+ 1).
+(5)
+Greedy grouping chooses this prefix and repeats the same optimal
+choice on the remaining suffix.
+3
+
+
+Gu et al.
+Algorithm 1 Sectioning Hierarchical Inputs under a Token Budget
+1: Procedure: Partition(𝑣, 𝐵)
+2: Output: ordered section list 𝐾
+3: if tok(𝑣) ≤𝐵or atomic(𝑣) then return [𝑣]
+4: if leaf(𝑣) then return SplitText(𝑣, 𝐵)
+5: 𝐾←[ ],
+𝑃←[ ]
+6: for 𝑢∈children(𝑣) in document order do
+7:
+if tok(𝑢) > 𝐵then
+8:
+Flush(𝐾, 𝑃);
+𝐾←𝐾⊕Partition(𝑢, 𝐵)
+9:
+else
+10:
+if tok(𝑃⊕[𝑢]) > 𝐵then Flush(𝐾, 𝑃)
+11:
+𝑃←𝑃⊕[𝑢]
+12:
+end if
+13: end for
+14: Flush(𝐾, 𝑃)
+15: return 𝐾
+Notation. atomic identifies indivisible leaves; SplitText splits
+leaves at format-permitted boundaries within 𝐵. Flush(𝐾, 𝑃)
+appends nonempty 𝑃to 𝐾and clears 𝑃. tok counts serialized
+tokens for subtrees or sibling lists.
+Under this model, optimality extends to the tree. Any fitting
+subtree split by a feasible partition can be replaced by one subtree
+section without increasing the count: its proper descendants cannot
+share a sibling section with nodes outside it. An oversized child
+separates the siblings before and after it into independent packing
+sequences and is partitioned recursively. Applying Equation (5) to
+each sequence and induction to each oversized child gives
+𝑁𝐵= min
+P∈A𝐵
+|P|,
+(6)
+where 𝑁𝐵is the count produced by Algorithm 1 using lengths𝑤, and
+A𝐵is the set of feasible partitions. Thus, retaining fitting subtrees
+and greedily grouping siblings jointly achieve the minimum section
+count under the structural constraints.
+Controlling the Section Count. The budget 𝐵determines both
+which subtrees can remain intact and how many sections the agent
+processes. Keeping sibling subtrees intact can leave unused capacity
+even with optimal grouping. Flat fills each section with 𝐶tokens,
+except possibly the last one. We therefore seek a budget that com-
+pensates for this packing loss, allowing a sibling sequence to use no
+more sections than Flat at budget𝐶. The following result establishes
+2𝐶−1 as the smallest integer budget with the following guarantee.
+Proposition 3.1 (Tight budget for sibling packing). Fix a
+positive integer 𝐶. Let 𝑁(𝐵) denote the number of sections produced
+by greedy sibling packing at budget 𝐵. For every nonempty ordered
+sequence of indivisible sibling subtrees with positive integer lengths
+𝑤𝑖≤2𝐶−1 and total length 𝑊= Í
+𝑖𝑤𝑖, greedy packing satisfies
+𝑁(2𝐶−1) ≤
+𝑊
+𝐶
+
+.
+(7)
+Moreover, 2𝐶−1 is the smallest integer budget 𝐵≥𝐶that guarantees
+𝑁(𝐵) ≤⌈𝑊/𝐶⌉for every such sequence with 𝑤𝑖≤𝐵.
+Proof. Set 𝐵= 2𝐶−1, and let 𝐿1, . . . , 𝐿𝑁be the resulting section
+lengths. The claim is immediate for 𝑁= 1. For each adjacent pair,
+the first subtree of the next section did not fit in the preceding
+section. Hence 𝐿𝑖+ 𝐿𝑖+1 > 𝐵, and integer lengths imply 𝐿𝑖+ 𝐿𝑖+1 ≥
+2𝐶. Summing over the 𝑁−1 boundaries gives
+2𝐶(𝑁−1) ≤2𝑊−𝐿1 −𝐿𝑁≤2𝑊−2.
+(8)
+Thus 𝑊≥𝐶(𝑁−1) + 1, which yields Equation (7).
+For tightness, take 𝐶≥2 and any integer 𝐵with 𝐶≤𝐵≤2𝐶−2.
+Use 𝐶repetitions of the pair (𝐶−1,𝐶). Each subtree fits, but every
+adjacent pair has length 2𝐶−1 > 𝐵, so every subtree requires a
+separate section. Consequently,
+𝑁(𝐵) = 2𝐶> 2𝐶−1 =
+𝐶(2𝐶−1)
+𝐶
+
+.
+(9)
+No smaller budget in the range 𝐵≥𝐶suffices; for 𝐶= 1, the
+minimum is already 𝐵= 1.
+□
+Proposition 3.1 shows that budget 2𝐶−1 suffices to preserve
+each fitting sibling subtree while using no more sections than Flat
+at budget 𝐶for the same sequence. Its tightness gives a theoretical
+basis for choosing 2𝐶−1 as the upper endpoint of the budget search.
+Recursive partitioning produces sibling sequences that are packed
+separately. Applying the same boundary argument within these
+sequences yields a bound for the complete tree.
+Corollary 3.2. Under the additive length model, let 𝑊= 𝑤(𝑟)
+and let 𝐹𝐵count the boundaries between the sibling sequences packed
+separately by recursion, treating an intact root as one group. At 𝐵=
+2𝐶−1, the complete tree satisfies
+𝑁2𝐶−1 ≤
+𝑊
+𝐶
+
++ 𝐹2𝐶−1.
+(10)
+Proof. For 𝑁𝐵= 1 the claim is immediate. Otherwise, each of
+the 𝑁𝐵−1 −𝐹𝐵within-group boundaries contributes at least 2𝐶to
+the sum of adjacent section lengths. Their sum is at most 2𝑊−2,
+since the first and last sections each contribute at most once and
+all others at most twice. Therefore 𝑊≥𝐶(𝑁𝐵−1 −𝐹𝐵) + 1.
+□
+Based on the sibling packing bound, we search within [𝐶, 2𝐶−1],
+using Flat’s budget as the lower endpoint and the tight sibling
+packing threshold as the upper endpoint. Let 𝑛𝑥(𝐵) = |S𝐵(𝑥)|
+denote the resulting section count and B𝑥⊆{𝐶,𝐶+ 1, . . . , 2𝐶−
+1} the candidate budgets considered by the search. We select the
+candidate whose section count is closest to that of Flat:
+𝐵★(𝑥,𝐶) = arg min
+𝐵∈B𝑥|𝑛𝑥(𝐵) −𝑇flat(𝑥,𝐶)| .
+(11)
+For each candidate budget, we construct sections using the
+agent’s tokenizer and compute 𝑛𝑥(𝐵). For equal count differences,
+we prefer a candidate whose count is not below 𝑇flat(𝑥,𝐶), then the
+smaller budget. The selected budget determines how many sections
+the agent processes: 𝑇tree(𝑥,𝐶) = 𝑛𝑥(𝐵★(𝑥,𝐶)).
+3.2
+Structural Paths
+Structural segmentation keeps related content together whenever
+possible, while structural paths identify its position in the overall
+hierarchy. TreeAgent pairs each segment𝑠𝑡with a structural path 𝑎𝑡
+derived from the original input tree, allowing the agent to interpret
+local content within its hierarchical context.
+The path follows the ancestor chain from the root to the tar-
+get node. For a nonroot node 𝑣with parent 𝑝, let 𝜆(𝑣) denote its
+4
+
+
+TreeAgent: Structure-Aware Memory Agent
+identifier within 𝑝, determined by its name or position in the input
+structure and distinguishing it from the other children of 𝑝. The
+node path is defined recursively as
+𝜋(𝑟) = 𝜖,
+𝜋(𝑣) = 𝜋(𝑝) ∥⟨𝜆(𝑣)⟩,
+(12)
+where 𝑟is the root, 𝜖denotes the empty root path, and ∥denotes
+sequence concatenation. Appending each child’s identifier to its
+parent’s path preserves the ancestor chain from the root.
+TreeAgent constructs the path of each segment according to
+the structural units it covers. For a segment formed from a single
+subtree rooted at 𝑣, we use 𝑎𝑡= 𝜋(𝑣). For a segment formed by
+grouping consecutive child subtrees 𝑢𝑖, . . . ,𝑢𝑗of a parent 𝑝, with
+𝑖< 𝑗, we use 𝑎𝑡= (𝜋(𝑝), [𝑖, 𝑗]), combining the parent’s path with
+the inclusive range of covered children in input order. When an
+oversized leaf is split into text spans, each resulting segment retains
+the path of that leaf. These rules give
+𝑎𝑡=
+
+
+𝜋(𝑣),
+subtree rooted at 𝑣,
+(𝜋(𝑝), [𝑖, 𝑗]),
+siblings 𝑢𝑖, . . . ,𝑢𝑗, 𝑖< 𝑗,
+𝜋(𝑣),
+text span from leaf 𝑣.
+(13)
+For grouped subtrees, the parent path identifies their shared hierar-
+chical context, while the child range specifies the portion covered
+by the segment. For a split leaf, its path preserves the structural
+location of the source content. Because paths are derived from the
+original input tree, a segment retains this location information even
+when it does not contain the full enclosing structure.
+3.3
+Residual Memory Links
+Combining information across segments can require historic evi-
+dence that is no longer retained in the current memory. TreeAgent
+retrieves relevant evidence from previously saved memory states
+through residual memory links organized by the input hierarchy.
+After processing each segment 𝑠𝑡, TreeAgent saves the updated
+memory 𝑚𝑡under the segment index 𝑡. For a node 𝑣∈𝑉, let ℓ(𝑣)
+denote the index of the final segment containing content from its
+subtree. TreeAgent associates 𝑣with the saved memory state 𝑚ℓ(𝑣),
+which contains the agent’s cumulative memory after that segment
+has been processed. For a leaf split across multiple text spans, ℓ(𝑣)
+identifies the segment containing its final span.
+TreeAgent constructs residual links from the input tree and the
+boundaries between consecutive segments. For each parent 𝑝and
+child 𝑣, TreeAgent links the memory associated with 𝑣to the final
+segment of 𝑝, provided that the source memory is available before
+the target segment is processed. The resulting links are
+Eres = { (ℓ(𝑣), ℓ(𝑝)) | 𝑝∈𝑉,
+𝑣∈children(𝑝),
+ℓ(𝑣) < ℓ(𝑝) }.
+(14)
+A link (𝑖,𝑡) allows the agent to access the saved memory 𝑚𝑖when
+processing segment 𝑠𝑡. The strict inequality ensures that the source
+state has already been saved; the root can also serve as a target
+parent. Thus, the links can be determined from the tree and segment
+boundaries before processing, while their source memories become
+available as processing proceeds.
+For the current segment 𝑠𝑡, the incoming links identify the ac-
+cessible memory indices. These indices specify the saved memory
+states available for retrieval during the current update:
+L𝑡= { 𝑖| (𝑖,𝑡) ∈Eres }.
+(15)
+When the final segments of multiple parents coincide, their valid
+links are combined. Each source index appears only once in L𝑡, so
+multiple links to the same saved memory state do not duplicate
+that state in the retrieval candidates.
+Within these linked memory states, the question guides the
+selection of relevant evidence. TreeAgent splits the states indexed
+by L𝑡into short text spans and ranks them by lexical overlap with
+the question. It discards spans with zero overlap and selects at most
+𝑘spans with the highest scores, truncating each to a specified token
+limit. The selected spans are concatenated to form the retrieved
+context 𝑟𝑡. If L𝑡= ∅or no span matches the question, 𝑟𝑡= ∅. The
+hierarchy thus determines where to retrieve from, and the question
+determines what to retrieve.
+Integration with Memory Agents. These components define the
+observation supplied to the memory agent: the segment provides
+local content, its path identifies the structural location, and retrieved
+spans supply historic evidence. TreeAgent combines them with the
+context 𝑐A
+𝑡
+supplied by the original workflow, retaining the agent’s
+memory update and answer procedures. Let 𝐻𝑡−1 denote the set of
+memory states saved before step 𝑡, each paired with its segment
+index, with 𝐻0 = ∅. Retrieval uses only these historic states; the
+updated memory is saved after the current update:
+𝑟𝑡= R(𝑞, L𝑡, 𝐻𝑡−1),
+𝑜𝑡= (𝑠𝑡,𝑎𝑡,𝑟𝑡,𝑐A
+𝑡),
+𝑚𝑡= UA,𝜃(𝑞,𝑚𝑡−1,𝑜𝑡),
+𝐻𝑡= 𝐻𝑡−1 ∪{(𝑡,𝑚𝑡)}.
+(16)
+The update combines information accumulated in the recurrent
+memory 𝑚𝑡−1 with historic evidence retrieved through 𝑟𝑡. Residual
+memory links therefore allow evidence in saved states to contribute
+again without having to survive every intervening memory update.
+4
+Experiments
+We evaluate whether TreeAgent improves existing memory agents
+across structured input formats, context lengths, and task types
+without additional training. Component ablations and computa-
+tional measurements further assess the contributions of its struc-
+tural components and the associated inference costs.
+4.1
+Evaluation Data and Tasks
+We collect publicly available structured data from real-world appli-
+cations, including API responses, web pages [5], interface specifica-
+tions [1], and static structured data from open-source repositories.
+The data cover four formats: JSON, HTML, YAML, and JavaScript.
+The JSON dataset contains API responses from USGS [38], NVD
+[23], NIH [24, 25], GBIF [9], Crossref [6], Contracts Finder [10],
+and USAspending [39], covering earthquake events, vulnerabilities,
+research funding and clinical trials, biodiversity, scholarly metadata,
+and public procurement and spending. The HTML data include web
+pages and DOM records from sources such as WebSRC, while the
+5
+
+
+Gu et al.
+YAML data include OpenAPI specifications from sources such as
+APIs.guru. The JavaScript data include object and array initializers
+extracted from open-source repositories [2, 8, 22, 27, 37, 43], rep-
+resenting static structured state in applications. Inputs retain the
+syntax and hierarchical structure of their respective formats.
+The evaluation comprises eight tasks that range from retrieval
+within a single record to retrieval across multiple records and ag-
+gregation within a specified scope. Three tasks retrieve one, two,
+or four fields from a single specified record, testing whether agents
+associate the requested fields with the correct entity. Two further
+tasks retrieve the same field from two or four specified records, re-
+quiring agents to distinguish entities and collect the corresponding
+information. The remaining three tasks require aggregation over
+records within the scope specified by the question: counting records
+that satisfy a condition, identifying the most frequent values, and
+finding a numerical extremum.
+The evaluation uses four datasets, one per format, covering eight
+input lengths from 8K to 1M tokens. Natural language questions are
+formulated from the records in each input according to the eight
+task definitions, with 50 test examples per task and input length.
+4.2
+Experimental Setup
+Memory agents. We evaluate MemAgent-7B [48], InfMem-4B
+[42], MemReread-4B [16], and ReMemR1-7B [36]. We integrate
+TreeAgent into their inference procedures without additional train-
+ing. Within each agent, Flat and TreeAgent share model parameters
+and the original memory update and answer procedures.
+Evaluation protocol. Within each agent, Flat and TreeAgent share
+the test examples and evaluation protocol. Flat uses a segment bud-
+get of 5,000 tokens, and TreeAgent adjusts its token budget to ap-
+proximate Flat’s segment count using the procedure in Section 3.1.
+Metrics. We report mean answer scores. Single-value and numer-
+ical answers receive a score of one if correct and zero otherwise. For
+multi-value answers, the score is the number of correctly matched
+values divided by the larger of the predicted and reference list
+lengths, with answer order enforced when required by the question.
+Dataset scores average equally over tasks and input lengths; overall
+scores further average equally over datasets and agents.
+4.3
+Main Results
+Overall performance. Table 1 shows that TreeAgent increases the
+overall mean answer score from 39.49% to 43.10%, yielding a gain
+of 3.61%. All four memory agents improve when averaged across
+the four datasets. InfMem-4B and MemReread-4B obtain gains of
+5.65% and 6.35%, respectively, while MemAgent-7B and ReMemR1-
+7B improve by 0.85% and 1.58%. TreeAgent outperforms Flat in 14
+of the 16 comparisons across agents and datasets. Averaging over
+agents, gains are positive on all four datasets. These results show
+improvements across agents and input formats, with substantial
+variation in their magnitude across agents.
+Performance across context lengths. Figure 2 reports mean answer
+scores as inputs grow from 8K to 1M tokens. Both methods generally
+score lower on longer inputs. Nevertheless, TreeAgent outperforms
+Flat in 31 of the 32 comparisons across agents and context lengths,
+including all four agents at 1M tokens. For MemReread-4B, the gain
+increases from 2.43% at 8K to 8.40% at 1M.
+Performance across task types. We use the JSON evaluation set
+to examine how the overall improvements are distributed across
+the eight tasks. Figure 3 reports TreeAgent’s gains over Flat for
+each memory agent, with each result averaged equally over the
+eight context lengths. Averaging equally across the four agents,
+TreeAgent improves all eight tasks, with gains ranging from 3.41% to
+9.81%. The mean gains for retrieval within a record, retrieval across
+records, and aggregation are 6.40%, 6.53%, and 6.84%, respectively.
+These comparable gains show that the benefits extend from field
+retrieval within individual records to tasks requiring information
+collection and aggregation across records.
+InfMem-4B gains 10.46% and 14.12% on retrieval from two and
+four records, respectively, exceeding its gains on all three tasks
+involving retrieval within a single record. MemReread-4B also ob-
+tains substantial gains of 10.48% and 16.26% on these two tasks. For
+both agents, the improvement is larger when retrieving from four
+records than from two. These results demonstrate benefits when
+agents must collect information from several records, consistent
+with TreeAgent’s design objective of organizing current inputs
+while providing access to historic information.
+MemReread-4B improves on all eight tasks, including gains of
+28.00% on single-field retrieval and 23.50% on numerical extrema.
+Its improvements span field retrieval, retrieval across records, and
+aggregation. ReMemR1-7B exhibits a different pattern: its largest
+gains occur in conditional counting and frequent-value identifica-
+tion, at 8.75% and 3.96%, while changes in tasks requiring multiple
+fields or records are smaller. InfMem-4B improves on seven tasks
+but loses 1.75% on frequent-value identification. These results show
+that both the distribution and magnitude of task-level gains depend
+on the underlying memory agent.
+4.4
+Component Ablation
+We assess component contributions by introducing them sequen-
+tially. Starting from Flat, Tree adds structural sectioning, Tree+Path
+adds structural paths, and TreeAgent adds residual memory links
+with span retrieval. Table 1 reports all four variants using the same
+test examples and evaluation protocol. Each comparison measures
+the incremental gain over the preceding variant.
+Incremental contributions. Averaging equally across the four
+agents and four datasets, the mean answer score increases from
+39.49% for Flat to 41.35% for Tree, followed by 41.70% for Tree+Path
+and 43.10% for TreeAgent. Structural sectioning provides a sub-
+stantial initial improvement, and adding structural paths further
+improves performance. Once both components are in place, resid-
+ual memory links with span retrieval yield additional gains in 15
+of the 16 comparisons across agents and datasets. These improve-
+ments show that access to historic memory provides value beyond
+organizing the current input by structure.
+Variation in component gains. Sequential ablations on the JSON
+evaluation set demonstrate the benefits of different TreeAgent
+components across agents. Structural sectioning alone improves
+MemReread-4B by 13.04%, raising the mean answer score from
+6
+
+
+TreeAgent: Structure-Aware Memory Agent
+Table 1: Mean answer scores (%) for four memory agents, averaged over eight tasks and eight context lengths (8K–1M). Tree,
+Tree+Path, and TreeAgent successively add structural sectioning, structural paths, and residual memory links with span
+retrieval to Flat. AVG. averages the four datasets; the final group averages the four agents. Bold marks the best score within
+each group and column.
+Memory agent
+Method
+JSON
+HTML
+YAML
+JavaScript
+AVG.
+MemAgent-7B
+Flat
+35.48
+34.96
+40.68
+50.44
+40.39
+Tree
+36.75
+35.10
+40.85
+49.30
+40.50
+Tree+Path
+36.94
+35.22
+40.62
+49.20
+40.50
+TreeAgent
+37.28
+35.29
+42.00
+50.38
+41.24
+InfMem-4B
+Flat
+57.67
+38.65
+65.01
+63.51
+56.21
+Tree
+57.75
+42.95
+68.10
+67.25
+59.01
+Tree+Path
+58.15
+43.60
+67.95
+68.45
+59.54
+TreeAgent
+65.12
+44.56
+68.74
+69.04
+61.86
+MemReread-4B
+Flat
+24.07
+27.46
+46.07
+38.85
+34.11
+Tree
+37.11
+27.30
+50.05
+38.70
+38.29
+Tree+Path
+38.28
+27.05
+50.80
+39.55
+38.92
+TreeAgent
+39.57
+27.01
+54.41
+40.87
+40.46
+ReMemR1-7B
+Flat
+17.39
+21.96
+24.22
+45.49
+27.26
+Tree
+18.26
+22.20
+24.55
+45.30
+27.58
+Tree+Path
+18.60
+22.30
+24.90
+45.55
+27.84
+TreeAgent
+19.03
+22.47
+27.35
+46.52
+28.84
+Four-agent mean
+Flat
+33.65
+30.76
+44.00
+49.57
+39.49
+Tree
+37.47
+31.89
+45.89
+50.14
+41.35
+Tree+Path
+37.99
+32.04
+46.07
+50.69
+41.70
+TreeAgent
+40.25
+32.33
+48.13
+51.70
+43.10
+Flat
+TreeAgent
+Mean answer score (%)
+(a) MemAgent-7B
+35
+40
+45
+50
+8K
+32K
+128K
+1M
+(b) InfMem-4B
+48
+56
+64
+72
+8K
+32K
+128K
+1M
+(c) MemReread-4B
+24
+32
+40
+48
+8K
+32K
+128K
+1M
+(d) ReMemR1-7B
+24
+28
+32
+8K
+32K
+128K
+1M
+Figure 2: Mean answer scores (%) of Flat and TreeAgent as context length increases from 8K to 1M tokens. Each panel shows
+one memory agent with fixed model parameters. At each length, scores are averaged over eight tasks with 50 examples per
+task, and then averaged equally across the four datasets.
+24.07% to 37.11%. Structural paths and residual memory access pro-
+vide further improvements. For InfMem-4B, adding residual mem-
+ory links with span retrieval to Tree+Path raises the score from
+58.15% to 65.12%, a further gain of 6.97%. The results highlight the
+value of preserving local structure and retrieving earlier evidence
+during memory updates. TreeAgent integrates both mechanisms
+into existing agent workflows without additional training.
+4.5
+Budget Matching and Computational
+Overhead
+The theoretical analysis of segment counts in Section 3.1 informs
+the adjustment of the token budget to bring TreeAgent’s segment
+count close to Flat’s. On the JSON evaluation set, the proportion of
+examples with identical segment counts under TreeAgent and Flat
+averages 74.8% across the four agents.
+7
+
+
+Gu et al.
+−2
+0
+2
+4
+6
+5.00
+2.00
+0.75
+0.12
+−0.69
+2.00 1.73
+3.50
+(a) MemAgent-7B
+−5
+0
+5
+10
+15
+20
+25
+30
+8.00
+5.62
+8.12
+10.46
+14.12
+7.75
+−1.75
+7.25
+(b) InfMem-4B
+−5
+0
+5
+10
+15
+20
+25
+30
+28.00
+5.78
+15.08
+10.48
+16.26
+13.00 11.90
+23.50
+(c) MemReread-4B
+−2
+0
+2
+4
+6
+8
+10
+−1.75
+0.25 0.00
+1.88
+−0.44
+8.75
+3.96
+0.50
+(d) ReMemR1-7B
+Gain over Flat (%)
+1 Field
+4 Records
+2 Fields
+Conditional Count
+4 Fields
+Frequent Values
+2 Records
+Numeric Extremum
+Figure 3: Answer score gains of TreeAgent over Flat across eight tasks on the JSON evaluation set (TreeAgent −Flat, %). Gains
+are averaged equally over eight context lengths from 8K to 1M tokens, with 50 test examples per task and context length. Panels
+use different y-axis ranges.
+We additionally measure model calls and cumulative input to-
+kens over the complete inference process. Across the four agents,
+TreeAgent increases the mean number of model calls by 3.7%–7.6%
+relative to Flat, while changes in cumulative input tokens range
+from −5.7% to +4.0%. On this evaluation set, TreeAgent improves
+performance with a modest increase in model calls, while its cumu-
+lative input token usage remains close to that of Flat.
+5
+Related Work
+Memory agents. Recurrent Memory Transformer passes learned
+memory tokens across text segments to maintain information across
+processing steps [3]. At the agent level, MemAgent processes long
+inputs segment by segment and updates bounded memory before
+producing an answer [48]. Subsequent work extends memory main-
+tenance and access through gating for updates and stopping, re-
+trieval, memory-guided rereading, and operations over memory
+banks [35, 50]. InfMem incorporates retrieval into memory control
+[42], MemReread uses existing memory to guide rereading [16],
+and ReMemR1 enables callbacks to historic memory states during
+memory updates [36]. TreeAgent complements these mechanisms
+by using the input hierarchy to organize the segments and his-
+toric evidence available at each update, while retaining the agent’s
+memory update and answer procedures.
+Structured document understanding. Document structure has
+been used to improve content representations and reading com-
+prehension. MarkupLM encodes XPath information in document
+representations [17], while DOM-LM and WebFormer also exploit
+webpage structure to model relationships among content elements
+[7, 40]. WebSRC studies the roles of textual semantics and struc-
+tural information through question-answering tasks that require
+understanding webpage structure [5]. TreeAgent examines how
+this structure can support the processing of long inputs segment by
+segment. It preserves complete subtrees that fit the budget so that
+locally related fields are available within a single memory update,
+and attaches structural paths to identify each segment’s hierarchical
+position when it is presented separately from the full input.
+Hierarchical retrieval and reasoning. Hierarchical structures also
+organize retrieval and reasoning over long documents. RAPTOR
+constructs retrieval trees through recursive clustering and summa-
+rization [33], while Chen et al. use discourse relations for hierar-
+chical retrieval [4]. ToM exploits document hierarchies to generate
+rationales at child nodes and aggregate them at parent nodes for
+bottom-up reasoning [11]. TreeAgent likewise uses hierarchical rela-
+tions to organize information integration, operating on cumulative
+memory states formed during segment-wise processing. Parent–
+child relations in the input tree link the historic state associated
+with a child to the final segment of its parent. The structural re-
+lations determine which historic states are accessible and when,
+while the question guides the selection of relevant evidence within
+those states. Information retained in historic states can therefore
+contribute again to reasoning at higher structural levels without
+having to survive every intervening memory update.
+6
+Conclusion
+We presented TreeAgent for processing long hierarchical inputs
+using recurrent memory agents. TreeAgent uses the input hierarchy
+to organize sections, identify their structural locations, and retrieve
+relevant evidence from historic memory states, while retaining the
+underlying agent’s memory update and answer procedures. Our
+theoretical analysis establishes upper bounds on segment counts
+and guides the selection of a token budget to keep these counts
+close to those of fixed-length segmentation. Residual links allow
+relevant historic evidence to bypass intermediate memory updates
+and inform reasoning at higher structural levels. We evaluated
+TreeAgent on retrieval and aggregation tasks across four formats
+and input lengths from 8K to 1M tokens. Without additional train-
+ing, TreeAgent improves the average score across datasets for all
+four evaluated agents, with an overall gain of 3.61%. Sequential
+ablations show additional average gains from structural paths and
+residual memory links with retrieval beyond those from sectioning
+alone. Together, these findings support using input hierarchy to
+guide both the organization of current observations and access to
+historic memory when reasoning over long structured data.
+8
+
+
+TreeAgent: Structure-Aware Memory Agent
+References
+[1] APIs.guru. 2026. APIs.guru OpenAPI Directory. https://github.com/APIs-guru/
+openapi-directory. Accessed 2026-07-24.
+[2] Babel Contributors. 2026. Babel. https://github.com/babel/babel.
+Commit
+86b96c84eef3; accessed 2026-07-28.
+[3] Aydar Bulatov, Yury Kuratov, and Mikhail Burtsev. 2022. Recurrent Memory
+Transformer. In Advances in Neural Information Processing Systems, Vol. 35. Cur-
+ran Associates, Inc., New Orleans, LA, USA, 11079–11091. doi:10.52202/068431-
+0805
+[4] Huiyao Chen, Yi Yang, Yinghui Li, Meishan Zhang, Baotian Hu, and Min Zhang.
+2026. Beyond Chunking: Discourse-Aware Hierarchical Retrieval for Long Doc-
+ument Question Answering. In Proceedings of the 64th Annual Meeting of the
+Association for Computational Linguistics (Volume 1: Long Papers). Association for
+Computational Linguistics, San Diego, California, United States, 18176–18198.
+doi:10.18653/v1/2026.acl-long.829
+[5] Xingyu Chen, Zihan Zhao, Lu Chen, JiaBao Ji, Danyang Zhang, Ao Luo, Yuxuan
+Xiong, and Kai Yu. 2021. WebSRC: A Dataset for Web-Based Structural Reading
+Comprehension. In Proceedings of the 2021 Conference on Empirical Methods in
+Natural Language Processing. Association for Computational Linguistics, Online
+and Punta Cana, Dominican Republic, 4173–4185. doi:10.18653/v1/2021.emnlp-
+main.343
+[6] Crossref. n.d. REST API. https://www.crossref.org/documentation/retrieve-
+metadata/rest-api/. Accessed 2026-10-26.
+[7] Xiang Deng, Prashant Shiralkar, Colin Lockard, Binxuan Huang, and Huan Sun.
+2022. DOM-LM: Learning Generalizable Representations for HTML Documents.
+arXiv:2201.10608 [cs.CL] https://arxiv.org/abs/2201.10608
+[8] ESLint Contributors. 2026. ESLint. https://github.com/eslint/eslint. Commit
+6ddf8587e5cf; accessed 2026-07-28.
+[9] GBIF. n.d. GBIF API Reference. https://techdocs.gbif.org/en/openapi/. Accessed
+2026-10-26.
+[10] GOV.UK. n.d. Contracts Finder. https://www.gov.uk/contracts-finder. Accessed
+2026-10-26.
+[11] Jiani Guo, Zuchao Li, Jie Wu, Qianren Wang, Yun Li, Lefei Zhang, Hai Zhao, and
+Yujiu Yang. 2025. ToM: Leveraging Tree-oriented MapReduce for Long-Context
+Reasoning in Large Language Models. In Proceedings of the 2025 Conference on
+Empirical Methods in Natural Language Processing. Association for Computational
+Linguistics, Suzhou, China, 17793–17812. doi:10.18653/v1/2025.emnlp-main.899
+[12] Pengfei Hao, Shuaibo Li, Hongqiu Wang, Sixu He, Chunwang Huang, and Lei Zhu.
+2026. Toward Thyroid Cancer BRAF V600E Mutation Prediction via Multimodal
+Large Language Model: Dataset and Model Development. In Medical Image
+Computing and Computer Assisted Intervention – MICCAI 2026 (Lecture Notes in
+Computer Science, Vol. 16895). Springer Nature Switzerland, 343–352. doi:10.1007/
+978-3-032-38470-6_33
+[13] Pengfei Hao, Shuaibo Li, Hongqiu Wang, Zhizhuo Kou, Junhang Zhang, Guang
+Yang, and Lei Zhu. 2025. Surgery-R1: Advancing Surgical-VQLA with Reasoning
+Multimodal Large Language Model via Reinforcement Learning. arXiv preprint
+arXiv:2506.19469 (2025).
+[14] Pengfei Hao, Hongqiu Wang, Shuaibo Li, Zhaohu Xing, Guang Yang, Kaishun
+Wu, and Lei Zhu. 2025. Surgical-MambaLLM: Mamba2-enhanced Multimodal
+Large Language Model for VQLA in Robotic Surgery. In Medical Image Computing
+and Computer Assisted Intervention – MICCAI 2025. Springer Nature Switzerland,
+573–583.
+[15] Xinzhe Huang, Kedong Xiu, Tianhang Zheng, Churui Zeng, Wangze Ni,
+Zhan Qin, Kui Ren, and Chun Chen. 2025.
+DualBreach: Efficient Dual-
+Jailbreaking via Target-Driven Initialization and Multi-Target Optimization.
+arXiv:2504.18564 [cs.CR] https://arxiv.org/abs/2504.18564
+[16] Baibei Ji, Xiaoyang Weng, Juntao Li, Zecheng Tang, Yihang Lou, and Min Zhang.
+2026. MemReread: Enhancing Agentic Long-Context Reasoning via Memory-
+Guided Rereading. arXiv:2605.10268 [cs.CL] https://arxiv.org/abs/2605.10268
+[17] Junlong Li, Yiheng Xu, Lei Cui, and Furu Wei. 2022. MarkupLM: Pre-training
+of Text and Markup Language for Visually Rich Document Understanding. In
+Proceedings of the 60th Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers). Association for Computational Linguistics,
+Dublin, Ireland, 6078–6087. doi:10.18653/v1/2022.acl-long.420
+[18] Shuaibo Li, Pengfei Hao, Hongtao Wu, Jianfeng Dong, Ping Li, Xiaohong Liu, and
+Lei Zhu. 2026. Hermes: An Evidence-Driven Agentic Framework for Trustworthy
+and Explainable AI-Generated Video Detection. In Proceedings of the 43rd Interna-
+tional Conference on Machine Learning (Proceedings of Machine Learning Research,
+Vol. 306). PMLR, 67305–67316. https://proceedings.mlr.press/v306/li26be.html
+[19] Shuaibo Li, Zhaohu Xing, Hongqiu Wang, Pengfei Hao, Xingyu Li, Zekai Liu,
+and Lei Zhu. 2025. Toward Medical Deepfake Detection: A Comprehensive
+Dataset and Novel Method. In Medical Image Computing and Computer Assisted
+Intervention – MICCAI 2025. Springer Nature Switzerland, 626–637.
+[20] Shuaibo Li, Yijun Yang, Zhaohu Xing, Hongqiu Wang, Pengfei Hao, Xingyu Li,
+Zekai Liu, Qing Zhang, and Lei Zhu. 2026. SynerDetect: Hierarchical Synergistic
+Learning for Generalizable AI-Generated Image Detection. In Proceedings of the
+AAAI Conference on Artificial Intelligence, Vol. 40. 6405–6414.
+[21] Shuaibo Li, Laixin Zhang, Wei Ma, Jianwei Guo, Shibiao Xu, Zhijie Qiu, and Hong-
+bin Zha. 2026. RealNet: Efficient and Unsupervised Detection of AI-Generated
+Images via Real-Only Representation Learning. In Proceedings of the AAAI Con-
+ference on Artificial Intelligence, Vol. 40. 38889–38898.
+[22] Lodash Contributors. 2026. Lodash. https://github.com/lodash/lodash. Commit
+a666ba591064; accessed 2026-07-28.
+[23] National Institute of Standards and Technology. n.d. National Vulnerability
+Database. https://www.nist.gov/itl/nvd. Accessed 2026-10-25.
+[24] National Institutes of Health. n.d. ClinicalTrials.gov API. https://data.nih.gov/
+data-sources/clinicaltrialsgov-api. Accessed 2026-10-25.
+[25] National Institutes of Health. n.d. NIH RePORTER API. https://api.reporter.nih.
+gov/. Accessed 2026-10-25.
+[26] OpenAI. 2025. Introducing ChatGPT agent: bridging research and action. OpenAI.
+https://openai.com/index/introducing-chatgpt-agent/ Published July 17, 2025.
+Accessed 2026-10-21.
+[27] Plotly.js Contributors. 2026. Plotly.js. https://github.com/plotly/plotly.js. Commit
+0af79ccbd45f; accessed 2026-07-28.
+[28] Weiwei Qi, Shuo Shao, Wei Gu, Tianhang Zheng, Puning Zhao, Zhan Qin, and Kui
+Ren. 2026. Majic: Markovian adaptive jailbreaking via iterative composition of
+diverse innovative strategies. In Proceedings of the AAAI Conference on Artificial
+Intelligence, Vol. 40. 32755–32763.
+[29] Weiwei Qi, Chongyu Wang, Tianhang Zheng, Zefeng Wu, Zhilin Guo, Xiaojun
+Jia, Zhongjie Ba, and Kui Ren. 2026. ASCENT: First-Order Optimal Fine-Tuning
+with Recalibration for Safety–Utility Co-Enhancement. arXiv:2610.08061 [cs.CR]
+https://arxiv.org/abs/2610.08061
+[30] Weiwei Qi, Zefeng Wu, Zhilin Guo, Tianhang Zheng, Chaochao Lu, Liang
+He, Zhan Qin, and Kui Ren. 2026. DARWIN: Evolving Jailbreak Adversary
+and Guardrail for LLM Safety Evaluation and Protection.
+arXiv preprint
+arXiv:2607.19829 (2026).
+[31] Weiwei Qi, Zefeng Wu, Tianhang Zheng, Zikang Zhang, Xiaojun Jia, Zhan
+Qin, and Kui Ren. 2026. Towards identification and intervention of safety-
+critical parameters in large language models. In Findings of the Association for
+Computational Linguistics: ACL 2026. 32293–32312.
+[32] Prithvi Rajasekaran, Ethan Dixon, Carly Ryan, and Jeremy Hadfield. 2025. Effec-
+tive context engineering for AI agents. Anthropic Engineering. https://www.
+anthropic.com/research/effective-context-engineering-for-ai-agents Published
+September 29, 2025. Accessed 2026-10-21.
+[33] Parth Sarthi, Salman Abdullah, Aditi Tuli, Shubh Khanna, Anna Goldie, and
+Christopher D. Manning. 2024. RAPTOR: Recursive Abstractive Processing for
+Tree-Organized Retrieval. In International Conference on Learning Representations.
+OpenReview.net, Vienna, Austria, 22 pages. https://arxiv.org/abs/2401.18059
+[34] Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei
+Zhang, Mingchuan Zhang, Y. K. Li, Y. Wu, and Daya Guo. 2024. DeepSeek-
+Math: Pushing the Limits of Mathematical Reasoning in Open Language Models.
+arXiv:2402.03300 [cs.CL] https://arxiv.org/abs/2402.03300
+[35] Leheng Sheng, Yongtao Zhang, Wenchang Ma, Yaorui Shi, Ting Huang, Xi-
+ang Wang, An Zhang, Ke Shen, and Tat-Seng Chua. 2026. When to Memo-
+rize and When to Stop: Gated Recurrent Memory for Long-Context Reasoning.
+arXiv:2602.10560 [cs.CL] https://arxiv.org/abs/2602.10560
+[36] Yaorui Shi, Yuxin Chen, Siyuan Wang, Sihang Li, Hengxing Cai, Qi Gu, Xiang
+Wang, and An Zhang. 2025. Look Back to Reason Forward: Revisitable Memory
+for Long-Context LLM Agents. arXiv:2509.23040 [cs.CL] https://arxiv.org/abs/
+2509.23040
+[37] three.js Contributors. 2026. three.js. https://github.com/mrdoob/three.js. Commit
+27e70ddf91e9; accessed 2026-07-28.
+[38] U.S. Geological Survey. n.d. API Documentation: Earthquake Catalog. https:
+//earthquake.usgs.gov/fdsnws/event/1/. Accessed 2026-10-25.
+[39] USAspending. n.d. USAspending API. https://api.usaspending.gov/docs/. Ac-
+cessed 2026-10-26.
+[40] Qifan Wang, Yi Fang, Anirudh Ravula, Fuli Feng, Xiaojun Quan, and Dongfang
+Liu. 2022. WebFormer: The Web-page Transformer for Structure Information
+Extraction. In Proceedings of the ACM Web Conference 2022. Association for
+Computing Machinery, New York, NY, USA, 3124–3133. doi:10.1145/3485447.
+3512032
+[41] Ruoyu Wang, Heng Zhao, Renjie Wu, Tianhang Zheng, Mengnan Zhao, Wanyu
+Lin, and Kui Ren. 2026. AgentSnare: Learning to Delay, Divert, and Defuse
+Autonomous Web Penetration Agents. arXiv:2607.26998 [cs.CR] https://arxiv.
+org/abs/2607.26998
+[42] Xinyu Wang, Mingze Li, Peng Lu, Xiao-Wen Chang, Lifeng Shang, Jinping Li,
+Fei Mi, Prasanna Parthasarathi, and Yufei Cui. 2026. InfMem: Learning System-
+2 Memory Control for Long-Context Agent. arXiv:2602.02704 [cs.CL] https:
+//arxiv.org/abs/2602.02704
+[43] webpack Contributors. 2026. webpack. https://github.com/webpack/webpack.
+Commit 2043f6e66e87; accessed 2026-07-28.
+[44] Zefeng Wu, Weiwei Qi, Jielong Chen, Tianhang Zheng, Di Hong, Chaochao
+Lu, Liang He, Zhan Qin, and Kui Ren. 2026. DataShield: Uncovering Risky
+Fine-Tuning Data Across LLMs Through Consensus Subspace Alignment. arXiv
+preprint arXiv:2607.15081 (2026).
+9
+
+
+Gu et al.
+[45] Kedong Xiu, Yunhan Yang, Churui Zeng, Tianhang Zheng, Xinzhe Huang, Di
+Wang, Puning Zhao, Zhan Qin, and Kui Ren. 2026. Dynamic Jailbreaking Attack.
+arXiv:2510.02422 [cs.CR] https://arxiv.org/abs/2510.02422
+[46] Langqi Yang, Tianhang Zheng, Yixuan Chen, Kedong Xiu, Hao Zhou, Wangze
+Ni, Lei Chen, Zhan Qin, and Kui Ren. 2026. HarmMetric Eval: Benchmarking
+Metrics and Judges for LLM Harmfulness Assessment. arXiv:2509.24384 [cs.CL]
+https://arxiv.org/abs/2509.24384
+[47] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan,
+and Yuan Cao. 2023. ReAct: Synergizing Reasoning and Acting in Language
+Models. arXiv:2210.03629 [cs.CL] https://arxiv.org/abs/2210.03629
+[48] Hongli Yu, Tinghong Chen, Jiangtao Feng, Jiangjie Chen, Weinan Dai, Qiying Yu,
+Ya-Qin Zhang, Wei-Ying Ma, Jingjing Liu, Mingxuan Wang, and Hao Zhou. 2025.
+MemAgent: Reshaping Long-Context LLM with Multi-Conv RL-based Memory
+Agent. arXiv:2507.02259 [cs.CL] https://arxiv.org/abs/2507.02259
+[49] Churui Zeng, Kedong Xiu, Weiwei Qi, Yuqi Hao, Chaochao Lu, Liang He, Zhan
+Qin, and Tianhang Zheng. 2026. TRACE: Task-Aware Adaptive Self-Evolving
+Agentic Jailbreaking. arXiv preprint arXiv:2605.30883 (2026).
+[50] Kehao Zhang, Shangtong Gui, Sheng Yang, Wei Chen, and Yang Feng. 2026. Learn-
+ing to Remember: End-to-End Training of Memory Agents for Long-Context
+Reasoning. arXiv:2602.18493 [cs.LG] https://arxiv.org/abs/2602.18493
+[51] Laixin Zhang, Shuaibo Li, Wei Ma, and Hongbin Zha. 2025. TrueMoE: Dual-
+Routing Mixture of Discriminative Experts for Synthetic Image Detection. arXiv
+preprint arXiv:2509.15741 (2025).
+[52] Lucen Zhong, Zhengxiao Du, Xiaohan Zhang, Haiyi Hu, and Jie Tang. 2025.
+ComplexFuncBench: Exploring Multi-Step and Constrained Function Calling
+under Long-Context Scenario. arXiv:2501.10132 [cs.CL] https://arxiv.org/abs/
+2501.10132
+A
+Additional Method Details
+Flat and TreeAgent share the recurrent interface:
+𝑚𝑡= UA,𝜃(𝑞,𝑚𝑡−1,𝑜𝑡).
+(A.1)
+The following details specify TreeAgent’s observations and the
+controlled evaluation.
+A.1
+Leaf Handling and Token Accounting
+For a divisible leaf exceeding 𝐵, SplitText produces consecutive
+spans within 𝐵at format-permitted boundaries. JSON strings retain
+escape sequences and surrogate pairs; fragments restore quota-
+tion marks and enclosing structure. Natural text boundaries are
+preferred when they sufficiently fill the budget. A split leaf com-
+pletes only after its final fragment. YAML block scalars, undecom-
+posed JavaScript expressions, interpolated templates, and embedded
+HTML script or style content remain indivisible and may exceed 𝐵.
+The budget counts native subtree or sibling-group serialization; an-
+cestor wrappers, paths, retrieved memory, and the agent’s existing
+context are accounted for separately.
+A.2
+Budget Search
+Let 𝑁= 𝑇flat(𝑥,𝐶) and𝑛(𝐵) = |S𝐵(𝑥)|. The search evaluates integer
+budgets in [𝐶, 2𝐶−1] using the agent’s tokenizer and caches section
+counts. Candidate selection uses the lexicographic key
+𝜅(𝐵) =  |𝑛(𝐵) −𝑁|, I[𝑛(𝐵) < 𝑁], 𝐵.
+(A.2)
+Equal count differences favor a count not below 𝑁, then a smaller
+budget. Retain 𝐶if 𝑛(𝐶) ≤𝑁. Otherwise, evaluate 𝑛(2𝐶−1) and
+binary search for the transition to 𝑛(𝐵) ≤max{𝑁,𝑛(2𝐶−1)}. If
+𝑛(2𝐶−1) > 𝑁, retain the final search budget; otherwise compare
+it with its predecessor using 𝜅.
+A.3
+Paths, Residual Links, and Span Retrieval
+JSON paths start at $; identifier keys use dot notation and other
+keys use quoted brackets. Array indices use brackets. For a section
+grouping consecutive children𝑢𝑖, . . . ,𝑢𝑗of a parent 𝑝, the structural
+annotation is 𝑎𝑡= (𝜋(𝑝), [𝑖, 𝑗]), where both endpoints are included.
+For example, the parent path $.records together with the range
+[1, 2] identifies the children at indices 1 and 2. A text span split
+from a leaf retains that leaf’s path.
+The original tree and the section boundaries determine ℓ(𝑣),
+the index of the final section containing source content from the
+subtree rooted at 𝑣. For a split leaf, this is the section containing
+its final text span. After every section 𝑠𝑡is processed, the updated
+cumulative memory 𝑚𝑡is saved under the section index 𝑡. Each
+node 𝑣is associated with the saved state 𝑚ℓ(𝑣). Nodes with the
+same final section therefore refer to the same saved state.
+Residual retrieval follows the parent–child links defined in the
+main paper. A child 𝑣of parent 𝑝contributes the source index ℓ(𝑣)
+only at the target step 𝑡= ℓ(𝑝), and only if ℓ(𝑣) < 𝑡. The root is
+included as a possible target parent. When multiple parents have
+the same final section, their source indices are combined into L𝑡
+and deduplicated before retrieval. All source states are read from
+𝐻𝑡−1; the current state 𝑚𝑡is saved only after the memory update.
+For each saved state indexed by L𝑡, divide its text at line and
+sentence boundaries. Lowercase terms, split camel case and under-
+scores, and remove a fixed set of function words. With term counts
+𝑐𝑞,𝑐𝑧and shared-term set 𝑉(𝑞,𝑧), rank a span 𝑧by
+score(𝑧,𝑞) =
+∑︁
+𝑤∈𝑉(𝑞,𝑧)
+min(𝑐𝑞(𝑤),𝑐𝑧(𝑤)) + 0.25|𝑉(𝑞,𝑧)|.
+(A.3)
+Discard zero-overlap spans and resolve ties by source segment index
+and span order within each saved state. Select at most four spans
+across the combined candidate set, truncate each to 96 tokens, and
+concatenate them to form 𝑟𝑡. If L𝑡is empty or no candidate has
+positive overlap, set 𝑟𝑡= ∅.
+If each saved state contains at most 𝑀tokens, storing the states
+from 𝑇sections requires 𝑂(𝑇𝑀) tokens, in addition to structural
+metadata. At step 𝑡, span extraction and lexical scoring examine
+only the states indexed by L𝑡.
+A.4
+Structural Sectioning Proof Details
+We use the additive integer lengths and feasible partitions defined in
+Section 3.1. For a node 𝑣, let 𝑄𝐵(𝑣) be the minimum number of fea-
+sible sections covering its subtree. A fitting subtree has 𝑄𝐵(𝑣) = 1.
+For an oversized node, let O𝐵(𝑣) contain its children with length
+greater than 𝐵, and let G𝐵(𝑣) contain the maximal nonempty con-
+secutive sequences of its other children. For 𝑔∈G𝐵(𝑣), let 𝐷𝐵(𝑔)
+be the minimum number of sections covering 𝑔without splitting
+its child subtrees. Then
+𝑄𝐵(𝑣) =
+
+
+1,
+𝑤(𝑣) ≤𝐵,
+∑︁
+𝑢∈O𝐵(𝑣)
+𝑄𝐵(𝑢) +
+∑︁
+𝑔∈G𝐵(𝑣)
+𝐷𝐵(𝑔),
+𝑤(𝑣) > 𝐵.
+(A.4)
+To justify the recurrence, first consider a fitting child that a fea-
+sible partition splits. Every section containing part of that child
+lies inside it: a section extending outside would have to contain the
+whole child as part of a sibling group. Replacing the internal sec-
+tions by the whole child therefore preserves feasibility and cannot
+increase the count. Repeating this replacement yields an optimal
+partition that retains every fitting child. No feasible section can con-
+tain an entire oversized child, or cross from one side of that child to
+10
+
+
+TreeAgent: Structure-Aware Memory Agent
+the other without containing it. Its internal partition and the adja-
+cent sibling sequences are consequently independent. Their optima
+give a lower bound on any feasible partition, and concatenating
+their optimal sections attains that bound.
+Within each sequence𝑔, deleting a prefix from a feasible partition
+leaves a feasible partition of the suffix after empty sections are
+removed. This proves the suffix monotonicity used in Equation (5).
+Greedy grouping attains 𝐷𝐵(𝑔), and induction on tree height shows
+that Algorithm 1 attains every term in Equation (A.4).
+For Corollary 3.2, collect the nonempty sequences G𝐵(𝑣) en-
+countered during recursion in document order. They partition the
+leaf units into 𝐺𝐵groups and hence have 𝐹𝐵= 𝐺𝐵−1 boundaries
+between groups. If the root fits, use 𝐺𝐵= 1 and 𝐹𝐵= 0. Writing 𝑛𝑔
+for the number of output sections in group 𝑔gives
+𝐺𝐵
+∑︁
+𝑔=1
+(𝑛𝑔−1) = 𝑁𝐵−𝐺𝐵= 𝑁𝐵−1 −𝐹𝐵.
+(A.5)
+These are the boundaries to which the packing inequality applies.
+All section lengths are positive integers, so the two endpoint contri-
+butions give the same subtraction of at least two as in Equation (8).
+B
+Benchmark and Data Appendix
+The main paper defines the shared tasks, answer contract, and
+evaluation grid. This appendix provides the additional informa-
+tion needed to inspect the benchmark data: source provenance
+and licenses, parser units, construction and validation procedures,
+and dataset inventory. Representative native-format excerpts are
+provided in our code repository.
+B.1
+Benchmark Sources, Construction, and
+Validation
+We selected source collections whose native syntax exposes an
+explicit hierarchy and whose visible records support deterministic
+lookup and aggregation. The four benchmarks therefore test the
+same capabilities without converting the original JSON, HTML,
+YAML, or JavaScript syntax into a common representation.
+JSON dataset. The JSON dataset contains API responses from
+seven source groups. USGS provides earthquake events and their
+attributes [38]; NVD provides CVE vulnerability records, scores, and
+references [23]; and NIH provides research funding projects through
+RePORTER and clinical trial records through ClinicalTrials.gov
+[24, 25]. GBIF provides species occurrence records and taxonomic
+information [9], while Crossref provides metadata on scholarly
+works, authors, and references [6]. Contracts Finder provides UK
+procurement and contract records [10], and USAspending provides
+US federal contract spending records [39].
+The parser unit is a JSON value inside an ordered response list.
+Construction selects supporting records, generates a question in
+natural language and a reference specification, and adds distractor
+payloads. Validation executes the reference specification over the
+complete visible context and checks answer uniqueness, with ag-
+gregation restricted to the scope specified by the question. The 32K
+training and development splits are used for model development;
+the test split, which contains all eight length buckets, is held out.
+Multimodal clinical reasoning is outside this benchmark [12, 14].
+HTML dataset. The HTML dataset uses pages from the WebSRC
+v1.0 test archive [5], which declares CC BY 4.0. Its parser units are
+HTML tables, lists, and DOM subtrees; text, element order, and
+native markup remain visible to the model. Construction derives
+lookup and aggregation questions from records with unique visible
+descriptions and fills the target length with additional WebSRC
+pages. Independent validation reparses every context, executes the
+stored reference specification, checks source identifiers and answer
+uniqueness, and verifies the length constraints under the tokenizers
+used during construction. The dataset contains only test examples.
+YAML dataset. The YAML dataset uses OpenAPI documents in-
+dexed by the APIs.guru directory [1]. For each document, we record
+its source identifier and available license metadata. A parser unit is
+one YAML OpenAPI document; paths, operations, parameters, and
+responses supply records. Canonical documents are deduplicated
+before construction. Lookup examples preserve their target fields
+and supporting documents across lengths, whereas aggregation
+answers are recomputed after distractor documents are added. An
+independent validator reparses the YAML, replays the document
+paths and reference specifications, and checks source composition
+and context lengths. The dataset contains only test examples.
+JavaScript dataset. The JavaScript dataset evaluates static struc-
+tured state written in JavaScript syntax; it does not evaluate pro-
+gram execution or general program understanding. The dataset
+is built from statically extractable object and array initializers in
+six repositories distributed under the MIT License: ESLint, web-
+pack, three.js, Plotly.js, Babel, and Lodash [2, 8, 22, 27, 37, 43]. Calls,
+functions, spreads, identifier references, computed keys, parse er-
+rors, sensitive strings, and ambiguous records are rejected. Every
+accepted initializer is checked by a Tree-sitter parser and an inde-
+pendent JSON5 interpretation, which must produce the same static
+value without executing source code. Each initializer retains its
+source repository, license, and location. The dataset contains only
+test examples and measures static record retrieval and aggregation.
+B.2
+Dataset Inventory
+The four benchmarks contain 29,200 unique examples: 19,600 for
+the JSON dataset, including its training and development splits,
+and 3,200 test examples for each of the HTML dataset, the YAML
+dataset, and the JavaScript dataset. The evaluation in the main text
+uses the 3,200 held-out test examples from each benchmark.
+C
+Experimental Protocol
+This section specifies the additional settings for the comparison
+without additional training. It describes the shared controls, prompts
+and limits, decoding procedure, and evaluation without changing
+the scope defined in the main paper.
+C.1
+Experimental Scope, Models, and
+Tokenizers
+The Cartesian product of four benchmarks, eight tasks, eight con-
+text lengths, and 50 examples contains 12,800 distinct test exam-
+ples. Evaluating every example under Flat and TreeAgent with
+each of four memory agents produces 102,400 scored outputs. Each
+11
+
+
+Gu et al.
+condition is evaluated once, and model parameters remain fixed
+throughout this comparison.
+We use the public checkpoints evaluated in the main paper,
+pairing each model with its distributed tokenizer. Context length
+labels identify construction buckets and do not imply identical
+token counts under the four tokenizers. Section construction and
+token measurements use the tokenizer of the evaluated model.
+C.2
+Controlled Comparison
+Within each memory agent, Flat and TreeAgent use the same exam-
+ples, checkpoint, tokenizer, memory update procedure, available
+control actions, answer interface, decoding parameters, and evalu-
+ator. Flat partitions the serialized input into consecutive sections
+with a base budget of 5,000 tokens. TreeAgent uses the same base
+budget and searches candidate integer budgets from 5,000 to 9,999
+tokens as described in Appendix A.2.
+During recurrent reading, Flat supplies the current text sec-
+tion and the context constructed by the original memory agent.
+TreeAgent supplies a structural section, its structural path, and
+query-relevant spans retrieved from the saved states indexed by L𝑡,
+while retaining the original agent’s context and control procedure.
+The source indices follow the residual links defined in the main
+paper: a child state associated with ℓ(𝑣) is eligible at 𝑡= ℓ(𝑝) only
+when ℓ(𝑣) < 𝑡. At most four spans are supplied per update, each
+limited to 96 tokens. Retrieval precedes the memory update, and
+the updated state is saved under the current section index.
+C.3
+Prompts, Limits, Decoding, and
+Randomness
+Flat and TreeAgent receive the same underlying benchmark exam-
+ple and question. The task instruction requests only the answer
+values and specifies whether several values must follow the or-
+der stated in the question. It reveals no schema, response index,
+structural path, supporting location, or reference answer. Each
+memory agent retains the prompts and intermediate actions of
+its released workflow. TreeAgent changes the reading observation
+described above and adds no demonstrations specific to a task. Adap-
+tive jailbreak robustness and output harmfulness remain untested
+[15, 28, 30, 45, 46, 49].
+Table 2 reports the maximum number of generated tokens for
+each agent’s calls. The controller column covers explicit planning,
+decomposition, retrieval, or callback actions when the workflow
+uses them. MemAgent uses memory and final answer calls without
+a separate controller. Request limits include both the prompt and
+the maximum generation. They are 32,768 tokens for MemAgent
+and InfMem, and 40,960 tokens for MemReread and ReMemR1.
+We use greedy decoding with temperature 0 and top_p=1.0.
+The inference seed is 42 when the serving interface accepts a seed.
+Dataset sampling also uses seed 42, and deterministic preprocessing
+fixes the Python hash seed to zero. The search bounds and selection
+rule were fixed for the complete test matrix and were not tuned
+separately by benchmark, task, or context length. The selected
+budget was then computed deterministically for each example from
+its input, tokenizer, and native format.
+Table 2: Maximum generated tokens for agent calls. MemA-
+gent does not use a separate controller limit.
+Memory agent
+Memory
+Answer
+Controller
+MemAgent-7B
+1,024
+1,024
+n/a
+InfMem-4B
+1,024
+1,024
+1,024
+MemReread-4B
+1,024
+1,024
+8,192
+ReMemR1-7B
+2,048
+2,048
+1,024
+Table 3: Realized computation on the JSON dataset: ratios
+of cumulative TreeAgent to Flat quantities. Input tokens
+include complete model inputs over all calls.
+Memory agent
+Model calls
+Input tokens
+MemAgent-7B
+1.074
+1.038
+InfMem-4B
+1.037
+0.945
+MemReread-4B
+1.068
+0.943
+ReMemR1-7B
+1.076
+1.040
+Table 4: Paired score differences on the JSON dataset (%) and
+95% confidence intervals. Absolute scores appear in Table 1.
+Memory agent
+Difference
+95% CI
+MemAgent-7B
+1.80
+[0.62, 2.98]
+InfMem-4B
+7.45
+[5.98, 8.91]
+MemReread-4B
+15.50
+[13.77, 17.23]
+ReMemR1-7B
+1.64
+[0.39, 2.89]
+C.4
+Evaluation and Aggregation
+The primary metric is the mean answer score defined in the main
+paper. The evaluator first extracts the final answer containing only
+the requested values and then applies the rule for the corresponding
+task. Matching respects the requested order for ordered retrieval
+tasks and ignores order for the frequency ranking task. Text match-
+ing is insensitive to case and surrounding formatting. Numerical
+matching allows a tolerance equal to the larger of 0.01 and 0.1% of
+the reference magnitude.
+An unavailable model response is represented by an empty ex-
+tracted answer; empty or malformed extracted answers receive zero.
+Scores are first averaged over the 50 examples in each combination
+of benchmark, task, context length, memory agent, and method.
+The score for each benchmark averages the eight tasks and eight
+lengths equally. The reported average over benchmarks gives equal
+weight to the JSON dataset, the HTML dataset, the YAML dataset,
+and the JavaScript dataset. Thus, the aggregate is not weighted by
+context tokens or by the number of model calls.
+C.5
+Realized Computation and Paired Analysis
+On the JSON dataset, section counts match for 74.8% of examples.
+Table 3 reports realized usage. Paired 95% confidence intervals use
+the normal approximation over 3,200 matched examples per agent
+(Table 4); all exclude zero.
+12
+
+
+TreeAgent: Structure-Aware Memory Agent
+D
+Exploratory Fine-Tuning
+We conduct an exploratory experiment to assess whether addi-
+tional training improves InfMem-4B when used with TreeAgent.
+Starting from the released checkpoint, we optimize the model with
+Group Relative Policy Optimization (GRPO) [13, 34] on 16,000 JSON
+training examples at 32K tokens. We select the checkpoint with
+the highest mean answer score on a separate development set of
+400 examples at 32K. The selected checkpoint and the checkpoint
+before training are evaluated on the same JSON test set, using the
+same TreeAgent observation process, greedy decoding, and answer
+scoring.
+Training runs for 30 steps with 64 prompts per batch and four
+rollouts per prompt. We use a learning rate of 5 × 10−6 and apply
+LoRA to all linear modules with rank 32, scaling factor 32, and
+zero dropout. Training examples are shuffled with seed 42, and
+checkpoints are saved every five steps. The reward combines the
+answer score with two auxiliary terms of 0.05 each for a valid
+interaction and completion of the memory update. Safety-aware
+fine-tuning remains future work [29, 31, 44].
+Table 5 reports the results at each input length. The mean an-
+swer score increases from 65.117% to 66.318%, an absolute score
+difference of 1.201%. Scores improve at seven of the eight lengths,
+with the largest difference of 4.458% at 512K.
+Table 5: Mean answer scores (%) on the JSON test set for
+InfMem-4B with TreeAgent. Fixed and Trained denote the
+checkpoints before and after additional training, respectively.
+Diff. denotes Trained minus Fixed.
+Context
+Fixed Trained
+Diff.
+8K
+74.688
+74.979
+0.291
+16K
+68.979
+70.125
+1.146
+32K
+73.063
+72.479 -0.584
+64K
+71.813
+72.583
+0.770
+128K
+65.625
+66.583
+0.958
+256K
+61.896
+64.021
+2.125
+512K
+51.188
+55.646
+4.458
+1M
+53.688
+54.125
+0.437
+Overall
+65.117
+66.318
+1.201
+E
+Evidence Scope and Statistical Interpretation
+The evaluation concerns recurrent memory agents on explicit hi-
+erarchies in JSON, HTML, YAML, and static JavaScript initializers,
+excluding visual authenticity assessment [19–21, 51]. These four
+native formats provide complementary tests of record binding, hier-
+archical lookup, and aggregation across sibling records. TreeAgent
+uses the hierarchy exposed by the corresponding parser, so the com-
+parison focuses on how structured observations affect recurrent
+memory updates.
+The comparison without additional training uses greedy decod-
+ing. The paired confidence intervals on the JSON dataset quantify
+variation in the score difference between TreeAgent and the Flat
+baseline over matched examples, complementing the aggregate
+results across agents, formats, tasks, and context lengths.
+13

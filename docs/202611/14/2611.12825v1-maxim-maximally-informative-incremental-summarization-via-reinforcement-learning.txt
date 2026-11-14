@@ -1,0 +1,2805 @@
+MaxIM: Maximally Informative Incremental
+Summarization via Reinforcement Learning
+Jihwan Jeong1 Guy Tennenholtz2∗Yinlam Chow3 Chih-Wei Hsu1 Craig Boutilier1
+1Google Research
+2Noetive
+3Google DeepMind
+{jihwanjeong, yinlamchow, cwhsu, cboutilier}@google.com, guytenn@gmail.com
+Abstract
+AI systems must often maintain bounded memory of unbounded interaction histo-
+ries. However, optimizing the memory representation, and its updates, for down-
+stream task utility is difficult for standard reinforcement learning (RL) due to severe
+credit assignment bottlenecks induced by sparse, delayed rewards. We introduce
+MaxIM (Maximally Informative Incremental Memory), a framework that formu-
+lates incremental summarization as a capacity-constrained, information-theoretic
+reward-shaping problem. Grounded in value suboptimality bounds, we show that
+bounding sequential information loss motivates maximizing the predictive log-
+likelihood of future, task-relevant targets, a variational lower bound on predictive
+sufficiency. We introduce a recursive consistency condition to ensure summaries
+are grounded by maximizing mutual information (MI) with the observed history.
+We mitigate credit assignment issues with a parameterized asymmetric critic that
+computes step-wise variational MI bounds for dense reward shaping. Empirical
+evaluation on long-horizon scientific reading and multi-turn dialogue benchmarks
+shows that MaxIM outperforms RL, supervised fine-tuning, and prompt-focused
+baselines on factual grounding, comprehensive autorater metrics, and downstream
+task utility across strict token budgets and extended horizons, without the need for
+expensive human preference labels.
+1
+Introduction
+A critical challenge facing AI agents in continuous, streaming environments—from real-time person-
+alization [1, 2] to long-horizon dialogue [3, 4]—is the inability to retain unbounded context. Despite
+the expanded context windows of modern large language models (LLMs), processing ever-growing
+interaction logs frequently degrades reasoning performance due to “lost in the middle” phenom-
+ena [5]. While heuristic memory buffers (e.g., MemGPT [6]) and RL-based memory models (e.g.,
+MemAgent [7], Mem-α [8]) offer practical mechanisms for context management, agents ultimately
+need rigorous methods to actively compress these streams into a fixed-capacity working memory.
+We assume a trainable history/context summarization policy manages this bounded memory state,
+while a separate, frozen action agent uses it to choose how to act in the environment. In this setting, the
+objective of a memory system is to maximize downstream task utility, Rtask. In principle, optimizing
+a summarizer using reinforcement learning (RL) on Rtask yields an optimal compression strategy.
+However, in long-horizon settings, task rewards are notoriously sparse and delayed, inducing extreme
+credit assignment failures in RL—the policy receives insufficiently granular feedback to learn which
+observation-stream features are predictive of task success. Conversely, optimizing for surface-level
+text reconstruction [9, 10] discards deeper latent intents needed for effective future inference.
+∗Work done while at Google.
+40th Conference on Neural Information Processing Systems (NeurIPS 2026).
+arXiv:2611.12825v1  [cs.AI]  9 Nov 2026
+
+
+Parameterized
+Critic 
+Frozen Agent
+Environment
+Predictive sufficiency
+Oracle Context 
+Bounded
+Memory
+Observation
+Recursive consistency
+Actor
+Inference
+Training
+Figure 1: The MaxIM framework. Streaming Inference (Solid Lines): A trained actor policy
+incrementally compresses prior summaries zt−1 and incoming observations ot into a bounded memory
+zt. This memory, alongside recent observations, provides the context for a frozen downstream agent
+interacting with the environment with zero critic calls at test time. Asymmetric Training (Dotted
+Lines): During training, a pretrained critic qϕ evaluates the actor’s summary using oracle context
+Yt and the immediate history (zt−1, ot). It computes dense, information-theoretic shaping rewards
+(predictive sufficiency and recursive consistency) that step-wise guide the policy, bypassing the credit
+assignment bottleneck of the sparse terminal task reward Rtask.
+To bridge this gap, we develop MaxIM (Maximally Informative Incremental Memory), a novel
+RL framework that addresses credit assignment with dense information-theoretic reward shaping.
+Leveraging bounds from state abstraction theory, we show that the performance gap induced by
+constrained memory is bounded by sequential information loss. We show that bounding this loss
+motivates maximizing the predictive log-likelihood of future, task-relevant target variables Yt, a
+variational lower bound on predictive sufficiency. However, optimizing an LLM purely for future
+prediction can induce severe hallucinations (i.e., fabricating plausible-sounding text that aligns with
+the task/target, but is disconnected from actual observations). To prevent this, we derive a recursive
+consistency regularizer that maximizes the mutual information (MI) with the immediate history,
+substantially suppressing ungrounded generation.
+To optimize this dual-objective, MaxIM employs RL with asymmetric context (see Figure 1). We
+leverage synthetic datasets to train a parameterized critic using supervised cross-entropy minimization,
+which computes step-wise baseline-normalized variational predictive likelihood (VPL) bounds [11],
+thus providing dense shaping rewards to the policy. We update the policy using standard policy
+gradient methods equipped with a backward-discounted reward-to-go to account for temporal error
+accumulation, while gradually annealing the shaping weight to ensure that late-stage training directly
+optimizes downstream task utility.
+Our contributions are: (1) We develop MaxIM, a principled RL framework for capacity-constrained
+generative memory that solves the sparse credit assignment bottleneck via dense information-theoretic
+reward shaping. (2) We link value suboptimality bounds to sequential information loss across both
+static and dynamic partially observable environments, deriving two complementary regularizers:
+predictive sufficiency and recursive consistency. (3) We offer an effective training architecture using
+scalable synthetic data generation and a unified asymmetric critic to compute calibrated variational
+lower bounds, obviating the need for human preference labels. (4) We demonstrate MaxIM’s efficacy
+on diverse benchmarks—a dynamic multi-turn user simulator and a novel arXiv scientific reading
+task—achieving superior factual grounding, token-budget Pareto efficiency, and task success.
+2
+Related Work
+Incremental Summarization and Memory Buffers.
+Traditional summarization processes entire
+documents to generate static outputs [12, 13], whereas incremental summarization recursively updates
+a summary as streaming information arrives [14]. While early text streaming systems relied on
+clustering algorithms [15], modern neural approaches exploit structural representations (e.g., JSON
+states) for incremental updates [10]. A parallel line of work compresses long contexts in continuous
+space—including learned soft-prompt or embedding compression [16–18] and optimal-transport
+2
+
+
+token-merging or KV-cache compression. These methods require either retraining the downstream
+model to consume continuous latents or white-box access to internal model activations. By contrast,
+we maintain a discrete, human-readable text memory under a token budget K, allowing it to interface
+directly with any frozen black-box agent. Recently, sophisticated memory buffer methods have
+emerged to manage unbounded LLM contexts. The closest analogs to our setup are memory systems
+such as MemGPT [6], Mem-α [8], and MemAgent [7]. While MemGPT and Mem-α focus on
+tool-calling, MemAgent learns an explicit, generative memory update policy using RL, as we do.
+However, these methods rely on sparse task rewards which can exacerbate hallucination and historical
+drift due to credit assignment failures. MaxIM builds on this foundation by introducing theoretically
+derived, dense MI regularizers that explicitly guide the retention of task-relevant information.
+Preference Modeling and Information-Theoretic Shaping.
+Modern alignment techniques like
+RLHF [19, 20] and RLAIF [21, 22] typically train heuristic reward models on pairwise rankings
+using the Bradley-Terry model [23]. While successful for general alignment, these scalar models lack
+formal guarantees w.r.t. preserving task-critical information and struggle with long-horizon credit
+assignment. While MaxIM is similar to RLAIF in its use of an oracle AI for offline data generation,
+we depart from preference-based rewards. Instead, we frame context compression as a reward shaping
+problem [24]. Specifically, by training a critic to compute calibrated VPL bounds, MaxIM provides
+dense, step-by-step information-theoretic rewards. This directly optimizes rigorous MI lower bounds,
+promoting predictive sufficiency and factual grounding without the theoretical liabilities of standard
+preference approximations.
+RL with Asymmetric Context.
+RL with asymmetric context (or privileged information) trains
+policies using a critic that has access to oracle information unavailable to the actor [25, 26]. Widely
+used in robotics to train student policies with expert teachers, we adapt it to LLM memory. By treating
+future text or latent intents as “oracle hindsight context,” we compute dense information-theoretic
+rewards that shape the LLM’s summary update policy without expensive human labels.
+3
+Background
+3.1
+Capacity-Constrained Memory and Sparse Rewards
+Incremental Summarization.
+We formalize the environment as a sequential interaction stream. An
+agent (or actor) engages with an environment, generating actions at ∈A given a continuous stream of
+observations ot ∈Ω. Optimal decision making generally requires conditioning on the current history
+Ht = (o1, a1, . . . , at−1, ot). Maintaining Ht indefinitely is computationally intractable for LLMs due
+to their finite context windows, hence, the agent adopts a summarizer policy πθ(zt | zt−1, at−1, ot)
+that incrementally updates a textual summary zt ∈SK
+k=1 Vk, where V is the LLM vocabulary
+and K is a maximum token budget. The agent’s policy conditions its action choice solely on the
+capacity-constrained working memory zt and the current observation ot to select its next action at.2
+We assume the agent is fixed/frozen and focus on training the summarizer for optimal performance.
+Sparse Rewards and Regularized MDPs.
+The standard RL objective for optimizing policies
+maximizes expected cumulative task reward: J(θ) = Eπθ[P
+t γtRtask,t]. However, in long-horizon
+settings, Rtask can be exceptionally sparse (e.g., evaluated only at the end of a multi-turn dialogue
+or after reading a full document). This sparsity makes RL challenging due to credit assignment
+failures. While classic reward shaping [24] injects dense signals without altering the optimal policy
+via potential functions, this is insufficient in our capacity-constrained setting. Instead, we alter
+the objective to form a regularized Markov decision process (MDP) [27]. By injecting dense,
+step-wise information-theoretic auxiliary rewards, we explicitly constrain the policy’s exploration
+manifold, guiding it to find an effective bounded-memory policy rather than the theoretically infeasible
+unconstrained optimal (which would require unbounded memory).
+A Unified POMDP Formulation.
+While our sequence compression formulation applies broadly,
+our framework models the interaction stream as a partially observable MDP (POMDP). This treats
+2We assume the agent conditions on memory and the latest observation, though it can use the last k observations if compute
+and context permit.
+3
+
+
+summary zt as a textual belief state tracking an unobservable latent state st ∈S. Crucially, this
+interpretation gracefully accommodates diverse streaming models, such as:
+Dynamic Latent States (e.g., User Simulation): In multi-turn interactions, a user’s underlying
+persona, intent, or mood acts as a dynamic latent state st that evolves sequentially. The summary zt
+tracks this intent to guide the agent’s conversational responses.
+Static Latent States and Active Perception (e.g., Goal-directed reading): For tasks like reading a
+scientific paper to answer eventual questions, the environment state (i.e., full document semantics and
+golden target answers) is static. However, with bounded context, it becomes fundamentally partially
+observable. Intermediate actions (e.g., reading the next text chunk) are pure sensing actions, while
+the summary zt serves as the belief state, accumulating the necessary sufficient statistics from the
+observations to resolve the unobserved target variables (questions) at the terminal step. By viewing
+both settings through this lens, we bridge incremental summarization and classical belief tracking,
+and thus establish formal value suboptimality bounds (see Section 4).
+3.2
+Mutual Information and Representation Learning
+Estimating Mutual Information.
+Mutual information (MI), denoted I(X; Y ) and defined as
+I(X; Y ) = EP (x,y)
+
+log
+P (x,y)
+P (x)P (y)
+
+, measures the reduction in uncertainty about a random variable Y
+given knowledge of X. Estimating MI in high-dimensional continuous or discrete spaces is difficult.
+One prevalent approach in representation learning, contrastive predictive coding (CPC), uses the
+InfoNCE loss [28]. While successfully applied to learning continuous embeddings, InfoNCE has been
+proven to be strictly upper-bounded by log N, where N is the batch size [29]. This bound saturates
+rapidly when modeling high-entropy distributions like autoregressive text generation, limiting its
+utility as a metric for unbounded optimization.
+Variational Bounds.
+To overcome this log N limitation, variational approximations based on
+f-divergences are often adopted, such as the NWJ [30] or SMILE [31] estimators. However, these
+estimators are known to suffer from high variance, numerical instability, and extreme hyperparameter
+sensitivity, particularly when the true MI is large [32]. Because of this, we focus on the VPL
+bound [11]. By introducing a parameterized variational distribution qϕ(Y | X), we leverage the
+non-negativity of KL divergence to establish a theoretically sound lower bound:
+I(X; Y ) ≥H(Y ) + EP (x,y)[log qϕ(y | x)].
+(1)
+In standard representation learning, maximizing this log-likelihood maximizes I(X; Y ) when the
+marginal entropy H(Y ) is constant. In closed-loop POMDPs, the agent’s actions influence future
+states, causing H(Yt) to become weakly policy-dependent. However, as we prove in Section 4,
+our framework circumvents this dependency: maximizing predictive log-likelihood directly bounds
+conditional entropy H(Yt | zt), which bounds the sequential information loss regardless of the
+marginal H(Yt). This provides a tractable, theoretically rigorous, low-variance surrogate objective
+that scales naturally to modern LLMs.
+4
+Methodology: The MaxIM Framework
+We frame capacity-constrained incremental summarization as a task of information-theoretic reward
+shaping. Our objective is to learn a summarizer update policy πθ that dynamically creates and
+maintains a working memory zt, bounded by a strict token limit K, to maximize downstream task
+utility Rtask. Crucially, πθ is solely responsible for memory management; a separate, frozen action
+agent (e.g., a conversational assistant or a question-answering module) conditions on this memory
+zt to act within the environment. Because Rtask is often sparse and delayed in long-horizon streams
+(e.g., assessed only at the terminal turn T), standard RL struggles with credit assignment. Our goal is
+to derive principled, dense shaping rewards that offer step-by-step auxiliary guidance through the
+optimization landscape.
+4.1
+Value Suboptimality and Predictive Sufficiency
+Maintaining the full observation history Ht = (Ht−1, at−1, ot) is computationally intractable in
+streaming environments, forcing systems to compress Ht into a bounded summary zt. To quantify
+the impact of this compression on downstream task utility, we frame the sequential interaction
+4
+
+
+as a POMDP, treating zt as a capacity-constrained Markovian state abstraction [33, 34]. Let Yt
+denote the task-relevant target variable at step t—e.g., static comprehension answers in goal-directed
+reading (Yt+1 = Yt), or a user’s evolving latent state st in multi-turn dialogue—and let µθ denote
+the trajectory distribution induced by πθ with the frozen action agent πact(at | zt, ot). As detailed
+in Appendix A.1, we assume: (A1) Target Mediation, where expected task rewards and next-step
+state-observation transitions depend on (Ht, at) through (Yt, at) (covering both static targets and
+closed-loop settings where at alters Yt+1); (A2) Memory Causality (zt ⊥Yt | Ht), meaning πθ
+updates zt from observed history without privileged access to Yt; and (A3) Compressed Action
+Selection (at ⊥Yt | Ht, zt), meaning the actor selects at based on (zt, ot) alone.
+Theorem 1 (Value Suboptimality Bound; extending [33, 34]). Let V ∗(Ht) be the optimal expected
+return achievable with the full observation history, and V ∗(zt) be the optimal expected return
+achievable using the capacity-constrained summary zt. Under Assumptions (A1)–(A3) with rewards
+bounded in [−Rmax, Rmax], the expected suboptimality gap under the induced trajectory distribution
+µθ is bounded by the sequential information loss Iµθ(Yt; Ht | zt):
+Eµθ
+
+|V ∗(Ht) −V ∗(zt)|
+
+≤
+√
+2Rmax
+(1 −γ)2
+r
+sup
+k
+Iµθ(Yk; Hk | zk).
+(2)
+Theorem 1 (proved alongside an approximate-mediation extension in Appendix A.1) establishes that
+to minimize the value suboptimality gap, it suffices for the agent to minimize sequential information
+loss Iµθ(Yt; Ht | zt). This observation directly yields our first shaping objective:
+Proposition 1 (Predictive Sufficiency). To minimize the value suboptimality gap under a token budget
+|zt| ≤K, the policy can instead maximize the negative conditional entropy −Hµθ(Yt | zt), which we
+call predictive sufficiency. Introducing a parameterized variational distribution (critic) qϕ(Yt | zt),
+under (A2) sequential information loss satisfies Iµθ(Yt; Ht | zt) = Eµθ[−log qϕ(Yt | zt)]−Hµθ(Yt |
+Ht) −∆post(ϕ; θ), where ∆post(ϕ; θ) := Ezt∼µθ[DKL(Pµθ(Yt | zt) ∥qϕ(Yt | zt))] ≥0. Thus,
+maximizing Eµθ[log qϕ(Yt | zt)] maximizes a variational lower bound on predictive sufficiency—
+minimizing an upper bound on Iµθ(Yt; Ht | zt) up to closed-loop filtering-entropy shifts (zero for
+static targets; Appendix A.2)—without requiring constant marginal entropy Hµθ(Yt).
+We prove Proposition 1 in Appendix A.2, where Proposition 4 characterizes how budget K and critic
+quality enter Eq. (2): since |zt| ≤K carries at most K log |V| + log 2 nats, information loss obeys a
+rate-distortion floor decreasing with K until zt is sufficient for Yt. Maximizing Eµθ[log qϕ(Yt | zt)]
+approaches this frontier up to ∆post(ϕ; θ).
+4.2
+Factual Grounding and Recursive Consistency
+While maximizing predictive sufficiency −Hµθ(Yt | zt) ensures the summary retains task-relevant
+information, optimizing this objective in isolation can introduce a severe failure mode for LLMs:
+Lemma 1 (The Hallucination Failure Mode). Let πθ be a stochastic policy operating under token
+budget K. Because the mapping from a complex history Ht to a sparse downstream target Yt is
+many-to-one, optimizing solely for predictive sufficiency maxθ[−Hµθ(Yt | zt)] under-specifies the
+summary mapping. The policy can achieve the objective by fabricating plausible but ungrounded
+text that correlates with Yt, sampled from its pre-trained prior. This maximizes the ungrounded
+conditional entropy H(zt | Ht) and severs the summary’s dependence on the true history.
+As argued in Appendix A.3, this lemma implies that an unconstrained policy can satisfy the predictive
+sufficiency objective by generating idealized, highly probable text that encodes the target Yt while
+suppressing I(zt; Ht) toward the minimum required by the data processing inequality (DPI). This
+vulnerability aligns with uncertainty quantification research in LLMs [35, 36] showing that high
+ungrounded conditional entropy H(zt | Ht) is a primary indicator of confabulation.
+Proposition 2 (Recursive Consistency (Informal)). To suppress hallucination and promote factual
+grounding during streaming updates from local context ˜Ht = (zt−1, at−1, ot), the policy can
+regularize updates by maximizing the MI between the new summary and its conditioning context:
+maxθ Iµθ(zt; ˜Ht). We refer to this regularizer as recursive consistency.
+We formalize and prove Proposition 2 in Appendix A.4. Since Iµθ(zt; ˜Ht) = Hµθ(zt)−Hµθ(zt | ˜Ht),
+maximizing Iµθ(zt; ˜Ht) penalizes ungrounded entropy Hµθ(zt | ˜Ht), while predictive sufficiency
+5
+
+
+prevents zt from collapsing into a trivial constant summary (which would drop −Hµθ(Yt | zt) back to
+−Hµθ(Yt)). Because πθ observes only ˜Ht, any task-relevant detail omitted from zt−1 is permanently
+lost unless re-observed: Proposition 5 and Corollary 1 (Appendix A.4) formalize how per-turn losses
+accumulate, vanishing when K suffices to update the task-relevant sufficient statistics from ˜Ht and
+showing why myopic single-step compression fails.
+4.3
+The MaxIM Objective and Unified Asymmetric Critic Training
+We operationalize Propositions 1 and 2 into step-wise RL rewards using the local streaming context
+˜Ht = (zt−1, at−1, ot). Computing exact MI online during RL rollouts is intractable; instead, we
+generate an offline synthetic dataset D with privileged access to Yt (Appendix B) and pre-train a
+critic qϕ via teacher forcing.
+From Sufficiency and Consistency to Pointwise Mutual Information (PMI) Rewards.
+To turn
+both objectives into calibrated step-wise rewards, we cast each as a log-likelihood ratio. For predictive
+sufficiency (Proposition 1), using log qϕ(Yt | zt) as-is conflates summary quality with target difficulty:
+easy targets score well even when zt is uninformative, whereas hard targets score poorly even for
+thorough summaries. Subtracting a summary-free baseline log qϕ(Yt)—independent of zt conditional
+on (Ht, Yt), leaving the immediate policy gradient of log qϕ(Yt | zt) unbiased—isolates the infor-
+mation zt provides about Yt in PMI form, log qϕ(Yt|zt)
+qϕ(Yt) . For recursive consistency (Proposition 2),
+I(zt; ˜Ht) = E
+
+log P ( ˜
+Ht|zt)
+P ( ˜
+Ht)
+
+= E
+
+log P (zt| ˜
+Ht)
+P (zt)
+
+. Scoring consistency via backward reconstruction
+log qϕ( ˜Ht | zt) fails to penalize hallucinated claims appended alongside true statements, since fabri-
+cated sentences in zt need not lower the likelihood of reconstructing ˜Ht. Estimating I(zt; ˜Ht) in the
+forward direction, log P (zt| ˜
+Ht)
+P (zt) , evaluates each token of zt: claims unsupported by ˜Ht are no more
+probable given ˜Ht than unconditionally, yielding zero or negative log-ratios.
+Because both objectives share this conditional-to-unconditional log-ratio structure, at each step t we
+query qϕ with the conditioning input present and replaced by a fixed null placeholder—znull when
+omitting zt (e.g., "(no summary available)") to approximate P(Yt), and ˜Hnull when omitting
+(zt−1, at−1, ot) to approximate P(zt). Routing all four queries via mode-specific system instructions
+(Appendix E.3) trains a single unified critic qϕ via cross-entropy loss on D:
+L(ϕ) = −ED
+h
+λpred
+ log qϕ(Yt | zt) + log qϕ(Yt | znull)
+
++ λcons
+ log qϕ(zt | ˜Ht) + log qϕ(zt | ˜Hnull)
+i
+,
+(3)
+with loss weights λpred, λcons > 0. During RL, the frozen qϕ scores zt at turn t via length-normalized
+PMI using teacher-forced forward passes only (zero critic generation):
+rpred,t =
+1
+|Yt|
+|Yt|
+X
+i=1
+h
+log qϕ(Yt,i | Yt,<i, zt) −log qϕ(Yt,i | Yt,<i, znull)
+i
+,
+(4)
+rcons,t =
+1
+|zt|
+|zt|
+X
+i=1
+h
+log qϕ(zt,i | zt,<i, ˜Ht) −log qϕ(zt,i | zt,<i, ˜Hnull)
+i
+.
+(5)
+Proposition 6 (Appendix A.5) formalizes per-step baseline unbiasedness, multi-step/sigmoid trade-
+offs, the KL decomposition for rcons,t, and critic shift bounds (validated in Appendix F.2).
+4.4
+Policy Update and Algorithm Overview
+During RL, the summarizer policy maps (zt−1, at−1, ot) to an updated summary zt. Because
+discarding critical information early causes irreversible downstream loss, we propagate future task
+and shaping signals back to each turn t using a backward-discounted return-to-go Gt,s at RL step s.
+We map rpred,t and rcons,t onto a common bounded scale via centered sigmoids:
+ˆrt = ws
+ σ(αs(rpred,t −bs)) −1
+2
+
++ wc
+ σ(αc(rcons,t −bc)) −1
+2
+
+.
+(6)
+6
+
+
+Here (ws, wc) weighs sufficiency and consistency, respectively, with wc < ws so consistency acts
+as a grounding regularizer and does not dominate sufficiency; and (αs, bs, αc, bc) are calibrated
+offline using summaries sampled from the initial pre-RL base policy (Appendix D.3). Centering
+at −1
+2 assigns baseline-quality summaries zero shaping reward (avoiding positive length bias on
+variable-horizon episodes). Because ˆrk is summed across turns k = t, . . . , T whereas Rtask is sparse,
+we scale ˆrk by ηshape = 1 −γ so accumulated shaping rewards remain balanced against Rtask. Finally,
+a cosine schedule λs ∈[0, 1] over RL update iterations s holds λs = 1 early to resolve credit
+assignment and decays λs →0 mid-training so late-stage updates optimize Rtask without residual
+critic bias:
+Gt,s =
+T
+X
+k=t
+γk−t Rtask,k + ηshapeλs ˆrk
+
+.
+(7)
+We update πθ using KL-regularized PPO [37] with group-based relative advantage estimation [38]:
+for each initial state, G rollouts are sampled and Gt,s is standardized at each turn t via a leave-one-out
+baseline across the remaining G −1 active rollouts in the group (Algorithm 1, Appendix C).
+5
+Experiments
+We evaluate MaxIM on two complementary streaming benchmarks instantiating our static and
+dynamic POMDP formulations (Section 4), addressing three research questions:
+• RQ1: Does MaxIM’s information-theoretic reward shaping improve downstream task utility and
+token-budget Pareto efficiency over state-of-the-art memory baselines?
+• RQ2: How does MaxIM perform on fine-grained atomic-claim grounding and qualitative axes—
+Truthfulness, Usefulness, and Consistency—under cross-family LLM judges?
+• RQ3: How do MaxIM’s individual reward components (sufficiency PMI, recursive consistency
+PMI, and mid-training cosine annealing) contribute to task utility and grounding?
+5.1
+Experimental Setup
+Tasks and Environments.
+Task 1: arXiv Scientific Reading. The agent incrementally reads
+500-token chunks of a paper (up to 20 in RL; 25 at test) under a strict K = 500 token budget, plus
+K ∈{100, 300, 800} to test budget scaling. To minimize pretraining leakage, we curate 2,196 recent
+ar5iv papers [39] across nine domains into disjoint critic/SFT (1,281), RL (533), validation (44), and
+post-cutoff test (338) splits, each with five cross-section synthesis multiple choice questions (MCQs)
+(Appendix B.1). To penalize guessing with no evidence and to evaluate evidence explicitly retained in
+zT , we use Abstain-MCQ Accuracy: given only zT , the frozen actor selects A–D or E (“Insufficient
+information”), earning +1 for correct, 0 for E, and −1/3 for wrong guesses (0 random expectation).
+An Early-Section Stress Test (332 held-out papers) probes retention of technical details (design
+justifications, ablation trade-offs) appearing only in chunks 3–7 across 13–22 subsequent updates.
+Task 2: WildChat Multi-Turn User Simulation. The agent tracks a user’s evolving latent state
+under a K = 1,024 token budget using a 10-key JSON belief schema (goals, preferences, constraints,
+affect) in multi-turn conversations. From English WildChat dialogues [40] (≥6 user turns), we
+annotate causal per-turn states offline, train a user simulator to generate utterances and ground-truth
+states st (Appendix D.1), and form disjoint critic/SFT (3,000), RL (3,500), validation (200), and
+test (500) splits (Appendix B.2). Because conversational quality spans multiple axes that a single
+online scalar can misspecify, RL optimizes terminal belief-tracking accuracy (1–10 rating rescaled
+to Rtask ∈[0, 1]; Appendix F.3), whereas test evaluation measures multi-axis agent utility in fresh
+closed-loop rollouts (T ≤15). Specifically on the test dialogues, the frozen assistant sees only a
+local window (k = 1) with just the most recent turn (ut−1, at−1), the latest user message ut, and
+zt−1. Given (u1:T , a1:T ) and true states s0:T , GPT-4.1 rates (1–10) Overall User Satisfaction, Goal
+Completion, Preference & Constraint Retention, and Coherence & Adaptability (Appendix D.4).
+Table 1 reports signed ∆vs. a memory-free No-Belief baseline (k = 1 only) on all N = 500
+dialogues and on T ≥10 dialogues (N = 158 seeds with ≥10 turns under No-Belief).
+Baselines and Implementation.
+We compare MaxIM against three non-RL baselines: Prompt-
+Only (zero-shot base updates), Policy SFT (distilled on offline oracle summaries; Appendix B), and
+Best-of-N MI SFT (N = 8 on arXiv; distilling single-step updates with highest shaping reward ˆrt to
+7
+
+
+Table 1: Main downstream task utility results (RQ1). Left: arXiv Abstain-MCQ accuracy (±
+SEM; N = 338), abstention rate, and Early-Section Stress Test (N = 332, chunks 3–7). Right:
+WildChat paired ∆vs. memory-free No-Belief (k = 1 only) on 1–10 GPT-4.1 agent ratings over all
+N = 500 dialogues (No-Belief: 8.58 Sat., 8.75 Goal, 8.74 Pref.) and the T ≥10 cohort (N = 158;
+No-Belief: 8.08 Sat., 8.28 Pref.; full scores and Coherence in Table 9). Best bold; second-best
+underlined. †p < 0.05, ‡p < 0.01 vs. MaxIM (paired bootstrap).
+arXiv Scientific Reading (K=500)
+WildChat Dialogue (∆vs. No-Belief ↑)
+Method
+Abstain
+MCQ ↑
+Abst.
+(%) ↓
+Early
+Chunk ↑
+All T (N=500)
+T≥10 (N=158)
+Sat.
+Goal
+Pref.
+Sat.
+Pref.
+Prompt-Only
+31.30±1.28
+68.1
+17.35±1.05
+−0.09
+−0.09
++0.01
+−0.09
++0.08
+Policy SFT
+38.76±1.29
+59.1
+12.47±0.87
+−0.04
+−0.05
++0.05
+−0.21
+0.00
+Best-of-N MI SFT
+29.05±1.16
+70.1
+—
+—
+—
+—
+—
+—
+MemAgent RL [7]
+52.90±1.40
+46.0
+—
+−0.28‡
+−0.27‡
+−0.13‡
+−0.15
++0.02
+Task-Only RL
+54.44±1.45
+43.7
+32.23±1.26
+−0.30‡
+−0.29‡
+−0.15‡
+−0.37†
+−0.11†
+MI-Only RL
+50.30±1.50
+47.8
+—
+0.00
+0.00
++0.07
++0.18
++0.23
+Suff-Only RL
+51.54±1.46
+46.9
+—
+−0.18†
+−0.14
+−0.12‡
++0.16
++0.23
+MaxIM (Ours)
+66.39±1.31
+32.0
+48.55±1.35
++0.05
++0.05
++0.16
++0.11
++0.30
+test myopic MI selection); two sparse-reward RL baselines: MemAgent RL [7] and Task-Only RL,
+which do not use MI shaping; and two ablations: Suff-Only RL (wc = 0, no recursive consistency)
+and MI-Only RL (Rtask = 0, shaping only). Summarizers, the unified critics, frozen actors, and
+the user simulator use Gemini 2.5 Flash [41]; offline summary target synthesis and the RL belief
+rater use Gemini 3.0 Flash; and test-time WildChat ratings, atomic-claim grounding, and qualitative
+evaluations use cross-family GPT-4.1. RL methods use G = 8 and γ = 0.9 (γ = 1.0 for MemAgent
+RL), with zero critic calls at test time.
+5.2
+Main Results: Downstream Task Utility and Budget Scaling (RQ1)
+Scientific Reading and Long-Range Credit Assignment.
+On arXiv (K = 500, Table 1), non-RL
+baselines abstain on 59%–70% of synthesis questions: Prompt-Only (31.30%) lacks guidance on
+which details matter downstream, Policy SFT (38.76%) compounds exposure bias over 25 updates,
+and Best-of-N MI SFT (29.05%) confirms Corollary 1 (Appendix A.4)—greedily selecting single-
+step updates by immediate PMI cannot plan capacity across chunks or replace non-myopic RL.
+Sparse-reward RL substantially improves retention (MemAgent 52.90%, Task-Only 54.44%), yet
+MaxIM reaches 66.39%, beating Task-Only by +11.95 pp and MemAgent by +13.49 pp and
+cutting abstention to 32.0%. On the Early-Section Stress Test (chunks 3–7), MaxIM’s lead widens
+to 48.55% vs. 32.23% for Task-Only (+50.6% relative) and 17.35% for Prompt-Only, confirming
+dense PMI shaping helps retain early task-relevant details.
+Token-Budget Pareto Frontier.
+Across strict budgets K ∈{100, 300, 500, 800} (Figure 2(a)),
+MaxIM dominates the Pareto frontier: at K = 100, MaxIM achieves 34.26% Abstain-MCQ—
+beating Prompt-Only at a 5× larger K = 500 budget (31.30%)—and at K = 500 (66.39%) it
+surpasses Prompt-Only even at K = 2,000 (64.32%; Table 6), saturating smoothly at 67.04%
+(K = 800) per Proposition 4. Figure 2(b) tracks chunk claim incorporation (the share of atomic
+claims in chunk ot entailed by zt): all methods incorporate 45%–50% in chunks 1–5, but baselines
+saturate once the K = 500 buffer fills whereas MaxIM sustains 26.8% even in chunks 21–25.
+Bounded-Memory Multi-Turn Dialogue: When Imperfect Beliefs Hurt.
+On WildChat (Table 1),
+the assistant with no belief tracking (No-Belief) already scores high on average (8.58 Sat., 8.74 Pref.).
+However, its scores drop noticeably on longer dialogues (T ≥10) to 8.08 and 8.28. Strikingly, every
+baseline without MI shaping underperforms No-Belief on Satisfaction and Goal Completion—
+including Task-Only RL (∆= −0.30, p = 0.0084; −0.37 on T ≥10) and MemAgent RL
+(∆= −0.28, p = 0.0206): conditioning replies on inaccurately tracked beliefs steers the assistant
+toward false assumptions, proving worse than no belief state at all. Notably, Task-Only (8.79/10)
+and MemAgent (8.98/10) nearly match MaxIM (9.00/10; Table 10) on the terminal belief-tracking
+8
+
+
+100
+300
+500
+700
+15
+30
+45
+60
+75
+K=100
+K=300
+K=500
+K=800
+Task-Only
+MemAgent
+Policy SFT
+Best-of-N
+Average Summary Tokens
+Abstain-MCQ Acc. (%)
+(a) arXiv Budget Pareto
+1–5
+6–10
+11–15
+16–20
+21–25
+15
+25
+35
+45
+Streaming Chunk Window t
+Chunk Incorporation (%)
+(b) arXiv Claim Incorporation
+3
+5
+8
+10
+12
+40
+50
+60
+70
+80
+90
+Prompt-Only (50%)
+Dialogue Turn t
+Belief Usefulness Win (%)
+(c) WildChat Belief Usefulness
+MaxIM (Ours)
+Task-Only RL
+MemAgent RL
+Policy SFT
+Prompt-Only
+Best-of-N SFT
+Figure 2: Budget scaling and long-horizon dynamics. (a) arXiv token-budget Pareto curve
+(K ∈{100, 300, 500, 800}; K = 500 baselines labeled): MaxIM at K = 100 outperforms Prompt-
+Only at a 5× larger K = 500 budget. (b) Chunk claim incorporation (percentage of atomic claims in
+chunk ot entailed by zt) across 5-chunk windows (t = 1 . . . 25): MaxIM resists late-turn memory
+saturation. (c) WildChat GPT-4.1 pairwise belief-state Usefulness win rate vs. Prompt-Only.
+Table 2: Source grounding and qualitative summary evaluation (RQ2; GPT-4.1). Grounding of
+terminal zT , pairwise Usefulness/Truthfulness win rates vs. Prompt-Only, and 1–10 Consistency.
+arXiv Scientific Reading (N=338)
+WildChat Multi-Turn Dialogue (N=500)
+Method
+Entail
+(%) ↑
+Contr
+(%) ↓
+Gnd.
+Claims ↑
+Use
+Win %
+Cons.
+(1–10)
+Entail
+(%) ↑
+Contr
+(%) ↓
+Gnd.
+Claims ↑
+Use
+Win %
+Truth
+Win %
+Prompt-Only
+98.04
+0.50
+33.0
+—
+6.16
+84.38
+11.04
+18.7
+—
+—
+Policy SFT
+75.01
+11.62
+21.0
+13.4
+7.12
+83.68
+9.00
+16.5
+37.6
+36.2
+MemAgent RL
+98.35
+0.62
+47.6
+80.1
+6.07
+85.42
+9.35
+21.0
+66.4
+61.0
+Task-Only RL
+98.37
+0.65
+47.3
+62.5
+6.44
+87.50
+7.04
+23.1
+79.8
+69.8
+MI-Only RL
+98.13
+0.78
+63.4
+47.0
+6.04
+85.19
+10.53
+20.5
+40.8
+40.8
+Suff-Only RL
+98.39
+0.56
+49.9
+74.4
+5.99
+89.77
+6.48
+22.0
+72.2
+65.8
+MaxIM (Full)
+97.48
+1.06
+54.0
+72.9
+7.55
+91.75
+4.27
+40.3
+73.8
+72.4
+reward Rtask itself; optimizing terminal belief accuracy alone fails to improve agent utility because it
+tolerates intermediate-turn hallucinations and omissions that derail live responses (Section 5.3).
+Long-Horizon Recovery via MI Shaping. By contrast, on T ≥10 dialogues, only MI-shaped
+policies outperform No-Belief across every metric (bottom block of Table 1). Full MaxIM is the
+only method with positive gains (∆> 0) across all metrics on both cohorts, hitting ∆= +0.30 on
+T ≥10 Preference Retention while resolving goals in fewer turns (10.68 vs. 12.61; Table 9), beating
+Task-Only by +0.35 Sat. (p = 0.0012; +0.48 on T ≥10) and MemAgent by +0.34 (p = 0.0032).
+5.3
+Factual Grounding and Qualitative Assessment (RQ2)
+GPT-4.1 evaluates two protocols (Table 2; Appendix E): atomic-claim grounding decomposes
+terminal zT into claims classified against the source as supported (Entail %), neutral, or fabricat-
+ed/distorted (Contr %), and reports mean supported claims (Gnd. Claims); qualitative evaluation
+compares each method vs. Prompt-Only (t = 20 on arXiv; zT on WildChat) on task helpfulness (Use
+Win %) and faithfulness (Truth Win %), and scores arXiv Consistency (Cons.) on a 1–10 scale by
+whether (zt−1, ot) →zt preserves prior context while integrating ot.
+Factual Grounding and Qualitative Trade-Offs on Scientific Reading.
+In Table 2 (left), RL
+policies sustain high arXiv entailment (97.5%–98.4%), whereas Policy SFT degrades (75.01%
+entailment, 11.62% contradiction) as errors compound across 25 sequential updates. MaxIM attains
+97.48% entailment while packing 54.0 grounded claims—63.6% above Prompt-Only (33.0) and
+above Task-Only (47.3) and MemAgent (47.6), whereas MI-Only packs 63.4 claims with low
+selectivity (47.0% Usefulness). Against Prompt-Only at t = 20, MemAgent has a higher Usefulness
+win rate than MaxIM (80.1% vs. 72.9%), whereas MaxIM achieves the highest Consistency overall
+(7.55 vs. MemAgent’s 6.07), retains more claims (54.0 vs. 47.6), and leads by 13.49 pp on Abstain-
+9
+
+
+Table 3: Reward-component and annealing ablations (RQ3). (a) Isolating Rtask, rpred, and rcons
+(WC ∆Sat. vs. No-Belief). (b) Cosine-decay window of λs (% of RL steps; N = 338).
+(a) Reward Component Ablation
+(b) arXiv Annealing (K=500)
+Rtask rpred rcons Variant
+arXiv MCQ
+(%) ↑
+WC Contr
+(%) ↓
+WC
+∆Sat. ↑
+Decay
+(% Steps)
+Val MCQ
+(%)
+Test MCQ
+(%) ↑
+✓
+Task-Only
+54.44±1.45
+7.04±0.49
+−0.30
+None (λs=1)
+73.18
+57.10±1.40
+✓
+✓
+Suff-Only
+51.54±1.46
+6.48±0.41
+−0.18
+Early (13–60%)
+73.18
+61.18±1.33
+✓
+✓
+MI-Only
+50.30±1.50
+10.53±0.44
+0.00
+Late (65–90%)
+74.55
+61.12±1.44
+✓
+✓
+✓
+MaxIM
+66.39±1.31 4.27±0.27
++0.05
+Mid (45–60%)
+75.91
+66.39±1.31
+vs. 2nd-best: +11.95 pp
+−2.21 pp
++0.05
+vs. none:
++2.73 pp
++9.29 pp
+MCQ. Moreover, when GPT-4.1 compares MaxIM and MemAgent directly (t = 3 . . . 20), it prefers
+MaxIM on Usefulness at every chunk (54.8%–72.0% win rate; Table 11).
+Dynamic Belief Grounding on WildChat.
+While arXiv provides explicit text, WildChat requires
+inferring implicit user states without confabulation. MaxIM achieves the highest entailment (91.75%),
+cuts contradictions to 4.27%—54% below MemAgent (9.35%), 39% below Task-Only (7.04%),
+and 61% below Prompt-Only (11.04%)—and retains nearly twice as many grounded claims (40.3 vs.
+21.0–23.1), explaining why MaxIM aids the k = 1 assistant while unshaped RL misleads it. MaxIM
+also leads Truthfulness (72.4%) and ranks second in Usefulness (73.8% vs. Task-Only’s 79.8%).
+Figure 2(c) (Table 11) shows why: for t ≤5, Task-Only’s speculative inferences edge MaxIM on
+Usefulness (82.1% vs. 79.5% at t = 5) at lower Truthfulness (70.5% vs. 78.6%), whereas for t ≥8
+MaxIM leads every baseline on both Usefulness (up to 90.2%) and Truthfulness (88.5%).
+5.4
+Ablation Studies: Reward Components and Annealing Dynamics (RQ3)
+Synergy of Sufficiency, Recursive Consistency, and Task Anchoring.
+Table 3(a) isolates each
+reward term: only full MaxIM achieves positive WildChat ∆Sat. (+0.05; +0.23 vs. Suff-Only,
++0.35 vs. Task-Only). Dropping recursive consistency (Suff-Only RL, wc = 0) cuts arXiv accuracy
+by −14.85 pp (51.54%), yields the lowest consistency (5.99; Table 2), and raises WildChat contradic-
+tions by +51.8% (6.48% vs. 4.27%): while Suff-Only aids T ≥10 dialogues (∆= +0.16; Table 1),
+unregularized sufficiency rewards speculative claims (Lemma 1) that pull overall Satisfaction negative
+(∆= −0.18, p = 0.048). Conversely, MI-Only RL (Rtask = 0) reaches 50.30% arXiv accuracy and
++0.18 T ≥10 Satisfaction without task reward (Proposition 1), yet leaves a 16.09 pp arXiv gap and
+10.53% contradictions (Proposition 6(ii)), motivating task anchoring.
+Role of Mid-Training Cosine Annealing.
+Table 3(b) varies the λs decay window on arXiv
+(K = 500). Constant shaping (No Annealing, 57.10%) beats Task-Only (54.44%), while decaying
+too early (13%–60%, 61.18%) or late (65%–90%, 61.12%) trails Mid-Decay (45%–60%, 66.39%)
+by > 5 pp (+9.29 pp over none). Holding λs = 1 early guides exploration toward informative,
+grounded summaries (escaping sparse-reward plateaus), while mid-training decay (λs →0) lets late
+updates optimize Rtask without critic bias (Proposition 6(iii)).
+6
+Conclusion
+In this work, we introduced MaxIM, a mathematically principled RL framework for capacity-
+constrained incremental summarization. To overcome the severe credit assignment bottlenecks of
+sparse, long-horizon task rewards, we formulated context compression as an information-theoretic
+reward shaping problem. By establishing formal links between value suboptimality and sequen-
+tial information loss across static and dynamic POMDPs, we derived two complementary, dense
+regularizers: predictive sufficiency to promote downstream task utility, and recursive consistency
+to enforce factual grounding and substantially reduce LLM hallucination. By exploiting a unified
+asymmetric critic architecture trained on scalable synthetic data with PMI scoring and no test-time
+overhead, MaxIM provides dense step-wise shaping signals without a need for expensive human
+preference labels. Our empirical evaluations across long-horizon scientific reading and closed-loop
+multi-turn conversation settings demonstrate that MaxIM achieves superior downstream task success,
+Pareto-efficient token compression, and factual consistency.
+10
+
+
+References
+[1] Paul Covington, Jay Adams, and Emre Sargin. Deep neural networks for youtube recommenda-
+tions. Proceedings of the 10th ACM Conference on Recommender Systems, 2016.
+[2] Keqin Bao, Ming Yan, Yang Zhang, Jizhi Zhang, Wenjie Wang, Fuli Feng, and Xiangnan He.
+Real-time personalization for LLM-based recommendation with customized in-context learning.
+arXiv preprint arXiv:2410.23136, 2024.
+[3] Jing Xu, Arthur Szlam, and Jason Weston. Beyond goldfish memory: Long-term open-domain
+conversation. In Proceedings of the 60th Annual Meeting of the Association for Computational
+Linguistics, 2022.
+[4] Xinchao Xu, Zhibin Gou, Wenquan Wu, Zheng-Yu Niu, Hua Wu, Haifeng Wang, and Shihang
+Wang. Long time no see! open-domain conversation with long-term persona memory. In
+Findings of the Association for Computational Linguistics: ACL 2022, pages 2639–2650, 2022.
+[5] Nelson F Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio Petroni,
+and Percy Liang. Lost in the middle: How language models use long contexts. Transactions of
+the Association for Computational Linguistics, 12:157–173, 2024.
+[6] Charles Packer, Vivian Fang, Shishir G Patil, Kevin Lin, Sarah Wooders, and Joseph E Gonzalez.
+MemGPT: Towards llms as operating systems. In arXiv preprint arXiv:2310.08560, 2023.
+[7] Hongli Yu, Tinghong Chen, Jiangtao Feng, Jiangjie Chen, Weinan Dai, Qiying Yu, Ya-Qin
+Zhang, Wei-Ying Ma, Jingjing Liu, Mingxuan Wang, and Hao Zhou. Memagent: Reshaping
+long-context llm with multi-conv rl-based memory agent. In The Fourteenth International
+Conference on Learning Representations, 2026.
+[8] Yu Wang, Ryuichi Takanobu, Zhiqi Liang, Yuzhen Mao, Yuanzhe Hu, Julian McAuley, and
+Xiaojian Wu. Mem-α: Learning memory construction via reinforcement learning, 2025. URL
+https://arxiv.org/abs/2509.25911.
+[9] Yapei Chang, Kyle Lo, Tanya Goyal, and Mohit Iyyer. BOOOOKSCORE: A systematic
+exploration of book-length summarization in the era of LLMs. In International Conference on
+Learning Representations (ICLR), 2024.
+[10] EunJeong Hwang, Yichao Zhou, James B Wendt, Beliz Gunel, Nguyen Vo, Jing Xie, and
+Sandeep Tata. Enhancing incremental summarization with structured representations. In
+Findings of the Association for Computational Linguistics: EMNLP 2024, pages 3830–3842,
+2024.
+[11] David Barber and Felix Agakov. Information maximization in noisy channels : A variational
+approach. In S. Thrun, L. Saul, and B. Schölkopf, editors, Advances in Neural Information Pro-
+cessing Systems, volume 16. MIT Press, 2003. URL https://proceedings.neurips.cc/
+paper_files/paper/2003/file/a6ea8471c120fe8cc35a2954c9b9c595-Paper.pdf.
+[12] Abigail See, Peter J. Liu, and Christopher D. Manning. Get to the point: Summarization with
+pointer-generator networks. In Regina Barzilay and Min-Yen Kan, editors, Proceedings of the
+55th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers),
+pages 1073–1083, Vancouver, Canada, July 2017. Association for Computational Linguistics.
+doi: 10.18653/v1/P17-1099. URL https://aclanthology.org/P17-1099/.
+[13] Mike Lewis, Yinhan Liu, Naman Goyal, Marjan Ghazvininejad, Abdelrahman Mohamed, Omer
+Levy, Veselin Stoyanov, and Luke Zettlemoyer. BART: Denoising sequence-to-sequence pre-
+training for natural language generation, translation, and comprehension. In Dan Jurafsky,
+Joyce Chai, Natalie Schluter, and Joel Tetreault, editors, Proceedings of the 58th Annual
+Meeting of the Association for Computational Linguistics, pages 7871–7880, Online, July
+2020. Association for Computational Linguistics. doi: 10.18653/v1/2020.acl-main.703. URL
+https://aclanthology.org/2020.acl-main.703/.
+[14] Chris Kedzie, Fernando Diaz, and Kathleen McKeown. Real-time web scale event summariza-
+tion using sequential decision making. In Proceedings of the Twenty-Fifth International Joint
+Conference on Artificial Intelligence, IJCAI’16, pages 3754–3760. AAAI Press, 2016. ISBN
+9781577357704.
+11
+
+
+[15] James Allan, Ron Papka, and Victor Lavrenko. On-line new event detection and tracking.
+In Proceedings of the 21st Annual International ACM SIGIR Conference on Research and
+Development in Information Retrieval, SIGIR ’98, pages 37–45, New York, NY, USA, 1998.
+Association for Computing Machinery. ISBN 1581130155. doi: 10.1145/290941.290954. URL
+https://doi.org/10.1145/290941.290954.
+[16] Jesse Mu, Xiang Lisa Li, and Noah Goodman. Learning to compress prompts with gist tokens.
+In Advances in Neural Information Processing Systems, volume 36, 2023.
+[17] Alexis Chevalier, Alexander Wettig, Anirudh Ajith, and Danqi Chen. Adapting language models
+to compress contexts. In Proceedings of the 2023 Conference on Empirical Methods in Natural
+Language Processing (EMNLP), pages 3829–3846, 2023.
+[18] Tao Ge, Jing Hu, Lei Wang, Xun Wang, Si-Qing Chen, and Furu Wei. In-context autoencoder
+for context compression in a large language model. In The Twelfth International Conference on
+Learning Representations (ICLR), 2024.
+[19] Nisan Stiennon, Long Ouyang, Jeffrey Wu, Daniel Ziegler, Ryan Lowe, Chelsea Voss, Alec
+Radford, Dario Amodei, and Paul F Christiano. Learning to summarize with human feedback.
+In Advances in Neural Information Processing Systems, volume 33, pages 3008–3021, 2020.
+[20] Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela Mishkin,
+Chong Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language models
+to follow instructions with human feedback. In Advances in Neural Information Processing
+Systems, volume 35, pages 27730–27744, 2022.
+[21] Yuntao Bai, Saurav Kadavath, Sandipan Kundu, Amanda Askell, Jackson Kernion, Andy Jones,
+Anna Chen, Anna Goldie, Azalia Mirhoseini, Cameron McKinnon, et al. Constitutional ai:
+Harmlessness from ai feedback. arXiv preprint arXiv:2212.08073, 2022.
+[22] Harrison Lee, Samrat Phatale, Hassan Mansoor, Thomas Lu, Thomas MacMillan, Federico
+Ramirez, Roman Garcia, Kellie Richter, Sarah Walker, Uri Alon, et al. RLAIF: Scaling rein-
+forcement learning from human feedback with ai feedback. arXiv preprint arXiv:2309.00267,
+2023.
+[23] Ralph Allan Bradley and Milton E Terry. Rank analysis of incomplete block designs: I. the
+method of paired comparisons. Biometrika, 39(3/4):324–345, 1952.
+[24] Andrew Y Ng, Daishi Harada, and Stuart Russell. Policy invariance under reward transforma-
+tions: Theory and application to reward shaping. In Proceedings of the Sixteenth International
+Conference on Machine Learning (ICML 1999), pages 278–287, 1999.
+[25] Lerrel Pinto, Marcin Andrychowicz, Peter Welinder, Wojciech Zaremba, and Pieter Abbeel.
+Asymmetric actor critic for image-based robot learning. In Robotics: Science and Systems
+(RSS), 2018. doi: 10.15607/RSS.2018.XIV.008.
+[26] Dian Chen, Brady Zhou, Vladlen Koltun, and Philipp Krähenbühl. Learning by cheating.
+In Leslie Pack Kaelbling, Danica Kragic, and Komei Sugiura, editors, Proceedings of the
+Conference on Robot Learning, volume 100 of Proceedings of Machine Learning Research,
+pages 66–75. PMLR, 30 Oct–01 Nov 2020. URL https://proceedings.mlr.press/v100/
+chen20a.html.
+[27] Matthieu Geist, Bruno Scherrer, and Olivier Pietquin. A theory of regularized Markov decision
+processes. In International Conference on Machine Learning, pages 2160–2169. PMLR, 2019.
+[28] Aaron van den Oord, Yazhe Li, and Oriol Vinyals. Representation learning with contrastive
+predictive coding, 2019. URL https://arxiv.org/abs/1807.03748.
+[29] David McAllester and Karl Stratos. Formal limitations on the measurement of mutual informa-
+tion. In Proceedings of the Twenty Third International Conference on Artificial Intelligence and
+Statistics, volume 108 of Proceedings of Machine Learning Research, pages 875–884. PMLR,
+2020. URL https://proceedings.mlr.press/v108/mcallester20a.html.
+12
+
+
+[30] XuanLong Nguyen, Martin J Wainwright, and Michael Jordan.
+Estimating diver-
+gence functionals and the likelihood ratio by penalized convex risk minimization.
+In
+J. Platt, D. Koller, Y. Singer, and S. Roweis, editors, Advances in Neural Infor-
+mation Processing Systems, volume 20, pages 1089–1096. Curran Associates, Inc.,
+2007.
+URL https://proceedings.neurips.cc/paper_files/paper/2007/file/
+72da7fd6d1302c0a159f6436d01e9eb0-Paper.pdf.
+[31] Jiaming Song and Stefano Ermon. Understanding the limitations of variational mutual infor-
+mation estimators. In International Conference on Learning Representations, 2020. URL
+https://openreview.net/forum?id=B1x62TNtDS.
+[32] Ben Poole, Sherjil Ozair, Aaron Van Den Oord, Alex Alemi, and George Tucker. On variational
+bounds of mutual information. In Kamalika Chaudhuri and Ruslan Salakhutdinov, editors,
+Proceedings of the 36th International Conference on Machine Learning, volume 97 of Pro-
+ceedings of Machine Learning Research, pages 5171–5180. PMLR, 09–15 Jun 2019. URL
+https://proceedings.mlr.press/v97/poole19a.html.
+[33] Lihong Li, Thomas J Walsh, and Michael L Littman. Towards a unified theory of state abstraction
+for MDPs. In ISAIM, 2006.
+[34] Jayakumar Subramanian, Amit Sinha, Raihan Seraj, and Aditya Mahajan.
+Approximate
+information state for approximate planning and reinforcement learning in partially observable
+systems. Journal of Machine Learning Research, 23(12):1–83, 2022.
+[35] Lorenz Kuhn, Yarin Gal, and Sebastian Farquhar. Semantic uncertainty: Linguistic invariances
+for uncertainty estimation in natural language generation.
+In The Eleventh International
+Conference on Learning Representations (ICLR), 2023.
+[36] Potsawee Manakul, Adian Liusie, and Mark J. F. Gales. SelfCheckGPT: Zero-resource black-
+box hallucination detection for generative large language models. In Proceedings of the 2023
+Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 9004–9017,
+2023.
+[37] John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal
+policy optimization algorithms. arXiv preprint arXiv:1707.06347, 2017.
+[38] Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang,
+Mingchuan Zhang, Y. K. Li, Y. Wu, and Daya Guo. Deepseekmath: Pushing the limits of
+mathematical reasoning in open language models, 2024. URL https://arxiv.org/abs/
+2402.03300.
+[39] ar5iv. ar5iv: Articles from arxiv as responsive HTML5 web pages, 2026. URL https:
+//ar5iv.labs.arxiv.org/.
+[40] Wenting Zhao, Xiang Ren, Jack Hessel, Claire Cardie, Yejin Choi, and Yuntian Deng. WildChat:
+1m ChatGPT interaction logs in the wild. In The Twelfth International Conference on Learning
+Representations, 2024. URL https://openreview.net/forum?id=Bl8u7ZRlbM.
+[41] Gheorghe Comanici, Eric Bieber, Mike Schaekermann, Ice Pasupat, Noveen Sachdeva, Inderjit
+Dhillon, Marcel Blistein, Ori Ram, Dan Zhang, Evan Rosen, et al. Gemini 2.5: Pushing the
+frontier with advanced reasoning, multimodality, long context, and next generation agentic
+capabilities, 2025. URL https://arxiv.org/abs/2507.06261.
+13
+
+
+A
+Theoretical Analysis and Proofs
+This appendix presents the unified formal analysis and complete proofs for all theoretical claims
+in Section 4: Theorem 1 and Proposition 3 on POMDPs with static or action-dependent targets
+(Appendix A.1); Propositions 1 and 4 on predictive sufficiency, finite-K rate-distortion floors, and
+critic posterior approximation error (Appendix A.2); Lemma 1 on the hallucination failure mode
+(Appendix A.3); Propositions 2 and 5 together with Corollary 1 on recursive consistency, sequential
+information loss under local context updates, and non-myopic RL (Appendix A.4); and Proposition 6
+on pointwise mutual information (PMI) identities and critic distribution shift under KL-regularized
+RL and annealing (Appendix A.5).
+A.1
+Proof of Theorem 1 and Approximate Target Mediation
+Let µθ denote the trajectory distribution induced by rolling out the incremental summarizer πθ(zt |
+zt−1, at−1, ot) alongside the fixed downstream action agent πact(at | zt, ot). Denote the full-history
+posterior belief by bt(·) := P(Yt ∈· | Ht) and the compressed posterior belief by ˆbt(·) := P(Yt ∈· |
+zt). Formally, V ∗(Ht) := sup˜πact E
+ P
+k≥t γk−tRtask,k | Ht
+
+denotes the optimal value achievable
+over history-measurable actor policies ˜πact(ak | Hk), and V ∗(zt) := supπact Eπθ
+ P
+k≥t γk−tRtask,k |
+zt
+
+denotes the optimal value over (zk, ok)-measurable actor policies πact(ak | zk, ok) holding the
+summarizer kernel πθ fixed. Assumptions (A1)–(A3) in Section 4.1 state:
+(A1) Target Mediation: There exist transition and observation kernels T, O and an expected reward
+function r : Y × A →[−Rmax, Rmax] such that conditionally on (Ht, Yt, at), Yt+1 ∼T(· |
+Yt, at), ot+1 ∼O(· | Yt+1, at), and E[Rtask,t | Ht, at] = ⟨bt, r(·, at)⟩. This subsumes both
+passive document reading (T(· | y, a) = δy, as in arXiv) and interactive closed-loop POMDPs
+where actions at alter future latent states Yt+1 (as in WildChat).
+(A2) Memory Causality: zt ⊥Yt | Ht, since πθ conditions only on (zt−1, at−1, ot) ⊆Ht and
+exogenous sampling randomness (privileged targets Yt are accessed solely by the offline critic
+during training).
+(A3) Compressed Acting: at ⊥Yt | (Ht, zt), which holds whenever at ∼πact(· | zt, ot) (or
+conditioned additionally on bounded recent turns) uses exogenous randomness.
+Theorem 1 (Value Suboptimality Bound; extending [33, 34]). Let V ∗(Ht) be the optimal expected
+return achievable with the full observation history, and V ∗(zt) be the optimal expected return
+achievable using the capacity-constrained summary zt. Under Assumptions (A1)–(A3) with rewards
+bounded in [−Rmax, Rmax], the expected suboptimality gap under the induced trajectory distribution
+µθ is bounded by the sequential information loss Iµθ(Yt; Ht | zt):
+Eµθ
+
+|V ∗(Ht) −V ∗(zt)|
+
+≤
+√
+2Rmax
+(1 −γ)2
+r
+sup
+k
+Iµθ(Yk; Hk | zk),
+and conditioning on closed-loop actions never inflates this loss: Iµθ(Yt; Ht | zt, at) ≤Iµθ(Yt; Ht |
+zt).
+Proof. From the agent’s perspective, mapping the true observation history Ht into a capacity-
+constrained summary zt acts as a lossy state abstraction. Operating on this abstraction introduces
+approximation errors in predicting both the immediate reward and the transition dynamics. By
+the performance difference bounds for state abstractions (e.g., Theorem 2 in [33] and approximate
+information state Bellman induction [34]), the value suboptimality is bounded by the maximum
+single-step Bellman error ϵt introduced by the abstraction, multiplied by
+1
+1−γ . This error ϵt is
+bounded by the sum of immediate reward errors (∆Rt) and discounted transition dynamics errors
+(γ∆Pt · Vmax).
+Crucially, we evaluate both Bellman operators at each common fixed action a ∈A, so exogeneity or
+marginal stationarity of Yt is never required. By (A2), P(Yt ∈· | Ht, zt) = bt almost surely. Because
+the immediate reward function depends strictly on the target variable Yt via (A1), the maximum
+single-step reward error ∆Rt is bounded by the Total Variation (TV) distance between the true
+14
+
+
+posterior belief bt = P(Yt | Ht) and the compressed posterior belief ˆbt = P(Yt | zt):
+∆Rt = sup
+a∈A
+⟨bt−ˆbt, r(·, a)⟩
+ ≤(max R−min R)·DTV
+ P(Yt | Ht), P(Yt | zt)
+
+= 2Rmax·DTV.
+(8)
+For the transition dynamics error ∆Pt, standard abstraction proofs evaluate the divergence in the
+environment’s transition model for a fixed action. In static environments, the underlying state does
+not evolve, so ∆Pt = 0. In dynamic closed-loop environments, for any fixed action a ∈A, define
+the fixed-action Markov kernel Ga(y, ·) :=
+R
+Y O(· | y′, a) T(dy′ | y, a) mapping current latent
+states to next observations. Under (A1)–(A2), the full-history and compressed next-observation
+laws at action a are linear pushforwards ⟨bt, Ga⟩and ⟨ˆbt, Ga⟩; because both operators evaluate the
+identical action a through the shared kernel Ga, the causal effect of a on Yt+1 enters both sides
+identically, and data processing for TV yields DTV(⟨bt, Ga⟩, ⟨ˆbt, Ga⟩) ≤DTV(bt,ˆbt) (preserved
+under composition with πθ(zt+1 | zt, a, ot+1)). Accounting for dual-signed value differences in
+[−Vmax, Vmax] gives |E[V ∗(Ht+1) | Ht, a] −E[V ∗(zt+1) | zt, a]| residual contribution bounded via
+∆Pt · Vmax ≤2DTV · Vmax.
+Let Vmax ≤Rmax
+1−γ be the maximum possible value achievable. The worst-case single-step Bellman
+error ϵt is bounded by:
+ϵt ≤∆Rt + γ∆Pt · Vmax ≤2Rmax
+1 −γ DTV.
+(9)
+By Pinsker’s inequality, the TV distance is bounded by the KL divergence: DTV ≤
+q
+1
+2DKL.
+Substituting this yields:
+ϵt ≤
+√
+2Rmax
+1 −γ
+q
+DKL
+ P(Yt | Ht) ∥P(Yt | zt)
+
+.
+(10)
+We now take the expectation over the induced trajectory distribution µθ. By Jensen’s Inequality
+(E[
+√
+X] ≤
+p
+E[X]):
+Eµθ[ϵt] ≤
+√
+2Rmax
+1 −γ
+Eµθ
+hp
+DKL
+i
+≤
+√
+2Rmax
+1 −γ
+q
+Eµθ[DKL].
+(11)
+By (A2), the expected KL divergence between the true and compressed conditionals over the joint
+distribution is precisely the conditional mutual information, or information loss:
+Eµθ
+
+DKL(P(Yt | Ht) ∥P(Yt | zt))
+
+= Iµθ(Yt; Ht | zt).
+(12)
+Summing this step-wise bound across the discounted horizon (P
+k≥t γk−t =
+1
+1−γ ) yields Eq. (2).
+Finally, expanding Iµθ(Yt; (Ht, at) | zt) in both orders gives Iµθ(Yt; Ht | zt)+Iµθ(Yt; at | Ht, zt) =
+Iµθ(Yt; at | zt) + Iµθ(Yt; Ht | zt, at); since Iµθ(Yt; at | Ht, zt) = 0 by (A3) and Iµθ(Yt; at | zt) ≥
+0, we obtain Iµθ(Yt; Ht | zt, at) ≤Iµθ(Yt; Ht | zt).
+Proposition 3 (Approximate Target Mediation). If Assumption (A1) holds only approximately—with
+reward mediation error supHt,a |E[Rtask,t | Ht, a] −⟨bt, r(·, a)⟩| ≤εr and observation kernel error
+supHt,a DTV(P(ot+1 | Ht, a), ⟨bt, Ga⟩) ≤εT —then Theorem 1 holds with an explicit additive
+misspecification floor + 2εr+2γVmaxεT
+1−γ
+.
+Proof. Applying the triangle inequality to Eqs. (8)–(9) adds 2εr + 2γVmaxεT to each per-step
+Bellman residual, which accumulates across P
+k≥t γk−t = (1 −γ)−1 to + 2εr+2γVmaxεT
+1−γ
+.
+A.2
+Proof of Proposition 1 and Capacity / Critic-Transfer Bounds
+Proof of Proposition 1. By definition, the conditional mutual information expands as:
+Iµθ(Yt; Ht | zt) = Hµθ(Yt | zt) −Hµθ(Yt | Ht, zt).
+(13)
+Because the summary zt is generated solely by conditioning on the history Ht (Assumption (A2)),
+they form the Markov chain Yt →Ht →zt, yielding Hµθ(Yt | Ht, zt) = Hµθ(Yt | Ht) and hence:
+Iµθ(Yt; Ht | zt) = Hµθ(Yt | zt) −Hµθ(Yt | Ht).
+(14)
+15
+
+
+The term Hµθ(Yt | Ht) represents the irreducible uncertainty of the target given the full history. In-
+troducing a parameterized variational distribution qϕ(Yt | zt), the expected variational log-likelihood
+satisfies the exact identity:
+Eµθ[log qϕ(Yt | zt)] = −Hµθ(Yt | zt)
+|
+{z
+}
+predictive sufficiency
+−Ezt∼µθ
+h
+DKL
+ Pµθ(Yt | zt) ∥qϕ(Yt | zt)
+i
+|
+{z
+}
+=: ∆post(ϕ;θ) ≥0
+.
+(15)
+Thus Eµθ[log qϕ(Yt | zt)] ≤−Hµθ(Yt | zt) is a variational lower bound on predictive sufficiency,
+and substituting Eq. (15) into Eq. (14) gives Iµθ(Yt; Ht | zt) = Eµθ[−log qϕ(Yt | zt)] −Hµθ(Yt |
+Ht) −∆post(ϕ; θ) ≤Eµθ[−log qϕ(Yt | zt)] −Hµθ(Yt | Ht), bypassing any assumption of constant
+marginal entropy Hµθ(Yt).
+Intuition and Interpretation of Proposition 4.
+Before stating Proposition 4, we highlight its two
+practical takeaways. First, in practice zt is limited to K discrete tokens, so zero information loss is
+unattainable whenever Ht contains more than K log |V| + log 2 nats of task-relevant signal about
+Yt: Part (i) shows that optimal information loss obeys a rate-distortion floor ιt(K) that decreases
+at most linearly with budget K and saturates at 0 once K can encode a minimal sufficient statistic
+for Yt—directly explaining the concave budget-scaling curve in Figure 2(a). Second, RL optimizes
+a learned offline critic qϕ rather than the unknown true posterior Pµθ(Yt | zt): Part (ii) shows that
+optimizing the discounted variational surrogate transfers directly into a downstream value guarantee
+up to critic posterior error ¯∆(decomposed in Eq. (18) into critic capacity, finite-sample fit, and
+distribution shift), optimization tolerance δ, and closed-loop filtering variation ∆filt (∆filt = 0 on
+static tasks such as arXiv).
+Proposition 4 (Finite-K Capacity Floor and Approximate-Critic Transfer). Under Assumptions
+(A1)–(A3) with token budget zt ∈ZK := SK
+ℓ=0 Vℓ(|V| ≥2) over feasible policy class ΘK:
+(i) Finite-K Rate-Distortion Floor: Define ιt(K) := infπθ∈ΘK Iµθ(Yt; Ht | zt). Then Iµθ(Yt; Ht |
+zt) = Iµθ(Yt; Ht) −Iµθ(Yt; zt), and
+ιt(K) ≥max
+n
+0,
+inf
+πθ∈ΘK Iµθ(Yt; Ht) −K log |V| −log 2
+o
+.
+(16)
+(ii) Approximate-Critic Value Transfer: Define the discounted variational objective ¯Jsurr,t(θ) :=
+(1 −γ) P
+k≥t γk−tEµθ[log qϕ(Yk
+|
+zk)] and discounted capacity floor ¯ιt(K)
+:=
+infπθ∈ΘK(1 −γ) P
+k≥t γk−tIµθ(Yk; Hk
+|
+zk)
+≥
+(1 −γ) P
+k≥t γk−tιk(K).
+Let
+¯∆
+:=
+supk≥t supθ∈ΘK ∆post,k(ϕ; θ) bound the critic posterior gap and ∆filt
+:=
+supk≥t supθ,θ′∈ΘK
+Hµθ(Yk | Hk) −Hµθ′(Yk | Hk)
+ bound closed-loop filtering-entropy
+variation (∆filt = 0 identically for static/exogenous targets). Then any δ-approximate maximizer
+ˆθ ∈ΘK satisfying ¯Jsurr,t(ˆθ) ≥supθ∈ΘK ¯Jsurr,t(θ) −δ obeys
+Eµˆ
+θ
+
+|V ∗(Ht) −V ∗(zt)|
+
+≤
+√
+2Rmax
+(1 −γ)2
+q
+¯ιt(K) + ¯∆+ δ + ∆filt.
+(17)
+Proof. Part (i): By (A2), Iµθ(Yt; zt | Ht) = 0, so expanding Iµθ(Yt; (Ht, zt)) in both orders yields
+Iµθ(Yt; Ht | zt) = Iµθ(Yt; Ht) −Iµθ(Yt; zt). Since |ZK| = PK
+ℓ=0 |V|ℓ= |V|K+1−1
+|V|−1
+≤2|V|K for
+all |V| ≥2, we have Iµθ(Yt; zt) ≤Hµθ(zt) ≤K log |V| + log 2 for every πθ ∈ΘK; taking the
+infimum over πθ ∈ΘK proves Eq. (16). Whenever K log |V| + log 2 < infπθ∈ΘK Iµθ(Yt; Ht),
+ιt(K) > 0 strictly, decreasing at most linearly in K before hitting 0 once K suffices to encode a
+minimal sufficient statistic of Ht for Yt.
+Part (ii): For finite target alphabet Y (of length ≤LY tokens) and a token-smoothed critic with
+per-token probability ≥λsm ∈(0, 1/|V|] so 0 ≤−log qϕ(y | z) ≤B := LY log(1/λsm), let νθ
+and νD denote the joint laws of (Yk, zk) under µθ and offline critic data D, with ϵ := DTV(νθ, νD).
+Writing the maximal-coupling decomposition νθ = (1 −ϵ)W + ϵP+ and νD = (1 −ϵ)W + ϵQ+,
+concavity of R 7→HR(Y | Z) combined with conditioning on a Bernoulli(ϵ) mixture indicator
+gives (1 −ϵ)HW (Y | Z) ≤HR(Y | Z) ≤(1 −ϵ)HW (Y | Z) + ϵ log |Y| + h(ϵ) for both
+R ∈{νθ, νD} (where h(p) = −p log p −(1 −p) log(1 −p)), so |HνD(Y | Z) −Hνθ(Y | Z)| ≤
+16
+
+
+ϵ log |Y|+h(ϵ) independently of |ZK|. Together with | CEνθ(ϕ)−CEνD(ϕ)| ≤Bϵ (for CER(ϕ) :=
+ER[−log qϕ(Y | Z)] ∈[0, B]), ∆post,k(ϕ; θ) decomposes into critic expressivity, finite-sample
+estimation, and distribution-shift errors:
+∆post,k(ϕ; θ) ≤inf
+ϕ′ ∆post,k(ϕ′; νD)
+|
+{z
+}
+∆approx
++
+h
+CEνD(ϕ) −inf
+ϕ′ CEνD(ϕ′)
+i
+|
+{z
+}
+∆est
++
+ B + log |Y|
+
+DTV(νθ, νD) + h
+ DTV(νθ, νD)
+
+|
+{z
+}
+∆shift(θ)
+.
+(18)
+Now by Eq. (15), ¯Jsurr,t(θ) = −(1 −γ) P
+k≥t γk−t Hµθ(Yk | zk) + ∆post,k(ϕ; θ)
+
+. Because
+∆post,k(ϕ; ˆθ) ≥0 and ∆post,k(ϕ; θ∗) ≤¯∆, any δ-maximizer ˆθ ∈ΘK of ¯Jsurr,t satisfies, for every
+comparator θ∗∈ΘK,
+(1 −γ)
+X
+k≥t
+γk−tHµˆ
+θ(Yk | zk) ≤(1 −γ)
+X
+k≥t
+γk−tHµθ∗(Yk | zk) + ¯∆+ δ.
+Subtracting (1−γ) P
+k≥t γk−tHµˆ
+θ(Yk | Hk) and adding and subtracting Hµθ∗(Yk | Hk) at each step
+k yields (1−γ) P
+k≥t γk−tIµˆ
+θ(Yk; Hk | zk) ≤(1−γ) P
+k≥t γk−tIµθ∗(Yk; Hk | zk)+ ¯∆+δ+∆filt.
+Taking infθ∗∈ΘK bounds the discounted average information loss by ¯ιt(K) + ¯∆+ δ + ∆filt, and
+summing Eqs. (11)–(12) of Theorem 1 across k ≥t via Jensen’s inequality on (1 −γ)γk−t yields
+Eq. (17).
+A.3
+Justification of Lemma 1 (The Hallucination Failure Mode)
+Justification. We show that optimizing solely for predictive sufficiency, maxθ[−Hµθ(Yt | zt)], leaves
+the policy vulnerable to hallucination because natural language is expressive and over-parameterized
+relative to a sparse target.
+By the Data Processing Inequality (DPI) applied to the Markov chain Yt →Ht →zt, Iµθ(zt; Ht) ≥
+Iµθ(zt; Yt) = Hµθ(Yt) −Hµθ(Yt | zt), so a nonzero minimum amount of historical signal is needed
+to achieve high predictive sufficiency −Hµθ(Yt | zt). However, when H(Yt) ≪K log |V|, encoding
+Yt consumes only a fraction of the K-token budget, leaving many distinct strings zt that induce the
+exact same posterior P(Yt | zt). Under KL-regularized RL anchored to a pre-trained LLM prior
+πpre, an unconstrained policy fills residual capacity with fluent, high-prior-probability continuations
+correlated with Yt rather than grounded exclusively in Ht.
+Concretely, suppose zt decomposes bijectively into task-relevant semantics zY
+t extracted from Ht
+and auxiliary narrative znoise
+t
+sampled conditionally on zY
+t independently of (Ht, Yt), so znoise
+t
+⊥
+(Ht, Yt) | zY
+t . Then predictive sufficiency is completely unchanged, −Hµθ(Yt | zY
+t , znoise
+t
+) =
+−Hµθ(Yt | zY
+t ), while the chain rule of mutual information gives
+Iµθ(zt; Ht) = Iµθ(zY
+t ; Ht) + Iµθ(znoise
+t
+; Ht | zY
+t ) = Iµθ(zY
+t ; Ht),
+(19)
+suppressing historical mutual information to the bare minimum needed for zY
+t
+while inflating
+ungrounded conditional entropy Hµθ(zt | Ht) = Hµθ(zY
+t
+| Ht) + Hµθ(znoise
+t
+| zY
+t ) by the full
+entropy of the fabricated narrative znoise
+t
+.
+A.4
+Formalization and Proof of Proposition 2 and Recursive Sequential Information Loss
+Proposition 2 (Formalized: Recursive Consistency Bounds Ungrounded Generation). Let πθ(zt | ˜Ht)
+map local context ˜Ht = (zt−1, at−1, ot) to bounded summaries ZK := SK
+ℓ=0 Vℓ(|V| ≥2) with
+predictive sufficiency −Hµθ(Yt | zt) ≥−η. Then:
+(i) Non-Degenerate Conditional Entropy Bound: Marginal summary entropy is bounded below
+away from collapse by Hµθ(zt) ≥Hµθ(Yt) −η, while conditional generation entropy satisfies
+Hµθ(zt | ˜Ht) = Hµθ(zt) −Iµθ(zt; ˜Ht) ≤K log |V| + log 2 −Iµθ(zt; ˜Ht).
+(20)
+In particular, for any decomposition zt ↔(zgnd
+t
+, znoise
+t
+) with ungrounded component znoise
+t
+⊥
+˜Ht | zgnd
+t
+(Lemma 1), Hµθ(znoise
+t
+| zgnd
+t
+) ≤K log |V| + log 2 −Iµθ(zt; ˜Ht).
+17
+
+
+(ii) Prior-Confabulation Rate Bound: If at context ˜Ht the policy samples from any history-
+independent confabulation prior Q ∈∆(ZK) with probability α( ˜Ht) ∈[0, 1]—i.e., πθ(· |
+˜Ht) = (1 −α( ˜Ht))πgnd(· |
+˜Ht) + α( ˜Ht)Q(·)—then the expected confabulation rate
+¯α := Eµθ[α( ˜Ht)] satisfies
+¯α ≤1 −Iµθ(zt; ˜Ht) −h(¯α)
+K log |V| + log 2
+≤1 −Iµθ(zt; ˜Ht) −log 2
+K log |V| + log 2 ,
+(21)
+where h(p) = −p log p −(1 −p) log(1 −p) (and h(¯α) is replaced by 0 when α( ˜Ht) ≡¯α is
+constant).
+Proof. Part (i): For discrete zt ∈ZK, Hµθ(zt | Yt) ≥0 implies Hµθ(zt) ≥Iµθ(Yt; zt) =
+Hµθ(Yt) −Hµθ(Yt | zt) ≥Hµθ(Yt) −η, preventing collapse into context-independent low-entropy
+strings whenever Hµθ(Yt) > η. Meanwhile |ZK| = PK
+ℓ=0 |V|ℓ≤2|V|K yields Hµθ(zt) ≤
+K log |V| + log 2 and Eq. (20). Notice this is an upper-bound regularizer rather than an equivalence:
+maximizing Iµθ(zt; ˜Ht) forces Hµθ(zt | ˜Ht) down when capacity is utilized, and under zt ↔
+(zgnd
+t
+, znoise
+t
+) with znoise
+t
+⊥˜Ht | zgnd
+t
+, the chain rule gives Hµθ(zt | ˜Ht) = Hµθ(zgnd
+t
+| ˜Ht) +
+Hµθ(znoise
+t
+| zgnd
+t
+) ≥Hµθ(znoise
+t
+| zgnd
+t
+).
+Part (ii): Let U ∈{0, 1} denote the latent mixture indicator with P(U = 1 | ˜Ht) = α( ˜Ht),
+P(zt ∈· | ˜Ht, U = 0) = πgnd(· | ˜Ht), and P(zt ∈· | ˜Ht, U = 1) = Q(·). By monotonicity and
+the chain rule of mutual information, Iµθ(zt; ˜Ht) ≤I(zt, U; ˜Ht) = I(U; ˜Ht) + (1 −¯α)I(zt; ˜Ht |
+U = 0) + ¯α I(zt; ˜Ht | U = 1). Since zt ⊥˜Ht | (U = 1), I(zt; ˜Ht | U = 1) = 0; on U = 0,
+I(zt; ˜Ht | U = 0) ≤H(zt | U = 0) ≤K log |V| + log 2; and I(U; ˜Ht) ≤H(U) = h(¯α) ≤log 2
+(with I(U; ˜Ht) = 0 if α( ˜Ht) ≡¯α). Rearranging Iµθ(zt; ˜Ht) ≤h(¯α) + (1 −¯α)(K log |V| + log 2)
+yields Eq. (21).
+Proposition 5 (Sequential Information Loss Under Recursive Updates). Suppose πθ(zt | ˜Ht) updates
+memory solely from the local context ˜Ht = (zt−1, at−1, ot) (with H0 = ∅). Then at every turn
+t ≥1:
+Iµθ(Yt; Ht | zt) = Iµθ(Yt; ˜Ht | zt) + Iµθ(Yt; Ht−1 | ˜Ht).
+(22)
+Under Assumptions (A1)–(A3), if each step’s local compression loss satisfies Iµθ(Yk; ˜Hk | zk) ≤εloc,
+then cumulative information loss satisfies Iµθ(Yt; Ht | zt) ≤t εloc. In particular, if the posterior
+belief bk = P(Yk | Hk) evolves via recursive Bayes update bk = Φ(bk−1, ak−1, ok) and budget K
+suffices to losslessly encode reachable beliefs into ZK, there exists an incremental policy achieving
+supk Iµθ(Yk; Hk | zk) = 0.
+Proof. Because (Ht−1, ˜Ht) = (Ht, zt−1) and zt−1 ⊥Yt | Ht (as zt−1 is generated causally from
+Ht−1 ⊆Ht and private randomness), Iµθ(Yt; Ht | zt) = Iµθ(Yt; (Ht−1, ˜Ht) | zt). Expanding
+the right-hand side via the chain rule yields Iµθ(Yt; ˜Ht | zt) + Iµθ(Yt; Ht−1 | ˜Ht, zt), and since
+zt ⊥(Yt, Ht−1) | ˜Ht, Iµθ(Yt; Ht−1 | ˜Ht, zt) = Iµθ(Yt; Ht−1 | ˜Ht), proving Eq. (22). Next, at
+t = 1, H0 = ∅gives Iµθ(Y1; H0 | ˜H1) = 0. For t ≥2, non-negativity of MI and the chain rule
+give Iµθ(Yt; Ht−1 | zt−1, at−1, ot) ≤Iµθ((Yt, ot); Ht−1 | zt−1, at−1); under (A1)–(A2), (Yt, ot) ⊥
+(Ht−1, zt−1) | (Yt−1, at−1), so DPI on Ht−1 →Yt−1 →(Yt, ot) conditional on (zt−1, at−1) yields
+Iµθ((Yt, ot); Ht−1 | zt−1, at−1) ≤Iµθ(Yt−1; Ht−1 | zt−1, at−1) ≤Iµθ(Yt−1; Ht−1 | zt−1) (using
+Theorem 1’s action-monotonicity step under (A3); the identical bound holds under post-turn dialogue
+indexing ˜Ht = (zt−1, ot, at)). Inducting across k = 1, . . . , t yields Iµθ(Yt; Ht | zt) ≤t εloc. Finally,
+if K admits an injective encoding e : Breach ,→ZK, setting zk = e(Φ(e−1(zk−1), ak−1, ok)) yields
+P(Yk | zk) = P(Yk | Hk) almost surely and supk Iµθ(Yk; Hk | zk) = 0.
+Corollary 1 (Suboptimality of Myopic Greedy Compression vs. Non-Myopic RL). Consider a
+stream HT = (o1, . . . , oT ) with mutually independent chunk targets YT = (Y (1), . . . , Y (T )) where
+Y (k) arrives in chunk ok = (Y (k), Nk), 0 < PT
+m=1 H(Y (m)) = H(YT ) ≤K log |V|, and nuisance
+details Nk ⊥YT satisfy H(Nk) > K log |V| + log 2. A myopic single-step selector (such as Best-of-
+N MI SFT) maximizing immediate step-k sufficiency and consistency without backward-discounted
+future credit can fill all K tokens at k = 1, forcing either saturation refusal (I(zT ; Y (m)) < H(Y (m))
+18
+
+
+for m > 1) or irreversible eviction of Y (1) by DPI (Y (1) →z1 →zT ). Conversely, optimizing the
+discounted return-to-go Gt,s (Eq. 7) penalizes early capacity exhaustion across all subsequent turns
+m ∈{k, . . . , T}, incentivizing selective retention of Y (k) over Nk.
+Proof. At k = 1, future targets Y (2:T ) are independent of o1, so encoding Y (1) while filling the
+remaining K-token budget with grounded nuisance N1 from o1 simultaneously attains maximal
+single-step predictive sufficiency −H(YT | z1) = −H(Y (2:T )) among all causal step-1 summaries
+and maximal recursive consistency I(z1; ˜H1). Yet because H(zt) ≤K log |V| + log 2 at every step,
+allocating Bnuis > K log |V|+log 2−H(YT ) nats to N1 leaves strictly less than PT
+m=1 H(Y (m)) =
+H(YT ) nats for task targets: at later turns m > 1, keeping N1 forces omitting incoming Y (m)
+(I(zT ; Y (m)) < H(Y (m))), whereas unstructured overwriting without re-accessing o1 risks evicting
+Y (1), which is permanently lost by DPI on Y (1) →z1 →zT (I(Y (1); zT ) ≤I(Y (1); z1)). Under
+Eq. (7), losing Y (1) at step k lowers rpred,m for every m ≥k plus Rtask,T , imposing cumulative
+discounted penalty Ω(PT
+m=k γm−k).
+A.5
+Pointwise Mutual Information Identities and Critic Shift
+Motivation and Intuition.
+While Propositions 1 and 2 characterize MaxIM’s population ob-
+jectives (−Hµθ(Yt | zt) and Iµθ(zt; ˜Ht)), our practical algorithm (Sections 4.3–4.4) optimizes
+step-wise pointwise mutual information (PMI) ratios scored by a frozen offline critic qϕ with masked
+null baselines (znull, ˜Hnull), bounded sigmoid transformations, and mid-training cosine annealing.
+Proposition 6 bridges theory and implementation across three practical questions: (i) Why subtract
+log qϕ(Yt | znull)? Raw log qϕ(Yt | zt) conflates summary informativeness with inherent target
+difficulty; subtracting log qϕ(Yt | znull) acts as an exact per-step zero-mean baseline that cancels
+target difficulty without biasing the immediate policy gradient. (ii) What does forward consistency
+PMI optimize—and why does MI-Only RL still need Rtask? Expanding the expected forward log-ratio
+recovers Iνθ(zt; ˜Ht) minus a conditional critic gap, plus +DKL(Pνθ(zt) ∥qϕ(zt | ˜Hnull)); this posi-
+tive KL term explains why unanchored MI-Only RL (Rtask = 0, Section 5.4) can inflate consistency
+PMI by drifting toward telegraphic strings that are improbable under the masked prior qϕ(· | ˜Hnull).
+(iii) How is offline critic shift controlled? KL regularization keeps νθ close to νD early in RL while
+λs = 1 resolves sparse credit assignment, and cosine annealing (λs →0) removes all residual critic
+and prior-mismatch bias in late training.
+Proposition 6 (PMI Unbiasedness, Recursive Consistency, and Critic Shift). Let qϕ be a frozen
+critic trained on offline distribution νD via Eq. (3), and let νθ denote the marginal state-summary
+distribution under policy πθ. Then:
+(i) Unbiased Immediate Sufficiency Baseline:
+Subtracting the length-normalized masked-
+summary baseline
+1
+|Yt| log qϕ(Yt | znull) in Eq. (4) satisfies Ezt∼πθ(·| ˜
+Ht)
+
+∇θ log πθ(zt |
+˜Ht)
+1
+|Yt| log qϕ(Yt | znull)
+
+= 0 conditional on (Ht, Yt) (and across the full trajectory when
+targets are exogenous), preserving exact per-step policy-gradient unbiasedness for raw rpred,t
+while canceling instance-level target entropy.
+(ii) Recursive Consistency Decomposition: Prior to 1/|zt| length normalization (which rescales
+per-token values to avoid favoring verbose summaries), the expected sequence-level forward
+log-ratio satisfies
+Eνθ
+h
+log
+qϕ(zt | ˜Ht)
+qϕ(zt | ˜Hnull)
+i
+= Iνθ(zt; ˜Ht) −E ˜
+Ht
+
+DKL(Pνθ(zt | ˜Ht) ∥qϕ(zt | ˜Ht))
+
++ DKL
+ Pνθ(zt) ∥qϕ(zt | ˜Hnull)
+
+.
+(23)
+(iii) KL-Controlled Shift and Annealing: Relative to reference trajectory distribution µref, policy-to-
+critic shift satisfies DTV(νθ, νD) ≤
+q
+1
+2DKL(µθ ∥µref)+DTV(νref, νD), and decaying λs →0
+(Eq. 24) eliminates residual critic and prior-mismatch bias for s ≥send.
+Proof. Part (i) and Practical Departures: Conditional on (Ht, Yt), neither |Yt| nor log qϕ(Yt | znull)
+depends on the sampled summary zt, so Ezt∼πθ(·| ˜
+Ht)
+
+∇θ log πθ(zt | ˜Ht)
+1
+|Yt| log qϕ(Yt | znull)
+
+=
+19
+
+
+1
+|Yt| log qϕ(Yt | znull) ∇θ
+P
+zt πθ(zt | ˜Ht) = 0, preserving unbiased immediate policy gradients
+while subtracting instance-level target difficulty to reduce gradient variance across prompts. In
+practice, Eq. (6) and Eq. (7) introduce two deliberate departures from a pure linear control variate: (1)
+in closed-loop dialogue, future baselines log qϕ(Yk | znull) (k > t) depend on zt via at and normalize
+future state difficulty so the policy is not rewarded for steering toward trivially low-entropy user states;
+and (2) passing rpred,t and rcons,t through centered sigmoids σ(α(r −b)) −1
+2 makes the baseline
+nonlinear, trading exact variance-reduction linearity for bounded step-wise scale (preventing heavy-
+tailed log-ratio spikes) and zero-centered length neutrality on variable-horizon episodes. Decaying
+λs →0 (Part iii) removes any asymptotic shaping bias.
+Part (ii): Adding and subtracting log Pνθ(zt | ˜Ht) and log Pνθ(zt) inside Eνθ[log qϕ(zt | ˜Ht) −
+log qϕ(zt | ˜Hnull)] yields Eq. (23). Thus, forward PMI penalizes ungrounded tokens where qϕ(zt,i |
+zt,<i, ˜Ht) ≈qϕ(zt,i | zt,<i, ˜Hnull), while the +DKL(Pνθ(zt) ∥qϕ(zt | ˜Hnull)) term explains why
+purely unanchored MI optimization (MI-Only RL, Rtask = 0) eventually drifts into telegraphic
+strings unlikely under qϕ(· | ˜Hnull).
+Part (iii): By the triangle inequality, data processing for TV (since νθ is a marginal projection of µθ),
+and Pinsker’s inequality, DTV(νθ, νD) ≤DTV(νθ, νref) + DTV(νref, νD) ≤
+q
+1
+2DKL(µθ ∥µref) +
+DTV(νref, νD) (where training qϕ across high-quality, vague, and hallucinated summary tiers widens
+νD to reduce DTV(νref, νD)). Finally, under Eq. (24), λs = 0 for all s ≥send, identically removing
+all residual ∆post(ϕ; θ) and masked-prior mismatch terms from Eq. (7) so late-stage PPO updates
+optimize the exact KL-regularized downstream task objective.
+B
+Synthetic Data Generation
+A key advantage of MaxIM is that its dense reward signals are derived entirely from synthetic offline
+data, eliminating the need for expensive human preference labels. This appendix details the data
+generation pipelines for both benchmarks.
+B.1
+arXiv Data Generation
+Paper Scraping, Chunk Segmentation, and Disjoint Splits.
+We scrape recent papers from
+ar5iv [39], the HTML5 mirror of arXiv, in March 2026 and April–September 2026 across 9 di-
+verse categories (cs.LG, cs.CL, cs.AI, cs.RO, eess.SY, math.OC, astro-ph.IM, q-bio.QM,
+physics.comp-ph) to ensure topical diversity and minimize parametric pretraining leakage. For
+each paper, we extract the main body prose (excluding the abstract, bibliography, and appendices)
+and segment it along paragraph and sentence boundaries into ≈500-token chunks under the Gemini
+SentencePiece tokenizer, yielding up to 25 chunks per paper. In total, we curate 2,196 papers (≥20
+chunks): 1,814 March 2026 papers partitioned strictly disjointly by salted MD5 hash (70%/30%)
+into 1,281 critic-training papers (used exclusively for offline critic pre-training and Policy SFT)
+and 533 RL-training papers (used exclusively for online RL rollouts and Best-of-N MI SFT with
+N = 8), 44 validation papers for checkpoint selection, and 338 post-cutoff held-out test papers (mean
+24.58 chunks/paper; 5 synthesis MCQs per paper). For the Early-Section Stress Test, we construct
+an analogous disjoint split (525 RL train / 36 validation / 332 test papers) whose comprehension
+questions are derived strictly from body chunks 3–7 (excluding the Abstract and Introduction).
+MCQ Generation and Anti-Leakage Calibration.
+For each paper, we prompt an oracle model
+(Gemini 3.0 Flash) with the full paper text and request 5 synthesis-level multiple-choice questions
+requiring cross-section reasoning. Each question has 4 options (A–D) with exactly one correct answer.
+The prompt explicitly instructs the model to generate questions that cannot be answered from any
+single section alone, forcing the summarizer to retain cross-sectional information. To prevent frozen
+downstream solvers from exploiting option-length heuristics or parametric priors without reading
+the summary, we apply an automated distractor-rewrite pass enforcing ±10% word/character parity
+across options A–D (with 1–2 distractors slightly longer than the gold answer), deterministically
+permute option order, and append a fifth abstention option E (“The summary does not contain enough
+information to answer this question”). This calibration reduces no-summary forced-choice accuracy
+from 67.5% to 27.6% (near the 25% chance floor) and no-summary Abstain-MCQ accuracy to 2.6%
+(91.9% abstention). The full MCQ generation prompt is provided in Appendix E.
+20
+
+
+Three-Tier Summary Variants and Critic (Input, Target) Pairs.
+At each turn t of each critic-
+training paper, we synthesize three summary quality variants using an oracle model:
+1. High-Quality (zhq
+t ): Generated with the paper prefix o1:t and MCQ context visible, instructing
+the oracle to retain the maximal task-relevant evidence within budget K. These serve as positive
+targets for both sufficiency and recursive consistency, as well as Policy SFT supervision.
+2. Vague (zvague
+t
+): Generated by degrading zhq
+t into a fluent but generic overview that omits specific
+technical mechanisms, equations, and quantitative results, calibrating the critic to penalize
+information-poor summaries.
+3. Hallucinated (zhalluc
+t
+): Generated by altering core claims and empirical findings in zhq
+t
+into
+plausible but fabricated statements of matched style and length, calibrating the critic against
+confabulation.
+To construct supervised (input, target) examples for Eq. (3) (training details in Appendix D.2; exact
+prompt templates in Appendix E.3), for every summary z ∈{zhq
+t , zvague
+t
+, zhalluc
+t
+, znull} (where znull =
+"(no summary available)"), the frozen Abstain-MCQ action model answers the paper’s five
+questions Q1:5 from z alone, producing a distilled 5-letter answer sequence ˆY (z) ∈{A, . . . , E}5
+(selecting E whenever z lacks supporting evidence). Across the 1,281 critic-training papers, D
+comprises 136,003 examples across six subsets: (i) conditional sufficiency pairs
+ (zt, Q1:5), ˆY (zt)
+
+for zt ∈{zhq
+t , zvague
+t
+, zhalluc
+t
+} (26,949, 26,949, and 26,926 examples) plus masked-summary baselines
+ (znull, Q1:5), ˆY (znull)
+
+(1,281 examples, one per paper); and (ii) forward recursive consistency
+pairs
+ (zhq
+t−1, ot), zhq
+t
+
+(26,949 examples, with zhq
+0 = ∅) plus masked-context baselines
+  ˜Hnull, zhq
+t
+
+(26,949 examples, replacing both context fields with "(not available)").
+B.2
+WildChat Data Generation
+Seed Data, Disjoint Partitioning, and Trajectory Regeneration.
+We use WildChat [40] conversa-
+tions as seeds. Specifically, we extract English conversations with ≥6 user turns (7,968 validated
+dialogues) and prompt an annotator model (Gemini 3.0 Flash) sequentially at each turn t with the
+observable dialogue prefix up to turn t and prior state st−1 to causally annotate the user’s evolving
+internal state. To test out-of-distribution generalization to unseen user personas, 500 full dialogues are
+held out from user-simulator training, from which 200 form our unseen-simulator OOD evaluation
+split. The remaining 7,468 simulator-training dialogues train the user simulator and are partitioned
+strictly disjointly into 3,000 critic/SFT seed dialogues (2,928 rolled out into 25,497 turns for critic
+and Policy SFT training, plus 2,511 held-out critic validation triplets), 3,500 RL seed dialogues for
+online RL, 200 validation dialogues, 500 held-out test dialogues, and 268 offline PMI-calibration
+seeds. Because the original WildChat conversations were generated with an assistant model to which
+we do not have access, we synthetically regenerate full multi-turn trajectories using an action agent
+and a trained user simulator (Appendix D.1). This creates a controlled closed-loop environment
+where we have access to ground-truth user internal states at every turn.
+Dynamic Conversation Generation.
+Each conversation proceeds for up to 12 turns during RL
+training and up to 15 turns at evaluation (testing +25% horizon extrapolation), initialized with
+z0 = ∅and persona s0, via the following loop for turn t = 1, 2, . . . :
+1. The user simulator generates the next user utterance ut conditioned on prior latent state st−1 and
+conversation history. If the simulator outputs a termination signal, the episode ends.
+2. The action agent generates a response at conditioned on the conversation context and the
+summarizer’s prior belief estimate zt−1 injected into its system prompt (no belief injected at
+t = 1, since z0 = ∅).
+3. Given user observation ot = ut and assistant action at, the summarizer policy updates the
+post-turn belief zt ∼πθ(· | zt−1, ot, at) (post-action turn indexing so zt aligns with post-turn
+user state st), and the user simulator updates st (Yt).
+Belief Summary Variants and 10-Key Schema.
+Analogous to the arXiv pipeline, we
+generate three quality tiers of belief summaries (HQ, vague, hallucinated) plus masked-
+context baseline queries (znull, ˜Hnull) at each turn using an oracle model with access to
+21
+
+
+the true user internal states.
+Belief states are structured as canonical 10-key proba-
+bilistic JSON objects inside <state>...</state> tags:
+core_intent_functional_goal,
+affective_state_perceived_stakes, user_expertise_epistemic_stance, cognitive_
+demand_information_specificity,
+interaction_strategy_communication_demeanor,
+agent_perception_trust_output_control,
+task_state_domain_context,
+patience_
+reserve_accumulator, task_success_outlook, and specific_needs_and_constraints.
+For vague sufficiency examples, four keys are degraded to generic placeholders paired with
+<insufficient_information> targets; for hallucinated sufficiency examples, four keys receive
+orthogonal distractor traits, enforcing strict critic conditioning on zt.
+C
+MaxIM Training Algorithm
+Algorithm 1 details the complete three-phase pipeline for training the MaxIM agent, including offline
+synthetic data generation, unified critic pre-training, and KL-regularized PPO policy optimization
+with mid-training cosine annealing.
+Algorithm 1 MaxIM: Maximally Informative Incremental Memory Update
+Require: Initial Policy πθ, unified critic qϕ, Weights (ws, wc), Discount γ, Shaping scale ηshape,
+Annealing schedule λs, Token limit K
+1: Phase 1: Synthetic Data Generation
+2: Generate offline trajectories D with privileged access to target Y on the disjoint critic-training
+split.
+3: Phase 2: Critic Pre-training & Offline PMI Calibration
+4: Train qϕ via supervised cross-entropy minimization (Eq. 3) on D and calibrate (αs, bs, αc, bc)
+on initial base-policy rollouts.
+5: Phase 3: RL Fine-Tuning
+6: while training step s = 1 . . . Smax do
+7:
+Initialize trajectory buffer B ←∅
+8:
+for each initial environment state in batch (8 prompts) do
+9:
+Sample a group of G = 8 trajectories from the same initial conditions:
+10:
+for each trajectory i ∈{1, . . . , G} in group do
+11:
+z0 ←Empty String, a0 ←None
+12:
+for t = 1 . . . Ti do
+13:
+Observe ot (in interactive dialogue, assistant first replies at ∼πact(· | zt−1, ot, . . . ))
+and record privileged target Yt.
+14:
+Sample zt ∼πθ(· | ˜Ht) subject to |zt| ≤K, where ˜Ht = (zt−1, at−1, ot) (or post-turn
+˜Ht = (zt−1, ot, at) in dialogue; (zt−1, ot) in passive reading).
+15:
+Store state-action tuple ( ˜Ht, zt).
+16:
+end for
+17:
+Evaluate terminal action (if deferred to Ti, e.g., MCQ answering from zTi) and receive
+terminal task reward Rtask,Ti (Rtask,t = 0 for t < Ti).
+18:
+Initialize G(i)
+Ti+1 = 0.
+19:
+for t = Ti . . . 1 do
+20:
+Compute PMI scores rpred,t, rcons,t (Eqs. 4–5) via teacher-forced critic passes.
+21:
+Compute centered sigmoid MI step reward (Eq. 6): ˆrt = ws
+ σ(αs(rpred,t −bs)) −
+1
+2
+
++ wc
+ σ(αc(rcons,t −bc)) −1
+2
+
+.
+22:
+Compute discounted return: G(i)
+t
+= Rtask,t + ηshapeλs ˆrt + γG(i)
+t+1.
+23:
+Append transition ( ˜Ht, zt, G(i)
+t ) to group buffer.
+24:
+end for
+25:
+end for
+26:
+Standardize returns G(i)
+t
+via turn-indexed leave-one-out baseline and prompt-wide std
+scaling to compute advantages A(i)
+t , append to B.
+27:
+end for
+28:
+Update policy πθ using KL-regularized PPO with advantage estimates in B.
+29: end while
+22
+
+
+D
+Details of Experiments
+D.1
+User Simulator
+The WildChat user simulator is trained via SFT on the offline WildChat dataset [40], where per-
+turn internal state annotations were first generated by an oracle annotator model. Specifically,
+we train a unified joint state-and-response user simulator (initialized from Gemini 2.5 Flash
+and fine-tuned for 6 epochs on the 7,468 simulator-training dialogues).
+At each turn, condi-
+tioned on the initial persona s0 and full dialogue history, the simulator emits a structured trace
+<think><impact>...</impact><dimensions>{10-key JSON}</dimensions></think> fol-
+lowed immediately by the next natural-language user utterance (or a termination token) in a single call.
+Up to two schema-validation resamples ensure 100% canonical 10-key ground-truth state coverage
+across multi-turn rollouts (median length 8.0 turns).
+D.2
+Critic Training
+The variational critic qϕ is trained via standard cross-entropy minimization over target tokens only
+(masking prompt and instruction tokens). Rather than maintaining separate checkpoints for sufficiency
+and consistency, each benchmark trains a single unified Gemini 2.5 Flash critic on a six-way
+multi-task mixture (assigning unit sampling weight 1.0 to HQ, vague, and hallucinated conditional
+sufficiency examples as well as conditional and masked-context grounding examples, and weight
+0.05 to masked-summary sufficiency baselines):
+• Sufficiency PMI (rpred,t): On arXiv, qϕ scores the mean log-likelihood of the 5 single-token
+Abstain-MCQ target letters (A–E) conditioned on zt minus the cached masked-summary baseline
+(zt = znull). On WildChat, qϕ scores the per-token log-likelihood of the canonical 10-key
+post-turn true user state st conditioned on zt minus the masked-state baseline (znull).
+• Recursive Consistency PMI (rcons,t): On both benchmarks, qϕ scores the per-token log-
+likelihood of the generated summary zt conditioned on local context ˜Ht ( ˜Ht = (zt−1, ot) on
+arXiv; ˜Ht = (zt−1, ot, at) on WildChat) minus its masked-context baseline conditioned on ˜Hnull.
+Training uses three quality tiers—HQ, vague, and hallucinated—so the critic sees the full spectrum of
+summary quality during training. We use single-epoch offline training (≤1 epoch over HQ targets)
+to prevent memorization. The same critic checkpoint is shared across all shaped RL conditions
+within a benchmark. While we train one unified critic per benchmark here for clean experimental
+isolation, because Eq. (3) routes tasks purely through natural-language system instructions over
+token cross-entropy, the same architecture directly supports joint multi-task and cross-domain critic
+training.
+D.3
+RL Hyperparameters and Implementation Details
+Reward Transformation, Offline Calibration, and Annealing.
+To combine sufficiency and
+consistency PMI scores on a common bounded scale while centering neutral summaries at zero,
+we evaluate initial pre-RL base-policy rollouts strictly offline to compute the mean midpoint b
+and within-prompt standard deviation σwithin for each PMI signal, setting slope α = 1/σwithin and
+mapping each signal to σ(α(r −b)) −1
+2 ∈[−0.5, +0.5] (eliminating positive survival-length bias on
+variable-horizon WildChat dialogues). On arXiv (K = 500), this yields (bs, bc) = (−0.28, 1.71) and
+(αs, αc) = (2.85, 7.95) (with budget-specific midpoints bs ∈{−0.79, −0.43, −0.28, −0.10} and
+bc ∈{2.02, 1.78, 1.71, 1.68} for K ∈{100, 300, 500, 800}, and bs = −0.72 on the Early-Section
+Stress Test); on WildChat, (bs, bc) = (0.0921, 0.4950) and (αs, αc) = (33.53, 4.36). Across both
+domains, we use MI weights (ws, wc) = (0.30, 0.11) alongside Rtask ∈[0, 1], discount γ = 0.9,
+step-shaping scale ηshape = 1 −γ = 0.1 to account for multi-turn reward accumulation, and cosine
+annealing λs holding 1.0 through step sstart = 450 before decaying smoothly to 0.0 at step send = 600:
+λs =
+
+
+
+
+
+1,
+s ≤sstart,
+1
+2
+
+1 + cos
+
+π s−sstart
+send−sstart
+
+,
+sstart < s < send,
+0,
+s ≥send.
+(24)
+In addition, to enforce valid XML delimiters during RL across all methods, a lightweight tag-
+formatting penalty (weight 0.05, scaled by 0.1) assigns 0 when complete <summary>...</summary>
+23
+
+
+(arXiv) or <state>...</state> (WildChat) tags are present, −0.5 if only one tag is present, and
+−1.0 if neither is present.
+Advantage Normalization.
+Table 4 summarizes our training and evaluation settings. For group-
+relative advantage estimation across G = 8 rollouts per prompt, let Gt = {j ∈{1, . . . , G} : Tj ≥t}
+denote active trajectories at turn t. Whenever |Gt| ≥2, we compute an exact leave-one-out baseline
+˜Ai,t = G(i)
+t
+−
+1
+|Gt|−1
+P
+j∈Gt\{i} G(j)
+t
+(setting ˜Ai,t = 0 if |Gt| < 2) and normalize by the prompt-
+wide standard deviation across all valid turn-rollout pairs in the group, avoiding noisy small-sample
+variance division at late turns. Policies are updated using KL-regularized PPO [37].
+Table 4: Summary of training and evaluation settings. Settings shared identically across both
+benchmarks span a single combined column.
+Setting / Hyperparameter
+arXiv Scientific Reading
+WildChat Multi-Turn Dialogue
+Base Backbone (Policy, Critic, Actor)
+Gemini 2.5 Flash
+Offline Target / RL Belief Rater
+Gemini 3.0 Flash
+Atomic-Claim Splitter
+Gemini 2.5 Flash-Lite
+Prompts per Step × Group Size G
+8 × 8 = 64 trajectories/step
+Offline SFT Batch Size (Critic / Policy SFT)
+32–64 (≤1 epoch over HQ targets)
+Discount γ / Step Scale ηshape
+0.9 / 0.1 (MemAgent RL: γ=1.0)
+MI Shaping Weights (ws, wc)
+(0.30, 0.11)
+MI Cosine-Decay Window (sstart →send)
+RL steps 450 →600
+External Grounding & Qualitative Judge
+GPT-4.1 (+ Gemini 3.0 Flash check)
+GPT-4.1 (k=1 eval window)
+Summary Token Budget K (Train / Eval)
+500 (sweep: 100, 300, 500, 800)
+1,024
+Episode Horizon T (Train / Eval)
+20 train / 25 eval chunks
+12 train / 15 eval turns
+Total Online RL Steps Smax
+1,000 (45–60% decay; ckpt /25)
+800 (56–75% decay; ckpt /25)
+Calibrated Midpoints (bs, bc)
+(−0.28, 1.71) at K=500
+(0.0921, 0.4950)
+Calibrated Slopes (αs, αc)
+(2.85, 7.95)
+(33.53, 4.36)
+Optimization and Computational Overhead.
+Computing the step-wise variational rewards re-
+quires only teacher-forced forward passes through the critic transformer, avoiding expensive autore-
+gressive generation. To ensure we do not block environment trajectory generation, critic reward
+computation is executed asynchronously across distributed inference servers and collected at episode
+end.
+D.4
+Evaluation Protocol, Training Compute, and Inference Cost
+Task Metrics, Bounded-Memory Multi-Turn Dialogue, and Causal Belief Scoring.
+For arXiv, a
+frozen action model answers 5 MCQs conditioned only on the final summary. Under our primary
+Abstain-MCQ protocol (options A–E), correct answers earn +1, abstentions (E) earn 0, and wrong
+commitments (A–D) incur −1/3. For WildChat, because evaluating a conversational agent spans
+multiple distinct quality axes (goal fulfillment, constraint adherence, coherence) and collapsing them
+into a single scalar reward risks misspecification, during RL training an oracle rater (Gemini 3.0
+Flash) receives (s0, u1, a1, s1, z1, . . . , sT , zT ) under a strict causal 1 . . . t grounding rule (never
+penalizing zt for traits revealed at turns > t) and outputs 1–10 belief accuracy ratings (rescaled to
+[0, 1] as Rtask, and reported in Table 10). At test time (RQ1, Tables 1 and 9), to evaluate downstream
+conversational utility under bounded context without retraining the assistant, we execute fresh rollouts
+(T ≤15) on the N = 500 held-out test split where the frozen Gemini 2.5 Flash assistant receives only
+the single preceding user–assistant interaction (k = 1: (ut−1, at−1)) and the latest user message ut
+together with zt−1 (whereas the No-Belief baseline receives only (ut−1, at−1, ut)). An independent
+GPT-4.1 evaluator (temperature = 0), conditioned strictly on (u1:T , a1:T ) and ground-truth user
+states s0:T without access to zt or method identity, rates each session (1–10) on Goal Completion,
+Preference & Constraint Retention, Coherence & Adaptability, and Overall User Satisfaction.
+Statistical significance between paired conversation seeds is computed via 10,000-resample paired
+bootstrap on both all N = 500 seeds and the fixed T ≥10 cohort (N = 158 seeds where No-Belief
+requires T ≥10 turns).
+Qualitative Autorater and Atomic-Claim Grounding Protocols.
+For qualitative evaluation
+(Table 2, Appendix F.4), a cross-family GPT-4.1 judge (temperature = 0) compares candidate
+24
+
+
+summaries conditioned on identical observed prefixes up to turn t with randomized A/B order
+on Truthfulness and Usefulness, and independently scores each policy’s single-step transition
+(zt−1, ot) →zt on a 1–10 Consistency scale so ratings are not confounded by differences in zt−1
+(prompts in Appendix E). While our evaluation pipeline computes all three qualitative metrics on both
+tasks, Table 2 reports Consistency on arXiv and Truthfulness on WildChat due to complementary
+ceiling effects: on arXiv prose summaries, factual precision saturates near ceiling across RL methods
+(97.5%–98.4% entailment) whereas Consistency strongly separates policies (5.99–7.55); conversely,
+on WildChat’s fixed 10-key JSON schema, standalone Consistency saturates near ceiling across all RL
+policies (9.69–9.86; Appendix F.4) whereas Truthfulness varies substantially (36.2%–72.4%). For
+atomic-claim grounding, Gemini 2.5 Flash-Lite (temperature = 0) first decomposes each candidate
+summary zt—and, for chunk claim incorporation (Figure 2(b), Table 7), each incoming source chunk
+ot (extracted once per paper and shared across all methods)—into standalone, de-contextualized
+atomic factual claims; GPT-4.1 then classifies each claim against the observed source prefix as
+ENTAILED, NEUTRAL, or CONTRADICTED via natural language inference (NLI), complemented by a
+Gemini 3.0 Flash cross-check on arXiv (Appendix F.4).
+Training and Inference Computational Complexity.
+All SFT, RL, and serving jobs run on Google
+Cloud TPU accelerators. Let Smax denote the total number of online RL update steps (Smax = 1,000
+on arXiv and Smax = 800 on WildChat) and Nparam denote the active parameter count of the shared
+Gemini 2.5 Flash backbone used across every trainable policy, unified critic, action agent, and user
+simulator. Because shared-cluster wall-clock duration fluctuates with serving-replica concurrency,
+Table 5 reports hardware-independent relative training FLOPs normalized to sparse-reward RL
+(1.00×) under standard transformer accounting (2Nparam FLOPs per forward/decode token, 6Nparam
+per forward-backward training token, plus 2Nparam PPO reference evaluation). Because critic passes
+are teacher-forced log-likelihood evaluations (2Nparam/token, zero decoding), masked baselines are
+cached once per episode, and cosine annealing sets λs = 0 for s ≥600, MaxIM requires only
+≈1.25× total training FLOPs on arXiv (1.23× online RL plus 0.02× one-time critic SFT) and
+≈1.17× on WildChat (1.14× online RL plus 0.03× critic SFT) relative to Task-Only/MemAgent
+RL, adding < 15% per-step RL wall-clock overhead during s < 600 (0% for s ≥600). Beyond
+the final benchmark runs in Table 5, preliminary development (data-pipeline validation, reward-
+weight and annealing sweeps) consumed roughly 2.5× the compute of the reported experiments. At
+deployment, test-time inference incurs zero critic overhead (1.00× FLOPs and latency): every
+method executes the same single summarizer call per turn (O(T · K) generated tokens), avoiding the
+O(T 2Lchunk) quadratic attention cost of full-context prompting.
+Table 5: Training-time forward/generation budget, relative training FLOPs (1.00× = sparse-
+reward RL), and test-time inference cost per T-turn episode. Smax is total RL update steps (1,000
+on arXiv; 800 on WildChat). Critic passes use teacher-forced log-likelihoods (0 generated tokens).
+Method
+Offline SFT
+Steps
+Online RL
+Trajectories
+Critic Passes
+per RL Turn
+Rel. Train
+FLOPs
+Test
+Critic
+Test Memory
+Calls / FLOPs
+Prompt-Only
+0
+0
+0
+0
+0
+T calls (1.00×)
+≤K tok/turn
+(identical across
+all methods)
+Policy SFT
+1,000 (arXiv)
+600 (WC)
+0
+0
+≈0.02×
+0
+Best-of-N MI SFT
+(N=8, arXiv)
+350 (+ 8×533
+offline rollouts)
+0
+2 cond. +
+cached base.
+≈0.08×
+0
+MemAgent RL /
+Task-Only RL
+0
+64×Smax
+(64K arXiv /
+51.2K WC)
+0
+1.00×
+0
+MaxIM
+(Full, Ours)
+1,000 / 900
+(Critic SFT)
+64×Smax
+(64K arXiv /
+51.2K WC)
+2 cond. + cached
+base. (s < 600)
+≈1.25× (arXiv)
+≈1.17× (WC)
+0
+E
+Prompt Templates
+This appendix documents the prompt templates used across MaxIM’s summarizer policies, synthetic
+data pipelines, variational critics, and evaluation judges. Template variables injected at runtime are
+denoted in monospace braces (e.g., {max_summary_tokens}).
+25
+
+
+E.1
+Incremental Summarizer Policy Prompts
+At each turn t, the summarizer policy πθ receives a domain-specific system prompt and a user
+message containing the previous summary zt−1 alongside the latest chunk or dialogue exchange.
+On WildChat, the output inside <state>...</state> follows the 10-key JSON schema defined in
+Appendix B.2.
+arXiv Incremental Summarizer Prompt
+System: You are reading a scientific paper one chunk at a time. After each chunk of text, you must update your running
+summary of the paper. Constraint: Your summary must be at most {max_summary_tokens} tokens. Your goal is
+to retain the most important information for understanding and reasoning about the paper. Wrap your summary in
+<summary>...</summary> tags.
+User: Previous summary: {prev_summary_or_empty}
+New paper chunk ({turn}): {chunk_text}
+WildChat Incremental Belief-State Summarizer Prompt
+System: You are estimating a user’s hidden internal state during a conversation between the user and an AI assistant.
+Maintain a probabilistic belief about the user’s internal state across the canonical 10-key JSON schema, expressing
+uncertainty when appropriate (e.g., “likely frustrated”, “possibly confused”). Wrap your JSON state estimate in
+<state>...</state> tags (at most {max_state_tokens} tokens).
+User: Previous belief state: {prev_state_or_empty}
+Latest exchange (Turn {turn}): User: {u_t} / Assistant:
+{a_t}
+E.2
+Offline Benchmark Synthesis Prompt
+To construct cross-section comprehension targets for arXiv (Appendix B.1), Gemini 3.0 Flash
+generates five synthesis-level MCQs from the full paper text prior to distractor length-parity calibration
+and option-E augmentation.
+arXiv Cross-Section MCQ Synthesis Prompt (Gemini 3.0 Flash)
+System / User: You are an expert scientific reviewer. Given the full text of an academic paper, generate exactly 5
+synthesis-level multiple-choice questions (MCQs) that test deep comprehension of the paper.
+Requirements: (1) Each question must require synthesizing information from multiple sections and must NOT be
+answerable from surface-level single-paragraph recall. (2) Each question must have 4 options (A–D) with exactly 1
+correct answer and a verification reasoning trace. (3) Cover core problem motivation, methodological mechanisms,
+empirical findings, limitations, and cross-section connections.
+Paper text: {full_paper_text}
+E.3
+Unified Critic Prompts for PMI Estimation
+As described in Section 4.3 and Appendix D.2, a single unified critic checkpoint qϕ per benchmark
+handles all four conditional and null-baseline log-likelihood queries in Eqs. (4)–(5). Cross-entropy
+training loss and RL teacher-forced scoring are applied strictly to the Target tokens; null baselines
+replace the conditioning summary or local context with fixed placeholder strings ("(no summary
+available)", "(no state estimate available)", or "(not available)").
+Unified Critic: arXiv Predictive Sufficiency (qϕ(Yt | zt) and qϕ(Yt | znull))
+System: Given a running summary of a scientific paper and 5 multiple-choice questions (options A–D plus E: insufficient
+information), predict the answer letter selected from the summary alone.
+User: Summary: {z_t_or_"(no summary available)"}
+Questions: {five_mcqs_with_options_A_to_E}
+Target
+(scored
+tokens):
+Answer 1:
+{a_1}\nAnswer 2:
+{a_2}\nAnswer 3:
+{a_3}\nAnswer 4:
+{a_4}\nAnswer 5: {a_5}
+26
+
+
+Unified Critic: WildChat Predictive Sufficiency (qϕ(Yt | zt) and qϕ(Yt | znull))
+System: Given the estimated user belief state, predict the canonical 10-key ground-truth user internal state JSON.
+User: Estimated state: {z_t_or_"(no state estimate available)"}
+Target (scored tokens): True state: {canonical_10key_true_state_json}
+Unified Critic: Forward Recursive Consistency (qϕ(zt | ˜Ht) and qϕ(zt | ˜Hnull))
+System: Given the previous summary/state and the latest chunk or dialogue turn, predict the updated summary/state.
+User:
+Previous state:
+{z_prev_or_"(not available)"}
+Latest chunk/turn:
+{o_t_exchange_or_"(not
+available)"}
+Target (scored tokens): Updated state: {z_t}
+E.4
+Downstream Task Evaluation Prompts
+At test time, arXiv terminal summaries zT are evaluated by the frozen Abstain-MCQ action model,
+and WildChat bounded-memory (k = 1) conversations are scored by an independent GPT-4.1 judge
+that never observes zt.
+Frozen Abstain-MCQ Action Model Prompt (arXiv)
+System / User: Answer each multiple-choice question using ONLY the provided paper summary. Choose A, B, C, or
+D ONLY if the summary contains sufficient supporting evidence; otherwise select E (“The summary does not contain
+enough information to answer this question”). Scoring awards +1 for a correct A–D answer, 0 for E, and −1/3 for an
+incorrect A–D guess.
+Summary: {z_T}
+Questions: {five_mcqs_with_options_A_to_E}
+Bounded-Memory Downstream Chat Evaluator Prompt (WildChat, GPT-4.1)
+System / User: You are an impartial evaluator assessing an AI assistant in a multi-turn conversation. Given ONLY (1)
+the complete User/Assistant transcript {u_1..T, a_1..T} and (2) the user’s ground-truth internal states {s_0..T}
+(with no access to any model belief state), rate the Assistant on a 1–10 integer scale with turn-level evidence on four axes:
+(1) Goal Completion (fulfillment of the user’s underlying functional goal); (2) Preference & Constraint Retention
+(adherence to earlier user preferences and constraints); (3) Coherence & Adaptability (non-repetitive progression
+adapted to user feedback); and (4) Overall User Satisfaction (holistic session-level utility).
+E.5
+Atomic-Claim Grounding and Qualitative Autorater Prompts
+Our source-grounding pipeline (Section 5.3, Appendix D.4) first decomposes passages into standalone
+atomic claims using Gemini 2.5 Flash-Lite and then verifies source entailment in batched NLI calls
+using GPT-4.1 (or Gemini 3.0 Flash). Qualitative evaluation uses GPT-4.1 for randomized A/B
+pairwise judging (Truthfulness, Usefulness) and standalone 1–10 Consistency scoring.
+Atomic Factual Claim Decomposition Prompt (Gemini 2.5 Flash-Lite)
+User: You are an expert natural language processing auditor. Break down the provided passage into a list of standalone,
+self-contained atomic claims/facts. Guidelines: (1) Each claim must be a complete, grammatical sentence expressing a
+single fact or assertion. (2) De-contextualize claims so they are self-contained (replace pronouns such as “they” or “it”
+with explicit nouns). (3) Do NOT omit any factual information from the passage. Return ONLY a valid JSON list of
+strings.
+Passage to decompose: {summary_z_t_or_source_chunk_o_t}
+27
+
+
+Atomic-Claim Source Grounding NLI Prompt (GPT-4.1 / Gemini 3.0 Flash)
+User: You are an expert fact-checker and Natural Language Inference (NLI) auditor. For each numbered Hypothesis
+claim below, determine its relationship to the Premise (observed source chunks/turns 1 . . . t): ENTAILED (fully supported
+and directly verified by the premise), CONTRADICTED (contradicts or distorts facts in the premise), or NEUTRAL (contains
+ungrounded claims or assumptions not supported by the premise). Output Claim k:
+<1-sentence explanation>
+| Verdict:
+<ENTAILED|CONTRADICTED|NEUTRAL>.
+Premise: {observed_source_prefix_1..t}
+Hypotheses: {numbered_atomic_claims}
+Pairwise Truthfulness and Usefulness Autorater Prompt (arXiv & WildChat, GPT-4.1)
+User: Compare candidate summaries/belief states A and B (randomized order) at turn {t} given the observed history
+1 . . . {t} and task reference context (paper MCQs on arXiv; true user states s1:{t} on WildChat). Evaluate two criteria
+independently: (1) Truthfulness: Which candidate is more factually grounded in the observed history up to turn {t},
+avoiding unsupported or fabricated claims, intents, or constraints? (2) Usefulness: Which candidate retains more
+task-relevant information for downstream question answering (arXiv) or crafting helpful assistant replies (WildChat)?
+Output per axis: Reasoning:
+<...> | Preference:
+<A, B, or Tie>.
+Standalone 1–10 Consistency Autorater Prompt (GPT-4.1)
+User: Given (1) the previous summary/belief state zt−1 after turn {t-1}, (2) the new observation/exchange at turn {t},
+and (3) the updated summary/belief state zt, rate Consistency on a 1–10 integer scale: Does zt preserve valid prior
+information from zt−1, faithfully integrate relevant new evidence from turn {t}, and evolve coherently without abrupt
+drift? Output: Reasoning:
+<...> | Score:
+<1..10>.
+F
+Extended Empirical Results
+This appendix provides the complete numerical tables and turn-level diagnostics supporting Figure 2
+and Sections 4.3 and 5.
+F.1
+Full Token-Budget Scaling and Chunk Claim Incorporation
+Table 6 reports the full token-budget sweep on the N = 338 post-cutoff arXiv test split across strict
+summary budgets K ∈{100, 300, 500, 800}, alongside unconstrained Prompt-Only reference runs at
+K ∈{1,200, 2,000} (plotted in Figure 2(a)). MaxIM shifts the entire compression frontier upward:
+at K = 100 (95.8 mean tokens), MaxIM reaches 34.26% Abstain-MCQ accuracy, outperforming
+Prompt-Only at K = 500 (31.30%, 469.0 tokens; 4.9× fewer tokens). At K = 500 (66.39%,
+427.7 tokens), MaxIM surpasses Prompt-Only even at K = 2,000 (64.32%, 1,453.3 tokens; 3.4×
+compression gain) before saturating at 67.04% (K = 800), consistent with Proposition 4. Notably,
+if abstention (option E) is removed, standard 4-way Forced-MCQ accuracy compresses into a narrow
+87.7%–94.0% band across all methods and budgets (e.g., Prompt-Only already scores 88.28% at
+K = 100 vs. 92.07% for MaxIM at K = 500): once any coarse summary identifies a paper’s topic,
+the frozen solver eliminates implausible distractors via parametric knowledge, confirming that explicit
+abstention is essential to measure evidence actually retained in zT .
+Table 7 details the 5-chunk-window claim incorporation rates shown in Figure 2(b). During chunks
+1–5, spare buffer capacity allows all methods to incorporate 44.9%–56.5% of incoming chunk claims.
+Once the K = 500 budget fills (chunks 11–25), unguided Prompt-Only drops to 15.4% because it
+avoids overwriting prior text. MI-Only RL (23.3% in chunks 21–25) packs claims aggressively from
+the start (56.5%) under consistency shaping, whereas full MaxIM sustains the highest late-paper
+incorporation (26.8% in chunks 21–25) by selectively evicting low-utility background prose to retain
+late methodological and experimental findings.
+F.2
+Offline Critic Validation: Raw VPL vs. PMI
+Table 8 compares unnormalized conditional log-likelihood (raw VPL) against our baseline-subtracted
+PMI critic qϕ (Section 4.3) on held-out trajectories and synthetic quality triplets (zhq
+t , zvague
+t
+, zhalluc
+t
+)
+prior to RL. Raw sufficiency log-likelihood log qϕ(Yt | zt) is dominated by cross-paper ques-
+tion difficulty, yielding tiny within-paper spread (σwithin = 0.043 nats) and near-zero correlation
+with downstream Abstain-MCQ utility (r = +0.050). Subtracting the masked-summary baseline
+28
+
+
+Table 6: Full arXiv token-budget Pareto scaling (N = 338). Average ± SEM across episodes
+(SentencePiece token counts under Gemini 2.5 Flash tokenizer).
+Budget
+Method
+Abstain-
+MCQ ↑
+Abstain
+% ↓
+Avg.
+Tokens
+Terminal
+Tokens
+arXiv K=100
+Prompt-Only
+7.04±0.69
+92.07±0.70
+97.7±0.1
+98.1±0.2
+arXiv K=100
+MaxIM (Ours)
+34.26±1.27
+64.32±1.28
+95.8±0.1
+98.7±0.1
+arXiv K=300
+Prompt-Only
+22.43±1.11
+76.75±1.13
+284.2±0.6
+297.7±1.2
+arXiv K=300
+MaxIM (Ours)
+50.06±1.35
+48.40±1.36
+276.8±0.6
+298.3±0.4
+arXiv K=500
+Prompt-Only
+31.30±1.28
+68.11±1.29
+469.0±0.8
+500.3±1.6
+arXiv K=500
+MaxIM (Ours)
+66.39±1.31
+32.01±1.31
+427.7±1.5
+496.7±0.5
+arXiv K=800
+Prompt-Only
+38.88±1.34
+60.30±1.35
+730.0±1.4
+800.6±2.1
+arXiv K=800
+MaxIM (Ours)
+67.04±1.30
+31.60±1.30
+653.9±3.0
+789.6±1.8
+arXiv 1.2K/2K
+Prompt-Only (Ref.)
+49.35/64.32
+49.76/34.73
+1036.9/1453.3
+1195.0/1899.9
+Table 7: arXiv turn-wise chunk claim incorporation (%) across 5-chunk streaming windows
+(N = 338, K = 500; supporting Figure 2(b)). Entries measure the percentage of atomic claims in
+incoming chunk ot (extracted by Gemini 2.5 Flash-Lite) entailed by updated summary zt (verified by
+Gemini 3.0 Flash).
+Method
+Chunks 1–5
+Chunks 6–10
+Chunks 11–15
+Chunks 16–20
+Chunks 21–25
+Prompt-Only
+49.8%
+31.7%
+19.5%
+15.9%
+15.4%
+Policy SFT
+48.5%
+31.4%
+22.6%
+18.0%
+17.6%
+MemAgent RL (γ=1.0)
+44.9%
+38.3%
+25.7%
+19.2%
+18.6%
+Task-Only RL (γ=0.9)
+50.2%
+40.0%
+27.0%
+21.0%
+20.4%
+MI-Only RL (Rtask=0)
+56.5%
+44.2%
+30.5%
+24.0%
+23.3%
+MaxIM (Full, Ours)
+50.2%
+44.2%
+33.9%
+27.3%
+26.8%
+log qϕ(Yt | znull) cancels paper difficulty, expanding within-paper spread by 8.1× (0.351 nats) and
+raising utility correlation to r = +0.324 (with 100% pairwise accuracy separating HQ from vague or
+hallucinated WildChat belief states). Similarly, forward consistency PMI relative to ˜Hnull removes
+raw likelihood’s preference for longer summaries (r(tokens) shifts from +0.323 to −0.170) and
+boosts HQ-vs.-hallucinated classification AUROC from 0.685 to 0.963.
+Table 8: Offline critic validation comparing Raw VPL vs. PMI on held-out arXiv trajecto-
+ries/triplets and held-out WildChat validation triplets.
+Validation Metric
+Raw VPL
+Critic
+PMI Critic
+(Ours)
+arXiv Within-Paper Sufficiency Spread (σwithin, nats ↑)
+0.043
+0.351 (8.1×)
+arXiv Correlation with Downstream Abstain-MCQ (r ↑)
++0.050
++0.324 (6.5×)
+arXiv Hallucination Discrimination AUROC (HQ vs. Halluc. ↑)
+0.685
+0.963 (+27.8 pts)
+arXiv Grounding Length Correlation (r(tokens), closer to 0)
++0.323
+−0.170
+WildChat Sufficiency Pairwise Acc. (HQ > Vague / Halluc.)
+—
+100.0% / 100.0%
+WildChat Recursive Consistency Pairwise Acc. (HQ > Halluc.)
+—
+83.6% (+0.369 nats)
+F.3
+WildChat Downstream Agent Evaluation and Causal Belief-Tracking Fidelity
+Table 9 expands Table 1 with absolute 1–10 GPT-4.1 scores, Coherence ratings, and average con-
+versation lengths across all N = 500 test dialogues and the fixed T ≥10 cohort (N = 158). On all
+N = 500 seeds, MaxIM ranks first on all four dimensions while resolving user goals in the fewest
+turns (8.49 vs. 8.75 for No-Belief). In paired bootstrap tests, MaxIM significantly outperforms both
+Task-Only RL (+0.29 to +0.35 across axes, p ≤0.0056) and MemAgent RL (+0.30 to +0.34,
+p ≤0.0064), as well as Suff-Only RL on Satisfaction (+0.23, p = 0.0480) and Preference Retention
+(+0.28, p = 0.0096). On the T ≥10 cohort, No-Belief drops by 0.46–0.51 points as early user
+constraints fall outside the k = 1 window; here, only MI-shaped policies recover positive gains
+29
+
+
+across every axis, with MaxIM outperforming Task-Only RL by +0.41 to +0.48 points (p < 0.05)
+and shortening dialogues from 12.61 to 10.68 turns.
+Table 9: Full WildChat bounded-memory (k = 1, T ≤15) downstream chat-agent evaluation
+(GPT-4.1 judge without summary access, 1–10 scale). Average ± SEM (with paired ∆vs. No-Belief
+in parentheses, computed prior to rounding) on all N = 500 test seeds and the fixed No-Belief
+T ≥10 long-horizon cohort (N = 158).
+Method
+User Sat. ↑
+Goal Comp. ↑
+Pref. Ret. ↑
+Coherence ↑
+Avg.
+Turns
+(i) All Test Dialogues (N=500)
+No-Belief (k=1)
+8.58±0.11
+8.75±0.10
+8.74±0.10
+8.70±0.09
+8.75
+Prompt-Only
+8.49±0.11 (−0.09)
+8.66±0.10 (−0.09)
+8.75±0.09 (+0.01)
+8.62±0.10 (−0.08)
+8.74
+Policy SFT
+8.54±0.11 (−0.04)
+8.70±0.10 (−0.05)
+8.79±0.09 (+0.05)
+8.72±0.09 (+0.02)
+8.61
+MemAgent [7]
+8.30±0.11 (−0.28)
+8.48±0.10 (−0.27)
+8.60±0.10 (−0.13)
+8.44±0.11 (−0.26)
+8.84
+Task-Only RL
+8.28±0.12 (−0.30)
+8.46±0.11 (−0.29)
+8.58±0.10 (−0.15)
+8.47±0.10 (−0.23)
+8.58
+MI-Only RL
+8.58±0.10 (0.00)
+8.74±0.09 (0.00)
+8.81±0.09 (+0.07)
+8.73±0.09 (+0.03)
+8.71
+Suff-Only RL
+8.40±0.11 (−0.18)
+8.60±0.10 (−0.14)
+8.62±0.10 (−0.12)
+8.56±0.10 (−0.14)
+8.57
+MaxIM (Full)
+8.63±0.10 (+0.05) 8.80±0.09 (+0.05) 8.90±0.08 (+0.16) 8.77±0.09 (+0.06)
+8.49
+(ii) Fixed Long-Horizon Cohort (T≥10, N=158)
+No-Belief (k=1)
+8.08±0.20
+8.36±0.18
+8.28±0.19
+8.19±0.18
+12.61
+Prompt-Only
+7.99±0.20 (−0.09)
+8.23±0.19 (−0.13)
+8.35±0.19 (+0.08)
+8.15±0.19 (−0.04)
+11.12
+Policy SFT
+7.87±0.20 (−0.21)
+8.15±0.18 (−0.21)
+8.28±0.18 (0.00)
+8.14±0.18 (−0.05)
+11.08
+MemAgent [7]
+7.94±0.21 (−0.15)
+8.15±0.20 (−0.21)
+8.30±0.19 (+0.02)
+8.06±0.20 (−0.13)
+11.12
+Task-Only RL
+7.72±0.22 (−0.37)
+7.98±0.20 (−0.38)
+8.17±0.19 (−0.11)
+7.90±0.20 (−0.29)
+10.84
+MI-Only RL
+8.26±0.19 (+0.18)
+8.48±0.18 (+0.12)
+8.51±0.17 (+0.23)
+8.44±0.17 (+0.25) 10.91
+Suff-Only RL
+8.25±0.20 (+0.16)
+8.49±0.18 (+0.13)
+8.51±0.19 (+0.23)
+8.36±0.18 (+0.17)
+10.89
+MaxIM (Full)
+8.20±0.19 (+0.11)
+8.42±0.17 (+0.06)
+8.58±0.16 (+0.30)
+8.32±0.17 (+0.13)
+10.68
+Table 10 evaluates the 1–10 causal belief-tracking reward Rtask directly on held-out Test (N = 500),
+unseen-simulator OOD (N = 200), and T = 15 horizon extrapolation. Together, Tables 9 and 10
+expose a striking reward-to-utility gap: MemAgent RL (8.98) and Task-Only RL (8.79) nearly
+match MaxIM (9.00 Test; 9.05 OOD) on terminal belief accuracy, yet both degrade live assistant
+performance below No-Belief. Because sparse terminal Rtask evaluates only the final state, unshaped
+RL tolerates intermediate-turn confabulations (7.04%–9.35% contradictions vs. MaxIM’s 4.27%;
+Table 2) and suffers sharper horizon decay at T = 15 (7.79 and 8.18 vs. MaxIM’s 8.50), misleading
+the assistant on earlier turns.
+Table 10: WildChat 1–10 causal belief-state tracking fidelity (training reward metric) across
+held-out Test (N = 500), unseen-simulator OOD (N = 200), and T = 15 horizon extrapolation.
+Method
+Test (N=500)
+Unseen-Sim OOD (N=200)
+Turn 15 Extrap.
+Prompt-Only
+8.32 ± 0.07
+8.44 ± 0.11
+7.11
+Policy SFT
+8.31 ± 0.06
+8.29 ± 0.09
+6.96
+MI-Only RL (Rtask=0)
+8.33 ± 0.07
+8.32 ± 0.10
+6.85
+Suff-Only RL (wc=0)
+8.76 ± 0.06
+8.76 ± 0.09
+7.50
+Task-Only RL (γ=0.9)
+8.79 ± 0.06
+8.90 ± 0.08
+7.79
+MemAgent RL (γ=1.0) [7]
+8.98 ± 0.05
+8.92 ± 0.09
+8.18
+MaxIM (Full, Ours)
+9.00 ± 0.05
+9.05 ± 0.08
+8.50
+F.4
+Turn-Stratified Qualitative and Cross-Judge Grounding Evaluation
+Cross-Family Grounding Verification.
+To verify that Table 2’s arXiv grounding results are not
+specific to GPT-4.1, we re-evaluate terminal-zT atomic-claim entailment using Gemini 3.0 Flash.
+We observe the exact same pattern: all RL policies maintain high factual precision—98.43% (Suff-
+Only RL), 98.19% (MemAgent RL), 98.14% (Task-Only RL), 97.77% (MI-Only RL), and 96.76%
+(MaxIM), alongside 98.44% for Prompt-Only—whereas Policy SFT drops to 74.70% as imitation
+errors compound over 25 updates.
+30
+
+
+Turn-Stratified Qualitative Dynamics.
+Table 11 tracks GPT-4.1 qualitative ratings across inter-
+mediate and terminal turns on both benchmarks. On arXiv (Table 11(a)), Policy SFT achieves high
+Usefulness at t = 3 (77.0%) while summaries remain short, but collapses to 13.4% by t = 20 as
+ungrounded claims accumulate. By contrast, MaxIM climbs from 39.0% (t = 3) to 78.0% (t = 15)
+and 72.9% (t = 20) against Prompt-Only while achieving the highest standalone Consistency score
+(7.55 vs. 5.99–6.44 across other RL methods). Furthermore, when GPT-4.1 compares MaxIM directly
+against MemAgent on the exact same paper prefixes, MaxIM wins on Usefulness at every evaluated
+chunk (72.0% at t = 3 through 54.8% at t = 20, plus a 61.6% Consistency win rate at t = 20).
+On WildChat (Table 11(b)), standalone 1–10 Consistency saturates near ceiling across all RL policies
+(9.69–9.86 vs. 9.64 for Prompt-Only and 9.37 for Policy SFT; MaxIM scores 9.73 ± 0.04) because
+unchanged fields of the 10-key JSON state carry forward smoothly across turns. Pairwise Usefulness
+and Truthfulness reveal a clear horizon crossover: at early turns (t = 3, 5), Task-Only RL’s speculative
+trait guesses slightly edge MaxIM on Usefulness (82.1% vs. 79.5% at t = 5) at the cost of lower
+Truthfulness (70.5% vs. 78.6%). Once conversations extend to t ≥8, MaxIM leads every baseline
+on both Usefulness (76.4%–90.2%) and Truthfulness (71.5%–88.5%).
+Table 11: Turn-stratified GPT-4.1 qualitative evaluation. (a) arXiv pairwise Usefulness win
+rate (%) vs. Prompt-Only across chunks t (plus standalone 1–10 Consistency at t = 20, and direct
+MaxIM vs. MemAgent judging). (b) WildChat pairwise Usefulness / Truthfulness win rates (%) vs.
+Prompt-Only across turns (active conversation counts N shown per column on a 100-seed replay
+subset alongside all N = 500 terminal states).
+(a) arXiv Pairwise Summary Comparison (N=338; vs. Prompt-Only unless noted)
+Method
+t = 3
+t = 5
+t = 10
+t = 15
+t = 20 (Use % / Cons.)
+Policy SFT
+77.0%
+35.0%
+26.0%
+19.0%
+13.4% / 7.12
+MI-Only RL
+40.0%
+38.0%
+47.0%
+47.0%
+47.0% / 6.04
+Task-Only RL
+42.0%
+52.0%
+61.0%
+69.0%
+62.5% / 6.44
+Suff-Only RL
+72.0%
+78.0%
+80.0%
+81.0%
+74.4% / 5.99
+MemAgent RL
+31.0%
+48.0%
+74.0%
+87.0%
+80.1% / 6.07
+MaxIM (Full)
+39.0%
+50.0%
+72.0%
+78.0%
+72.9% / 7.55
+MaxIM vs. MemAgent
+72.0%
+62.0%
+57.0%
+56.0%
+54.8% (61.6% Cons. win)
+(b) WildChat Belief-State Usefulness / Truthfulness Win % vs. Prompt-Only
+Method
+Term.
+(N=500)
+t = 3
+(N=99)
+t = 5
+(N=96)
+t = 8
+(N=65)
+t = 10
+(N=37)
+t = 12
+(N=21)
+t = 15
+(N=12)
+Policy SFT
+37.6/36.2
+50.0/44.1
+40.2/40.2
+38.2/37.4
+37.7/36.1
+40.6/34.4
+51.6/51.6
+MI-Only RL
+40.8/40.8
+49.0/52.0
+42.9/43.8
+42.3/45.5
+37.7/41.0
+43.8/37.5
+51.6/50.0
+Task-Only RL
+79.8/69.8 78.4/64.7 82.1/70.5
+74.8/67.5
+78.7/75.4
+78.1/75.0
+79.0/71.0
+Suff-Only RL
+72.2/65.8
+67.6/62.7
+69.6/61.6
+73.2/63.4
+68.9/60.7
+81.2/75.0
+69.4/61.3
+MemAgent RL
+66.4/61.0
+67.6/57.8
+67.0/61.6
+70.7/63.4
+73.8/65.6
+75.0/62.5
+61.3/58.1
+MaxIM (Full)
+73.8/72.4
+72.5/65.7
+79.5/78.6
+76.4/71.5 90.2/88.5 87.5/78.1 80.6/75.8
+31
+
+
+G
+Broader Impacts and Limitations
+G.1
+Broader Impacts
+MaxIM introduces a principled approach to bounded memory management in streaming environments.
+On the positive side, this framework enhances the reliability of long-horizon AI agents by actively
+suppressing hallucinations and enforcing factual grounding through recursive consistency. This is
+particularly beneficial for high-stakes applications requiring persistent context—such as educational
+tutoring, accessibility tools, and medical or legal document analysis—where unbounded context
+scaling is computationally prohibitive.
+However, the capability to persistently track dynamically evolving latent states (such as user emotions
+or implicit intents, as demonstrated in our WildChat experiments) poses potential privacy and
+surveillance risks. If deployed without safeguards, agents equipped with highly effective intent-
+tracking memory could be used for manipulative profiling or invasive monitoring. Furthermore,
+because the memory update relies heavily on its own prior state, early biases or misinterpretations
+encoded in the summary may compound over time. Mitigating these risks requires transparent user
+consent for long-term memory tracking, routine auditing of the internal summary states for bias or
+sensitive personal information, and the implementation of robust safety filters on the downstream
+action agent.
+G.2
+Limitations
+While MaxIM effectively mitigates credit assignment failures through information-theoretic shaping,
+we acknowledge several limitations that provide avenues for future work:
+• The Markovian approximation and irreversible loss: MaxIM enforces a strict Markovian
+bottleneck by conditioning solely on the immediate local context ˜Ht = (zt−1, at−1, ot). During
+inference, if the policy erroneously discards a critical piece of information at step t, the loss is
+irreversible because the model lacks attention mechanisms to re-access Ht−2. Pairing MaxIM’s
+compressed working memory with an external episodic retrieval fallback is a promising hybrid
+architecture for deployment.
+• Oracle dependency for critic training: MaxIM circumvents the need for expensive human
+preference labels, shifting supervision to an offline synthetic pipeline (Appendix B) where
+privileged target variables Yt are available strictly during training. Applying MaxIM to a new
+domain requires defining a task-relevant target proxy Yt and generating offline critic data; as
+quantified in Proposition 3 of Appendix A.1, misspecifying Yt introduces an additive mediation
+floor proportional to (εr, εT ).
+• Training compute overhead: While step-wise teacher-forced PMI rewards eliminate autore-
+gressive critic generation and incur zero test-time overhead (Table 5), the RL fine-tuning phase
+requires critic forward passes during the shaping window (s < 600), adding training compute
+relative to sparse-reward RL.
+• LLM-as-a-Judge evaluation bias: Using a single model family for both policy training and
+qualitative evaluation can introduce self-preference bias. To mitigate this risk, we conduct atomic-
+claim source grounding and qualitative evaluations using an independent cross-family judge
+(GPT-4.1) alongside Gemini 3.0 Flash; nonetheless, live human-in-the-loop user studies would
+further complement simulated multi-turn benchmarks.
+32

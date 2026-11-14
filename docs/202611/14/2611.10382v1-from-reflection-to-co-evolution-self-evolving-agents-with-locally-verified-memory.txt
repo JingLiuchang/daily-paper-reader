@@ -1,0 +1,2968 @@
+From Reflection to Co-Evolution:
+Self-Evolving Agents with Locally Verified Memory
+Xinxiang Yin1, Xinglang Zhang2, Haodong Chen3, Zhiqing Cui3, Weidong Tang4,
+Yuxuan Wang5, Junrui Wang6, Jingyi Zhang1, Jianfeng Zhang7, Jian Qian1
+1The University of Hong Kong
+2Huazhong University of Science and Technology
+3The Hong Kong University of Science and Technology
+4National University of Singapore
+5Peking University
+6Xi’an Jiaotong University
+7Huawei Noah’s Ark Lab
+{xinxiangyin24}@gmail.com
+{jianqian}@hku.hk
+Abstract
+LLM agents have made impressive progress
+in coding and mathematical reasoning, moti-
+vating growing interest in learning from long-
+horizon interaction. Memory supports this pro-
+cess, but plausible lessons can be redundant or
+reinforce inappropriate actions. Can a mem-
+ory’s source decision provide a practical test
+for whether to retain it? We localize consequen-
+tial trajectory steps, extract candidate memo-
+ries, and replay each source decision with and
+without its candidate under the same context.
+This reveals two properties: most candidates
+barely shift the probed distribution, and both
+successful and failed source actions can be re-
+inforced or suppressed. These observations mo-
+tivate Anchor, which tests shift magnitude and
+source-role alignment before retention. Admit-
+ted memories guide later trajectories, enabling
+experience-driven improvement under a frozen
+policy. On held-out ALFWorld and WebShop
+tasks, Anchor improves success rate and mean
+score by up to 19.9% and 17.2%, respectively,
+relative to the strongest baseline for each back-
+bone. With Qwen3.5-27B, it retains 41% fewer
+ALFWorld cards than unfiltered retention and
+outperforms all four WebShop cost-comparison
+baselines while using fewer tokens.
+1
+Introduction
+Large language model (LLM) applications span
+coding (Shi et al., 2026b; Yang et al., 2024),
+mathematical and logical reasoning (Ren et al.,
+2025; Zhang et al., 2026g,i), scientific investiga-
+tion (Zhang et al., 2026a; Cui et al., 2026), and
+interactive cognitive training (Shi et al., 2026a).
+Beyond individual tasks, recent work asks how
+agents can improve through long-horizon interac-
+tion and reuse experience (Wang et al., 2023; Shinn
+et al., 2023). Memory provides a direct mecha-
+nism: Reflexion, ExpeL, and ReasoningBank ex-
+tract reusable lessons from trajectories without up-
+dating model parameters (Shinn et al., 2023; Zhao
+et al., 2024; Ouyang et al., 2026).
+Choosing which lessons to retain raises two con-
+nected problems. First, textual plausibility and
+successful retrieval do not establish a memory’s
+decision value: a lesson may repeat what the pol-
+icy already knows or reinforce an inappropriate
+action. Aggregate task success also leaves the con-
+tribution of an individual memory unresolved (Tan
+et al., 2025a). Second, continual writing increases
+storage, context, and maintenance costs, so retain-
+ing ineffective lessons makes future reuse more
+expensive (Fang et al., 2026a). Recent methods use
+action changes and trajectory feedback to guide
+selection (Zhang et al., 2026h; Wang et al., 2026a).
+We seek a candidate-level test that connects reten-
+tion to behavioral evidence before a memory enters
+the bank:
+ Can a memory’s source decision provide a
+practical test for whether to retain it?
+We let the agent localize consequential decisions
+in completed trajectories and extract a memory
+from each. Replaying each source decision with
+and without its candidate under the same context
+reveals how that memory changes the policy (Sec-
+tion 3).
+This replay exposes two properties of self-
+extracted memory. Memory influence is concen-
+trated: most candidates barely shift the probed
+distribution, while a smaller subset produces sub-
+stantial changes (Figure 2). Memory influence is
+directional: both successful and failed source ac-
+tions can be reinforced or suppressed after mem-
+ory injection (Figure 3). A large shift alone there-
+fore does not identify whether the effect agrees
+1
+arXiv:2611.10382v1  [cs.CV]  7 Nov 2026
+
+
+Question：
+Task : Clean the kitchen and store it for 
+later use 
+Observation : You are holding a dirty, 
+reusable plate in a kitchen. A sink, 
+cupboard, and trash bin are within reach. 
+Available actions :
+(1) Put it in the cupboard;
+(2) Throw it in the trash bin; 
+(3) Place it in the sink.
+with different types of memory 
+(a) With no memory 
+(b) Inert memory 
+(c) Wrong direction
+(d) Anchor memory
+Agent reasoning path
+(A) With no memory 
+cupboard
+cupboard
+(B) With inert memory 
+trash bin 
+(C) With wrong direction 
+sink
+(D) With Anchor direction 
+Figure 1: Memory can change the next action. In this schematic kitchen example, putting a dirty reusable plate in
+the sink is preferable to the cupboard or trash bin. Anchor screens for a role-aligned change.
+with the source role. Conversely, a success mem-
+ory can strengthen an action without changing the
+top choice. These observations motivate testing
+both the magnitude of a memory’s influence and
+its source-role alignment.
+Our approach. We introduce Anchor, which tests
+candidates before retention. Localizer extracts
+lessons from source decisions; Amplituder mea-
+sures JS shift; Aspecter checks source-role align-
+ment; and BankMaster stores, retrieves, and main-
+tains admitted cards. Selected memories guide later
+trajectories, whose feedback supplies new candi-
+dates. This feedback loop between behavior and
+memory is the co-evolution studied here; model
+parameters remain frozen. Our analysis connects
+shift magnitude and direction to local action value
+under explicit conditions.
+Empirical findings. On ALFWorld (Shridhar
+et al., 2021) and WebShop (Yao et al., 2023),
+Anchor ranks first across two frozen backbones.
+With Qwen3.5-27B, it reaches 96.27% ALFWorld
+success and 73.50 WebShop score, versus 92.54%
+and 62.74 for the strongest respective baselines.
+Source-role filtering improves ALFWorld success
+by 28.6% relative to magnitude-only admission,
+with 41% fewer ALFWorld cards than unfiltered
+retention. On WebShop with Qwen3.5-27B, to-
+ken use is below all four cost-comparison base-
+lines: slightly below MEM1 and approximately
+34%, 59%, and 98.5% below ReasoningBank, Re-
+flexion, and AdaMEM, respectively.
+2
+Related Work
+Learning from interaction.
+Reflexion and Ex-
+peL extract verbal lessons, Voyager accumulates
+skills, and CLIN maintains causal abstractions
+without parameter updates (Shinn et al., 2023;
+Zhao et al., 2024; Wang et al., 2023; Majumder
+et al., 2023). ReasoningBank distills strategies,
+while Evo-Memory and MemEvolve study learning
+across task streams (Ouyang et al., 2026; Wei et al.,
+2026; Zhang et al., 2025). AdaMEM uses trajec-
+tory success and action changes to select strategy-
+training samples; MemRL learns memory utilities
+from feedback (Zhang et al., 2026h,e). Anchor
+instead tests individual candidates at their source
+decisions before storage.
+Memory
+organization
+and
+admission.
+MemGPT, Mem0, A-MEM, and SimpleMem
+manage, consolidate, link, or compress persistent
+information (Packer et al., 2024; Chhikara et al.,
+2025; Xu et al., 2025; Liu et al., 2026). LightMem
+targets consolidation cost (Fang et al., 2026a).
+For selective writes, A-MAC scores candidate
+attributes, ConsistencyGate checks source support,
+and Janus compares memories on an evaluation
+set (Zhang et al., 2026c; Zhang and Li, 2026; Chen
+et al., 2026b). MemGuard uses trajectory-verifier
+metadata for admission and maintenance (Wang
+et al., 2026a). Anchor adds a paired behavioral
+test of shift magnitude and source-role alignment.
+Decision-aware memory.
+EPR uses model like-
+lihoods to supervise demonstration retrieval, and
+CICL selects and compresses context using action-
+choice effects (Rubin et al., 2022; Guan et al.,
+2
+
+
+2026). Counterfactual auditing of robot memory
+distinguishes behavioral influence from appropriate
+guidance (Zhang et al., 2026d). Memento-II for-
+malizes reflective reads and writes as stateful policy
+improvement (Wang, 2026). Our focus is persis-
+tent admission through source-decision replay; the
+value analysis connects the resulting distribution
+shift to local return. Appendix A provides the ex-
+tended comparison.
+3
+Observation: Magnitude and Direction
+of Memory Effects
+3.1
+Action Shift
+A fixed policy πθ executes task g, observing ot,
+choosing at ∈At, and receiving feedback rt. Its
+trajectory and pre-action history are
+τ = (g, o0, a0, r0, . . . , oT−1, aT−1, rT−1, oT ),
+Ht = (g, o0, a0, r0, . . . , ot).
+(1)
+After task completion, extractor E uses the trajec-
+tory and feedback to identify consequential steps
+K(τ) and extract their memories:
+M(τ) = {mt : mt = E(τ, t), t ∈K(τ)}.
+(2)
+Each memory records reusable guidance together
+with its source task and state.
+Let B be the bank before adding these memories,
+R(B, Ht) the saved source retrieval, and F the
+context builder. The original and injected contexts
+are
+ht = F
+ Ht, At, R(B, Ht)
+
+,
+hmt
+t
+= F
+ Ht, At, R(B, Ht), mt
+
+.
+(3)
+Normalize action log probabilities ℓt(a) and ℓmt
+t (a)
+from the two contexts over the same admissible set:
+Pt(a) =
+exp ℓt(a)
+P
+a′∈At exp ℓt(a′),
+P mt
+t
+(a) =
+exp ℓmt
+t (a)
+P
+a′∈At exp ℓmt
+t (a′).
+(4)
+We use base-2 Jensen–Shannon (JS) divergence to
+measure the resulting action-distribution shift:
+¯Pt = 1
+2(Pt + P mt
+t
+),
+Mt = DJS(Pt, P mt
+t
+)
+= 1
+2DKL(Pt∥¯Pt) + 1
+2DKL(P mt
+t
+∥¯Pt).
+(5)
+Across 2,785 ALFWorld candidates, action-verb
+probe JS concentrates near zero, with a small tail
+JS divergence Mt (bits)
+Frequency (log 10 scale)
+101
+102
+103
+100
+0
+0.2
+0.4
+0.6
+0.8
+0.99
+80th : 0.1862
+Gaussian smoothed
+Figure 2: Shift magnitude. Action-verb probe JS diver-
+gence for 2,785 candidate memories. Most shifts cluster
+near zero; a smaller tail moves the probed distribution
+more strongly.
+of larger shifts (Figure 2). Most candidates barely
+change action-type preference. This concentration
+motivates Amplituder (Section 4.3): screen can-
+didates by replay shift to retain memories with a
+measurable influence on the policy.
+3.2
+Direction
+Magnitude leaves open which actions gain probabil-
+ity. Localizer assigns hindsight credit ct ∈[−1, 1]
+and role yt = sign(ct) ∈{+1, −1}: success main-
+tain or failure correction. We track the recorded
+source action:
+a(1)
+t
+:= at,
+∆p(1)
+t
+= P mt
+t
+(a(1)
+t ) −Pt(a(1)
+t ).
+(6)
+Positive ∆p(1)
+t
+reinforces the source action; nega-
+tive values suppress it. Under the same ALFWorld
+setup, Figure 3 exhibits all four sign combinations.
+The pairs (ct, ∆p(1)
+t ) distinguish success rein-
+forcement (+, +), success suppression (+, −),
+failure suppression (−, −), and failure reinforce-
+ment (−, +). The test yt∆p(1)
+t
+> 0 selects the two
+role-aligned cases. Effects in all four directions mo-
+tivate Aspecter (Section 4.4): check source-role
+alignment alongside magnitude, using probability
+changes and rankings to distinguish support for
+successful actions from correction of failed ones.
+The plot tracks source-action verbs (L = 1).
+3.3
+A Two-Axis View of Memory Effects
+We retain Pt, P mt
+t
+, and Mt from Section 3.1 and
+analyze their complete-action form on At. De-
+fine the displacement vt(a) = P mt
+t
+(a) −Pt(a).
+Whereas Memento-II formalizes memory reads
+and writes as stateful policy improvement (Wang,
+2026), our analysis relates magnitude and direction
+to the value of changing context at one decision.
+3
+
+
+Source credit  [-1,1]
+Source action change  [-1,1]
+Success reinforcement (+,+) 
+Failure suppression(−,−) 
+Success suppression(+,−) 
+Failure reinforcement(−,+) 
+Figure 3: Shift direction. Display-normalized source
+credit ct versus source-action change ∆p(1)
+t , preserving
+signs. Role-aligned: success reinforcement (+, +) and
+failure suppression (−, −). Misaligned: success sup-
+pression (+, −) and failure reinforcement (−, +).
+Source-action consistency.
+The bounds track
+the recorded action a(1)
+t
+= at.
+Interpreting it
+as the baseline top choice additionally assumes
+at = arg maxa∈At ℓt(a) at the complete-action
+level; token-wise greedy decoding alone does not
+establish this equality.
+Magnitude controls effect capacity.
+Let Qt(a)
+be the expected remaining return after action a un-
+der a fixed continuation policy, and write ER[Qt] =
+P
+a R(a)Qt(a). The change in expected Q-value
+and the action-value range are
+EP mt
+t
+[Qt] −EPt[Qt] =
+X
+a
+vt(a)Qt(a),
+Bt = max
+a∈At Qt(a) −min
+a∈At Qt(a).
+(7)
+Proposition 1 (Radius bound). Let αt
+=
+TV(Pt, P mt
+t
+). For the base-2 JS divergence Mt,
+
+X
+a
+vt(a)Qt(a)
+ ≤Btαt
+≤Bt
+p
+2 ln 2 Mt.
+(8)
+Near-zero complete-action divergence limits the
+possible expected-value change; the direction of
+mass transfer determines its sign.
+Direction determines the sign.
+Write vt as prob-
+ability mass transported from actions that lose mass
+to actions that gain it:
+X
+a
+vt(a)Qt(a) =
+X
+a,b
+µt(a, b)[Qt(b) −Qt(a)],
+(9)
+where µt(a, b) transports mass from a to b, with to-
+tal mass αt (Appendix B.2). Equal JS divergences
+can yield opposite value changes, depending on
+where this mass moves.
+Using the source action a(1)
+t
+and role yt from
+Section 3.2, define the signed source-role margin
+ηt = yt∆p(1)
+t
+= ytvt(a(1)
+t ).
+(10)
+Positive ηt corresponds to success reinforcement
+or failure suppression.
+Assumption 1 (Value alignment). The source-role
+margin satisfies ηt ≥0. There exists κt ≥0 such
+that every positive-mass transfer into a(1)
+t
+when
+yt = +1, or out of a(1)
+t
+when yt = −1, satisfies
+Qt(b) −Qt(a) ≥κt.
+Proposition 2 (Directional value bound). Under
+Assumption 1, the change in expected Q-value sat-
+isfies
+X
+a
+vt(a)Qt(a) ≥
+κtηt
+|{z}
+aligned gain
+−
+Bt(αt −ηt)
+|
+{z
+}
+remaining loss bound
+.
+(11)
+Memory injection increases the expected Q-value
+whenever κtηt > Bt(αt −ηt).
+The source-role-aligned transfers have mass ηt
+and gain at least κtηt in value; the remaining mass
+αt −ηt loses at most Bt per unit. Thus, local
+value improves when the aligned gain exceeds the
+remaining loss bound. Appendix B.3 gives the
+proof.
+These bounds explain magnitude and direction
+for complete-action distributions. The implemen-
+tation uses prefix likelihoods and hindsight roles
+as admission signals (Section 4); it tests probe
+response, not the unobserved Q-value conditions.
+Held-out task performance evaluates the retained
+memories’ utility.
+Transfer to future decisions.
+Let P = (Pt) and
+P mem = (P mem
+t
+) denote the baseline and memory-
+conditioned policies over T decisions, under the
+same initial distribution and environment dynamics.
+Here P mem
+t
+(· | H) includes memories retrieved at
+history H, extending the single-memory distribu-
+tion P mt
+t
+. With QP
+t (H, a) denoting the remaining
+return after action a followed by P, extend the
+displacement to each history:
+vt(H, a) = P mem
+t
+(a | H) −Pt(a | H).
+(12)
+Writing
+J
+for
+expected
+task
+return,
+the
+performance-difference
+identity
+(Schulman
+4
+
+
+et al., 2017) gives
+J(P mem) −J(P)
+= Eτ∼P mem
+"T−1
+X
+t=0
+X
+a
+vt(Ht, a)QP
+t (Ht, a)
+#
+.
+(13)
+When the value-alignment condition yields a non-
+negative lower bound in Eq. 11 at every history
+reached by P mem, it follows that J(P mem) ≥
+J(P) (Appendix B.4).
+4
+Methodology
+4.1
+Anchor: Write, Test, and Reuse
+Following Sections 3.1–3.2, Anchor tests how
+much a memory changes the policy and whether
+the change supports its source role. With πθ frozen,
+Localizer extracts candidates, Amplituder and As-
+pecter test them, and BankMaster stores and reuses
+admitted cards (Figure 4). Let Bi precede construc-
+tion trajectory i. Admission decisions Gt ∈{0, 1}
+give the update
+Mkeep(τ) = {mt ∈M(τ) : Gt = 1},
+Bi+1 = Bmaster(Bi, Mkeep(τ), τ).
+(14)
+4.2
+Localizer: Memory Extraction
+Localizer reflects on the completed trajectory and
+feedback, selecting consequential source steps with
+K = 5:
+K(τ) ⊆{0, . . . , T −1},
+|K(τ)| ≤K. (15)
+Each hint mt receives model-assigned credit ct ∈
+[−1, 1], whose sign yt identifies its source role;
+zero-credit candidates are excluded. Roles describe
+local decisions, not episode outcomes. Importance
+ranks candidates; hints remain fixed during replay
+and become cards only after admission.
+4.3
+Amplituder: Shift Magnitude
+Section 3.1 shows that most candidates barely
+change the probed distribution. Amplituder there-
+fore filters out negligible shifts before storage. It
+queries ht and hmt
+t
+without executing an environ-
+ment action, preserving the saved history, task guid-
+ance, retrieved cards, and candidate actions. Only
+the candidate-hint block differs; the resulting dis-
+tributions yield Mt in Eq. 5.
+Token-budgeted scoring.
+We sum log proba-
+bilities of the first L action-content tokens after
+<action> and normalize over distinct prefixes,
+yielding ePt and eP mt
+t
+. ALFWorld uses L = 1;
+WebShop uses L = 5. Shared prefixes form one
+category; admission tracks the source category
+v(1)
+t
+= ϕL(a(1)
+t ). Candidate construction, normal-
+ization, and complete-action prompts are detailed
+in Appendices C.4 and E.
+Both roles must cross a magnitude threshold:
+A+
+t ⇐⇒Mt ≥τsucc,
+A−
+t ⇐⇒Mt ≥τfail.
+(16)
+We use 0.05 and 0.12 bits, respectively. The lower
+success threshold accommodates source actions
+already strongly preferred before injection.
+4.4
+Aspecter: Source-Role Alignment
+Section 3.2 motivates checking whether memory
+supports a successful source decision or corrects a
+failed one. Recall that a(1)
+t
+is the recorded source
+action and ∆p(1)
+t
+is its probability change after in-
+jection (Eq. 6). The top choices before and after
+injection are
+ba0
+t = arg max
+a∈At Pt(a),
+bamt
+t
+= arg max
+a∈At P mt
+t
+(a).
+(17)
+The predicates below use complete-action nota-
+tion; the implementation substitutes ePt, eP mt
+t
+, and
+source category v(1)
+t
+on the fixed prefix set (Ap-
+pendix D.2).
+4.4.1
+Success Maintain
+The reinforcement condition Sgain
+t
+requires the in-
+jected top choice to equal the source action and its
+probability to increase by at least ϵsucc:
+Sgain
+t
+⇐⇒(bamt
+t
+= a(1)
+t )
+∧(∆p(1)
+t
+≥ϵsucc).
+(18a)
+4.4.2
+Failure Corrections
+The correction condition F dir
+t
+accepts either source
+suppression by at least ϵdrop or an injected prefer-
+ence for an alternative:
+F dir
+t
+⇐⇒(∆p(1)
+t
+≤−ϵdrop)
+∨(bamt
+t̸
+= a(1)
+t ).
+(18b)
+The ranking branch tests alternative preference,
+which can hold even without a source-probability
+decrease; it is distinct from positive signed-margin
+alignment in Eq. 10.
+5
+
+
+Retrieve & act
+Current state
+Action
+a
+Inference
+Build memory card
+When
+Guidance
+Role
+state pattern …
+Reusable rule …
+success / failure
+Memory bank
+Success
+memory
+…
+Fail memory
+…
+Confidence
+Merge
+Decay
+Retrieved
+memory
+New 
+trajectory 
+Add memory
+Replay memory 
+Replay at key step T
+Step t w/o m
+a1
+a2
+a3
+P
+( P, Pm)
+Valid paired scores
+Amplituder
+Shift magnitude
+Enough change?
+JS( P, Pm) ≥ τrole
+Aspecter
+Check the change direction
+Source probability
+before
+Success
+maintain
+Reinforce
+Failure
+correction
+Suppress
+Both pass
+Admit memory
+With Frozen πθ
+a1
+a2
+a3
+Pm
+Step t with m
+𝐶𝑡> 0, Δ𝑝𝑡> 0
+𝐶𝑡< 0, Δ𝑝𝑡< 0
+Reflection
+Completed trajectory
+…
+st−2
+at−2
+st−1
+at
+observe
+act
+observe
+Key step
+Saved Prefix
+𝑯𝒕
+Extract memory 
+from key step & trajectory
+memory candidate m
+“Use the available cool action.”
+Source action
+Step  contribution 
+𝒂𝒕
+𝑪𝒕∈[−𝟏, 𝟏]
+Check memory 
+self-evolving
+Figure 4: Anchor overview. Localizer extracts a fixed candidate from a source decision. Amplituder and Aspecter
+test its shift magnitude and source-role alignment. BankMaster stores admitted memories and retrieves them on
+later tasks. Kitchen actions and probability bars are schematic.
+Combined admission. Let Vt denote comparable
+probe scores and A+
+t , A−
+t the magnitude conditions
+(Eq. 16). Admission follows the source role:
+yt = +1 :
+Gt = 1 ⇐⇒Vt ∧A+
+t ∧Sgain
+t
+,
+yt = −1 :
+Gt = 1 ⇐⇒Vt ∧A−
+t ∧F dir
+t
+.
+(19)
+Otherwise Gt = 0. Appendix C.3 lists threshold
+values; Algorithm 2 implements the gate.
+4.5
+BankMaster: Retrieval and Maintenance
+BankMaster stores each admitted hint verbatim
+as card guidance, adding only role, applicability,
+retrieval keys, and source metadata. Card con-
+struction preserves the tested text. It retrieves the
+highest-scoring compatible cards:
+BR
+i (Ht) = {m ∈Bi : sret(m | Ht, At) ≥τR},
+R(Bi, Ht) = TopKm∈BR
+i (Ht) sret(m | Ht, At).
+(20)
+Here sret combines task-family and state similarity
+with action compatibility. Insertion and feedback-
+driven maintenance update the bank:
+B+
+i = Insert
+ Bi, {Card(mt) : Gt = 1}
+
+,
+Bi+1 = Maintain
+ B+
+i , Feedback(τ)
+
+.
+(21)
+Maintenance updates confidence, merges similar
+same-role cards, decays stale records, and prunes at
+capacity. Appendix C.2 provides details. Held-out
+evaluation uses read-only retrieval.
+5
+Experiments
+Our experiments address four research questions:
+RQ1: Memory utility.
+Can the extracted mem-
+ories improve held-out task performance across
+environments and backbones while retaining fewer
+memories than storing every candidate?
+RQ2: Admission design.
+How do shift magni-
+tude and source-role direction contribute to mem-
+ory quality, and what is gained by combining suc-
+cess memories with failure corrections?
+RQ3: Resource efficiency.
+How does Anchor
+balance task performance, persistent memory size,
+and total token use across memory construction
+and evaluation?
+RQ4: Self-evolution.
+As experience accumu-
+lates along a task stream, does selective memory
+reuse improve the frozen agent’s performance be-
+yond simply expanding its memory bank?
+5.1
+Experimental Settings
+Backbones and baselines.
+We freeze either
+Qwen2.5-14B-Instruct (Qwen Team, 2024) or
+Qwen3.5-27B (Qwen Team, 2026) and com-
+pare ReAct (Yao et al., 2022), Mem0 (Chhikara
+et al., 2025), Reflexion (Shinn et al., 2023),
+MemP (Fang et al., 2026b), LangMem (The
+LangChain Team, 2025), SimpleMem (Liu et al.,
+2026), ExpeL (Zhao et al., 2024), MEM1 (Zhou
+et al., 2025), AdaMEM (Zhang et al., 2026h), and
+ReasoningBank (Ouyang et al., 2026). All methods
+6
+
+
+Table 1: RQ1 Held-out task performance. ALFWorld success (%) and WebShop mean score and steps. Bold and
+underline mark the best and second-best results per backbone; task-family ties use Overall.
+ALFWorld
+WebShop
+Method
+Overall ↑
+Put ↑
+Clean ↑
+Heat ↑
+Cool ↑
+Examine ↑
+Puttwo ↑
+Score ↑
+Steps ↓
+Qwen2.5-14B-Instruct
+ReAct
+46.27
+33.33
+51.61
+26.09
+85.71
+72.22
+5.88
+41.77
+8.68
+	 Conventional memory methods
+Mem0
+12.69
+0.00
+0.00
+4.35
+0.00
+88.89
+0.00
+38.32
+9.11
+Reflexion
+67.16
+77.78
+55.91
+66.67
+74.60
+77.78
+52.94
+25.24
+8.41
+MemP
+56.72
+63.89
+63.44
+52.17
+50.79
+72.22
+31.37
+44.61
+16.21
+LangMem
+36.57
+12.50
+32.26
+26.09
+71.43
+83.33
+0.00
+36.60
+10.12
+SimpleMem
+32.84
+23.61
+12.90
+46.38
+30.16
+62.96
+35.29
+45.46
+7.31
+ExpeL
+62.69
+41.67
+70.97
+73.91
+80.95
+72.22
+29.41
+53.92
+8.71
+M Self-evolving memory methods
+MEM1
+30.35
+23.61
+23.66
+23.19
+28.57
+66.67
+25.49
+34.46
+9.95
+AdaMEM
+72.64
+73.61
+69.89
+69.57
+74.60
+68.52
+82.35
+36.75
+9.96
+ReasoningBank
+53.48
+45.83
+56.99
+46.38
+58.73
+55.56
+58.82
+59.05
+4.84
+ Anchor (ours)
+87.06
+91.67
+88.17
+82.61
+88.89
+92.59
+76.47
+65.88
+6.32
+Qwen3.5-27B
+ReAct
+61.19
+66.67
+51.61
+65.22
+76.19
+72.22
+35.29
+45.97
+10.64
+	 Conventional memory methods
+Mem0
+11.94
+0.00
+0.00
+0.00
+0.00
+88.89
+0.00
+52.02
+9.18
+Reflexion
+91.79
+100.00
+90.32
+95.65
+76.19
+88.89
+100.00
+48.18
+17.32
+MemP
+57.71
+98.61
+81.72
+1.45
+19.05
+61.11
+76.47
+59.83
+14.51
+LangMem
+59.70
+47.22
+53.76
+44.93
+44.44
+100.00
+84.31
+54.85
+8.90
+SimpleMem
+92.54
+95.83
+89.25
+82.61
+95.24
+100.00
+96.08
+61.68
+7.19
+ExpeL
+82.84
+75.00
+90.32
+73.91
+95.24
+77.78
+82.35
+55.44
+8.59
+M Self-evolving memory methods
+MEM1
+57.46
+50.00
+52.69
+43.48
+41.27
+100.00
+70.59
+48.28
+9.47
+AdaMEM
+65.67
+98.61
+33.33
+17.39
+76.19
+100.00
+94.12
+59.25
+49.00
+ReasoningBank
+80.35
+79.17
+77.42
+76.81
+57.14
+100.00
+100.00
+62.74
+6.61
+ Anchor (ours)
+96.27
+100.00
+90.32
+91.30
+100.00
+100.00
+100.00
+73.50
+5.33
+share the evaluation split within each backbone. We
+use each baseline’s open-source benchmark imple-
+mentation when available; otherwise, its memory
+mechanism uses the same environment and action-
+selection prompt as Anchor. Appendix C.4 details
+adaptation.
+Tasks and metrics.
+Memory construction uses
+200 ALFWorld tasks and 400 WebShop tasks.
+Held-out evaluation uses 402 ALFWorld tasks and
+4,055 WebShop instructions from a 10,000-product
+subset. ALFWorld reports success overall and by
+family; Overall pools successes across all tasks.
+WebShop reports mean task score and interaction
+steps. Evaluation is read-only: outcomes do not
+update the constructed banks. Appendix C.3 gives
+task counts and implementation settings.
+5.2
+Main Results: Performance on Held-Out
+Tasks
+Table 1 compares held-out performance across two
+environments, two frozen backbones, and ten base-
+lines. Table 2 and Figure 5 connect these gains to
+selective retention and bank size.
+Answer 1. Selected memories improve held-out
+performance with a smaller bank. Anchor ranks
+first in all four environment–backbone combina-
+tions. On ALFWorld, it retains 41% fewer mem-
+ories than writing every candidate while raising
+held-out success from 73.38% to 96.27% (Table 2;
+Figure 5). Thus, selective retention improves the
+usefulness of accumulated experience, not just its
+storage footprint.
+ALFWorld task success.
+With Qwen2.5-14B,
+Anchor reaches 87.06% success,
+exceeding
+AdaMEM (72.64%) by 14.43 points (19.9% rel-
+atively). With Qwen3.5-27B, it reaches 96.27%,
+surpassing SimpleMem (92.54%) by 3.73 points.
+Differences are calculated before rounding. Gains
+span task families: Anchor leads five of six with
+Qwen2.5 and reaches at least 90.32% in every fam-
+ily with Qwen3.5.
+7
+
+
+Table 2: RQ2 Overall ALFWorld admission ablation.
+Qwen3.5-27B success (%). Underline marks the best
+ablation.
+Admission variant
+Success (%)
+Æ ReAct (no memory)
+61.19
+	 Anchor w/o Amplituder & Aspecter
+73.38
+× Anchor w/o Aspecter
+74.88
+¥ Anchor w/o Failure Corrections
+86.82
+ Anchor w/o Success Maintain
+83.83
+ Anchor (ours)
+96.27
+WebShop score and interaction efficiency.
+Anchor scores 65.88 and 73.50 versus Reason-
+ingBank’s 59.05 and 62.74, improving by 11.6%
+and 17.2% relatively. It also reduces Qwen3.5
+mean steps from 6.61 to 5.33 and ranks second
+in Qwen2.5 step efficiency. Retained guidance im-
+proves outcomes without longer interactions.
+5.3
+Contributions of Magnitude and Direction
+Table 2 uses Qwen3.5-27B on the same ALFWorld
+split. Anchor w/o Amplituder & Aspecter writes
+every candidate; Anchor w/o Aspecter uses mag-
+nitude alone. Role ablations keep one role with its
+tests intact. Appendix Table 3 gives family-level
+results.
+Answer 2. Direction improves magnitude-only
+admission; retaining both roles performs best.
+Removing both tests yields 73.38%; magnitude
+filtering alone reaches 74.88%, a 1.49-point differ-
+ence. Adding direction raises success to 96.27%,
+a further 21.39 points (28.6% relative). The larger
+gain comes from distinguishing source-role effects
+among candidates that pass magnitude screening.
+Keeping both roles adds 9.45 points over success
+memories alone and 12.44 over failure corrections
+alone. Thus, the strongest tested variant combines
+behavioral screening with both reinforcement and
+correction memories.
+5.4
+Resource Use
+Answer 3. Selective retention improves the
+performance–resource trade-off.
+In Figure 5,
+Anchor stores 41% fewer ALFWorld memories
+while achieving higher success. On WebShop with
+Qwen3.5-27B, it leads the five plotted methods in
+score, mean steps, and token use (approximately
+86.9M). Token use is slightly below MEM1 and ap-
+proximately 34%, 59%, and 98.5% below Reason-
+ingBank, Reflexion, and AdaMEM, respectively.
+These comparisons measure bank size, token con-
+sumption, and interaction steps. Token totals cover
+construction and evaluation, including reflection,
+replay, and maintenance (Appendix C.4).
+5.5
+Self-Evolution Along the Task Stream
+Answer 4. Selective accumulation improves
+construction-stream performance and held-out
+reuse. Figure 5 tracks cumulative success over 200
+randomly sampled ALFWorld construction tasks.
+Anchor and Anchor w/o Amplituder & Aspecter
+share a frozen backbone but differ in admission.
+After early fluctuations, Anchor maintains higher
+cumulative success, finishing approximately 20%
+higher relatively despite slower bank growth. This
+curve compares behavior during memory construc-
+tion; Table 2 tests the resulting banks on held-out
+tasks. Together, they connect selective experience
+accumulation to stronger subsequent reuse without
+parameter updates.
+6
+Conclusion
+We introduced Anchor, which tests memories at
+their source decisions before retention.
+Paired
+replay measures shift magnitude and source-role
+alignment under a frozen policy. Across ALFWorld
+and WebShop, Anchor improves held-out perfor-
+mance; resource comparisons show smaller banks
+and lower token use. These results highlight mem-
+ory curation as a practical link between reflection
+and behavioral improvement. By letting experi-
+ence shape memory and selected memory guide
+subsequent behavior, Anchor offers a path toward
+experience-driven agent co-evolution.
+Limitations
+The scope of Anchor depends on the resolution of
+its behavioral probe and access to model probabili-
+ties.
+Action-space requirements.
+Our long-horizon
+benchmarks provide explicit candidate actions. Pre-
+fix scoring cannot distinguish actions sharing the
+scored tokens, including some object-level errors.
+Open-ended settings require other consistent mea-
+sures of memory-induced change, such as plan or
+response differences.
+Access to model probabilities.
+Token log proba-
+bilities are required but unavailable through some
+closed-source interfaces. Model-generated scores,
+rankings, or repeated-output preferences offer alter-
+natives. Future work can calibrate these measures
+and extend replay to broader tasks and interfaces.
+8
+
+
+Token Consumption(10^x)
+Performance
+Success rate (%)
+Memory bank count
+Training episodes
+Anchor success rate
+Anchor memory size
+Ours w/o Amplituder & Aspecter success rate
+Ours w/o Amplituder & Aspecter memory size
+Figure 5: RQ3 and RQ4 Success, bank size, and token consumption with Qwen3.5-27B. (Left) Sample success
+rate (cumulative; solid) over 200 randomly sampled ALFWorld memory-construction tasks and bank size (dashed)
+for Anchor and Anchor w/o Amplituder & Aspecter. (Right) WebShop mean score versus total input and output
+tokens across construction and evaluation (10x scale). Circle area is proportional to mean interaction steps; lower,
+smaller circles indicate lower cost.
+The Usage of LLM
+In accordance with ACL guidelines, we used large
+language models for writing assistance and lan-
+guage refinement.
+References
+Koenraad M R Audenaert. 2007.
+A sharp continu-
+ity estimate for the von neumann entropy.
+Jour-
+nal of Physics A: Mathematical and Theoretical,
+40(28):8127–8136.
+Xingyu Chen, Rui Wang, Zhaopeng Tu, and Liefeng Bo.
+2026a. Adamem: Learning what to remember with
+adaptive memory policies for personalized agents.
+Preprint, arXiv:2606.21144.
+Zhaorun Chen, Zhen Xiang, Chaowei Xiao, Dawn Song,
+and Bo Li. 2024. Agentpoison: Red-teaming llm
+agents via poisoning memory or knowledge bases.
+Preprint, arXiv:2407.12784.
+Zihan Chen, Songwei Dong, Chengshuai Shi, Peng
+Wang, Song Wang, Cong Shen, and Jundong Li.
+2026b. The past is prologue: A plug-in controller for
+selective updates in sequentially evolving llm mem-
+ory. Preprint, arXiv:2606.31121.
+Zihao Cheng, Zeming Liu, Yingyu Shan, Xinyi
+Wang, Xiangrong Zhu, Yunpu Ma, Hongru Wang,
+Yuhang Guo, Wei Lin, and Yunhong Wang. 2026.
+Mem2evolve: Towards self-evolving agents via co-
+evolutionary capability expansion and experience dis-
+tillation. Preprint, arXiv:2604.10923.
+Prateek Chhikara, Dev Khant, Saket Aryan, Taranjeet
+Singh, and Deshraj Yadav. 2025. Mem0: Building
+production-ready ai agents with scalable long-term
+memory. Preprint, arXiv:2504.19413.
+Zhiqing Cui, Xinxiang Yin, Yihong Tang, Xinglang
+Zhang, Yuanzhe Hu, Siru Zhong, Weidong Tang,
+Yuxuan Liang, Weijia Li, Ming Jin, Shirui Pan, Yuhao
+Kang, Dingyi Zhuang, and Jinhua Zhao. 2026. Earth-
+verse: Benchmarking scientific agents across dy-
+namic earth systems and natural hazards. Preprint,
+arXiv:2608.23525.
+Jizhan Fang, Xinle Deng, Haoming Xu, Ziyan Jiang,
+Yuqi Tang, Ziwen Xu, Shumin Deng, Yunzhi Yao,
+Mengru Wang, Shuofei Qiao, Huajun Chen, and
+Ningyu Zhang. 2026a. Lightmem: Lightweight and
+efficient memory-augmented generation. Preprint,
+arXiv:2510.18866.
+Runnan Fang, Yuan Liang, Xiaobin Wang, Jialong Wu,
+Shuofei Qiao, Pengjun Xie, Fei Huang, Huajun Chen,
+and Ningyu Zhang. 2026b. Memp: Exploring agent
+procedural memory. Preprint, arXiv:2508.06433.
+Zhibin Gou, Zhihong Shao, Yeyun Gong, Yelong
+Shen, Yujiu Yang, Nan Duan, and Weizhu Chen.
+2024.
+Critic: Large language models can self-
+correct with tool-interactive critiquing.
+Preprint,
+arXiv:2305.11738.
+Xinyu Guan, Qianyang Zhao, and Yuming Deng. 2026.
+Decision-aware memory cards:
+Counterfactual-
+inspired context selection and compression for tool-
+using llm agents. Preprint, arXiv:2606.08151.
+Yuanzhe Hu, Yu Wang, and Julian McAuley. 2026. Eval-
+uating memory in llm agents via incremental multi-
+turn interactions. Preprint, arXiv:2507.05257.
+Jiachang Liu, Dinghan Shen, Yizhe Zhang, Bill Dolan,
+Lawrence Carin, and Weizhu Chen. 2021.
+What
+makes good in-context examples for gpt-3? Preprint,
+arXiv:2101.06804.
+Jiaqi Liu, Yaofeng Su, Peng Xia, Siwei Han, Zeyu
+Zheng, Cihang Xie, Mingyu Ding, and Huaxiu Yao.
+2026. Simplemem: Efficient lifelong memory for
+llm agents. Preprint, arXiv:2601.02553.
+Nelson F. Liu, Kevin Lin, John Hewitt, Ashwin Paran-
+jape, Michele Bevilacqua, Fabio Petroni, and Percy
+Liang. 2023. Lost in the middle: How language mod-
+els use long contexts. Preprint, arXiv:2307.03172.
+9
+
+
+Aman Madaan, Niket Tandon, Prakhar Gupta, Skyler
+Hallinan, Luyu Gao, Sarah Wiegreffe, Uri Alon,
+Nouha Dziri, Shrimai Prabhumoye, Yiming Yang,
+Sean Welleck,
+Bodhisattwa Prasad Majumder,
+Shashank Gupta, Amir Yazdanbakhsh, and Peter
+Clark. 2023. Self-refine: Iterative refinement with
+self-feedback. Preprint, arXiv:2303.17651.
+Bodhisattwa Prasad Majumder, Bhavana Dalvi Mishra,
+Peter Jansen,
+Oyvind Tafjord,
+Niket Tandon,
+Li Zhang, Chris Callison-Burch, and Peter Clark.
+2023. Clin: A continually learning language agent
+for rapid task adaptation and generalization. Preprint,
+arXiv:2310.10134.
+Siru Ouyang, Jun Yan, I-Hung Hsu, Yanfei Chen,
+Ke Jiang, Zifeng Wang, Rujun Han, Long T. Le,
+Samira Daruki, Xiangru Tang, Vishy Tirumalashetty,
+George Lee, Mahsan Rofouei, Hangfei Lin, Jiawei
+Han, Chen-Yu Lee, and Tomas Pfister. 2026. Reason-
+ingbank: Scaling agent self-evolving with reasoning
+memory. Preprint, arXiv:2509.25140.
+Charles Packer, Sarah Wooders, Kevin Lin, Vivian Fang,
+Shishir G. Patil, Ion Stoica, and Joseph E. Gonzalez.
+2024. Memgpt: Towards llms as operating systems.
+Preprint, arXiv:2310.08560.
+Joon Sung Park, Joseph C. O’Brien, Carrie J. Cai,
+Meredith Ringel Morris, Percy Liang, and Michael S.
+Bernstein. 2023.
+Generative agents:
+Interac-
+tive simulacra of human behavior.
+Preprint,
+arXiv:2304.03442.
+Qwen Team. 2024. Qwen2.5: A party of foundation
+models.
+Qwen Team. 2026. Qwen3.5: Towards native multi-
+modal agents.
+Z. Z. Ren, Zhihong Shao, Junxiao Song, Huajian Xin,
+Haocheng Wang, Wanjia Zhao, Liyue Zhang, Zhe Fu,
+Qihao Zhu, Dejian Yang, Z. F. Wu, Zhibin Gou, Shi-
+rong Ma, Hongxuan Tang, Yuxuan Liu, Wenjun Gao,
+Daya Guo, and Chong Ruan. 2025. Deepseek-prover-
+v2: Advancing formal mathematical reasoning via
+reinforcement learning for subgoal decomposition.
+Preprint, arXiv:2504.21801.
+Ohad Rubin, Jonathan Herzig, and Jonathan Berant.
+2022. Learning to retrieve prompts for in-context
+learning. Preprint, arXiv:2112.08633.
+John Schulman,
+Sergey Levine,
+Philipp Moritz,
+Michael I. Jordan,
+and Pieter Abbeel. 2017.
+Trust
+region
+policy
+optimization.
+Preprint,
+arXiv:1502.05477.
+Jingwei Shi, Shengyu Tao, Xinxiang Yin, Chen Huang,
+Wenqiang Lei, and See-Kiong Ng. 2026a. Letgames:
+An llm-powered gamified approach to cognitive train-
+ing for patients with cognitive impairment. Preprint,
+arXiv:2604.09566.
+Jingwei Shi, Xinxiang Yin, Jing Huang, Jinman Zhao,
+and Shengyu Tao. 2026b. Codehacker: Automated
+test case generation for detecting vulnerabilities
+in competitive programming solutions.
+Preprint,
+arXiv:2602.20213.
+Noah Shinn, Federico Cassano, Edward Berman, Ash-
+win Gopinath, Karthik Narasimhan, and Shunyu Yao.
+2023. Reflexion: Language agents with verbal rein-
+forcement learning. Preprint, arXiv:2303.11366.
+Mohit Shridhar, Xingdi Yuan, Marc-Alexandre Côté,
+Yonatan Bisk,
+Adam Trischler,
+and Matthew
+Hausknecht. 2021.
+Alfworld: Aligning text and
+embodied environments for interactive learning.
+Preprint, arXiv:2010.03768.
+Yuru Song and Qi Xin. 2026. D-mem: Dopamine-gated
+agentic memory via reward prediction error routing.
+Preprint, arXiv:2603.14597.
+Theodore R. Sumers, Shunyu Yao, Karthik Narasimhan,
+and Thomas L. Griffiths. 2024.
+Cognitive
+architectures for language agents.
+Preprint,
+arXiv:2309.02427.
+Haoran Tan, Zeyu Zhang, Chen Ma, Xu Chen, Quanyu
+Dai, and Zhenhua Dong. 2025a. Membench: To-
+wards more comprehensive evaluation on the memory
+of llm-based agents. Preprint, arXiv:2506.21605.
+Zhen Tan, Jun Yan, I-Hung Hsu, Rujun Han, Zifeng
+Wang, Long T. Le, Yiwen Song, Yanfei Chen, Hamid
+Palangi, George Lee, Anand Iyer, Tianlong Chen,
+Huan Liu, Chen-Yu Lee, and Tomas Pfister. 2025b.
+In prospect and retrospect: Reflective memory man-
+agement for long-term personalized dialogue agents.
+Preprint, arXiv:2503.08026.
+The LangChain Team. 2025. LangMem SDK for agent
+long-term memory. Official project announcement.
+Guanzhi Wang, Yuqi Xie, Yunfan Jiang, Ajay Man-
+dlekar, Chaowei Xiao, Yuke Zhu, Linxi Fan, and
+Anima Anandkumar. 2023.
+Voyager: An open-
+ended embodied agent with large language models.
+Preprint, arXiv:2305.16291.
+Haoyu Wang, Guangyuan Dong, He Liang, Zijing
+Zhang, Jiachen Luo, Chuang Liu, Chao Xue, and
+Hao Tang. 2026a. Memguard: Persisting verifier
+signals for llm-agent memory governance. Preprint,
+arXiv:2608.21867.
+Jun Wang. 2026. Memento 2: Learning by stateful
+reflective memory. Preprint, arXiv:2512.22716.
+Yian Wang, Agam Goyal, Yuen Chen, and Hari Sun-
+daram. 2026b.
+State contamination in memory-
+augmented llm agents. Preprint, arXiv:2605.16746.
+Tianxin Wei, Noveen Sachdeva, Benjamin Coleman,
+Zhankui He, Yuanchen Bei, Xuying Ning, Mengting
+Ai, Yunzhe Li, Jingrui He, Ed H. Chi, Chi Wang,
+Shuo Chen, Fernando Pereira, Wang-Cheng Kang,
+and Derek Zhiyuan Cheng. 2026.
+Evo-memory:
+10
+
+
+Benchmarking llm agent test-time learning with self-
+evolving memory. Preprint, arXiv:2511.20857.
+Di Wu, Hongwei Wang, Wenhao Yu, Yuwei Zhang,
+Kai-Wei Chang, and Dong Yu. 2025. Longmemeval:
+Benchmarking chat assistants on long-term interac-
+tive memory. Preprint, arXiv:2410.10813.
+Rong Wu, Daocheng Fu, Licheng Wen, Xuemeng Yang,
+Shu Zou, Jianbiao Mei, Yuxin Wang, Hairong Zhang,
+Yu Yang, Tao Hu, Cong Zhang, Botian Shi, and Pin-
+long Cai. 2026. Memharness: Memory is recon-
+structed, not replayed. Preprint, arXiv:2607.28272.
+Peng Xia, Jianwen Chen, Hanyang Wang, Jiaqi Liu,
+Kaide Zeng, Yu Wang, Siwei Han, Yiyang Zhou,
+Xujiang Zhao, Haifeng Chen, Zeyu Zheng, Cihang
+Xie, and Huaxiu Yao. 2026. Skillrl: Evolving agents
+via recursive skill-augmented reinforcement learning.
+Preprint, arXiv:2602.08234.
+Wujiang Xu, Zujie Liang, Kai Mei, Hang Gao, Juntao
+Tan, and Yongfeng Zhang. 2025. A-mem: Agentic
+memory for llm agents. Preprint, arXiv:2502.12110.
+John Yang, Carlos E. Jimenez, Alexander Wettig, Kilian
+Lieret, Shunyu Yao, Karthik Narasimhan, and Ofir
+Press. 2024. Swe-agent: Agent-computer interfaces
+enable automated software engineering. Preprint,
+arXiv:2405.15793.
+Kairui Yang, Minghao An, Xunkai Li, Ziheng Yi, Zekai
+Chen, Guangyuan He, and Rong-Hua Li. 2026a.
+Mace: Memory-agent co-evolution with adaptive
+memory graphs for multi-agent systems. Preprint,
+arXiv:2609.21533.
+Tianyu Yang, Sudipta Paul, Vijay Srinivasan, Vivek
+Kulkarni, and Srinivas Chappidi. 2026b.
+Trust-
+mem: Learning trustworthy memory consolidation
+for llm agents with long-term memory. Preprint,
+arXiv:2606.25161.
+Xianglin Yang, Yufei He, Shuo Ji, Bryan Hooi, and
+Jin Song Dong. 2026c.
+Zombie agents: Persis-
+tent control of self-evolving llm agents via self-
+reinforcing injections. Preprint, arXiv:2602.15654.
+Shunyu Yao, Howard Chen, John Yang, and Karthik
+Narasimhan. 2023. Webshop: Towards scalable real-
+world web interaction with grounded language agents.
+Preprint, arXiv:2207.01206.
+Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak
+Shafran, Karthik Narasimhan, and Yuan Cao. 2022.
+React: Synergizing reasoning and acting in language
+models. arXiv preprint arXiv:2210.03629.
+Dechen Zhang, Xuan Tang, Xinxiang Yin, Xingwu
+Chen, Jian Qian, and Difan Zou. 2026a. Valg: An
+agentic system for ml theory research.
+Preprint,
+arXiv:2608.13060.
+Dylan Zhang, Yanshan Lin, Zhengkun Wu, Yihang Sun,
+Bingxuan Li, Dianqi Li, and Hao Peng. 2026b. Use-
+ful memories become faulty when continuously up-
+dated by llms. Preprint, arXiv:2605.12978.
+Guibin Zhang, Haotian Ren, Chong Zhan, Zhenhong
+Zhou, Junhao Wang, He Zhu, Wangchunshu Zhou,
+and Shuicheng Yan. 2025.
+Memevolve:
+Meta-
+evolution of agent memory systems.
+Preprint,
+arXiv:2512.18746.
+Guilin Zhang, Wei Jiang, Xiejiashan Wang, Aisha Behr,
+Kai Zhao, Jeffrey Friedman, Xu Chu, and Amine
+Anoun. 2026c. Adaptive memory admission control
+for llm agents. Preprint, arXiv:2603.04549.
+Jiajie Zhang, Yankai Xiang, and Changhao Chen.
+2026d.
+Memory that changes action is not
+memory that guides it:
+Counterfactual auditing
+of history-conditioned robot policies.
+Preprint,
+arXiv:2609.27247.
+Shengtao Zhang, Jiaqian Wang, Ruiwen Zhou, Junwei
+Liao, Yuchen Feng, Zhuo Li, Yujie Zheng, Weinan
+Zhang, Ying Wen, Zhiyu Li, Feiyu Xiong, Yutao Qi,
+Bo Tang, and Muning Wen. 2026e. Memrl: Self-
+evolving agents via runtime reinforcement learning
+on episodic memory. Preprint, arXiv:2601.03192.
+Xinglang Zhang, Yuanmeng Xiang, Yunyao Zhang,
+Zeliang Chen, Junqing Yu, and Zikai Song. 2026f.
+Too good to be real? diagnosing and reducing the
+gap between ai preference and real user engagement.
+Preprint, arXiv:2609.18282.
+Xinglang Zhang, Yunyao Zhang, ZeLiang Chen, Jun-
+qing Yu, Wei Yang, and Zikai Song. 2026g. Logical
+phase transitions: Understanding collapse in llm log-
+ical reasoning. Preprint, arXiv:2601.02902.
+Yan Zhang and Shibo Li. 2026.
+Consistencygate:
+Preventing memory contamination in llm agents
+via self-consistency admission control.
+Preprint,
+arXiv:2607.22962.
+Yunxiang Zhang, Yiheng Li, Ali Payani, and Lu Wang.
+2026h. Adamem: Test-time adaptive memory for
+language agents. Preprint, arXiv:2606.05684.
+Yunyao Zhang, Xinglang Zhang, Zeliang Chen, Jun-
+qing Yu, and Zikai Song. 2026i. Semiotic logical
+hexagon theory for llm logical reasoning. Preprint,
+arXiv:2607.21933.
+Zeyu Zhang, Xiaohe Bo, Chen Ma, Rui Li, Xu Chen,
+Quanyu Dai, Jieming Zhu, Zhenhua Dong, and Ji-
+Rong Wen. 2024. A survey on the memory mecha-
+nism of large language model based agents. Preprint,
+arXiv:2404.13501.
+Andrew Zhao, Daniel Huang, Quentin Xu, Matthieu
+Lin, Yong-Jin Liu, and Gao Huang. 2024.
+Ex-
+pel: Llm agents are experiential learners. Preprint,
+arXiv:2308.10144.
+Longtao Zheng, Rundong Wang, Xinrun Wang, and
+Bo An. 2024.
+Synapse: Trajectory-as-exemplar
+prompting with memory for computer control.
+Preprint, arXiv:2306.07863.
+11
+
+
+Wanjun Zhong, Lianghong Guo, Qiqi Gao, He Ye, and
+Yanlin Wang. 2023. Memorybank: Enhancing large
+language models with long-term memory. Preprint,
+arXiv:2305.10250.
+Andy Zhou, Kai Yan, Michal Shlapentokh-Rothman,
+Haohan Wang, and Yu-Xiong Wang. 2024.
+Lan-
+guage agent tree search unifies reasoning act-
+ing and planning in language models.
+Preprint,
+arXiv:2310.04406.
+Zijian Zhou, Ao Qu, Zhaoxuan Wu, Sunghwan
+Kim, Alok Prakash, Daniela Rus, Jinhua Zhao,
+Bryan Kian Hsiang Low, and Paul Pu Liang. 2025.
+Mem1: Learning to synergize memory and rea-
+soning for efficient long-horizon agents. Preprint,
+arXiv:2506.15841.
+12
+
+
+Appendix Contents
+A
+Extended Related Work . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 13
+B
+Theoretical Analysis . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 14
+C
+Experimental Details. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .17
+D
+Algorithms. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .21
+E
+Prompt Templates. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .21
+F
+Case Studies . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 28
+A
+Extended Related Work
+Learning from interaction.
+LATS combines tree search, value estimation, and reflection for plan-
+ning (Zhou et al., 2024). Reflexion stores verbal feedback, ExpeL extracts lessons, and Synapse reuses
+trajectories (Shinn et al., 2023; Zhao et al., 2024; Zheng et al., 2024); Voyager accumulates executable
+skills (Wang et al., 2023). CLIN updates persistent causal abstractions across trials without parameter
+updates (Majumder et al., 2023). ReasoningBank distills strategies, Evo-Memory evaluates learning
+across task streams, and MemEvolve adapts experiential knowledge and its management (Ouyang et al.,
+2026; Wei et al., 2026; Zhang et al., 2025). AdaMEM combines long-term trajectories with within-
+episode strategies; its Step-MFT selects strategy-training samples using trajectory success and action
+changes (Zhang et al., 2026h). MemRL learns memory utilities from execution feedback, while MACE
+co-evolves agents and memory graphs in multi-agent systems (Zhang et al., 2026e; Yang et al., 2026a).
+Anchor uses source decisions and feedback roles to select candidates before storage.
+Mem2Evolve couples experience distillation with the creation of tools and expert agents (Cheng et al.,
+2026); SkillRL co-evolves a hierarchical skill bank and the policy through reinforcement learning (Xia
+et al., 2026). Anchor selects external lessons for retention under a fixed policy and action interface.
+Memory organization and efficient reuse.
+Surveys characterize agent memory by its functions,
+representations, and evaluation (Zhang et al., 2024); CoALA connects modular memory with structured
+actions and decision-making (Sumers et al., 2024). Liu et al. (2023) show that information position
+affects performance, motivating careful selection and organization of retrieved experience. MemGPT
+manages information beyond the context window, Generative Agents combines retrieval with reflection,
+and MemoryBank adds summarization and forgetting to conversational memory (Packer et al., 2024;
+Park et al., 2023; Zhong et al., 2023). Mem0 consolidates facts, A-MEM links notes, and SimpleMem
+compresses memories (Chhikara et al., 2025; Xu et al., 2025; Liu et al., 2026). LightMem addresses
+consolidation cost, while MemHarness reconstructs experience for the current state (Fang et al., 2026a;
+Wu et al., 2026). MemBench, LongMemEval, and MemoryAgentBench test the effectiveness of sustained
+memory use (Tan et al., 2025a; Wu et al., 2025; Hu et al., 2026). Anchor adds behavioral admission to
+this memory-management pipeline.
+Reflective Memory Management combines multi-granularity construction and feedback-driven retrieval
+for dialogue (Tan et al., 2025b). Anchor places a paired source-decision test between extraction and
+storage, evaluating both construction-stream learning and read-only transfer.
+Selective and reliable memory updates.
+Self-Refine iteratively revises outputs using model-generated
+feedback (Madaan et al., 2023), while CRITIC uses external tools for validation (Gou et al., 2024). For
+persistent memory, A-MAC scores candidate attributes, AdaMem learns preference-conditioned writes,
+and D-MEM routes selected inputs into a slower evolution path (Zhang et al., 2026c; Chen et al., 2026a;
+Song and Xin, 2026). ConsistencyGate checks source support, TRUSTMEM checks update properties,
+and Janus compares memories on a compact evaluation set (Zhang and Li, 2026; Yang et al., 2026b;
+Chen et al., 2026b). MemGuard stores trajectory-verifier signals as metadata for admission and later
+maintenance (Wang et al., 2026a). Memory poisoning, state contamination, and persistent injection
+expose risks of unverified writes (Chen et al., 2024; Wang et al., 2026b; Yang et al., 2026c). Anchor
+directly measures local action-distribution changes and source-role alignment, extending admission
+beyond content- and outcome-based criteria.
+13
+
+
+Repeated updates can degrade useful memories (Zhang et al., 2026b), motivating a distinction between
+initial admission and later maintenance. Anchor addresses admission through source-decision evidence.
+Decision-aware memory.
+In online content evaluation, Zhang et al. (2026f) identify a gap between AI
+preference and real user engagement. For memory admission, we likewise prioritize behavioral evidence:
+paired replay measures how a candidate changes the agent’s decision distribution. Liu et al. (2021) retrieve
+semantically similar examples to improve in-context learning. EPR uses model likelihoods to supervise
+demonstration retrieval, addressing context selection rather than persistent writes (Rubin et al., 2022).
+CICL selects and compresses context using its effects on action choices at retrieval time (Guan et al.,
+2026). Counterfactual memory auditing of robot policies separates a memory’s behavioral influence from
+whether it guides actions appropriately (Zhang et al., 2026d). Anchor uses paired probes at the source
+decision and success or failure roles to guide persistent memory admission.
+B
+Theoretical Analysis
+B.1
+Proof of Proposition 1
+For any constant c,
+X
+a
+vt(a)Qt(a)
+=
+X
+a
+[P mt
+t
+(a) −Pt(a)] [Qt(a) −c],
+(22)
+because both distributions have unit mass. Taking c = (maxa Qt(a) + mina Qt(a))/2 gives
+
+X
+a
+vt(a)Qt(a)
+ ≤Bt
+2
+X
+a
+|P mt
+t
+(a) −Pt(a)|
+= Bt TV(Pt, P mt
+t
+) = Btαt.
+(23)
+Recall ¯Pt = (Pt + P mt
+t
+)/2. Pinsker’s inequality in natural logarithms gives
+TV(Pt, ¯Pt)2 ≤1
+2D(e)
+KL(Pt∥¯Pt),
+(24)
+and the same inequality holds for P mt
+t
+. Since TV(Pt, ¯Pt) = TV(P mt
+t
+, ¯Pt) = αt/2, averaging the two
+inequalities and converting nats to bits yields
+α2
+t ≤2 ln 2 Mt.
+(25)
+Combining Eqs. 23 and 25 proves Proposition 1.
+B.2
+Probability Transport and Direction
+Recall vt(a) = P mt
+t
+(a) −Pt(a) and αt = TV(Pt, P mt
+t
+). If αt > 0, define
+µt(a, b) = [−vt(a)]+[vt(b)]+
+αt
+.
+(26)
+Its row sums are [−vt(a)]+, its column sums are [vt(b)]+, and its total mass is αt. Therefore
+X
+a,b
+µt(a, b)[Qt(b) −Qt(a)]
+=
+X
+b
+[vt(b)]+Qt(b)
+−
+X
+a
+[−vt(a)]+Qt(a)
+=
+X
+a
+vt(a)Qt(a),
+(27)
+14
+
+
+which proves Eq. 9. For αt = 0, set µt = 0; both sides are zero.
+This identity also establishes direction as independent of magnitude. Consider two memories m+
+t and
+m−
+t with
+Pt = (1/2, 1/2),
+P m+
+t
+t
+= (3/4, 1/4),
+P m−
+t
+t
+= (1/4, 3/4),
+(28)
+and Qt = (1, 0). Symmetry gives DJS(Pt, P m+
+t
+t
+) = DJS(Pt, P m−
+t
+t
+), while
+E
+P
+m±
+t
+t
+[Qt] −EPt[Qt] = ±1/4.
+(29)
+Two memories can therefore have identical shift magnitude and opposite local value.
+B.3
+Proof of Proposition 2
+Under Assumption 1, if yt = +1, then vt(a(1)
+t ) = ηt ≥0, so the transport column ending at a(1)
+t
+has
+mass exactly ηt. Every positive-mass transfer in this column gains at least κt in value. If yt = −1, then
+vt(a(1)
+t ) = −ηt ≤0, so the transport row leaving a(1)
+t
+has mass exactly ηt, and each of its positive-mass
+transfers again gains at least κt.
+In either case, these transfers contribute at least κtηt. The remaining transport has mass αt −ηt, and
+each unit can lose at most Bt. Applying Eq. 9 gives
+X
+a
+vt(a)Qt(a) ≥κtηt −Bt(αt −ηt),
+(30)
+When κtηt > Bt(αt −ηt), the lower bound is strictly positive, proving Proposition 2. If every positive-
+mass transfer is value-aligned, each summand in Eq. 9 is nonnegative, and hence P
+a vt(a)Qt(a) ≥0.
+B.4
+From Local Value to Expected Return
+Let P and P mem be history-dependent policies in the same finite-horizon environment, with bounded
+rewards, the same initial-history distribution, and terminal value V P
+T = 0. Memory construction and
+retrieval may depend on the history; their resulting action distributions are included in the policies. Define
+QP
+t (H, a) = E
+
+rt + V P
+t+1(Ht+1)
+| Ht = H, at = a
+
+,
+V P
+t (H) =
+X
+a
+Pt(a | H)QP
+t (H, a).
+(31)
+Conditioning on Ht = H under P mem yields
+EP mem
+rt + V P
+t+1(Ht+1)
+−V P
+t (Ht) | Ht = H
+
+=
+X
+a
+
+P mem
+t
+(a | H) −Pt(a | H)
+
+· QP
+t (H, a)
+=
+X
+a
+vt(H, a)QP
+t (H, a).
+(32)
+Summing over t and taking expectations cancels the intermediate value terms. Since E[V P
+0 (H0)] = J(P),
+this proves Eq. 13.
+15
+
+
+At each history reached by P mem, apply the value-alignment condition to Pt(· | H) and P mem
+t
+(· | H),
+using a designated reference action and role and the continuation values QP
+t (H, ·). With the corresponding
+quantities ηt(H), αt(H), κt(H), and value range Bt(H), let
+bt(H) = κt(H)ηt(H)
+−Bt(H)[αt(H) −ηt(H)].
+(33)
+Applying Eq. 11 inside the expectation gives
+J(P mem) −J(P) ≥EP mem
+"T−1
+X
+t=0
+bt(Ht)
+#
+.
+(34)
+Thus nonnegative bt(H) at every reachable history implies nonnegative expected-return change. The
+source-state admission test evaluates local memory effects, while this identity connects effects across
+retrieved trajectories to task return.
+B.5
+Information-Theoretic Interpretation
+For the information-theoretic and finite-sample calculations below, abbreviate p = Pt and q = P mt
+t
+at a
+fixed step t, so DJS(p, q) = Mt. The magnitude test has an information interpretation. Draw a fair bit
+Z ∈{0, 1}, then draw an action A from p when Z = 0 and from q when Z = 1. Writing m = (p + q)/2
+and using base-2 entropy gives
+I(Z; A) = H(m) −1
+2H(p) −1
+2H(q)
+= 1
+2DKL(p∥m) + 1
+2DKL(q∥m)
+= DJS(p, q).
+(35)
+Thus JS measures how distinguishable the two policy conditions are from their actions; it does not say
+which actions are better. In particular, 0 ≤DJS(p, q) ≤1 bit, irrespective of the action-set size.
+Coarsening the action space.
+For a deterministic map g from complete actions to action verbs, the
+Markov chain Z →A →g(A) and the chain rule for mutual information yield
+DJS(g#p, g#q) = I(Z; g(A))
+≤I(Z; A) = DJS(p, q).
+(36)
+The inequality may be strict: a memory can change which object is selected without changing the verb.
+This statement concerns the pushforward of the same complete-action distributions. The token scorer in
+Eq. 45 instead constructs its distribution directly from candidate-prefix likelihoods; Eq. 36 characterizes
+aggregation of complete-action probabilities.
+Local sharpness of the radius bound.
+Take p = (1/2, 1/2) and q = (1/2+ε, 1/2−ε), with |ε| < 1/2.
+The binary entropy expansion h2(1/2 + x) = 1 −2x2/ ln 2 + O(x4) gives
+DJS(p, q) =
+ε2
+2 ln 2 + O(ε4),
+TV(p, q) = |ε|.
+(37)
+Consequently, the square-root dependence and leading constant in Eq. 8 are attained asymptotically
+for this binary perturbation. The bound controls capacity for value change; the transport argument in
+Appendix B.2 is still needed for its sign.
+16
+
+
+B.6
+Finite-Sample Resolution of Paired Probes
+Suppose each of the two fixed policy conditions produces n independent action draws on the same
+d ≥2 categories, with empirical distributions bp and bq. This subsection characterizes a sampling-based
+alternative to token-score probes; it is independent of the token-budget configuration used by the adapters.
+Hoeffding’s inequality and a union bound over the 2d empirical coordinates show that, with probability at
+least 1 −δ,
+max
+x∈{p,q} max
+a
+|bx(a) −x(a)| ≤en :=
+r
+ln(4d/δ)
+2n
+.
+(38)
+Hence each empirical distribution is within u = min{1, den/2} in total variation of its population
+distribution. For the tracked source category a(1)
+t
+and its role yt ∈{+1, −1},
+yt[bq(a(1)
+t ) −bp(a(1)
+t )]
+−yt[q(a(1)
+t ) −p(a(1)
+t )]
+ ≤2en.
+(39)
+The classical entropy-continuity inequality (Audenaert, 2007) gives |H(r) −H(s)| ≤fd(t) when
+TV(r, s) ≤t, where
+fd(t) =
+(
+h2(t) + t log2(d −1),
+t ≤1 −1/d,
+log2 d,
+t > 1 −1/d.
+(40)
+The mixtures (p + q)/2 and (bp + bq)/2 are also within u in total variation. Applying the entropy bound to
+the three terms of Eq. 35 yields
+|DJS(bp, bq) −DJS(p, q)| ≤2fd(u).
+(41)
+This bound certifies a population JS threshold when the measured value exceeds it by more than 2fd(u);
+the corresponding signed-margin threshold requires a margin of more than 2en. These certificates cover
+the scalar magnitude and signed-margin tests, while source-role correctness and top-action switches use
+their corresponding criteria. Larger sample sizes tighten both certificates.
+C
+Experimental Details
+C.1
+Admission Ablation by Task Family
+Table 3 expands the Overall ablation on the same task split. The row at 86.82% removes failure corrections
+and retains success-maintain memories; the row at 83.83% removes success-maintain memories and
+retains failure corrections. In both rows, the retained role still undergoes its magnitude and directional
+tests.
+Variant
+Overall
+Put
+Clean
+Heat
+Cool
+Examine
+Puttwo
+ReAct
+61.19
+66.67
+51.61
+65.22
+76.19
+72.22
+35.29
+Anchor w/o Amplituder & Aspecter
+73.38
+77.78
+70.97
+68.12
+82.54
+85.19
+54.90
+Anchor w/o Aspecter
+74.88
+81.94
+69.89
+73.91
+80.95
+83.33
+58.82
+Anchor w/o Failure Corrections
+86.82
+91.67
+86.02
+79.71
+90.48
+92.59
+80.39
+Anchor w/o Success Maintain
+83.83
+88.89
+82.80
+76.81
+92.06
+88.89
+72.55
+Anchor (ours)
+96.27
+100.00
+90.32
+91.30
+100.00
+100.00
+100.00
+Table 3: Full ALFWorld ablation. Qwen3.5-27B success (%) by task family.
+C.2
+BankMaster Details
+BankMaster stores each admitted mt verbatim in the card’s memory_guidance field and adds role,
+applicability conditions, retrieval keys, and source metadata. A success hint specifies an action to reinforce
+under matching conditions; a failure hint records a pattern to avoid and its immediate correction. Card
+construction enriches metadata without rewriting, summarizing, or otherwise changing the tested guidance.
+17
+
+
+The retrieval score in Eq. 20 combines task-family and state similarity with action compatibility. Up to
+three cards above threshold τR enter the policy context; cards whose cues or recommended actions do not
+match the decision are ignored. Table 4 lists the retrieval threshold, cross-family settings, skip conditions,
+and card-context budget.
+Each card stores confidence, support count, source metadata, and reuse statistics. After an episode,
+BankMaster updates retrieved-card confidence from feedback, merges similar cards with the same role,
+decays stale records, and prunes low-confidence cards at capacity, as formalized in Eq. 21. During held-out
+evaluation, the constructed bank supplies cards without updates.
+C.3
+Implementation Parameters
+Setting
+Value
+Setting
+Value
+Action decoding
+Token-wise greedy,
+256-token limit
+Probe statistic
+Token-level action scores
+Replay token budget L
+ALFWorld: 1; WebShop: 5 Paired context
+Fixed within each pair
+Failure JS threshold
+0.12 bits
+Success JS threshold
+0.05 bits
+Failure probability branch
+Source decrease ≥0.10
+Failure ranking branch
+(OR)
+Injected top action̸ =
+source
+Success ranking
+Injected top action =
+source
+Success comparison
+Probability increase
+Success reinforcement
+≥0.04
+Localized candidates
+K = 5 per episode
+Maximum cards
+8 per episode
+Retrieval size
+Top 3
+Retrieval threshold
+0.45
+Cross-family retrieval
+boost 0.50, penalty 0.15
+Retrieval skip
+confidence ≥0.50 and
+entropy ≤1.40 or margin
+≥0.12
+Card context budget
+320 tokens per card
+Bank capacity
+2,000 cards
+Merge threshold
+0.85
+Table 4: Implementation settings. Branch-specific thresholds use JS in bits. The measurement interface is
+described in Appendix C.4.
+ALFWorld data.
+We use the raw TextWorld/PDDL game files in awawa-agi/alfworld-raw, includ-
+ing training and evaluation game specifications. Task counts below refer to the selected experimental
+tasks.
+ALFWorld evaluation set.
+The held-out ALFWorld set contains 402 tasks: 72 Put, 93 Clean, 69 Heat,
+63 Cool, 54 Examine, and 51 Puttwo. Overall success pools all evaluated tasks. For task family f, let sf
+and nf denote its success count and evaluation count. We report
+Overall = 100
+P
+f sf
+P
+f nf
+,
+Successf = 100 sf
+nf
+.
+(42)
+Thus Overall is the total number of successes divided by the total evaluation count, rather than an
+unweighted average of task-family percentages.
+WebShop task split.
+We use the 10,000-product subset of YWZBrandon/webshop-data. Product-ID
+matching yields 4,455 attributed instructions (400 construction; 4,055 evaluation); 5,545 products have
+none. Counts refer to product-linked instructions, not unique strings or all product-option combinations.
+WebShop evaluation metric.
+WebShop is evaluated by mean score, not success rate. Let sWS
+i
+denote
+the score of evaluation task i on the reported score scale. Over NWS = 4,055 evaluation tasks, we
+compute
+MeanScoreWS =
+1
+NWS
+NWS
+X
+i=1
+sWS
+i
+.
+(43)
+18
+
+
+Unlike ALFWorld’s binary success indicator, this metric averages the task scores directly. Mean interaction
+steps are reported separately as an efficiency metric.
+C.4
+Admission Configuration and Measurement
+Measurement interface.
+The two adapters share a token-budget parameter L, counting action-content
+tokens immediately after <action>. The opening tag is context, not part of the scored span. ALFWorld
+scores the action head (L = 1); WebShop scores up to five action tokens (L = 5). Appendix E provides
+one replay template per environment: the complete saved decision context, with its history, task guidance,
+and retrieved memory. Only the injected condition adds mt. The scoring specification below applies to
+the paired measurements, including the case studies in Appendix F.
+Candidate actions.
+At each source decision, store a finite ordered list Ct of legal candidate action
+strings, including the recorded source action. ALFWorld obtains this list from the TextWorld environ-
+ment’s admissible_commands. WebShop obtains clickable products, option values, and navigation
+controls from the current page’s get_available_actions() interface, and serializes each as a complete
+click[...] command. Thus product selection and option selection are distinct candidates, not a single
+click category. The environment interfaces are documented in the ALFWorld and WebShop releases.
+When search is available, the frozen policy generates a finite list of query candidates from the current task
+and page before the paired test. The adapter serializes these as search[query] actions and stores the list
+with the source snapshot. Replay reuses this list and never generates new candidates from the injected
+hint or subsequent feedback. Remove duplicate complete strings while preserving their first occurrence.
+Token scores and shared prefixes.
+To score candidates, tokenize each action continuation using the
+policy tokenizer and the exact saved prefix ending in <action>. Let z(a) = (z1, . . . , zn(a)) be its
+action-content tokens, excluding the opening and closing tags, and let k(a) = min{L, n(a)}. Define
+ϕL(a) = z1:k(a) and form the set of distinct scored sequences
+Vt = {ϕL(a) : a ∈Ct}.
+(44)
+Candidates with identical scored sequences share one category. This deduplication prevents a verb from
+gaining weight merely because it has more object-level completions. For each v = (v1, . . . , v|v|) ∈Vt,
+teacher-force its tokens under each saved context h ∈{ht, hmt
+t } and sum their log probabilities:
+ℓL(v | h) =
+|v|
+X
+j=1
+log πθ
+ vj | h,
+<action>, v<j
+
+,
+ePh(v) =
+exp ℓL(v | h)
+P
+u∈Vt exp ℓL(u | h).
+(45)
+We sum token log probabilities, using all content tokens for actions shorter than L. Leading whitespace and
+token IDs follow the same saved serialization in both conditions. The resulting distribution is normalized
+over distinct candidate prefixes: actions sharing their first L tokens form one category. With L = 5,
+WebShop click targets occupy different categories when their tokenized arguments differ within the scored
+span.
+The source category is v(1)
+t
+= ϕL(a(1)
+t ). Compute JS and the source-category change using ePht and
+ePhmt
+t
+on exactly Vt. For example, if take apple 1 and take mug 2 share the same first token, L = 1
+assigns both to one category; that category appears only once in the softmax. A valid pair requires the
+saved context, source candidate, identical tokenization, and finite log probabilities for every scored token
+in both conditions. Missing top-k scores invalidate the pair rather than being treated as zero. Resolve
+score ties by the stored candidate order.
+19
+
+
+Admission configuration.
+Both source roles pass a magnitude test and a directional test. We use
+τsucc = 0.05 bits for success-maintain memories and τfail = 0.12 bits for failure corrections. Success-
+maintain memories require the injected top category to equal the source category and its probability to
+increase by at least ϵsucc = 0.04. Failure corrections require either a source-category decrease of at least
+0.10 or an injected top category different from the failed source category. Algorithm 2 gives the complete
+predicates.
+Baseline adaptation.
+Each comparison uses the backbone and evaluation split specified in Table 1.
+For a baseline whose open-source release includes the corresponding benchmark environment, we use
+that implementation. Otherwise, we adapt its memory mechanism to the same environment and action-
+selection prompt as Anchor, including the task guidance supplied to the policy. Each baseline retains its
+own memory extraction, organization, and retrieval procedure. These are complete-system comparisons;
+Table 2 isolates admission variants within the Anchor pipeline.
+Token accounting.
+The WebShop panel in Figure 5 uses Qwen3.5-27B and counts input and output
+tokens across all model calls during both memory construction and held-out evaluation. For each system,
+let Q be this complete call set. Total consumption is
+T(Q) =
+X
+q∈Q
+ nin(q) + nout(q)
+
+.
+(46)
+The total includes action selection, candidate-query generation, reflection and localization, hint writing,
+both replay conditions, card construction, and model-based maintenance wherever these calls occur in
+the system. Repeated history and retrieved-card tokens count on each call in which they occur; L is the
+scoring span, not the total input length. Environment steps and local, non-model retrieval are not model
+tokens. Baselines are counted over the same construction-plus-evaluation scope, including their own
+memory-related model calls. The per-task labels divide this total by 4,055 evaluation tasks, amortizing
+construction cost across evaluation. Circle area is proportional to the mean evaluation steps reported in
+Table 1.
+Source roles.
+The Localizer receives the goal, the recorded trajectory, and episode feedback, and
+autonomously assigns each selected source step a hindsight credit ct ∈[−1, 1]. Positive credit identifies a
+decision to reinforce, negative credit identifies a decision to correct, and zero credit denotes an uncertain
+role. For nonzero credit, the step role is yt = sign(ct). A success-maintain memory identifies a
+local decision to reinforce; a failure correction identifies a local decision to avoid or correct. The role
+describes the step, not the outcome of the whole episode. The categorical mapping is yt = +1 for
+success_maintain and yt = −1 for failure_correction; uncertain candidates are excluded
+from admission. The gate uses this sign, not the magnitude of ct. The prompt’s importance_score
+ranks candidates and is separate from signed hindsight credit. Task-specific guidance supplied to the
+Localizer is reproduced in Appendix E.
+Evaluation signals.
+Paired replay measures a fixed hint’s effect on the normalized candidate-prefix
+distribution. Local verification refers to passing the magnitude and role-specific preference predicates
+on this distribution. The theoretical bounds instead concern complete-action distributions and condition
+on Q-value gaps and residual mass transfer. These conditions are analytical assumptions, not quantities
+measured by the gate. In particular, the failure ranking branch can admit an alternative top category even
+when the source probability increases; it tests a different preference criterion from positive signed-margin
+alignment. Held-out task results assess the constructed bank’s utility under the deployed decoding rule.
+C.5
+Mechanistic Metrics
+We log candidate roles, JS, signed margins ηt, action changes, and rejection reasons, along with episode-
+level candidate counts, memory costs, probes, and outcomes. Figure 5 reports cumulative success
+S(N) = 100N−1 PN
+i=1 1{episode i succeeds} over 200 randomly sampled ALFWorld construction
+tasks, for 1 ≤N ≤200; dashed curves show bank size. Each point summarizes the task stream up to
+20
+
+
+that episode, with the bank evolving during construction. It is a construction-stream statistic rather than
+repeated evaluation of bank checkpoints on a fixed task set. Table 1 evaluates the final banks on the
+separate held-out set.
+D
+Algorithms
+Algorithm 1 makes the write-and-reuse loop explicit. During memory construction, the agent extracts
+candidates after observing an episode’s feedback. During held-out evaluation, the constructed bank is
+read without admitting memories from evaluation outcomes. Local replay scores a saved decision; it does
+not execute an alternative trajectory.
+D.1
+Formal Admission
+For the action distributions in Section 4, Gt is the branch-specific admission test in Eq. 19. Success-
+maintain memories require Mt ≥τsucc, bamt
+t
+= a(1)
+t , and ∆p(1)
+t
+≥ϵsucc. Failure corrections require
+Mt ≥τfail and either ∆p(1)
+t
+≤−ϵdrop or bamt
+t̸
+= a(1)
+t . The action set, source history, and previously
+retrieved memory are matched across probes; only the candidate hint changes.
+D.2
+Branch-Specific Implementation
+The token-budgeted gate applies Eq. 19 to ePt = ePht and eP mt
+t
+= ePhmt
+t . In this algorithm, Mt =
+DJS( ePt, eP mt
+t
+) and ∆p(1)
+t
+= eP mt
+t
+(v(1)
+t ) −ePt(v(1)
+t ) are computed on the fixed prefix categories. Define
+the injected top category bmt
+t
+= arg max eP mt
+t
+.
+Memory evolution
+Input: frozen policy πθ; task stream; initial bank B; admission rule G; candidate budget K; write flag w.
+1: for each task g do
+2:
+Initialize H and τ.
+3:
+while the episode is active do
+4:
+Observe o and admissible A; retrieve M ←R(B, H).
+5:
+Build and save h = F(H, A, M); select and execute a from πθ.
+6:
+Update H; append the transition and feedback to τ.
+7:
+end while; record outcome z.
+8:
+if w = 0 then continue.
+9:
+M(τ) ←Lloc(τ); keep at most K candidates.
+10:
+for each mt ∈M(τ) do
+11:
+Load ht, At, a(1)
+t , yt; freeze mt.
+12:
+Add only mt to a copy of ht; probe both on fixed candidates.
+13:
+if probes are invalid: continue.
+14:
+Compute Mt, ∆p(1)
+t
+(Eqs. 5 and 6).
+15:
+if Gt = 1 (Eq. 19): finalize a card and insert it into B.
+16:
+end for; update confidence from feedback; decay, merge, and prune B.
+17: end for; return outcomes and B.
+Algorithm 1: Memory evolution.
+The thresholds are τsucc = 0.05, τfail = 0.12, ϵdrop = 0.10, and ϵsucc = 0.04. The lower success
+threshold allows smaller shifts when the baseline already supports the source action. The failure ranking
+branch compares the injected top category with the fixed source category, independently of the baseline
+top category. The probability branch measures suppression; the ranking branch checks which category is
+preferred after injection.
+E
+Prompt Templates
+Figure 6 collects the complete prompts for five stages: action selection, memory extraction, hint construc-
+tion, paired replay, and card construction. Braced fields are filled at runtime. The templates retain all
+environment-specific instructions, including the ALFWorld heating protocol.
+21
+
+
+Branch-specific gate
+1: if either probe is invalid: return false.
+2: if the role is failure correction:
+3:
+return Mt ≥τfail and
+4:
+(∆p(1)
+t
+≤−ϵdrop or bmt
+t̸
+= v(1)
+t
+).
+5: if the role is success-maintain memory:
+6:
+return Mt ≥τsucc and
+7:
+bmt
+t
+= v(1)
+t
+and ∆p(1)
+t
+≥ϵsucc.
+8: return false for an uncertain role.
+Algorithm 2: Branch-specific gate.
+Information flow.
+The Localizer uses the trajectory and episode feedback to assign hindsight roles.
+The hint writer describes a local action under the source decision’s conditions, without presenting future
+observations as already available or supplying a complete solution. Candidate text remains fixed during
+replay. After admission, the card builder copies it verbatim into memory_guidance and adds only
+retrieval and source metadata.
+Paired context.
+Before executing an action, save the rendered messages: system instructions, history
+selected by F, task guidance, observation, ordered admissible actions, and retrieved cards. Replay clones
+this snapshot twice and adds CANDIDATE GUIDANCE immediately after the memory-evidence block
+in the injected copy. Both calls retain the original card text and order, history clipping, model, tokenizer,
+candidate actions, output contract, and L; inserting the hint must not truncate another field. The baseline
+omits only the candidate paragraph. Existing memory evidence is absent from both calls only when
+absent from the source prompt. The source action and hindsight role remain checker metadata; subsequent
+feedback is supplied only to the Localizer and hint writer. A missing snapshot or required score invalidates
+the pair.
+E.1
+ALFWorld Prompts
+Action and replay.
+Panels (a) and (d) use the same action-only output contract and saved goal, family
+recipe, phase guidance, observation, admissible actions, history, and cards. Both request a complete
+admissible action; replay scores its first content token after <action> (L = 1).
+Extraction and storage.
+The Localizer selects at most five consequential decisions, including successful
+actions and correctable mistakes (b). Long trajectories are compacted to at most 20 selected steps, with
+observations clipped before serialization. Panel (c) shows the failure-correction hint; the success branch
+instead reinforces the observed action without adding future steps. The builder stores the admitted hint
+unchanged, maps its source role to a memory type, and adds retrieval metadata (e).
+E.2
+WebShop Prompts
+Action and replay.
+The policy receives the instruction, task family, page phase, history, current page,
+available actions, and cards (f). History and page fields are clipped to 1,800 and 5,000 characters when
+the source prompt is built. Replay reuses those rendered fields and requests the same complete action in
+both conditions (i). It scores up to L = 5 action-content tokens on fixed candidates, excluding the opening
+<action> tag.
+Extraction and storage.
+The Localizer selects up to five consequential shopping decisions, including
+product, option, and checkout errors (g). Each serialized step contains the action, observation, and next
+observation; the last two fields are clipped to 400 and 300 characters. The writer supplies a local correction
+or reinforcement, not a full shopping solution (h). The builder preserves the admitted hint verbatim and
+adds page phase, attribute constraints, retrieval keys, and source metadata in separate fields (j).
+22
+
+
+(a) ALFWorld / 1. Action selection
+User
+TASK: {goal}
+{family_recipe}
+{phase_hint} {task_specific_protocol}
+Memory-use rules
+Treat each retrieved card as one local state transition, never as a complete plan. Match its task family, exact
+target noun, inventory cue, phase, and current admissible action. A matching success card may support the
+listed action. A fail card only describes a pattern to avoid and a local correction; never copy its failed action.
+Ignore a card when any of these cues conflict.
+MEMORY DECISION EVIDENCE: {retrieved_cards} Use it only when its cue and exact available action
+match the current state.
+Action rules
+use only exact actions from Admissible actions. Do not invent new object names or container names. Do not
+choose look, inventory, or help unless no task-progress action is available.
+RECENT ACTION HISTORY: {recent_history}
+Latest observation: {observation}
+Admissible actions: {admissible_actions}
+Output
+Return exactly one complete action inside <action>...</action>. Copy the action verbatim from Admissible
+actions. Output no explanation.
+(b) ALFWorld / 2. Memory extraction
+User
+Role and task
+You are CriticalStepLocator. Return JSON only. Select at most 5 most important decision steps, ranked by
+importance_score. Avoid routine navigation and duplicate observations.
+Output schema
+Each item must contain step_id, c_t, critical_role, importance_score, importance_type, why_critical,
+expected_fix_direction. Set critical_role to exactly one of success_maintain, failure_correction, or uncertain.
+Use the top-level JSON key candidates.
+Hindsight credit
+Independently score each selected source decision with c_t in [-1, 1], using the goal, trajectory, and episode
+feedback. Assign a positive score to a local action that should be reinforced and a negative score to an action
+that should be corrected. Set c_t to 0 and critical_role to uncertain when the evidence does not support either
+role. For nonzero c_t, its sign must agree with critical_role: positive means success_maintain and negative
+means failure_correction. Judge the local step rather than copying the whole-episode outcome. Keep
+importance_score as the separate candidate-ranking score.
+Selection rules
+For a failed episode, prioritize the earliest wrong local decision that could have been corrected, and include at
+least one failure_correction when the rollout contains an obvious detour, help/look misuse, unrelated object
+interaction, or skipped task-progress action.
+Environment rule: heating
+For a heat task, treat the microwave protocol as distinct steps: take the target, go to microwave, heat it, then go
+to the destination and move it. The microwave itself is not opened or closed for this task.
+EPISODE OUTCOME: {episode_outcome}
+GOAL: {goal}
+ROLLOUT: {trajectory_json}
+Figure 6: Complete prompt templates: (a) ALFWorld action selection; (b) ALFWorld memory extraction. Braced
+fields are filled at runtime.
+23
+
+
+(c) ALFWorld / 3. Hint construction
+User
+Role and task
+You are ANCHOR write_hint. Return JSON only with hint_text, hint_type, and leakage_risk.
+Guidance rules
+Write a local check-only action hint. Do not reveal future observations or a full solution. This is a
+failure_correction candidate. The hint must explicitly redirect away from the observed action toward the
+immediate local correction in expected_fix_direction; do not describe the observed action as correct.
+GOAL: {goal}
+CANDIDATE: {candidate_json}
+STATE: {state_json}
+(d) ALFWorld / 4. Paired replay
+User
+TASK: {goal}
+{family_recipe}
+{phase_hint} {task_specific_protocol}
+Memory-use rules
+Treat each retrieved card as one local state transition, never as a complete plan. Match its task family, exact
+target noun, inventory cue, phase, and current admissible action. A matching success card may support the
+listed action. A fail card only describes a pattern to avoid and a local correction; never copy its failed action.
+Ignore a card when any of these cues conflict.
+MEMORY DECISION EVIDENCE: {retrieved_cards} Use it only when its cue and exact available action
+match the current state.
+CANDIDATE GUIDANCE: {candidate_hint} Apply this guidance only when it matches the current state
+and an admissible action.
+Action rules
+use only exact actions from Admissible actions. Do not invent new object names or container names. Do not
+choose look, inventory, or help unless no task-progress action is available.
+RECENT ACTION HISTORY: {recent_history}
+Latest observation: {observation}
+Admissible actions: {admissible_actions}
+Output
+Return exactly one complete action inside <action>...</action>. Copy the action verbatim from Admissible
+actions. Output no explanation.
+Figure 6: Prompt templates (continued): (c) ALFWorld hint construction; (d) ALFWorld paired replay.
+24
+
+
+(e) ALFWorld / 5. Card construction
+User
+Role and task
+You are ANCHOR MemoryCardBuilder. Return JSON only. Build a reusable step-level card without
+future-only information or a full solution.
+Role mapping
+The candidate critical_role defines the card type: success_maintain means success_memory, while
+failure_correction means fail_memory. This step type is independent of whether the whole episode succeeded;
+a successful episode can contain a fail_memory and a failed episode can contain a success_memory.
+Card fields
+Include goal_signature, visible_entities, inventory_state, memory_guidance, task_plan, retrieval_keys,
+confidence, support_count, uses_future_information, contains_full_solution, copies_verification_hint.
+Guidance preservation
+Set memory_guidance to VERIFIED HINT verbatim and copies_verification_hint to true. Add only retrieval
+and source metadata; do not paraphrase, summarize, or extend the guidance.
+VERIFIED HINT: {candidate_hint}
+FAMILY: {task_family}
+GOAL: {goal}
+CANDIDATE: {candidate_json}
+STATE: {state_json}
+POLICY_DIFF: {policy_diff_json}
+TASK_PLAN: {task_plan_json}
+(f) WebShop / 1. Action selection
+User
+TASK: {goal}
+TASK FAMILY: {task_family}
+PHASE GUIDANCE: {current_phase}
+Memory-use rules
+Treat each retrieved card as one local page decision, never as a complete shopping plan. Match its task family,
+page phase, product attributes, and current available action. A matching success card may support the listed
+action. A failure card describes a pattern to avoid and a local correction; never copy its failed action. Ignore a
+card when these cues conflict.
+MEMORY DECISION EVIDENCE: {retrieved_cards} Use it only when its cue and exact available action
+match the current page.
+Action rules
+choose exactly one action, search[<keywords>] or click[<button-or-ASIN>]. Search with precise
+product keywords; on results select the matching ASIN; on a product page choose required options before
+Buy Now. Do not click description, features, or reviews. Do not invent a product, option, or button.
+RECENT ACTION HISTORY: {recent_history}
+Latest observation: {current_page}
+Admissible actions: {admissible_actions}
+Output
+Return exactly one complete action inside <action>...</action>. Output no explanation.
+Figure 6: Prompt templates (continued): (e) ALFWorld card construction; (f) WebShop action selection.
+25
+
+
+(g) WebShop / 2. Memory extraction
+User
+Role and task
+You are CriticalStepLocator. Review the WebShop trajectory and return JSON only, using the top-level key
+candidates. Select at most 5 consequential decisions, ranked by importance_score.
+Output schema
+Each item contains step_id, c_t, critical_role, importance_score, importance_type, why_critical, and
+expected_fix_direction. Set critical_role to success_maintain, failure_correction, or uncertain.
+Hindsight credit
+Independently score each selected source decision with c_t in [-1, 1], using the goal, trajectory, and episode
+feedback. Assign a positive score to a local action that should be reinforced and a negative score to an action
+that should be corrected. Set c_t to 0 and critical_role to uncertain when the evidence does not support either
+role. For nonzero c_t, its sign must agree with critical_role: positive means success_maintain and negative
+means failure_correction. Judge the local step rather than copying the whole-episode outcome. Keep
+importance_score as the separate candidate-ranking score.
+Selection rules
+Prefer the earliest correctable wrong decision in a failed episode, such as an irrelevant search, a mismatched
+ASIN, an omitted required option, or a premature Buy Now click. Retain successful choices whose product
+and option constraints match the instruction. Avoid routine page navigation, duplicate observations,
+future-only information, and whole-task solutions.
+EPISODE OUTCOME: {episode_outcome}
+GOAL: {goal}
+TRAJECTORY: {trajectory_json}
+(h) WebShop / 3. Hint construction
+User
+Role and task
+You are ANCHOR write_hint. Return JSON only with hint_text, hint_type, and leakage_risk.
+Guidance rules
+Write one short, local check-only hint for the selected WebShop decision. For a failure_correction, identify the
+observed choice to avoid and the immediate action or attribute check that corrects it. For a success_maintain,
+stabilize the observed matching action. Use only the current page, instruction, and admissible actions; do not
+reveal future pages, recommend an unavailable product, or give a complete shopping solution.
+GOAL: {goal}
+CANDIDATE: {candidate_json}
+STATE: {state_json}
+Figure 6: Prompt templates (continued): (g) WebShop memory extraction; (h) WebShop hint construction.
+26
+
+
+(i) WebShop / 4. Paired replay
+User
+TASK: {goal}
+TASK FAMILY: {task_family}
+PHASE GUIDANCE: {current_phase}
+Memory-use rules
+Treat each retrieved card as one local page decision, never as a complete shopping plan. Match its task family,
+page phase, product attributes, and current available action. A matching success card may support the listed
+action. A failure card describes a pattern to avoid and a local correction; never copy its failed action. Ignore a
+card when these cues conflict.
+MEMORY DECISION EVIDENCE: {retrieved_cards} Use it only when its cue and exact available action
+match the current page.
+CANDIDATE GUIDANCE: {candidate_hint} Apply this guidance only when it matches the current page
+and an available action.
+Action rules
+choose exactly one action, search[<keywords>] or click[<button-or-ASIN>]. Search with precise
+product keywords; on results select the matching ASIN; on a product page choose required options before
+Buy Now. Do not click description, features, or reviews. Do not invent a product, option, or button.
+RECENT ACTION HISTORY: {recent_history}
+Latest observation: {current_page}
+Admissible actions: {admissible_actions}
+Output
+Return exactly one complete action inside <action>...</action>. Output no explanation.
+(j) WebShop / 5. Card construction
+User
+Role and task
+You are ANCHOR MemoryCardBuilder. Return JSON only. Build a reusable step-level WebShop card from
+the verified decision, not a complete shopping plan.
+Role mapping
+Map success_maintain to success_memory and failure_correction to fail_memory; the step role is independent
+of the whole-episode outcome.
+Card content
+Store VERIFIED HINT verbatim as memory_guidance. Add shopping phase, product attributes, option
+constraints, retrieval keys, source metadata, confidence, and support count in separate fields.
+Guidance preservation
+Do not paraphrase, summarize, or extend memory_guidance. Generalize product-specific names or ASINs
+only in retrieval metadata, leaving the tested hint unchanged. Exclude future-only information from added
+metadata.
+VERIFIED HINT: {candidate_hint}
+FAMILY: {task_family}
+GOAL: {goal}
+CANDIDATE: {candidate_json}
+STATE: {state_json}
+POLICY_DIFF: {policy_diff_json}
+TASK_PLAN: {task_plan_json}
+Figure 6: Prompt templates (continued): (i) WebShop paired replay; (j) WebShop card construction.
+27
+
+
+F
+Case Studies
+The ALFWorld cases illustrate success reinforcement, failure suppression, and memory retrieval during
+execution. Paired probes compare action-verb probabilities at fixed source states.
+F.1
+Similar Memories, Different Local Effects
+Source trajectory.
+The task is to look at an alarm clock under a desk lamp. At the initial decision, the
+agent is in the middle of the room and selects go to desk 1. The next observation reveals the alarm
+clock and lamp on that desk (Figure 7). The recorded source verb go to is also the baseline probe’s top
+choice, with probability 0.835.
+Navigation: look at an alarm clock under a desk lamp
+o0
+Room center
+Desk reachable
+a0
+go to
+desk 1
+o1
+Alarmclock + lamp
+at desk 1
+a1
+take alarmclock 1
+from desk 1
+o2
+Alarmclock
+in inventory
+a2
+use
+desklamp 1
+o3
+Lamp on
+Goal achieved
+Recorded rollout: navigate to desk, take alarmclock, and turn on desklamp.
+Source decision: go to desk 1
+go to
+look
+0.00
+0.25
+0.50
+0.75
+1.00
+Verb probability
+0.835
+0.165
+0.995
+0.005
+0.148
+0.852
+Without hint
+With M1
+With M2
+Figure 7: Navigation: the same source state, opposite memory effects. The recorded rollout goes to desk 1,
+takes the alarm clock, and turns on the lamp to complete the task. Replay tests the initial navigation decision:
+M1 reinforces go to; M2 suppresses it and favors look. Bars show the two dominant verb categories without
+renormalization; remaining probability is below 4 × 10−5 in each distribution.
+Local comparison.
+The two records share the initial observation, admissible actions, source action, and
+baseline distribution. Their hints differ in whether navigation is the action to take or an action already
+completed (Figure 7).
+M1: Support navigation to the target
+The action ’go to desk 1’ successfully navigates you to the location containing the target objects.
+Proceed to interact with the alarmclock as specified in the goal.
+M2: Navigation already completed
+You have successfully navigated to desk 1. Verify that the alarmclock is present in your current
+view before proceeding.
+Interpretation.
+M1 reinforces the successful source decision, increasing its verb probability by 0.160.
+M2 instead describes navigation as completed at a pre-navigation state: it reduces go to by 0.687 and
+raises look to 0.852. Both shifts exceed the success-role magnitude threshold (Table 5), but only M1
+reinforces the source action. The larger shift from M2 therefore fails the directional test.
+28
+
+
+F.2
+A Local Correction for a Failed Heating Trajectory
+Source trajectory.
+The goal is to heat an apple and place it on a dining table. After collecting the apple
+and reaching the microwave, the recorded agent opens the microwave, moves the apple inside, closes it,
+and later retrieves and places it. It never executes the environment’s explicit heat action. Subsequent
+repeated actions and empty outputs exhaust the 50-step limit. Figure 8 shows selected observations and
+actions in their recorded order.
+Heating: heat an apple, then place it on a dining table
+o0
+room
+a0
+go to
+fridge
+...
+o4
+microwave
+closed
+a4
+open
+microwave
+o5
+microwave
+open
+...
+a12
+place
+apple
+o13
+goal
+unmet
+...
+o50
+step
+limit
+Step 4 opens the microwave; the available heat action is never executed.
+Logged outcome: failure at the 50-step limit
+open (recorded detour)
+heat (local correction)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Verb probability
+0.935
+0.060
+0.005
+0.988
+Without hint
+With correction
+Figure 8: Heating: correcting a failed source decision. The agent opens the microwave at step 4 but never executes
+heat, reaching the 50-step limit. Dots omit intervening logged steps; indices are zero-based. The hint suppresses
+open and reinforces heat, reversing their ranking.
+Localizer record.
+Localizer identifies the step-4 detour in train-00058-000. The record below gives
+the source action, two relevant admissible actions, and the correction role.
+Localized critical step
+Record / step: train-00058-000 / 4
+Source action: open microwave 1
+Admissible actions:
+open microwave 1;
+heat apple 1 with microwave 1
+Role: failure_correction
+Importance score: 1.1
+Importance type: heat protocol detour
+Why critical: An exact target heat action was available, but the rollout chose another action.
+Expected direction: Execute the exact target heat action immediately when it is listed.
+Extracted failure-correction hint
+Do not open the microwave first; the admissible actions list includes a direct command to heat the
+apple with the microwave, which should be executed immediately to achieve the goal.
+Local comparison.
+At step 4, the hint reduces the recorded source verb open from 0.935 to 0.005 and
+raises heat from 0.060 to 0.988 (Figure 8). JS divergence is 0.806 bits, and the recorded checker accepts
+the correction. This example demonstrates the intended failure-suppression direction at the replay state.
+29
+
+
+F.3
+Memory Cards
+Figure 9 groups the stored examples by role. Success-maintain memories support target acquisition, state
+modification, and tool activation; failure corrections address unnecessary appliance interactions, unrelated
+objects, and spatial-goal errors.
+Success-maintain memories
+Failure corrections
+S1: Acquire the target object
+Source hint: The alarmclock is currently
+on desk 1. To proceed with the task, you
+need to add it to your inventory.
+Source action: take alarmclock 1
+from desk 1
+Task family: look_at_obj
+F1: Avoid opening before direct heating
+memory_guidance: Do not open the
+microwave first; the admissible actions list
+includes a direct command to heat the apple
+with the microwave, which should be
+executed immediately to achieve the goal.
+Source action: open microwave 1
+Task family: pick_heat_then_place
+Card ID: self-local-00058-004
+S2: Complete cleaning before placement
+When a task requires an object to be in a
+specific state (e.g., ’clean’) before storage,
+execute the state-modifying action (e.g.,
+’clean’) at the appropriate facility (e.g.,
+’sink’) immediately upon arrival, rather than
+proceeding to the storage location or
+performing unrelated navigation.
+Source action: clean apple 3 with
+sinkbasin 1
+Task family: pick_clean_then_place
+Card ID: self-local-00062-003
+F2: Ignore an unrelated object
+When an opened container reveals an object
+that does not match the target item required
+for the current heating or placement goal,
+do not interact with the found object.
+Instead, close the container and resume the
+search for the correct target item to avoid
+unnecessary detours.
+Source action: take pot 1 from
+cabinet 2
+Task family: pick_heat_then_place
+Card ID: self-local-00022-006
+S3: Activate the tool before examination
+When a task requires examining an object
+with a specific tool, and the tool is present
+but inactive, the critical step is to activate
+the tool using the ’use’ action before
+attempting the examination. This activation
+is a prerequisite for the ’examine with’
+condition to be satisfied.
+Source action: use desklamp 1
+Task family: look_at_obj
+Card ID: self-local-00048-003
+F3: Respect the spatial goal
+When a goal specifies an object located
+relative to another object (e.g., ’under X’),
+do not interact with instances of that object
+found elsewhere. Instead, navigate to the
+reference object and verify the spatial
+relationship before acting. Avoid taking the
+object if the goal is merely to observe it in
+situ.
+Source action: take alarmclock 2
+from desk 1
+Task family: look_at_obj
+Card ID: self-local-00096-001
+Figure 9: Memory cards grouped by source role. Left: success-maintain memories S1–S3. Right: failure
+corrections F1–F3. Guidance text and source metadata are shown together; F1 preserves the tested heating hint
+verbatim.
+30
+
+
+Local effects of memory injection
+Hint / source record
+Source verb
+p0 →p1
+JS (bits)
+Injected top verb
+Check
+Navigation hints at the same source state
+M1 / eval-00006-000
+go to
+.835 →.995
+.074
+go to
+Pass
+M2 / eval-00007-000
+go to
+.835 →.148
+.375
+look
+Reject
+Success reinforcement and failure suppression
+S1 / train-00012-001 take
+.735 →1.000
+.146
+take
+Pass
+F1 / train-00058-000 open
+.935 →.005
+.806
+heat
+Pass
+p0 / p1: source-verb probability before / after injection. The source verb is the baseline top choice.
+Table 5: Paired source-state probes: navigation hints, success reinforcement, and failure suppression.
+Later retrievals in the construction run
+Episode /
+step
+Retrieved card
+Executed action
+Feedback (abridged)
+104 / 4
+self-local-00062-003
+clean apple 3 with
+sinkbasin 1
+Apple 3 is cleaned.
+128 / 6
+self-local-00062-003
+clean apple 2 with
+sinkbasin 1
+Apple 2 is cleaned.
+68 / 9
+self-local-00062-006
+move apple 1 to
+fridge 1
+Apple 1 is placed in the
+fridge.
+Table 6: Stored-card retrievals and executed actions during memory construction.
+F.4
+Inference-Time Memory Injection
+Paired source-state probes.
+Table 5 compares source-verb probabilities at fixed saved contexts. S1
+increases take by 0.265 and retains it as the top choice; F1 decreases open by 0.929 and makes heat the
+top choice. Both satisfy the admission rule.
+Source records.
+Table 5 lists the source records. The navigation probes share the initial state; the
+heating record links to F1 (self-local-00058-004), which preserves the tested hint. S1 quotes its
+source hint; S2, S3, F2, and F3 reproduce stored guidance. All probes use the complete saved context,
+L = 1, and base-2 JS (Appendix E). Trajectory excerpts retain the recorded action order. Table 6 identifies
+the later retrieval episodes and steps.
+A later retrieval during execution.
+At step 4 of training episode 104, the agent is at sinkbasin 1 with
+apple 3 in inventory. Its single retrieved card, self-local-00062-003, supplies this local instruction:
+Retrieved cue and executed action
+Injected cue: NEXT ACTION IF MATCHED: clean apple 3 with sinkbasin 1
+Available and executed action: clean apple 3 with sinkbasin 1
+Next observation: “You clean the apple 3 using the sinkbasin 1.”
+Episode outcome: success.
+The same card guides another cleaning decision with a different apple; a second card supports final
+placement. In all three steps in Table 6, NEXT ACTION IF MATCHED is admissible and equals the executed
+action.
+All three episodes are logged as successful. The paired probes isolate a local policy change, and the
+later traces record retrieval followed by the matching action and observation.
+31

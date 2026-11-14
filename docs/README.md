@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-13</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-14</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 21 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 17 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>8</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>13</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-14 00:30:01 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-14 23:01:33 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今天完成21篇论文筛选：8篇精读、13篇速读，重点聚焦向量索引自适应与LLM智能体记忆两条主线。最值得看的是满分10.0的《REWEAVE》——面向负载自适应HNSW的在线学习，以及9.0的《Can LLM Agents Organize Their Own Memory?》对智能体自主记忆组织的追问。普通读者可先读这两篇精读，再用VecDBLens、DISCERN和认证ANN检索三篇速读补齐向量数据库诊断、持久记忆与外包检索安全的视角。</p>
+<p>今日完成17篇论文筛选，精读4篇、速读13篇，重点聚焦智能体信息组织与稀疏信号调查两大基准。最值得看的是《InfoOrgBench》（9.0/10）与《LEGION》（9.0/10）：前者检验智能体能否把零散信息整合成清晰层级，后者评测其在对抗噪声下的稀疏信号调查能力。普通读者可优先精读这两篇基准，再结合速读中的自演化记忆与个性化检索方向，理解智能体能力评测的脉络。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +78,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">8 篇</strong>
+    <strong class="dpr-home-dashboard-count">4 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="REWEAVE: Online Learning for Workload-Adaptive HNSW Indexes">REWEAVE: Online Learning for Workload-Adaptive HNSW Indexes</span></li><li><span class="dpr-home-dashboard-paper-title" title="Can LLM Agents Organize Their Own Memory?">Can LLM Agents Organize Their Own Memory?</span></li><li><span class="dpr-home-dashboard-paper-title" title="Calibrated Early Termination with Bounded Optimality Gaps for Constrained Vector Search">Calibrated Early Termination with Bounded Optimality Gaps for Constrained Vector Search</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="InfoOrgBench: Can Agents Turn Scattered Information into Coherent Hierarchies?">InfoOrgBench: Can Agents Turn Scattered Information into Coherent Hierarchies?</span></li><li><span class="dpr-home-dashboard-paper-title" title="LEGION: Benchmarking Language Agents on Sparse-Signal Investigation Under Adversarial Noise">LEGION: Benchmarking Language Agents on Sparse-Signal Investigation Under Adversarial Noise</span></li><li><span class="dpr-home-dashboard-paper-title" title="TurnFlow: Benchmarking User-State Reasoning in Multi-Turn LLM Agents via Scene-Guided User Simulation">TurnFlow: Benchmarking User-State Reasoning in Multi-Turn LLM Agents via Scene-Guided User Simulation</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>3</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>2</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -94,9 +94,9 @@
     <strong class="dpr-home-dashboard-count">13 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="VecDBLens: An Evaluatology-Based Framework for Vector Database Diagnosis">VecDBLens: An Evaluatology-Based Framework for Vector Database Diagnosis</span></li><li><span class="dpr-home-dashboard-paper-title" title="DISCERN: Preserve at Write, Resolve at Read for Persistent LLM-Agent Memory">DISCERN: Preserve at Write, Resolve at Read for Persistent LLM-Agent Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="Authenticated Approximate Nearest Neighbor Search in Outsourced Vector Databases">Authenticated Approximate Nearest Neighbor Search in Outsourced Vector Databases</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="From Reflection to Co-Evolution: Self-Evolving Agents with Locally Verified Memory">From Reflection to Co-Evolution: Self-Evolving Agents with Locally Verified Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="TransMem: Transition-Aware Retrieval for Evolving Personal Memory">TransMem: Transition-Aware Retrieval for Evolving Personal Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="Hybrid Product Search Without the Copy: Lexical, Semantic and Filtered Retrieval Served Directly from a Data Lake">Hybrid Product Search Without the Copy: Lexical, Semantic and Filtered Retrieval Served Directly from a Data Lake</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>6</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>4</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>3</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>7</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>6</strong></span></div>
 </section>
 </div>
 

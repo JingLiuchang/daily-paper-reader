@@ -1,0 +1,1019 @@
+MULTILOOP: Evolving Multi-Agent Harnesses for
+Complex Information-Seeking Tasks
+Daniela Gottesman1∗
+Gal Yona2
+Ori Ram2
+Zorik Gekhman2
+Jonathan Herzig2
+Mor Geva1
+Roee Aharoni2
+1Tel Aviv University
+2Google Research
+gottesman3@tau.mail.ac.il
+Abstract
+The performance of LLM-based agents depends not only on the underlying model
+but also on the harness: the prompts, tools, and orchestration logic around it.
+Recent works automate harness optimization with coding agents that analyze
+execution traces, diagnose failures, and edit the harness code; however, those
+focused on single-agent systems. Multi-agent harnesses are harder to optimize as
+fixing them requires changing how agents interact in addition to how each behaves.
+We study whether automated harness optimization can diagnose and repair failures
+in multi-agent systems through a case study on complex information-seeking
+tasks from DeepSearchQA [Gupta et al., 2026]. We apply MULTILOOP, a simple
+optimization loop in which a coding agent iteratively analyzes, evaluates and edits
+the harness. With only 10 training samples, the evolved harness improves accuracy
+by 4.6% over the base harness and by 3.2% over the best single-agent system.
+However, a taxonomy of failure modes before and after optimization shows that
+the orchestration failures that characterize multi-agent systems largely persist. Our
+findings motivate harness optimization methods that encourage structural changes
+to how agents delegate tasks and share information.
+1
+Introduction
+Agentic behavior in large language models (LLMs) is typically enabled by a “harness”: the sur-
+rounding infrastructure that defines prompts, access to tools, and orchestration flow. As agentic
+systems grow more complex and produce longer trajectories, manually identifying harness failures
+has become impractical, motivating recent efforts to automate both detection and mitigation. These
+works automate harness optimization using coding agents to iteratively analyze execution traces,
+diagnose failures, and improve the harness code [Lee et al., 2026, Lou et al., 2026, Zhang et al.,
+2026b]. Crucially, for these optimizers to accurately diagnose failures and propose updates, they
+require full visibility into historical code changes, execution traces, and evaluation results. This
+optimization process, however, has been primarily studied for single-agent systems.
+Multi-agent harnesses, where an orchestrator agent delegates work to subagents, are a common
+and effective design for long-horizon tasks [Zhu et al., 2024, Grand et al., 2025, Schroeder et al.,
+2025, Zhang et al., 2026a, Anthropic, 2025, Alzu’bi et al., 2026]. However, shifting from single-
+to multi-agent harnesses complicates harness optimization. For example, reading the full rollouts
+of many subagents can overwhelm the optimizer’s context window [Zhang et al., 2025b]. More
+fundamentally, failures may also cascade from poor orchestration, such as delegating overly broad
+tasks, parallelizing dependent ones, or sharing too little context between agents, which leads to
+redundant work and long verification loops [Cemri et al., 2026, Wang et al., 2026b]. Unlike in
+single-agent systems, fixing these would require changing not only how individual agents behave but
+also how they interact. To our knowledge, no prior work has examined whether automated harness
+optimization can diagnose and repair such failures.
+∗Work done as an intern at Google Research.
+40th Conference on Neural Information Processing Systems (NeurIPS 2026).
+arXiv:2611.15754v1  [cs.MA]  11 Nov 2026
+
+
+In this work, we take a first step toward answering this question through a case study on automatically
+evolving a multi-agent harness for complex information-seeking tasks, using Google’s DeepSearchQA
+benchmark [Gupta et al., 2026]. This is a natural setting as it produces long, complex trajectories
+involving reasoning, tool use, and sandboxed environments. In addition, these tasks have been shown
+to benefit from multi-agent systems with subagent delegation which alleviate long-context issues and
+enable decomposition of sub-tasks [Zhang et al., 2026a].
+Rather than proposing a new optimization strategy, we apply an existing paradigm to a multi-agent
+harness to understand which failures it resolves and which remain. Following Lee et al. [2026],
+Zhang et al. [2026b], we employ MULTILOOP, a simple automated optimization loop where a coding
+agent iteratively improves a base multi-agent harness. In each iteration, an Optimizer agent evaluates
+the latest rollouts on a small training set of examples to identify weaknesses and failure modes in
+the current harness. With access to the history of past scores and prior harness edits, the agent
+consolidates recurring issues among different rollouts and executes targeted code edits to yield a new,
+optimized harness. Finally, the proposed harness is evaluated, and the loop repeats.
+We find that harness optimization does transfer to the multi-agent setting: the evolved harness
+improves accuracy by 4.61% over the base harness and outperforms the best single-agent system
+by 3.19%. However, these improvements come from prompt refinements, such as stricter answer
+formatting and instructions for processing tool outputs programmatically, and from the addition of a
+new tool, rather than from structural orchestration changes that improve coordination between agents.
+As a result, the orchestration failures characteristic of multi-agent systems largely persist. We support
+this with a taxonomy and qualitative evaluation of the failure modes before and after optimization.
+Ultimately, our findings motivate future work on harness optimization that encourages structural
+changes to multi-agent harnesses, such as redesigning how the orchestrator delegates tasks or what
+information agents pass to one another.
+2
+Harness Optimization
+Algorithm 1 MULTILOOP: automated multi-agent harness optimization
+1: Input: training set X, base harness H0, iterations N, LLM M
+2: A0, R0 ←EVALUATE(H0, M, X)
+▷Evaluate base harness on training set to get initial accuracy A0 and rollouts R0
+3: L ←{(H0, A0, R0)}
+▷Stores all harness versions, and their training set accuracy and rollouts
+4: for t = 1 . . . N do
+5:
+Ht ←OPTIMIZE(Ht−1, At−1, Rt−1, L)
+▷Optimizer proposes a new harness based on previous evaluation and history
+6:
+At, Rt ←EVALUATE(Ht, M, X)
+▷Evaluate the new harness on the training set
+7:
+L ←L ∪{(Ht, At, Rt)}
+▷Add the new harness, accuracy, and rollouts to the history
+8: return arg maxHt{At | (Ht, At, Rt) ∈L}
+This section presents our method for autonomous optimization of multi-agent harnesses. Algorithm 1
+implements MULTILOOP as an agentic workflow with two subroutines: EVALUATE and OPTIMIZE.
+We initialize MULTILOOP with a simple harness in which an orchestrator delegates tasks to subagents,
+each executing tool calls in its own context (see Appendix C, Figure 3 for a visualization).
+EVALUATE
+Given a harness Ht, EVALUATE runs the current agentic system independently on
+every training example in X, producing a rollout per example, collectively denoted Rt. To make
+these rollouts consumable by the Optimizer, each is programmatically converted into a markdown
+file that distinguishes orchestrator steps from subagent steps and renders every step’s model thoughts,
+tool calls, tool outputs, and generated answer. Finally, accuracy At is computed over the training set
+(explained in § 3) and appended to a running history of harness versions with their accuracies and
+rollouts, L, allowing the optimization loop to rollback from a bad harness version.
+OPTIMIZE
+The Optimizer is a coding agent that reads the evaluation outputs in L and proposes
+code edits to the harness. It is implemented with the Antigravity coding-agent SDK, which configures
+an agent with a system prompt (found in Appendix D), and a set of tools for filesystem navigation
+(file viewing, directory listing, and grep-based text search), code editing (file editing and creation),
+and shell execution (for checking code compilation and performing version-control operations).
+2
+
+
+3
+Experiments
+Experimental Setup
+We evaluate MULTILOOP on DeepSearchQA [Gupta et al., 2026], a recent
+900-prompt benchmark for evaluating agents on difficult multi-step information-seeking tasks. As
+iterative harness optimization is costly, the training set includes 10 challenging examples that all
+of the unoptimized agent systems in Table 1 could not solve, and the test set is the remaining 890
+examples. This is motivated by recent evidence that meaningful optimization signal can be extracted
+from a small number of well-chosen examples [Wang et al., 2025], and significant experimental costs
+as described in Appendix E. Across all experiments, we used Gemini-3-Flash as the model in the
+evaluated harness, and Gemini-3.1-Pro with the Antigravity harness as the Optimizer [Gemini Team,
+Google DeepMind, 2025].
+Table 1: Fully correct accuracy (FC) on 890
+DeepSearchQA test questions.
+Agent Architecture
+Multi-agent
+FC
+Without harness optimization
+Search Agent
+no
+58.35 ± 2.29
+Search + Other Tools (SPOT)
+no
+68.69 ± 2.16
+Orchestrator w/ SPOT subagents
+yes
+67.27 ± 2.18
+With full harness optimization
+SPOT
+no
+65.54 ± 2.21
+Orchestrator w/ SPOT subagents
+yes
+71.88 ± 2.09
+With prompt only opt.
+Orchestrator w/ SPOT subagents
+yes
+64.62 ± 2.22
+Baselines
+To evaluate our approach, we first
+compare against three baselines without any
+optimization. (1) Search Agent, a multi-step
+agent which only has access to a Google search
+tool; (2) Search Plus Other Tools (SPOT) Agent,
+which adds tools for website scraping, PDF
+scraping, and Python execution; and (3) Orches-
+trator with SPOT subagents, our baseline multi-
+agent harness. We then run three optimization
+experiments. First is (4) SPOT + harness op-
+timization, showing the effect of optimization
+on a single-agent harness, (5) is Orchestrator w/
+SPOT subagents + harness optimization which
+optimizes the multi-agent harness, and finally (6) Orchestrator w/ SPOT subagents + prompt opti-
+mization, an ablation experiment which only optimizes the system instructions, injected messages,
+and function declarations. All optimization loops are run for 10 iterations.
+Evaluation
+We measure the percentage of fully correct (FC) responses, defined as an exact semantic
+match to the ground-truth entity set (i.e., identifying all correct answers with zero incorrect ones)
+using Gemini-3-Flash [Gemini Team, Google DeepMind, 2025] and the DeepSearchQA [Gupta et al.,
+2026] grader prompt. Results show the average FC and 95% confidence interval averaged across two
+runs on the 890-question test set, which is disjoint from the training set.
+Results
+Table 1 shows that adding additional tools on top of the search tool improves performance,
+with the SPOT agent outperforming the Search Agent by 10.34%. Adding the naive multi-agent
+harness on top of that does not show immediate benefits, with the unoptimized Orchestrator with
+SPOT subagents underperforming the single SPOT agent by 1.42%. Applying MULTILOOP improves
+multi-agent performance by 4.61% to 71.88%, which is the best result we obtained on the test set. On
+the single-agent harness, optimization degraded the performance by 3.15%. For the ablation allowing
+only prompt optimization to the multi-agent harness, we see a performance decrease of 2.65%.
+4
+Analysis
+We now unpack the factors behind these results: why optimization degrades single-agent performance
+yet improves multi-agent performance, and which harness changes drove that improvement and how
+they reshaped the distribution of failures over the course of optimization.
+Optimization harms single agent performance
+We find that the single-agent degradation stems
+from an optimization step that added 30K-character truncation for tool outputs, which did not
+generalize to the test set. This suggests that a larger training set could be useful, however we kept the
+training set minimal at 10 samples due to compute constraints (see Appendix E).
+Analyzing the multi-agent optimization results
+Figure 1 compares the three multi-agent harnesses:
+unoptimized (Blue), full harness optimization (Orange), and prompt-only optimization (Green).
+Statistics are averaged over two evaluation runs on the 890-question test set.
+3
+
+
+Full harness optimization makes the system do more work overall: the orchestrator takes more
+steps (6.3 vs. 4.3), spawns more subagents (14.0 vs. 10.9), and each subagent runs longer (17.9 vs.
+13.9 steps), yielding 250 subagent steps and 236 subagent tool calls per question versus 152 and
+141 for the unoptimized harness. Prompt-only optimization instead spawns the fewest subagents
+(7.7 per question), but each one issues the longest trajectories: 20.6 steps and 19.6 tool calls on
+average, compared with 13.9 steps and 12.9 tool calls without optimization and 17.9 and 16.9 with
+full optimization, and 46% of prompt-only subagents hit the 30-step limit compared with 19% and
+35%, respectively. As a result, the prompt-only system does roughly the same total subagent work as
+the unoptimized one (158 vs. 152 steps per question) while being less accurate. This suggests that
+prompt-only optimization overfit on the train set, and pushed individual subagents into longer, less
+effective trajectories rather than better delegation, pointing at the value of allowing the optimizer to
+make structural changes. Because full optimization increases total inference, part of the gain may
+reflect additional compute rather than better harness design—a compute-matched comparison [Tran
+and Kiela, 2026] is left for future work.
+Orch Steps
+Sub-Agents Spawned
+Sub Agent Steps
+Tool Calls per Sub Agent
+0
+5
+10
+15
+20
+Count
+4.3
+10.9
+13.9
+12.9
+6.3
+14.0
+17.9
+16.9
+5.5
+7.7
+20.6
+19.6
+W/O Harness Opt
+With Harness Opt
+With Prompt Opt
+Figure 1: Comparison of trajectory statistics
+for Orchestrator with SPOT subagents.
+Taxonomy and Distribution of Failure Modes
+We manually analyzed 11 trajectories from the Or-
+chestrator with SPOT subagents run where the final
+output shifted from fully incorrect to fully correct (or
+vice versa) post-optimization. By cross-referencing
+observations with the Trajectory Audit Categories
+proposed by Li et al. [2026], we established 7 cat-
+egories, fully detailed in Appendix F: Bad Orches-
+tration (poor decisions about when, how, and how
+many subagents to dispatch); Ineffective Tool Usage
+(mechanical failures in tool selection and execution);
+Retrieval Scope Drift (losing track of key task con-
+straints mid-task); Criterion Mismatch (applying an
+incorrect decision rule, field definition, or time win-
+dow to an otherwise relevant source); Tool Output
+Misreading (misreading a value, label, or field from
+the correct source); Retrieval Dependency Errors (failing to connect correct intermediate results
+across sources or subagents); and Final Answer Composition (verbose final answers when a concise
+one is required).
+To better understand how MULTILOOP resolves specific errors, we analyze the rollouts over the
+training set from the Orchestrator w/ SPOT subagents setting, by counting the number of examples
+that contain at least one instance of a given error category. As illustrated in Fig. 2, the baseline model
+(No Opt.) has the highest overall frequency of errors, dominated by bad orchestration, ineffective
+tool usage, and final answer composition failures. The intermediate stage (Before Best Opt.) shows
+incremental progress. The best optimization configuration (Best Opt.) reduces overall failures,
+primarily by resolving final answer composition errors, retrieval dependencies, and retrieval scope
+drift. Orchestration and tool usage errors were not alleviated with harness optimization, indicating
+that these may require model improvements or more dedicated optimization logic.
+0
+10
+20
+30
+40
+50
+Count
+No Opt.
+Before
+Best Opt.
+Best Opt.
+10
+9
+10
+9
+9
+9
+4
+4
+1
+5
+5
+4
+10
+8
+3
+2
+1
+5
+4
+3
+45
+40
+30
+Bad Orchestration
+Ineffective Tool Usage
+Retrieval Dependency
+Criterion Mismatch
+Final Answer Comp.
+Retrieval Scope Drift
+Tool Output Misreading
+Figure 2: Distribution of failure modes.
+Harness Changes Made by MULTILOOP
+As
+outlined in Appendix G, Tables 2 and 3, the
+adjustments to the Orchestrator w/ SPOT sub-
+agents harness were primarily at the prompt-
+level (e.g., system instructions, function declara-
+tions, and error message propagation to agents).
+The only architectural change was the addition
+of a new tool (download_file) for retrieving
+files from the internet. The majority of the modi-
+fications focused on refining subagent tool usage
+by clarifying use-cases. To address orchestra-
+tion deficits, the orchestrator’s system prompt
+was updated to recommend query decomposi-
+tion, parallel delegation across subagents—mirroring the delegation principle in Anthropic’s Claude
+4
+
+
+multi-agent system [Anthropic, 2025] and the supervisor/worker pattern in LangGraph [LangChain
+AI, 2024]—and specific tool use behavior for subagents. Further, to mitigate tool output misreading,
+the subagents were given explicit directives on how to parse raw string outputs into JSON objects
+for programmatic analysis—similar to what Schick et al. [2023] and Hong et al. [2024] solve with
+typed structured schemas—and included an example of composing multiple tool calls within the
+python sandbox. Finally, errors in final answer composition were addressed through instructions that
+encouraged concise responses. The jump to the Best Opt. score of 71.88% stemmed specifically
+from refinements to the download tool and stricter final-answer formatting instructions. Consistent
+with Ursekar et al. [2026], aside from introducing the download tool, the optimizer avoided deeper
+structural changes (e.g., modifying the response schema between subagents and the orchestrator) in
+favor of surface-level prompt and formatting adjustments.
+Analyzing Changes in System Behavior
+Building on our analysis of the harness changes, we also
+look at how the agent’s behavior changed after harness optimization. 9 questions improved from
+fully incorrect to fully correct, while 2 regressed. Appendix H, Tables 4 and 5 showcase behavioral
+differences observed between the rollouts before and after optimization: improvements were mainly
+driven by programmatic processing of outputs via the download_file tool (6 examples) and better,
+sequential orchestration of dependent tasks (3 examples), while the 2 degraded examples failed
+because the orchestrator became trapped in long verification loops.
+5
+Related Work
+Issues with Multi-Agent Harnesses
+Multi-agent harnesses are a common design for long-horizon
+tasks because they give each subtask a fresh context window and let independent subtasks run in
+parallel [Anthropic, 2025, Zhu et al., 2024, Schroeder et al., 2025, Zhang et al., 2026a, Alzu’bi
+et al., 2026]. However, these systems require careful multi-agent coordination and communication.
+Kim et al. [2026] find that coordination helps on decomposable tasks, hurts on sequential ones, and
+propagates errors across agents unless a central coordinator catches them. Tran and Kiela [2026] show
+that under fixed compute, a single agent matches or beats multi-agent systems, due to information
+loss in hand-offs. Ou et al. [2025] find that structured information sharing and a reflective orchestrator
+can improve performance of multi-agent systems. Failure taxonomies place most multi-agent errors
+in task specification and inter-agent misalignment [Cemri et al., 2026], and even attributing a failure
+to the responsible agent and step is hard [Zhang et al., 2025b]. Our taxonomy in Appendix F, is
+consistent with these findings: bad orchestration dominates our failure distribution, and it is a category
+that harness optimization struggles to improve.
+Automatic Harness Optimization
+Earlier methods optimize prompts from LLM-generated feed-
+back [Yang et al., 2024, Yuksekgonul et al., 2024, Agrawal et al., 2026] or search over agentic
+workflows represented as code [Hu et al., 2025, Zhang et al., 2025a]. Recent work treats the full
+harness code as the optimization variable and uses a coding agent to propose and implement harness
+edits in an iterative loop [Lee et al., 2026, Zhang et al., 2026b, Ursekar et al., 2026, Zhang et al.,
+2026c, Lou et al., 2026, Lin et al., 2026, Nie et al., 2026, Chen et al., 2026, Karten et al., 2026]. Two
+limitations of this paradigm are directly relevant to our study. First, evolved harnesses may overfit
+the training set, with gains that shrink or vanish on held-out tasks [Wang et al., 2026a, Xia et al.,
+2026]. Second, optimizers favor surface-level edits such as prompt rewrites over structural changes
+[Ursekar et al., 2026, Xia et al., 2026]. A concurrent work, RRSI [Xia et al., 2026] mitigates both by
+regularizing proposal and selection.
+6
+Conclusions and Future Work
+We present a case study in which we apply MULTILOOP, a simple harness-optimization loop, to a
+multi-agent system for complex information-seeking tasks. On DeepSearchQA [Gupta et al., 2026],
+MULTILOOP improves the multi-agent harness, but the gains come from prompt refinements and a new
+tool rather than from changes to how agents delegate work or share information, and the orchestration
+failures that characterize multi-agent systems largely persist. Future work includes larger-scale
+experiments, compute-matched comparisons against single-agent baselines, and optimization methods
+that explicitly encourage structural changes to orchestration, such as redesigning task decomposition
+or the information passed between agents.
+5
+
+
+Acknowledgments and Disclosure of Funding
+We thank Tomer Levinboim for helpful discussions on early versions of this project.
+References
+Lakshya A. Agrawal, Shangyin Tan, Dilara Soylu, Noah Ziems, Rishi Khare, Krista Opsahl-Ong,
+Arnav Singhvi, Herumb Shandilya, Michael J. Ryan, Meng Jiang, Christopher Potts, Koushik
+Sen, Alex Dimakis, Ion Stoica, Dan Klein, Matei Zaharia, and Omar Khattab. GEPA: reflective
+prompt evolution can outperform reinforcement learning. In Carl Vondrick, Bharath Hariharan,
+Colin Raffel, Lerrel Pinto, Diyi Yang, and Aleksandra Faust, editors, The Fourteenth International
+Conference on Learning Representations, ICLR 2026, Rio de Janeiro, Brazil, April 23-27, 2026. pro-
+ceedings.iclr.cc, 2026. URL https://proceedings.iclr.cc/paper_files/paper/2026/
+hash/0e9e708b6f48e14fd0ac29e167413f76-Abstract-Conference.html.
+Salaheddin Alzu’bi, Baran Nama, Arda Kaz, Anushri Eswaran, Weiyuan Chen, Sarvesh Khetan,
+Rishab Bala, Tu Vu, and Sewoong Oh. Roma: Recursive open meta-agent framework for long-
+horizon multi-agent systems, 2026. URL https://arxiv.org/abs/2602.01848.
+Anthropic. How we built our multi-agent research system, 2025. URL https://www.anthropic.
+com/engineering/multi-agent-research-system.
+Mert Cemri, Melissa Z Pan, Shuyi Yang, Lakshya A Agrawal, Bhavya Chopra, Rishabh Tiwari,
+Kurt Keutzer, Aditya Parameswaran, Dan Klein, Kannan Ramchandran, Matei Zaharia, Joseph E.
+Gonzalez, and Ion Stoica. Why do multi-agent LLM systems fail? In The Thirty-ninth Annual
+Conference on Neural Information Processing Systems Datasets and Benchmarks Track, 2026.
+URL https://openreview.net/forum?id=fAjbYBmonr.
+Tingyang Chen, Shuo Lu, Kang Zhao, Weicheng Meng, Hanlin Teng, Tianhao Li, Chao Li, Xule
+Liu, Jian Liang, Zhizhong Zhang, Yuan Xie, Heng Qu, Kun Shao, and Jian Luan. Harnessx: A
+composable, adaptive, and evolvable agent harness foundry, 2026. URL https://arxiv.org/
+abs/2606.14249.
+Gemini Team, Google DeepMind. Gemini 3 pro model card. https://storage.googleapis.
+com/deepmind-media/Model-Cards/Gemini-3-Pro-Model-Card.pdf, November 2025.
+Accessed: 2026-06-28.
+Gabriel Grand, Joshua B. Tenenbaum, Vikash Mansinghka, Alexander K. Lew, and Jacob Andreas.
+Self-steering language models. In Second Conference on Language Modeling, 2025. URL
+https://openreview.net/forum?id=XvCBtm5PgF.
+Nikita Gupta, Riju Chatterjee, Lukas Haas, Connie Tao, Andrew Wang, Chang Liu, Hidekazu
+Oiwa, Elena Gribovskaya, Jan Ackermann, John Blitzer, Sasha Goldshtein, and Dipanjan Das.
+Deepsearchqa: Bridging the comprehensiveness gap for deep research agents, 2026. URL https:
+//arxiv.org/abs/2601.20975.
+Sirui Hong, Mingchen Zhuge, Jonathan Chen, Xiawu Zheng, Yuheng Cheng, Jinlin Wang, Ceyao
+Zhang, Zili Wang, Steven Ka Shing Yau, Zijuan Lin, Liyang Zhou, Chenyu Ran, Lingfeng
+Xiao, Chenglin Wu, and Jürgen Schmidhuber.
+Metagpt: Meta programming for A multi-
+agent collaborative framework.
+In The Twelfth International Conference on Learning Rep-
+resentations, ICLR 2024, Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024.
+URL
+https://openreview.net/forum?id=VtmBAGCN7o.
+Shengran Hu, Cong Lu, and Jeff Clune. Automated design of agentic systems. In The Thirteenth
+International Conference on Learning Representations, ICLR 2025, Singapore, April 24-28, 2025.
+OpenReview.net, 2025. URL https://openreview.net/forum?id=t9U3LW7JVX.
+Seth Karten, Joel Zhang, Tersoo Upaa Jr, Ruirong Feng, Wenzhe Li, Chengshuai Shi, Chi Jin, and
+Kiran Vodrahalli. Continual harness: Online adaptation for self-improving foundation agents,
+2026. URL https://arxiv.org/abs/2605.09998.
+6
+
+
+Yubin Kim, Ken Gu, Chanwoo Park, Chunjong Park, Samuel Schmidgall, A. Ali Heydari, Yao Yan,
+Zhihan Zhang, Yuchen Zhuang, Yun Liu, Mark Malhotra, Paul Liang, Hae Won Park, Yuzhe
+Yang, Xuhai Xu, Yilun Du, Shwetak Patel, Tim Althoff, Daniel McDuff, and Xin Liu. Towards
+a science of scaling agent systems. journal, Jan 2026. doi: 10.21203/rs.3.rs-8414536/v1. URL
+http://dx.doi.org/10.21203/rs.3.rs-8414536/v1.
+LangChain AI. LangGraph. https://github.com/langchain-ai/langgraph, 2024.
+Yoonho Lee, Roshen Nair, Qizheng Zhang, Kangwook Lee, Omar Khattab, and Chelsea Finn.
+Meta-harness: End-to-end optimization of model harnesses. arXiv preprint arXiv:2603.28052,
+2026.
+Ningyuan Li, Haiyang Shen, Mugeng Liu, Yudong Han, Zhuofan Shi, Sixiong Xie, and Yun Ma.
+Sgr-bench: Benchmarking search agents on state-gated retrieval. arXiv preprint arXiv:2605.22219,
+2026.
+Jiahang Lin, Shichun Liu, Chengjun Pan, Lizhi Lin, Shihan Dou, Zhiheng Xi, Xuanjing Huang, Hang
+Yan, Zhenhua Han, Tao Gui, and Yu-Gang Jiang. Agentic harness engineering: Observability-
+driven automatic evolution of coding-agent harnesses, 2026. URL https://arxiv.org/abs/
+2604.25850.
+Xinghua Lou, Miguel Lázaro-Gredilla, Antoine Dedieu, Carter Wendelken, Wolfgang Lehrach, and
+Kevin P. Murphy. Autoharness: improving llm agents by automatically synthesizing a code harness,
+2026. URL https://arxiv.org/abs/2603.03329.
+Jun Nie, Yonggang Zhang, Jun Song, Qianshu Cai, Dahai Yu, Yike Guo, Xinmei Tian, and Bo Han.
+Tthe: Test-time harness evolution, 2026. URL https://arxiv.org/abs/2607.08124.
+Tianyue Ou, Saujas Vaduguru, and Daniel Fried. Analyzing information sharing and coordination in
+multi-agent planning, 2025. URL https://arxiv.org/abs/2508.12981.
+Timo Schick, Jane Dwivedi-Yu, Roberto Dessi, Roberta Raileanu, Maria Lomeli, Eric Hambro, Luke
+Zettlemoyer, Nicola Cancedda, and Thomas Scialom. Toolformer: Language models can teach
+themselves to use tools. In Thirty-seventh Conference on Neural Information Processing Systems,
+2023. URL https://openreview.net/forum?id=Yacmpz84TH.
+Philip Schroeder, Nathaniel W. Morgan, Hongyin Luo, and James R. Glass. THREAD: Think-
+ing deeper with recursive spawning.
+In Luis Chiruzzo, Alan Ritter, and Lu Wang, editors,
+Proceedings of the 2025 Conference of the Nations of the Americas Chapter of the Associ-
+ation for Computational Linguistics: Human Language Technologies (Volume 1: Long Pa-
+pers), pages 8418–8442, Albuquerque, New Mexico, April 2025. Association for Computa-
+tional Linguistics. ISBN 979-8-89176-189-6. doi: 10.18653/v1/2025.naacl-long.427. URL
+https://aclanthology.org/2025.naacl-long.427/.
+Dat Tran and Douwe Kiela. Single-agent llms outperform multi-agent systems on multi-hop reasoning
+under equal thinking token budgets, 2026. URL https://arxiv.org/abs/2604.02460.
+Varun Ursekar, Apaar Shanker, Veronica Chatrath, Yuan Xue, and Samuel Marc Denton. VeRO:
+A harness for agents to optimize agents. In Forty-third International Conference on Machine
+Learning, 2026. URL https://openreview.net/forum?id=zQzmwG2Nue.
+Yike Wang, Huaisheng Zhu, Zhengyu Hu, Yige Yuan, Zhengyu Chen, Shakti Senthil, Hannaneh
+Hajishirzi, Yulia Tsvetkov, Pradeep Dasigi, and Teng Xiao. Rethinking the evaluation of harness
+evolution for agents. In COLM 2026 The 2nd Workshop on Lifelong Agents: Learning, Aligning,
+and Evolving, 2026a. URL https://openreview.net/forum?id=WVAeeSlVim.
+Yiping Wang, Qing Yang, Zhiyuan Zeng, Liliang Ren, Liyuan Liu, Baolin Peng, Hao Cheng, Xuehai
+He, Kuan Wang, Jianfeng Gao, Weizhu Chen, Shuohang Wang, Simon Shaolei Du, and yelong
+shen. Reinforcement learning for reasoning in large language models with one training example.
+In The Thirty-ninth Annual Conference on Neural Information Processing Systems, 2025. URL
+https://openreview.net/forum?id=IBrRNLr6JA.
+7
+
+
+Yutong Wang, Siyuan Xiong, Xuebo Liu, Wenkang Zhou, Liang Ding, Miao Zhang, and Min Zhang.
+Agentdropoutv2: Optimizing information flow in multi-agent systems via test-time rectify-or-reject
+pruning. arXiv preprint arXiv:2602.23258, 2026b.
+Peng Xia, Rujun Han, Zifeng Wang, Yanfei Chen, Yufan Zhuang, Yoonho Lee, Chengsong Huang,
+Han Yu, Zhongying CuiZhu, Yifei Ming, Huaxiu Yao, Burak Gokturk, Tomas Pfister, and Chen-
+Yu Lee. Rrsi: Regularized recursive self-improvement of agent harnesses, 2026. URL https:
+//arxiv.org/abs/2609.24972.
+Chengrun Yang, Xuezhi Wang, Yifeng Lu, Hanxiao Liu, Quoc V. Le, Denny Zhou, and Xinyun
+Chen. Large language models as optimizers. In The Twelfth International Conference on Learning
+Representations, ICLR 2024, Vienna, Austria, May 7-11, 2024. OpenReview.net, 2024. URL
+https://openreview.net/forum?id=Bb4VGOWELI.
+Mert Yuksekgonul, Federico Bianchi, Joseph Boen, Sheng Liu, Zhi Huang, Carlos Guestrin, and
+James Zou. Textgrad: Automatic "differentiation" via text, 2024. URL https://arxiv.org/
+abs/2406.07496.
+Alex Zhang, Omar Khattab, and Tim Kraska. Recursive language models. In The Fortieth Annual
+Conference on Neural Information Processing Systems, 2026a. URL https://openreview.
+net/forum?id=ColZtoh6As.
+Hangfan Zhang, Shao Zhang, Kangcong Li, Chen Zhang, Yang Chen, Yiqun Zhang, Lei Bai, and
+Shuyue Hu. Self-harness: Harnesses that improve themselves. arXiv preprint arXiv:2606.09498,
+2026b.
+Jenny Zhang, Shengran Hu, Cong Lu, Robert Lange, and Jeff Clune. Darwin godel machine: Open-
+ended evolution of self-improving agents, 2026c. URL https://arxiv.org/abs/2505.22954.
+Jiayi Zhang, Jinyu Xiang, Zhaoyang Yu, Fengwei Teng, Xiong-Hui Chen, Jiaqi Chen, Mingchen
+Zhuge, Xin Cheng, Sirui Hong, Jinlin Wang, Bingnan Zheng, Bang Liu, Yuyu Luo, and Chenglin
+Wu. AFlow: Automating agentic workflow generation. In The Thirteenth International Con-
+ference on Learning Representations, 2025a. URL https://openreview.net/forum?id=
+z5uVAKwmjf.
+Shaokun Zhang, Ming Yin, Jieyu Zhang, Jiale Liu, Zhiguang Han, Jingyang Zhang, Beibin Li, Chi
+Wang, Huazheng Wang, Yiran Chen, and Qingyun Wu. Which agent causes task failures and when?
+on automated failure attribution of LLM multi-agent systems. In Forty-second International Confer-
+ence on Machine Learning, 2025b. URL https://openreview.net/forum?id=GazlTYxZss.
+Andrew Zhu, Liam Dugan, and Chris Callison-Burch. Redel: A toolkit for llm-powered recursive
+multi-agent systems, 2024. URL https://arxiv.org/abs/2408.02248.
+A
+Appendix
+B
+Limitations
+For technical reasons, we were restricted to use Gemini models and Antigravity during the course of
+this work. It would be interesting to extend such experiments to additional models and harnesses.
+Another limitation is that we only used DeepSearchQA, and extending our evaluation to additional
+benchmarks would be appealing. Other knobs we would have liked to explore altering with more
+time and compute available is the number of optimization iterations, and the number and composition
+of the samples in the training set.
+C
+Visualization of Multi-Agent System
+Figure 3 illustrates the initial multi-agent harness, showing how the orchestrator delegates work to
+subagents via spawn_sub_agent while only receiving each subagent’s final answer back into its
+context.
+8
+
+
+Figure 3: The initial MULTILOOP orchestrator (left) and its subagent (right).
+D
+Optimizer Prompts
+System Prompt — Orchestration Mode
+You are a harness engineer improving a multi-agent QA system.
+You
+have full permission to modify the codebase–-edit, create, or delete
+files to improve the system.
+Analyze the rollouts, identify failure
+patterns, and make targeted code changes.
+Commit and upload your
+changes when done.
+System Prompt for the Optimizer— Prompt-Only Mode
+You are a prompt engineer improving a multi-agent QA system.
+You may
+ONLY edit {prompts_file}.
+Analyze the rollouts, identify failure
+patterns, and make targeted prompt changes.
+Commit and upload your
+changes when done.
+User Prompt for the Optimizer (both modes)
+### Score History
+{table of all prior rounds:
+version →% correct, F1, P, R}
+### Rollouts
+{path to rollout dir}.
+Each example subdirectory contains
+summary.json (prompt, expected answer, agent response) and
+rollout.md (step-by-step tool calls and outputs).
+### Instructions
+1. Read rollouts to understand failures.
+2. Identify failure patterns.
+9
+
+
+3. Make targeted changes.
+4. Verify the code builds.
+5. Commit and upload.
+E
+Price Breakdown of Experimental Setup
+We limited the number of optimization steps, and training examples due to budget constraints. A
+single evaluation over the test set (890 questions × 2 runs) costs about $7.3K for the unoptimized
+harness, $12.9K for the fully optimized harness, and $9.5K for the prompt-only harness (mean $4.25,
+$7.15, and $5.25 per question), and each evaluation of the 10-question training set costs $104 and
+$213 for the unoptimized and optimized harnesses (mean $10 and $21 per question, since these are
+the hardest examples).
+F
+Failure Mode Taxonomy
+Bad Orchestration The orchestrator makes poor decisions about when, how, and how many subagents
+to dispatch. This includes spawning parallel subtasks that have logical dependencies, sending overly
+broad or keyword-style prompts to subagents, spawning redundant subagents, over-parallelizing
+subagents, and falling into verification loops instead of outputting the final answer. Ineffective Tool
+Usage Agents fail at the mechanical level of tool selection and execution, such as picking the wrong
+tool for the content type (e.g. using the browse tool to examine pdfs), being blocked by sandbox
+limitations, not following through on stated tool intentions, and using the Python tool to simply call
+existing tools without further analysis of their results. Retrieval Scope Drift The agent loses track of
+key constraints mid-task, or fails to validate that all required entities satisfy those constraints before
+producing a final answer. Criterion Mismatch The agent reaches a relevant source but applies an
+incorrect decision rule, field definition, aggregation level, or time window. The resulting answers
+often contain locally correct values bound to the wrong criterion, like using data from the wrong
+year. Tool Output Misreading The agent reaches the correct page or data source but misreads a
+local value, label, or field. Some common examples are misinterpreting tool outputs like flattened
+tables, confusing similar-looking fields or rows, or struggling to extract data from interactive charts
+and paginated results that require dynamic interaction. Retrieval Dependency Errors The agent
+obtains correct intermediate results from individual sources but fails to properly connect them, such
+as failing to resolve conflicting data across sources or failing to join datasets from separate subagents
+into a comparative table. Final Answer Composition Agents produce verbose final answers with
+markdown tables, caveats, and paragraph explanations when a specific, concise answer is required.
+G
+System Architecture Updates
+Table 2 and Table 3 summarize the concrete harness and prompt changes implemented to address
+each identified failure category, from orchestration instructions to tool-output parsing guidance.
+10
+
+
+Error Category
+Implemented Harness Change
+Bad Orchestration
+Updated the orchestrator’s system instruction to direct how to manage subagents: You are the
+Orchestrator.
+Your job is to break down complex queries into smaller,
+independent sub-queries and spawn subagents to solve them.
+When a task
+involves comparing data across multiple entities (e.g., countries, years,
+boroughs), ALWAYS dispatch separate subagent queries for each entity so
+they can be researched in parallel.
+Be highly specific in your queries
+to the subagents so they know exactly what data to find.
+Ineffective Tool Usage
+Modified the orchestrator’s system instruction to instruct subagents to use specific tools for
+specific tasks: If the task involves analyzing datasets or tabular data,
+explicitly instruct the subagents to use their ‘run_python‘ tool to
+download and process the data.
+Modified error messages in failed tool executions:
+f’ERROR: Failed to extract page {page_number} from {url}
+Reason:
+{e}
+The PDF may be unavailable, require authentication, or the URL may point
+to an HTML page instead of a PDF. Try using the ‘browse‘ tool on this
+URL.’
+Updated the subagent’s system instruction on how to use tools:
+CRITICAL: When
+searching for specific statistics, numbers, or tabular data, Google
+Search snippets usually do NOT contain the exact answer.
+Instead of
+iteratively guessing numbers in your search queries, you MUST use the
+‘browse‘ tool to read the full page of the most promising URLs returned
+by ‘google_search‘.
+For PDF documents, use the ‘pdf_tool_search‘
+and ‘pdf_tool_extract‘ tools.
+For datasets, CSVs, or complex data
+analysis, use the ‘run_python‘ tool to download the data with
+‘download_lib.download_file()‘ and analyze it using ‘pandas‘.
+Added a hint in the function declaration of the google_search tool:
+If the exact answer
+is not in the snippets, do NOT guess numbers in new queries; instead, use
+the ‘browse‘ tool on the returned URLs.
+Added a new tool for downloading online files, like CSVs: def download_file(url:
+str,
+save_path:
+str = "downloaded_file") -> str:
+"""Downloads a file from the internet to the local sandbox."""
+...
+Table 2: Examples of optimization mitigations for failure modes. (Part 1)
+11
+
+
+Error Category
+Implemented Harness Change
+Tool Output Misreading
+Updated
+the
+subagent’s
+system
+instruction
+to
+explain
+the
+use-cases
+of
+different
+tools:
+CRITICAL: When searching for specific statistics, numbers,
+or tabular data, Google Search snippets usually do NOT contain the
+exact answer.
+Instead of iteratively guessing numbers in your search
+queries, you MUST use the ‘browse‘ tool to read the full page of the
+most promising URLs returned by ‘google_search‘.
+For PDF documents,
+use the ‘pdf_tool_search‘ and ‘pdf_tool_extract‘ tools.
+For datasets,
+CSVs, or complex data analysis, use the ‘run_python‘ tool to download
+the data with ‘download_lib.download_file()‘ and analyze it using
+‘pandas‘.
+Updated the function declarations of the tools to instruct the subagents how to use the tools in
+the sandboxed environment and parse their outputs: You MUST use the provided tools.
+NOTE: ALL injected tools return RAW STRINGS (str).
+If the returned
+string is in JSON format, you MUST parse it using ‘json.loads()‘ before
+indexing into it as a dictionary or list...
+str and extract_page(url:
+str, page_number:
+int) -> str
+- download_lib:
+download_file(url:
+str, save_path:
+str =
+"downloaded_file") -> str
+Use ‘download_lib‘ to download CSV, JSON, or other data files into your
+sandbox.
+DO NOT use requests/urllib, they will fail.
+Call the tools directly in your python code.
+For example:
+import json
+res = json.loads(google_search_lib.search(queries=["q1"]))
+download_lib.download_file(
+"https://example.com/data.csv", "data.csv")
+import pandas as pd
+df = pd.read_csv("data.csv")
+print(df.head())
+Final Answer Comp.
+Added a strict guardrail in the orchestrator’s system instruction: CRITICAL INSTRUCTION
+FOR FINAL RESPONSE:
+When you have gathered the required information, you MUST output ONLY
+the exact requested answer as your final text.
+ABSOLUTELY NO CONVERSATIONAL FILLER. Do not use phrases like "Based
+on...", "According to...", or "The answer is...".
+If the answer is a
+list of items, provide a simple comma-separated list of those items and
+NOTHING ELSE. Any extra text, explanations, or context will cause the
+test to FAIL.
+Table 3: Examples of optimization mitigations for failure modes. (Part 2)
+H
+Behavioral Changes: Before vs. After Examples
+Table 4 and Table 5 contrast pre- and post-optimization rollout behavior across representative
+questions, demonstrating measurable shifts such as adopting programmatic data processing, resolving
+sequential dependencies correctly, and browsing full pages instead of relying on search snippets.
+12
+
+
+Table 4: Examples of optimization mitigations for failure modes. (Part 1)
+Behavioral
+Change
+Example & Question
+“Before”
+Rollout
+Quote / Action
+“After” Rollout Quote
+/ Action
+Programmatic
+Data Processing
+(Using
+Python
+to download and
+parse data instead
+of searching)
+Question:
+“Based
+on OWID sources for
+records of the year
+2021... which country
+had the largest child
+mortality rate also in
+2021.”
+Quote:
+“I’ll use the
+Python tool to find the
+specific values or rank-
+ings by searching for
+‘top
+age-standardized
+death rates 2021’ on the
+web or looking for the
+GBD 2021 publication.”
+Action: The agent im-
+properly attempts to use
+the Python environment
+merely to run iterative
+Google search queries
+without
+downloading
+data, resulting in hal-
+lucinated values from
+snippets.
+Quote: “Since I can’t
+browse the interactive
+table results easily via
+search snippets, I will
+use Python to search and
+maybe download if I
+find a CSV link.”
+Action: The subagent
+successfully
+uses
+Python to circumvent
+sandbox
+limitations,
+utilizing
+the
+injected
+download_lib tool to
+fetch the CSV datasets,
+parse them with pandas,
+and
+extract
+the
+real
+values for 2021.
+Sequential
+Dependency
+Resolution
+(Waits for inter-
+mediate facts be-
+fore proceeding)
+Question:
+“Accord-
+ing to Toyota, what
+is the part number for
+the oil filter cap as-
+sembly for the high-
+est MSRP 2020 Toy-
+ota SUV that uses a
+battery with the same
+chemistry as the 2021
+Toyota Aqua?”
+Action: The Orchestra-
+tor attempted to solve
+the logically dependent
+steps at once by blindly
+guessing the target ve-
+hicle in parallel.
+It
+dispatched queries like:
+“oil filter cap assembly
+part number for 2020
+Toyota Land Cruiser”
+and “oil filter cap as-
+sembly part number for
+2020 Toyota Highlander
+Hybrid”
+before
+even
+identifying the required
+battery chemistry.
+Quote:
+“What is the
+battery
+chemistry
+of
+the 2021 Toyota Aqua?”
+and
+“Which
+2020
+Toyota SUV models use
+a battery with the same
+chemistry as the 2021
+Toyota Aqua?”
+Action:
+The Orches-
+trator avoids guessing
+and correctly assigns
+subagents sequentially
+to identify the Bipolar
+NiMH battery before ex-
+ecuting a targeted search
+for the Highlander Hy-
+brid’s oil filter cap.
+Continued on next page...
+13
+
+
+Table 5: Examples of optimization mitigations for failure modes. (Part 2)
+Behavioral
+Change
+Example & Question
+“Before”
+Rollout
+Quote / Action
+“After” Rollout Quote
+/ Action
+Page Browsing
+(Opening URLs
+to read full text
+instead of relying
+on snippets)
+Question:
+(Implied
+from context) Calcu-
+late the horsepower-
+to-cargo-volume ratio
+for specific Honda ve-
+hicles based on Kel-
+ley Blue Book (KBB)
+data.
+Quote: “I’ll present the
+calculation using Maxi-
+mum Cargo Volume as
+it’s the standard for gen-
+eral comparison.”
+Action:
+The
+agent
+relied entirely on the
+google_search
+snip-
+pets.
+Without reading
+the full context of the
+spec sheet, it incorrectly
+chose
+the
+minivan’s
+maximum cargo volume
+(144.9 cu. ft. with seats
+removed) instead of the
+standard trunk space,
+skewing the math.
+Quote:
+“I will use
+Google Search to find
+the
+specific
+kbb.com
+page for the 2023 Honda
+HR-V and then use the
+browse tool to extract
+the required specifica-
+tions.”
+Action:
+Guided by a
+new instruction to use
+the browse tool,
+the
+agent
+establishes
+the
+correct detailed inten-
+tion. This rigorous ap-
+proach causes it to ac-
+curately extract the stan-
+dard cargo volume be-
+hind the third row (“32.8
+cu.
+ft.”), leading to
+the correct mathematical
+conclusion.
+Over-
+Delegation
+&
+Exhaustive
+Verification
+(Degradation)
+(Over-thinking
+and
+getting
+trapped in loops)
+Question:
+(Implied
+from context) Find
+the most recently seen
+species among those
+assessed as ‘Extinct’
+(EX) on the IUCN
+Red List that occurred
+in Spain.
+Action: The subagent
+correctly
+zeroes
+in
+on multiple candidate
+species
+and
+executes
+Python looping scripts
+to cross-reference their
+last-seen
+dates
+via
+google search, rapidly
+deducing that the fresh-
+water snail Islamia ateni
+was the most recent.
+Quote: “Are there any
+others? I’ll use google
+search within python to
+find the specific list of
+EX insects in Spain.”
+Action:
+Even though
+the
+Orchestrator
+es-
+tablished
+the
+correct
+answers internally,
+it
+became paranoid about
+proving a negative.
+It
+redundantly
+spawned
+multiple subagents to
+hunt for obscure species,
+trapping the system in
+an endless verification
+loop.
+14

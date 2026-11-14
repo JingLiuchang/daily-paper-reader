@@ -1,0 +1,719 @@
+Hybrid Product Search Without the Copy: Lexical,
+Semantic and Filtered Retrieval Served Directly
+from a Data Lake
+Raghvendra Yadav, Xiang Fu, Chinmay Soman
+StarTree Inc., Mountain View, CA, USA
+{raghvendra, xiangfu, chinmay}@startree.ai
+Abstract—E-commerce catalogs increasingly live in lakehouse
+tables: Apache Iceberg metadata over Parquet files in object
+storage. Product search, however, still runs on copies of that
+catalog, in a lexical engine and a vector database, each with its
+own ingestion pipeline, schema, staleness window and bill. We
+show that search applications can be hosted directly on the data
+lake, with the lakehouse table as the single system of record.
+We extend Apache Pinot, a real-time OLAP engine that already
+serves Iceberg tables in place, with BM25 relevance scoring over
+its Lucene text index, corpus-wide term statistics so that scores
+are comparable across files, and reciprocal rank fusion in plain
+SQL; a real-time table fed by a stream can sit behind the same
+table, merged by the broker. On the Amazon ESCI benchmark
+(1.2M US products, 22,458 test queries), hybrid search served
+from the lake matches exact retrieval (nDCG@10 .361). The
+lake table is queryable 149 s after its files are registered, and
+a lake commit is searchable in 3.8 s, close to indexing directly
+into a search engine. On a brand-sorted lake of 277M products
+(0.8 TB), one 16-vCPU node answers brand-scoped vector, BM25
+and client-fused hybrid searches in 6.5–9 ms (p50), sustains 1,100
+vector and 635 BM25 searches per second at under 180 ms p99,
+and makes a commit searchable in 4.3 s. Search adds only its
+indexes: no copy of the catalog, no sync pipeline and no second
+schema, which cuts storage, rebuild time and the operational
+work of keeping copies consistent.
+Index Terms—product search, hybrid retrieval, BM25, vector
+search, reciprocal rank fusion, data lakehouse, Apache Iceberg
+I. Introduction
+Product catalogs are now routinely stored as lakehouse
+tables [1]: Parquet files in object storage described by an
+Iceberg [2] snapshot. Analytics, feature pipelines and reporting
+read those files in place. Search does not. A typical retail
+search stack copies the catalog into a lexical engine for
+BM25 [3] and into a vector database for dense retrieval, then
+fuses the two result lists in the application. Each copy has
+its own ingestion job, schema mapping, access control and
+freshness lag. Search freshness is then set by the slowest of
+these pipelines, every schema change has to be made three
+times, and every backfill, re-index and consistency check is
+operational work that exists only because the data was copied.
+We ask whether search applications—lexical, semantic and
+filtered product search—can run directly on the lake’s own
+files, with the lake as the only system of record and no loss of
+relevance, freshness or interactive latency. We build on Apache
+Pinot [4], which can already serve Iceberg tables in place by
+treating each Parquet data file as a segment, and make three
+contributions:
+1) Relevance over files we do not own. We add BM25
+scoring to Pinot’s Lucene text index (TEXT_SCORE),
+with a two-phase protocol that gathers corpus-wide
+term statistics (TEXT_SCORE_STATS), in the spirit of
+Elasticsearch’s DFS phase, so scores are comparable
+across files.
+2) Hybrid retrieval in SQL. BM25, approximate nearest-
+neighbour (ANN) search with structured filter push-
+down, and reciprocal rank fusion (RRF) [5] compose in
+one SQL query; corpus-wide BM25 statistics take one
+preceding metadata-only request.
+3) An evaluation on Amazon ESCI [6]: relevance on
+all 22,458 test queries with paired significance tests,
+onboarding, freshness, latency, throughput on a 277M-
+product lake, and infrastructure cost.
+Quality served from the files matches exact retrieval; the table
+is queryable minutes after its files are registered and a lake
+commit is searchable in seconds; selective queries answer
+in milliseconds; and the search tier stores only its indexes,
+never the rows. Selective queries, the common case in product
+search, are where the design is strongest: file statistics skip
+most of the lake before any index is touched.
+II. Background and Related Work
+Lakehouse tables. Iceberg tracks a table as a sequence of
+immutable snapshots, each listing Parquet data files and (in
+format v3) deletion vectors. Engines read the files with range
+requests against object storage.
+Lexical and dense retrieval. BM25 [3] scores a document
+by term frequency, inverse document frequency (IDF) and
+length normalisation; the IDF and average length are corpus
+statistics, so a sharded index returns comparable scores only
+if shards share them (Elasticsearch’s DFS phase [7]). Dense
+retrieval embeds queries and products with a bi-encoder and
+searches an ANN index such as HNSW [8]. Dense retriev-
+ers [9] are brittle out of domain, where BM25 remains a
+hard baseline [10]; on product search the two are comple-
+mentary [6], and filters can be applied before, during or after
+the graph search, with filter-aware graph indexes applying
+them during traversal [11], [12]. Fusion can be score-based
+(a convex combination of normalised scores) or rank-based;
+arXiv:2611.11031v1  [cs.LG]  8 Nov 2026
+
+
+RRF [5] needs no score calibration and is supported natively
+by most engines, although tuned convex combinations can do
+better with in-domain labels [13].
+Hybrid engines and search near the lake. Vespa [14],
+Elasticsearch [7] and OpenSearch combine lexical, vector
+and filtered retrieval with built-in fusion, but over their own
+ingested copy. Vector stores such as Milvus [15], Qdrant
+and Weaviate add hybrid and filtered search; Lance [16]
+and turbopuffer [17] keep their own index formats on object
+storage, and lakehouse vendors offer managed vector search
+synced from tables [18]. Lakehouse formats such as Delta
+Lake [19] and Iceberg made the lake transactional, which
+is what lets a search tier bind its indexes to a consistent
+snapshot. Closest to our work, Rottnest [20] builds substring,
+BM25 and vector indexes next to Parquet files on object
+storage, an index lake for Anserini [21] keeps postings as lake
+tables, and per-file ANN indexes composed with Iceberg file
+pruning serve filtered vector search [22]. We add corpus-wide
+BM25 statistics across per-file indexes, index lifecycle bound
+to Iceberg snapshots, one table across lake and stream, and
+a product-search evaluation. Our setting differs from all of
+the above: the source files belong to the lake, are written by
+other engines and change by snapshot; the search engine adds
+indexes on its own tier but never ingests or rewrites the rows.
+III. Architecture
+A. Indexes over files we do not own
+An external table maps every Parquet data file in the current
+Iceberg snapshot to one Pinot segment. Registration copies
+no rows: the segment directory holds metadata and a pointer
+to the source file, and the source file is the forward index.
+Secondary indexes—here a Lucene text index on the product
+text and an HNSW index on the embedding column—are built
+by the server when the segment loads, from column chunks
+read with range requests, and stored on the server’s tier next
+to the segment metadata; nothing is written into the lake. The
+indexes are the only search-side state. On ESCI the HNSW
+index takes about 3.1 KB per product and the text index about
+222 B, so vector indexes dominate index storage (Section V-D).
+B. Snapshot-consistent freshness
+A controller task follows the Iceberg catalog. New data files
+become new segments; when all segments of a snapshot are
+loaded, the snapshot is published and the broker routes queries
+to exactly that snapshot’s segments, pinning one snapshot per
+query. Removed files leave the routing table only when the
+snapshot that dropped them is published, so readers never see
+a half-applied commit. Iceberg v3 deletion vectors are applied
+at query time.
+C. Building indexes for a new file
+A new data file becomes queryable once its own indexes ex-
+ist, so the build sits on the freshness path. Three choices keep
+it short. The HNSW writer buffers the whole file (512 MB)
+so that its graph is built once rather than flushed in small
+pieces and merged; small files, typical of a streaming commit,
+are built from several threads, each into its own Lucene
+segment, and attached without a rebuild; and the controller
+polls segment state every 500 ms. Nothing is force-merged
+afterwards: each file keeps its own graph for its whole life.
+D. Cold and warm read paths
+Footers are read once and cached; later reads fetch single
+pages through the Parquet page index and a local page cache.
+Index files are persisted next to the segment metadata on
+the server’s tier and memory-mapped, so index lookups never
+touch object storage and the lake serves only the columns a
+query returns. Lucene reads the index buffers directly, without
+copying each page into a heap array (Section VI).
+E. Streaming and batch in one table
+New and changed products can also arrive on a Kafka
+stream into a Pinot real-time table, while the catalog of record
+stays in Iceberg as an external table. Both sit behind one
+hybrid or logical table: the broker keeps a time boundary
+between them, routes each query to lake segments for data
+before the boundary and to real-time segments for data after
+it, and merges the results, so applications see a single table.
+Search and analytics run over both through the same SQL,
+and data lands once in the lake: one pipeline and one query
+surface, a kappa-style design rather than separate batch and
+speed layers. This paper evaluates the lake path; the streaming
+path is Pinot’s existing real-time ingestion and is not measured
+here.
+F. BM25 scoring with corpus-wide statistics
+Pinot’s text predicate TEXT_MATCH was a boolean fil-
+ter: its Lucene collectors ran without scoring. We add
+TEXT_SCORE(column, query), which parses the query
+exactly as TEXT_MATCH does and returns the Lucene BM25
+score (𝑘1=1.2, 𝑏=0.75), or 0 for non-matching documents. Per
+segment it runs one scored search on the first block and serves
+later blocks from a document-to-score map. No re-indexing is
+needed: term frequencies and length norms are already stored.
+For a query 𝑞and document 𝑑,
+BM25(𝑞, 𝑑) =
+∑︁
+𝑡∈𝑞
+ln
+
+1 + 𝑁−𝑛𝑡+ 0.5
+𝑛𝑡+ 0.5
+
+𝑓𝑡,𝑑(𝑘1 + 1)
+𝑓𝑡,𝑑+ 𝑘1
+ 1 −𝑏+ 𝑏|𝑑|/|𝑑| ,
+(1)
+where 𝑓𝑡,𝑑is the term frequency, 𝑁the number of documents, 𝑛𝑡
+the number containing 𝑡and |𝑑| the mean document length. 𝑁, 𝑛𝑡
+and |𝑑| are corpus statistics, and a Lucene index computes them
+over itself. Because one file is one segment, per-segment IDF
+would make scores incomparable across files: a term that is rare
+in one file is common in another, and each file’s own statistics
+leak into the global top-𝑘. We therefore add a statistics phase,
+TEXT_SCORE_STATS(column, query), an aggregation
+that reads only index metadata and returns, for each query term,
+its document frequency and total term frequency, plus document
+and token counts; the broker sums them across segments and
+servers. Passing the merged statistics to TEXT_SCORE as a
+fourth argument substitutes the global 𝑁, 𝑛𝑡and |𝑑| in Eq. (1),
+so every segment scores against corpus-wide IDF and average
+
+
+Iceberg REST catalog
+snapshot 𝑠(data
+files, DVs)
+Parquet data files
+(object storage,
+owned by the lake)
+Controller sync task
+1 data file = 1 segment
+Servers: Lucene text index +
+HNSW index, built at load
+footer cache +
+page cache (prefetch)
+Broker, pinned to snapshot 𝑠:
+(1) TEXT_SCORE_STATS →corpus-wide BM25 statis-
+tics
+(2) BM25 ∥ANN (+ filter pushdown) per segment →RRF in SQL →top-𝑘
+new snapshot
+assign segments
+range reads
+Fig. 1. Hybrid retrieval served from lakehouse files. Rows stay in the lake (blue); only indexes and caches live on the search tier (orange). Queries are routed
+to exactly one published snapshot.
+length. The statistics query touches only the term dictionary and
+per-field counts; it reads no Parquet data. Section V-B measures
+the effect on ESCI. The statistics ignore row filters and can drift
+if the snapshot changes between the two requests, as with any
+DFS-style protocol.
+G. Hybrid query execution
+Vector search uses VECTOR_SIMILARITY on the HNSW
+index. Structured filters are pushed down; per segment a
+selectivity heuristic decides whether the filter bitmap restricts
+the graph search (selective filters), is applied to the ANN
+candidates (broad filters), or the segment is scanned exactly
+(very few candidates). Fusion needs no new operator. RRF
+scores a document by its ranks 𝑟𝑖(𝑑) in the fused lists,
+RRF(𝑑) =
+∑︁
+𝑖
+1
+𝑘+ 𝑟𝑖(𝑑) ,
+𝑘= 60,
+(2)
+and in Pinot’s multi-stage engine this is plain SQL over two
+ranked candidate lists, with a deterministic tie-breaker on the
+product id:
+WITH t AS (SELECT id, ROW_NUMBER() OVER
+(ORDER BY s DESC, id) r FROM (SELECT id,
+TEXT_SCORE(text,:q,'',:stats) s
+FROM products WHERE TEXT_MATCH(text,:q)
+ORDER BY s DESC LIMIT 100)),
+v AS (SELECT id, ROW_NUMBER() OVER
+(ORDER BY d, id) r FROM (SELECT id,
+cosineDistance(emb,:qv) d FROM products
+WHERE VECTOR_SIMILARITY(emb,:qv,100)
+ORDER BY d LIMIT 100))
+SELECT id, SUM(1.0/(60+r)) rrf FROM
+(SELECT * FROM t UNION ALL SELECT * FROM v)
+GROUP BY id ORDER BY rrf DESC LIMIT 10
+Structured predicates are added to both branches and pushed
+down to the segment scans.
+IV. Experimental Setup
+We ask four questions: does serving from the lake cost
+relevance (Section V-A); how fast and how much does it serve
+at scale (Section V-C); what does it cost to onboard, store and
+run (Sections V-D–V-E); and how fresh is it (Section V-F).
+Data. Amazon ESCI [6], US locale: 1,215,854 products and
+the official test split of 22,458 queries with 425,762 judgments.
+Gains for nDCG are E=1, S=0.1, C=0.01, I=0; Recall@100
+counts Exact products. Unjudged products have zero gain, so
+absolute scores are low and the comparison between rows is
+what matters. The indexed text is the title, brand, colour and the
+first 600/400 characters of bullets and description.
+Embeddings. BGE-base-en-v1.5 [23] (768 dimensions, L2-
+normalised), computed once and stored as a Parquet column;
+every system uses the same vectors and the model’s query prefix.
+Lake. One Iceberg table (format v2, REST catalog) in
+Amazon S3, partitioned by locale (identity transform; all
+US products fall in one partition) and written by pyiceberg as
+33 Parquet files of about 133 MB (4.38 GB): one row group
+per file, zstd compression, 64 KB data pages and a page index
+(ColumnIndex and OffsetIndex) on every column chunk, rows in
+the dataset’s original order. Relevance (Table I) was computed
+over the same files and build on a development machine; a
+2,000-query sample re-run on EC2 matched to four decimals.
+Performance runs on AWS (us-west-2) with the lake in S3 in the
+same region: onboarding, freshness and the engine baselines
+on r7g.2xlarge nodes (8 Graviton3 vCPUs, 64 GB), and latency
+and throughput on one i4i.4xlarge (16 vCPUs, 128 GB, local
+NVMe) with a separate load generator in the same zone, one
+process per client, at 1 to 128 clients over 1,000 sampled queries
+after 200 warm-up queries.
+Filtered hybrid. Both retrievers and the exact reference are
+restricted to branded products (94.1%).
+Systems. (i) Pinot lake-native: external table over the Iceberg
+files, Lucene text index and HNSW vector index built over the
+remote files; (ii) Elasticsearch 9.5.5 and (iii) OpenSearch 3.9.0
+with BM25, float32 HNSW (𝑀=16, ef 𝑐=100, 1,000 candidates)
+and their native RRF, following each vendor’s guidance for a
+read-heavy single node: one shard and no replicas, a 16 GB heap
+with the rest of memory left to the file cache, the index force-
+merged to one segment after loading, and _source disabled.
+Every system uses the same analyzer (standard tokenizer,
+lowercase, English stop words, no stemming). (iv) Reference:
+exact BM25 (bm25s, same analyzer) and exact inner-product
+search.
+Metrics. nDCG@10 and Recall@100 per query, compared
+with a paired two-sided randomisation test (10,000 sign flips);
+
+
+client-side latency (p50, p99) and throughput, at 32 clients as
+the median of repeated passes; time from registration or commit
+to fully searchable; and bytes stored beyond the lake.
+V. Results
+A. Retrieval quality
+Table I reports quality. Hybrid retrieval improves on both
+single modes in the exact reference (nDCG@10 .361 vs. .308
+BM25 and .350 vector), matching the complementarity reported
+on ESCI. Corpus-wide statistics matter: with per-segment IDF,
+lake-native BM25 falls to .271 nDCG@10; with the two-step
+statistics protocol it reaches .312, within .004 of the exact
+reference. HNSW costs .003 nDCG@10 against exact search.
+BM25 is identical across Pinot, Elasticsearch and OpenSearch
+(.312, 𝑝=0.49), as expected from the same analyzer and corpus
+statistics. Pinot’s vector and hybrid runs are slightly higher
+(hybrid +.005 to +.007, 𝑝< 10−4; +.013 to +.016 when
+the engines use 200 candidates) because Pinot ranks a larger
+candidate budget, the top 100 of each file’s graph (3,300 in all),
+against the engines’ 1,000; this reflects the budget, not a better
+index. With the broad brand filter, lake-native filtered hybrid
+and the exact filtered reference agree to the third decimal on the
+2,000-query sample (.345 / .595). Global statistics also carry
+into fusion: on the same sample, hybrid with per-segment IDF
+scores .341 against .360 with global statistics.
+B. Ablations
+Corpus statistics. Global statistics improve lake-native
+BM25 by +.040 nDCG@10 (𝑝< 10−4); they win on 10,034
+queries and lose on 3,685, with the rest tied. This is the one
+place where storing a table as many independent files changes
+relevance, and Eq. (1) with summed statistics removes the effect.
+Rewriting the same rows sorted by brand (a skewed layout)
+moves per-file BM25 from .272 to .293 nDCG@10 on the
+2,000-query sample, while global statistics give .314 under both
+layouts: with summed statistics, relevance no longer depends on
+how the lake happens to cut its files.
+Fusion in SQL. In-engine RRF matches client-side fusion
+(.3610 vs. .3605 nDCG@10).
+C. Latency and throughput
+Latency and throughput are measured on a lake of 277M
+products: replica 0 is the ESCI catalog and each of 227 further
+replicas gets new product ids and embeddings perturbed by
+Gaussian noise (cosine 0.95 to the original), written as 2,052
+files of about 400 MB and sorted by brand, as a lake clustered on
+a common filter column would be. A brand-scoped query skips
+all but one of the 2,052 files from their statistics and searches
+that one, re-applying the filter inside it, so a sorted rather than
+partitioned layout is safe [22]. One node then sustains 1,103
+vector searches per second at 53 ms p99, 635 BM25 searches
+and 375 hybrid searches fused by the application (Table II);
+fusing in SQL runs through the multi-stage engine and adds
+about 25 ms per query at one client. Throughput depends on
+the working set: the same load spread over 21,000 queries and
+their brands gives 318 vector searches per second, and a brand
+0
+1
+2
+3
+4
+Iceberg metadata
+text index
+HNSW index
+persist to S3
+open segment
+status poll
+Fig. 2. Where the 3.8 s from a lake commit to searchable goes on EC2, in
+seconds (one run; 10,000 new products in one file). Index building is under a
+third of it.
+touched for the first time answers in 237 ms (p50) while its
+pages load. A query without a selective filter searches every
+file’s graph, the case this design does not target. Servers share
+no per-query state, so throughput should grow with the number
+of servers; a multi-server run is future work. A commit of 10,000
+products to this lake is searchable in 4.3 s (median of three: 3.7,
+4.3, 4.9 s).
+D. Onboarding and storage
+Registering the 33 files takes 3.4 s; each segment then builds
+its text and HNSW indexes as it loads; the first segment answers
+after 31 s and the table after 149 s, while a copy-based engine
+must first read every row out of the lake, write it again and force-
+merge (Table III). Vector indexes dominate storage everywhere
+(3.78 GB), so the saving is the rows copied out of the lake and
+the pipeline that keeps them in sync.
+E. Infrastructure cost
+A copy-based stack copies the rows out of the lake onto
+each replica (the _source of a production index), runs a sync
+pipeline, and rebuilds by bulk loading and force-merging; Pinot
+keeps only its indexes (Table IV; on-demand prices, pipeline
+as one small instance). At 1.2M products both need two nodes
+at low load, so Pinot costs 0.91 of the copy-based stack, and
+0.46 below 47 QPS when search joins an existing lake analytics
+cluster (one node per 47 hybrid QPS, the measured single-node
+peak at this size, and no replicas of its own); it stays cheaper up
+to about 90 hybrid QPS. At 277M products, with two i4i.4xlarge
+replicas for either stack, the lake path avoids copying 1.6 TB of
+rows and running the pipeline, builds all its indexes in 2.7 h
+on one node against an estimated 45 h, and costs 0.98 of the
+copy-based stack, since node count now dominates the bill. The
+comparison omits the engineering time a pipeline takes to run.
+F. Freshness
+We commit 10,000 new products to the Iceberg table as
+one Parquet file and measure the time until all are searchable
+(50 sampled unique tokens return their products and the row
+count matches; 1 s polling, three runs). For Elasticsearch and
+OpenSearch we hand the copy pipeline the change set for free
+(no change-data-capture lag), bulk-index it and refresh. On EC2,
+commit-to-searchable (median of three) is 3.8 s for Pinot lake-
+native and 3.1 s and 3.6 s for Elasticsearch and OpenSearch,
+whose numbers exclude any pipeline lag. Figure 2 breaks the
+3.8 s down: the new file’s indexes take 1.1 s, while reading
+Iceberg metadata from S3 (1.1 s) and persisting the indexes
+before the segment goes online (0.7 s) together take longer; the
+
+
+TABLE I
+Retrieval quality on the ESCI-US test split (22,458 queries). Filtered hybrid restricts both retrievers to branded products.
+BM25
+Vector (HNSW)
+Hybrid RRF
+Filtered hybrid
+System
+nDCG@10
+R@100
+nDCG@10
+R@100
+nDCG@10
+R@100
+nDCG@10
+R@100
+Reference (exact BM25 / exact cosine)
+.308
+.530
+.350
+.609
+.361
+.621
+.342
+.588
+Pinot lake-native (global BM25 statistics)
+.312
+.533
+.348
+.603
+.361
+.622
+.345†
+.595†
+with per-segment IDF
+.271
+.506
+.341†
+.612†
+Elasticsearch 9.5.5 (1,000 candidates)
+.312
+.533
+.339
+.588
+.354
+.620
+–
+–
+OpenSearch 3.9.0 (ef search 1,000)
+.312
+.533
+.342
+.593
+.356
+.621
+–
+–
+†On a fixed 2,000-query sample (seed 2026). On the same sample the exact filtered reference reaches .345 / .595, and lake-native hybrid with global
+statistics .360 / .623.
+TABLE II
+277M products (0.8 TB, 2,052 files sorted by brand) on one i4i.4xlarge
+(16 vCPU, 128 GB, local NVMe; indexes memory-mapped). Latency in
+ms. 1,000 queries (500 for the one-client vector run), each scoped to
+the most common brand among its relevant products; 32-client rows
+are the median of 20–40 passes after warm-up. BM25 and hybrid use
+per-snapshot corpus statistics (Section VI; SQL RRF row with an
+earlier table covering 95.4% of queries).
+1 client
+32 clients
+Files
+Mode
+p50/p99
+QPS
+p50/p99 searched
+Brand vector
+7.5/9.5
+1,103
+27/53
+1
+Brand BM25
+6.5/47
+635
+40/176
+1
+Brand hybrid, client RRF
+8.9/48
+375
+75/246
+1
+Brand hybrid, SQL RRF
+33/74
+122
+252/389
+1
+latter can move off the critical path. Every query sees whole
+snapshots, never a half-applied batch.
+VI. Design Insights
+Per-file indexes trade fan-out for incremental freshness.
+A lake commit indexes only its new file (1.1 s on EC2) and
+nothing is ever merged, while an engine with one graph per
+index force-merges after a bulk load (260 s and 231 s). File size
+is the knob between how much a commit re-indexes and how
+many graphs a query searches.
+Freshness is bounded by metadata and persistence, not
+indexing. Building a new file’s indexes is under a third of the
+time from commit to searchable (Figure 2); the rest is catalog
+metadata, persistence and coordination, which is where the next
+second will come from.
+Indexes on a remote tier need zero-copy reads. Serving
+HNSW reads through Lucene’s buffered input copied every page
+it touched; handing Lucene the index buffer directly raised vector
+throughput by 34% on EC2 with identical results.
+Pruning keeps the working set in memory. At 277M
+products the indexes (1.1 TB) are over eight times the node’s
+memory, yet a brand-scoped query touches only the files that
+survive pruning, whose pages stay in the page cache once warm
+(237 ms on first touch, 7.5 ms warm). Pruning must also see
+files where the filter column is entirely null: their min/max
+statistics are empty, so the pruner kept all 122 brand-less files and
+every brand query searched 123 graphs. Reading the null count
+recorded in the segment metadata and skipping such files cut
+that to one graph and raised vector throughput 25 times, from
+30 to 760 searches per second before further tuning. Sorting
+or clustering the Iceberg table on the columns queries filter by
+(brand, category, seller) turns a search over the lake into a search
+over a few files.
+Corpus statistics are per snapshot, not per query. Gath-
+ering BM25 statistics touches every file’s text index, so at 2,052
+files it cost more than the scored search itself (26 vs. 6.5 ms).
+The statistics change only with the snapshot, so we materialize
+them for the whole vocabulary (658,669 terms, 19.5 min per
+snapshot) and serve them from memory; 97.6% of queries need
+no statistics request, rankings are identical to live statistics on
+all 179 queries we checked, and BM25 throughput rose from 60
+to 635 searches per second.
+Search and analytics on one copy. Retrieval is SQL, so
+results can be faceted or aggregated in the same query (e.g.
+GROUP BY brand over the hybrid top-𝑘), over lake and
+stream alike.
+VII. Conclusion
+Search applications do not need a copy of the catalog. With
+BM25 over corpus-wide statistics, ANN with filter pushdown
+and RRF in SQL, an engine that indexes the lake’s own files
+matches exact retrieval on quality, becomes searchable minutes
+after files are registered and seconds after a commit, and on
+one node serves selective searches over 277M products in
+milliseconds, at more than 1,000 vector searches per second.
+The lake stays the single system of record, streams can join it
+behind one table, and the copy, the sync pipeline and the work
+of running them go away. The scoring and statistics functions
+will be proposed to the Apache Pinot community.
+Artifact Availability
+Benchmark scripts, table configurations and per-query results
+are available from the authors on request.
+References
+[1] M. Armbrust, A. Ghodsi, R. Xin, and M. Zaharia, “Lakehouse: A new
+generation of open platforms that unify data warehousing and advanced
+analytics,” in Proc. CIDR, 2021.
+[2] “Apache Iceberg table spec,” https://iceberg.apache.org/spec/, 2025.
+[3] S. Robertson and H. Zaragoza, “The probabilistic relevance framework:
+BM25 and beyond,” Foundations and Trends in Information Retrieval,
+vol. 3, no. 4, 2009.
+[4] J.-F. Im, K. Gopalakrishna, S. Subramaniam, M. Shrivastava, A. Tumbde,
+X. Jiang, J. Dai, S. Lee, N. Pawar, J. Li, and R. Aringunram, “Pinot:
+Realtime OLAP for 530 million users,” in Proc. SIGMOD, 2018.
+
+
+TABLE III
+Onboarding and storage for the same 1,215,854 products (EC2, each system alone). Extra bytes are what each system stores beyond the 4.38 GB
+Iceberg table it was loaded from.
+System
+Load path
+Time to queryable
+Text index
+Vector index
+Row data
+Extra bytes
+Pinot lake-native
+register 33 files (3.4 s), index at load
+149 s
+0.27 GB
+3.78 GB
+0
+4.06 GB
+Elasticsearch 9.5.5
+bulk load (4 clients), refresh
+447 s
+0.24 GB
+3.78 GB
+0∗
+4.10 GB
+OpenSearch 3.9.0
+bulk load (4 clients), refresh
+435 s
+0.50 GB
+3.78 GB
+0∗
+4.29 GB
+∗_source disabled for a like-for-like comparison; keeping it stores the rows again.
+TABLE IV
+Resources for a copy-based search engine and for Pinot on the lake,
+for two replicas, at 1.2M and 277M products (0.8 TB); relative cost at
+low load from list prices and measured throughput, copy-based = 1.
+1.2M products
+277M (0.8 TB)
+Copy
+Pinot
+Copy
+Pinot
+Rows copied out of the lake 8.8 GB
+0
+1.6 TB
+0
+Indexes
+8.2 GB 8.1 GB ≈1.9 TB∗
+2.2 TB
+Sync pipelines
+1
+0
+1
+0
+Full build, one node
+707 s
+149 s
+≈45 h∗
+2.7 h
+Nodes
+2
+2
+2‡
+2‡
+Relative cost
+1.00
+0.91
+1.00
+0.98
+∗Estimated from the 1.2M-product measurements, scaled by catalog size.
+‡One i4i.4xlarge per replica; Section V-C measures one.
+[5] G. V. Cormack, C. L. A. Clarke, and S. Buettcher, “Reciprocal rank fusion
+outperforms condorcet and individual rank learning methods,” in Proc.
+SIGIR, 2009.
+[6] C. K. Reddy et al., “Shopping queries dataset: A large-scale ESCI
+benchmark for improving product search,” 2022, arXiv:2206.06588.
+[7] C. Gormley and Z. Tong, Elasticsearch: The Definitive Guide.
+O’Reilly
+Media, 2015.
+[8] Y. A. Malkov and D. A. Yashunin, “Efficient and robust approximate
+nearest neighbor search using hierarchical navigable small world graphs,”
+IEEE TPAMI, vol. 42, no. 4, 2020.
+[9] V. Karpukhin et al., “Dense passage retrieval for open-domain question
+answering,” in Proc. EMNLP, 2020.
+[10] N. Thakur et al., “BEIR: A heterogeneous benchmark for zero-shot
+evaluation of information retrieval models,” in Proc. NeurIPS Datasets
+and Benchmarks Track, 2021.
+[11] S. Gollapudi et al., “Filtered-DiskANN: Graph algorithms for approximate
+nearest neighbor search with filters,” in Proc. WWW, 2023.
+[12] L. Patel, P. Kraft, C. Guestrin, and M. Zaharia, “ACORN: Performant and
+predicate-agnostic search over vector embeddings and structured data,”
+Proc. ACM Manag. Data, vol. 2, no. 3, pp. 120:1–120:27, 2024.
+[13] S. Bruch, S. Gai, and A. Ingber, “An analysis of fusion functions for hybrid
+retrieval,” ACM Transactions on Information Systems, vol. 42, no. 1, pp.
+20:1–20:35, 2024.
+[14] “Vespa.ai: AI search platform,” https://vespa.ai, 2025.
+[15] J. Wang, X. Yi, R. Guo et al., “Milvus: A purpose-built vector data
+management system,” in Proc. SIGMOD, 2021.
+[16] W. Pace et al., “Lance: Efficient random access in columnar storage
+through adaptive structural encodings,” 2025, arXiv:2504.15247.
+[17] “turbopuffer: Serverless vector and full-text search on object storage,”
+https://turbopuffer.com, 2025.
+[18] “Databricks
+vector
+search,”
+https://docs.databricks.com/aws/en/
+vector-search/vector-search, 2025.
+[19] M. Armbrust et al., “Delta lake: High-performance ACID table storage
+over cloud object stores,” Proc. VLDB Endow., vol. 13, no. 12, 2020.
+[20] “Rottnest: Indexes for Parquet files on object storage,” https://github.com/
+marsupialtail/rottnest, 2024.
+[21] G. Hendriksen, D. Hiemstra, J. Lin, and A. P. de Vries, “Geese belong
+in (data) lakes: An index lake for Anserini,” in Proc. ACM International
+Conference on Information and Knowledge Management (CIKM), 2026.
+[22] R. Jain, T. Griffin, and S. Zawad, “Filtered vector search in a disaggregated
+lakehouse: Composing table-format pruning with per-file ANN,” 2026,
+arXiv:2608.05441.
+[23] S. Xiao, Z. Liu, P. Zhang, and N. Muennighoff, “C-Pack: Packaged re-
+sources to advance general Chinese embedding,” 2023, arXiv:2309.07597.
