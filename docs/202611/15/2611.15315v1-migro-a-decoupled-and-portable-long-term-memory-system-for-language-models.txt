@@ -1,0 +1,1377 @@
+Title: MIGRO: A Decoupled and Portable Long-Term Memory System for Language Models
+
+URL Source: https://arxiv.org/pdf/2611.15315v1
+
+Published Time: Fri, 13 Nov 2026 02:32:36 GMT
+
+Number of Pages: 35
+
+Markdown Content:
+# MIGRO: A Decoupled and Portable Long-Term Memory System for Language Models 
+
+Memory Should Outlive the Model 
+
+Mingxi Zou 1,2 , Yinghui Xu 1, Jiaxiang Chen 1, Langzhang Liang 1, Wei Zhu 4, Peng Ye 3
+
+Runkai Zhao 3, Ruoxi Jiang 2, Sijin Chen 6, Song Wang 7, Zhuo Wang 1, Lizhen Qu 5,† , Zenglin Xu 1,†  
+
+> 1
+
+Fudan University 2 Shanghai Academy of AI for Science (SAIS) 3 Shanghai AI Laboratory  
+
+> 4
+
+Yunnan University 5 6 The University of Hong Kong 7
+
+† Corresponding authors | Mingxi Zou (mxzou24@m.fudan.edu.cn) Cross-session reasoning Temporal understanding Knowledge adaptation Learning from examples Long-horizon recall Scale-up quality 
+
+(a) Performance 
+
+> Upgrade readiness Cross-family reach History continuity Continued learning Portable efficiency Replay-free reuse
+
+(b) Transfer 
+
+> Compact state Quality density Lean appends Long-horizon compactness Economical growth Deployment economy
+
+(c) Storage        
+
+> MIGRO LSTMem TiMem PlugMem Mem0 A-MEM TransMem Doc-to-LoRA
+
+Figure 1. MIGRO’s capability profiles across performance, transfer, and storage. Farther out indicates stronger measured capability on each axis. Appendix D.8 defines the axes and their scales. 
+
+ABSTRACT 
+
+Language models evolve, but the observations, revisions, and context accumulated through user interac-tions should remain usable. Each new model must be able to retrieve past evidence, track revisions, and add new observations. We present MIGRO , a decoupled long-term memory system that treats experience as a persistent state shared across successive language models. MIGRO follows a simple principle: preserve historical evidence exactly, organize it approximately, and decide what to retrieve only when the question is known. We call this asymmetric fidelity with deferred selectivity . A shared semantic index supports retrieval, while exact records retain observations and their historical relationships. Because models differ in vocabulary and tokenization, host-specific interfaces convert selected evidence into inputs the receiving model can use. Reversible encoding reduces archival storage while enabling exact recovery. The shared state and its access interfaces let successive hosts read and extend the accumulated experience. On matched LoCoMo states, MIGRO scores 7.3% higher and uses 99.3% less private memory than the strongest quality baseline. After handoff, continued writing retains 99.9% of full-history rebuilding quality by extending the inherited state. On million-token BEAM histories, MIGRO uses 57.5% less private storage on average than the most compact baseline. MIGRO combines high answer quality, continued memory growth across hosts, and low storage cost (Figure 1). Code is available at https://github.com/zOUMINGXI/MIGRO. 
+
+1 Introduction 
+
+Memory should outlive the model. Long-running user interactions accumulate observations, revisions, and preferences that remain relevant to later questions [1, 2]. During those interactions, the language model serving the user may be upgraded or replaced. A receiving model should recover what was said, distinguish earlier versions, 
+
+1arXiv:2611.15315v1 [cs.AI] 11 Nov 2026 MIGRO 
+
+and continue accumulating experience. The enduring object is the user’s history; the reasoning engine around it can change. Memory should outlive the model. 
+
+(a) Model-bound memory (b) MIGRO         
+
+> LLM A LLM A LLM B LLM B LLM C LLM C
+> new LLM new LLM new LLM new LLM
+> Memory A Memory B Memory C
+> Train / adapt Train / adapt
+> Replay. Retrain. Repeat.
+> Heavy work at every model switch
+
+MIGRO 
+
+> One persistent experience state
+> Switch hosts. Keep growing.
+
+Figure 2. An illustrative model-bound approach repeats training or adaptation after host replacement (left). MIGRO lets successive hosts read and extend one persistent experience state (right). 
+
+Research on language model memory has advanced along complementary directions. Neural approaches integrate past information through learned representations and model states [3–6]. Retrieval-augmented and agent memory systems retain explicit evidence beyond the active context [7–10], while memory-management frameworks organize evolving records and shared resources [11, 12]. External records can already be shared across models, as illustrated by plugin and text-based memory systems [10, 13]. An earlier revision may be lost when memory is summarized, while surviving evidence may still be difficult for a new host to retrieve or interpret [14]. Preserving history and making it usable are therefore distinct requirements. Successive revisions may share a semantic neighborhood while answering different questions about the past. A durable memory must retain those distinctions before knowing which ones will matter, including their source and historical relationships [15, 16]. This motivates two complementary principles. Asymmetric fidelity preserves historical evidence exactly while allowing approximate semantic addresses that index observations for retrieval [17, 18]. Deferred selectivity 
+
+postpones evidence selection until a question is known. At read time, an evidence packet provides a temporary view of the observations or exact spans selected for that question. Future readers can revisit the retained history with new questions instead of relying on an interpretation fixed at writing time. We introduce MIGRO, a decoupled long-term memory system that realizes this separation through one persistent experience state and host-specific interfaces. Writing retains canonical observations, their provenance, historical order, and available reference links; reading selects relevant evidence and adapts it to the receiving model’s vocabulary and tokenization [19]. Reversible predictive coding stores this state in an archive, its physical persistent form, from which the saved records can be recovered [20, 21]. Changing the host replaces the access interface; subsequent writes extend the inherited state. The experiments examine three consequences of this design across conversational, operational, and long-horizon memory tasks [1, 2, 22–24]. Access ablations reveal how semantic similarity alone can miss complementary evidence. Handoff and continued-writing studies show that inherited history can remain useful and continue growing under new hosts. Matched-state and long-history measurements show that exact preservation can coexist with compact states and low marginal storage cost. Our contributions are organized around three complementary requirements of long-term memory: 1. High-quality memory through fidelity-aware access. We introduce asymmetric fidelity with deferred selec-tivity , separating exact historical evidence from approximate semantic organization and query-conditioned access. Shared semantic anchors, observation-specific innovations, and contextual evidence retrieval realize this principle, supported by a formal characterization of information preservation and semantic ranking stability. 2. Portable memory with continuous experience accumulation. We develop a decoupled experience state that successive language models can access and extend through host-specific interfaces. Lexical/subword-aware 
+
+> 2
+
+## MIGRO 
+
+transport enables reuse across heterogeneous models, while continued writing after handoff preserves the continuity of accumulated experience without rebuilding its history through the receiving backbone. 3. Storage-efficient memory with exact recoverability. We combine compact semantic addressing with reversible causal coding to preserve historical evidence at low persistent cost. Long-history measurements, matched quality–storage comparisons, and shared-resource accounting demonstrate how exact preservation can coexist with economical memory growth and scalable reuse. 
+
+2 System Overview 
+
+MIGRO represents experience, the accumulated history of observations, as one persistent state. Each observation is a recorded input that contributes to this history. In Figure 3, follow writing from incoming observations into the shared state, then reading from that state to the current host. Persistence makes the state recoverable, while handoff changes the host without replacing the history. 1 Write · From Experience to a Shared Memory State 2 Read · Retrieve, Adapt, and Generate 
+
+3 Persist · Causal Compression and Cross-Model Portability  
+
+> New Observation 𝑜 𝑡
+> Utterance
+> “ Project Atlas ...”
+> Speaker Alice
+> Timestamp 2026-10-28
+> Session
+
+𝑐 𝑡  
+
+> Semantic Encoder
+
+ℰ (frozen) 
+
+𝑘 𝑡 = ℰ(𝑜 𝑡 ) 
+
+> (semantic address)
+> Content Tokenizer
+
+𝒯 𝑥 𝑡 𝑡 𝑡 = 𝑇 (𝑥 𝑡 ) 
+
+> (exact content)
+> Context Linking
+
+ℋ (frozen)    
+
+> ℎ𝑡 =ℋ(𝑜 𝑡 ,𝑜 𝑡 −1… 𝑡 −𝑘 )
+> (link to previous)
+
+Memory Compiler 𝒞 
+
+> Address Construction
+
+𝑐 𝑡 = ( 𝑘 𝑡 − μ)𝑈 
+
+> Anchor 𝑎 𝑗
+
+− 𝑔 (·) 
+
+Δ𝑡 
+
+> 𝑐 𝑡 [1: 𝑚 ]
+> 𝑐 𝑡 [𝑚 :]
+> Content Binding
+
+𝑒 𝑡 = 𝐸 𝑇 (𝑡 𝑡 )  
+
+> Metadata
+> 𝑚 𝑡 = [time, speaker, 𝑐 𝑡 , …]
+> Discourse Link
+
+𝑑 𝑡 = Pool( ℎ𝑡 ) 
+
+> Shared Memory
+> State
+
+𝓜 𝑡 
+
+> Anchors
+
+Δ Residuals Content Metadata Links Versions 
+
++ 𝑠 𝑡 
+
+> Memory Update
+
+𝓜 𝑡 = 𝓜 𝑡 −1 ∪ {𝑠 𝑡 } + 𝒱 (𝑠 𝑡 ) 
+
+> Query 𝑞
+> “ When is the new deadline for Project Atlas?”
+> Retrieval & Reranking
+
+𝑞 ↦ 𝑘 𝑞 = ℰ(𝑞 )  
+
+> Semantic Search
+> sim( 𝑘 𝑞 ,𝑐 𝑖 )
+> Lexical Match
+> lex( 𝑞 ,𝑡 𝑖 )
+> Cross-encoder
+> (frozen)
+
+𝑟 𝑖 = ℛ(𝑞 , 𝑠 𝑖 ) 
+
+> Embedding Transport
+
+𝑇 ℎ
+
+> Public Embedding
+
+𝑧 𝑖 = 𝐸 𝑠 (𝑡 𝑖 )
+
+> Host Adapter
+
+𝑇 ℎ(·) 
+
+𝑧 𝐸 ℎ 
+
+> Target LLM (frozen)
+
+𝑋 (0)   
+
+> 𝑧 sys 𝑧 𝐸 ℎ𝑧 𝑞
+
+[ ; ; ]
+
+> Block 1
+
+⋮ 
+
+> Block L LM Head
+> Response
+
+𝑦  
+
+> “ November 12.”
+> Top-K evidence
+
+𝐸 = { 𝑠 𝑖 1, …, 𝑠 𝑖𝐾 } 
+
+> Session-wise Causal Encoding
+> Session 𝑐
+
+……  
+
+> 𝑥 1, …, 𝑥 𝑛
+> Causal Language Model (frozen)
+
+𝑝 θ(𝑥 𝑡 |𝑥 <𝑡 
+
+> page
+
+) 
+
+> Transformer (causal)
+
+𝑝 𝑡  
+
+> 𝑝 𝑡 = LM( 𝑥 𝑡 |𝑥 <𝑡
+> page )
+> Arithmetic Coding
+> CDF
+> bits
+
+𝑏 𝑡 = −log 𝑝 𝑡    
+
+> Entropy Encode 0100101…
+> Compressed content + side information
+> Portable Snapshot
+> Compressed content
+> Anchors {𝑎 𝑗 }, { Δ𝑖 }
+> Metadata & links
+> Version records Save
+> /
+> Load
+> Cross-Model Usage
+> Qwen
+
+𝓜 𝑡 Read / Write  
+
+> Phi
+
+𝓜 𝑡 Read / Write  
+
+> Mistral
+
+𝓜 𝑡 Read / Write 
+
+> Same memory state across different models
+> Next accepted observation
+> Reuse prior state
+
+Figure 3. One experience state across writing, reading, persistence, and model handoff. Writing adds evidence and addresses; reading constructs a bounded evidence packet; persistence preserves the saved state for recovery. A receiving host reads and extends the inherited history. The diagram uses row vectors; equations use column vectors. 
+
+2.1 A Fact Revision Across Model Replacements 
+
+A user states that a project’s budget is 17 in version 1, then revises it to 18 and 19 under successive hosts. What is the latest budget? and What was the budget in version 1? require different answers, 19 and 17, from the same evolving history. When the original host returns, both questions should remain answerable. Table 10 in Appendix D.1 expands this illustrative trace. The example separates three ideas. Semantic similarity does not make observations identical: all three statements concern the same budget but record different values. The latest answer does not replace the full history: retaining only 19 erases the evidence for the first version. Model replacement does not change historical identity: a receiving host inherits earlier records and adds its own observations to that history. Semantic addresses organize these related records into a common neighborhood. Independent source bindings retain their content, provenance distinguishes their origins and historical positions, and query-time selection determines which version supports the answer. Local discourse links add contextual access hints within a bounded same-session window; cross-session revisions can remain unlinked while their evidence is still preserved. 
+
+3MIGRO 
+
+2.2 One State, Four Operations 
+
+Writing adds an observation, its address, and its historical relationships to the durable state. Reading leaves that state intact and constructs a temporary, attributed evidence packet for the current question and host. Persistence encodes the saved state so that its records and access structure can be recovered. Handoff attaches a new host interface to this state, allowing the receiver to read inherited observations and continue writing. Algorithm 1 in Appendix D.4 connects these operations. What must the shared state preserve so that these operations remain valid across future queries and hosts? 
+
+3 Problem Formulation and Design Principles 
+
+Long-term memory must preserve an evolving history while allowing changing models to use it. The budget example exposes both requirements: the state must retain distinct revisions, and a reader must select the revision relevant to its question. We formalize this separation before deriving the design principles. 
+
+3.1 Experience as a Persistent State 
+
+What must persist when the host changes? MIGRO separates three roles: exact evidence retains source-token bindings, provenance, and history; access structure organizes observations through semantic anchors and address innovations; contextual relationships retain references between records. An accepted observation is oi = ( xi, mi), where xi is its content and mi contains available provenance, including speaker, role, time, session, and source identity. Observations arrive chronologically and may be written by different hosts hi, each with frozen parameters θhi . Shared canonicalization σ normalizes each accepted observation, and a source tokenizer τs yields vi = τs(σ (oi)) . We call this saved content representation canonical evidence . Throughout, 
+
+exact recovery means recovery of these saved source-token IDs and their associated saved state; it does not mean unconditional reconstruction of input forms discarded before canonicalization. After n observations, the persistent state is 
+
+Mn = ( An, Dn, Xn, Pn, Gn, Vn). (1) Here (Xn, Pn, Vn) hold source bindings, provenance, and retained history; (An, Dn) hold anchors and address innovations; and Gn holds reference relations. Shared dependencies B specify how to represent source tokens, reconstruct addresses, and decode archives across hosts. The observations remain user-specific; these dependencies are reusable resources. 
+
+3.2 Memory Lifecycle and Model Handoff 
+
+Writing changes what future models can remember. Reading changes what the current model sees. A write extends persistent history; a read constructs a temporary evidence packet for its query: 
+
+Mi = Write hi (Mi−1, oi; B),
+
+(y, Eq) = Read h(q, Mn; Πh, B). (2) The access profile Πh specifies selection, the source-token budget, target context allowance, prompt and generation policies, and optional calibration. A record omitted from Eq remains in Mn for later readers and questions. Persistence encodes this state, and handoff changes its consumer: 
+
+S = Archive (Mn; B), Restore (S; B) = Mn,
+
+(Mn, h) Handoff (h′)
+
+−−−−−−→ (Restore (S; B), h′).
+
+(3) Restoration recovers saved source IDs, quantized coordinates, provenance, reference relations, and history. The receiver attaches its access interface and appends subsequent observations through the same schema. Appendix D.5 specifies these contracts. Handoff avoids reconstructing full history through the receiving backbone [14]. Restoration, index preparation, and interface initialization remain separate costs; Appendix D.7 describes them. The new host processes selected evidence during reading and a bounded historical window during writing, while the accumulated state remains continuous. 
+
+> 4
+
+## MIGRO 
+
+3.3 Deferred Selectivity: Why Preservation Precedes Access 
+
+Long-term memory faces an asymmetry in when information becomes relevant. At write time, the questions that will depend on an observation are unknown. At read time, the question is available and evidence can be selected accordingly. Persistence must retain distinctions that future questions may require; reading must expose the relevant distinctions within the current model’s access budget. Let Rn = (( vi, ¯mi, i)) ni=1 denote the accepted canonical history, including source-token sequences, saved historical metadata, and observation order. For a family of future questions Q, let Ans (q, R) be the answer determined by history R. Two histories are equivalent when no question in that family distinguishes them: 
+
+R ∼Q R′ ⇐⇒ Ans (q, R) = Ans (q, R′) for all q ∈ Q. (4) This relation identifies what a memory must preserve for the given family. The encoding–query separation connects information-theoretic compression to communication complexity [25–27]. 
+
+Proposition 1 (Irreversibility of query-distinguishable information loss) . Let F be a query-independent memory encoding. If F(R1) = F(R2) but R1̸ ∼Q R2, no readout using only q and F(R) can guarantee the correct answer to every question in Q for both histories. 
+
+In the running example, irreversibly overwriting the version-1 budget 17 with 19 removes the evidence needed to answer the version-1 question. A stronger future model cannot recover that value from the current state alone. By contrast, a record omitted from today’s evidence packet remains available to another query. Deferred selectivity preserves the possibility of reinterpreting history before choosing what to expose on each read. The binary-fact example in Appendix E.2 develops this distinction. This separation becomes more valuable as future readers acquire new capabilities and information needs. For nested question families, 
+
+Q1 ⊆ Q2, R ∼Q2 R′ =⇒ R ∼Q1 R′. (5) The broader family refines the distinctions that memory must retain. An encoding sufficient for an earlier task can merge histories that a later task separates. Canonical history preserves the opportunity to revisit those observations under new questions and stronger models. 
+
+3.4 Asymmetric Fidelity: Exact Evidence, Approximate Addresses 
+
+A book’s contents must be preserved, but its index need not encode enough information to reconstruct every page. The same distinction applies to memory: source bindings determine which historical record is preserved, while semantic addresses help locate it. Compact access geometry can therefore tolerate approximation without merging record identities. MIGRO assigns different fidelity requirements to these roles. The components (Xn, Pn, Vn) retain canonical evidence and its historical context. The components (An, Dn) organize semantic access through quantized shared representations, while Gn retains explicit reference relations. Let bRn be the canonical history recovered from an exactly restored saved state, ki the original normalized address, and bki its reconstructed, normalized address. Then 
+
+Devidence := 1[ bRn̸ = Rn] = 0, Daddress := max  
+
+> 1≤i≤n
+
+∥ki −bki∥2. (6) The persistent evidence is recovered exactly while the access geometry admits approximation. Related observations can share a semantic neighborhood yet retain independent values, sources, and historical positions. Quantized vector search provides the technical background for compact semantic coordinates [17, 28]. Quantization may move addresses slightly without changing which records are retrieved when their relevance scores are sufficiently separated. To characterize this condition for dense semantic scoring [18], consider a fixed candidate set C , with si(q) = ⟨kq, ki⟩ and bsi(q) = ⟨kq,bki⟩, where ∥kq∥2 = 1.
+
+> 5
+
+## MIGRO 
+
+Proposition 2 (Semantic Top-K stability) . Suppose |C | > K and max i∈C ∥ki − bki∥2 ≤ ε. Write s(K)(q) and 
+
+s(K+1)(q) for the boundary scores under the original addresses. If 
+
+γq := s(K)(q) − s(K+1)(q) > 2ε, (7) 
+
+the semantic Top-K set is unchanged by address reconstruction. 
+
+Each similarity score changes by at most ε. When the original boundary margin exceeds the combined perturbation of competing candidates, their semantic Top-K membership is preserved. Appendix E.1 proves both propositions. Here ε bounds reconstructed, normalized address error within C ; the reuse criterion in Equation 10 controls anchor selection separately. This result characterizes the geometric condition under which approximate semantic addressing preserves retrieval membership, while exact source bindings maintain historical identity independently of address approximation. 
+
+3.5 Portable Access and Joint Evaluation 
+
+All hosts access the same saved observation fields and source vocabulary, but their input representations differ. A host-specific interface selects an evidence packet and maps its source tokens into the receiver’s vocabulary and embedding space. Optional calibration belongs to this interface. Host replacement changes how the records enter the model while preserving their historical identities. For a receiving host h, selection and interpretation factorize as 
+
+E (h) 
+
+> q
+
+= Select Πh (q, Mn),
+
+Z(h) 
+
+> q
+
+= Es(vE (h)
+
+> q
+
+),
+
+yh = Gen θh
+
+
+
+Ih(q, Z(h) 
+
+> q
+
+; ηh)
+
+
+
+.
+
+(8) The shared embedding table Es represents selected source IDs, Ih constructs the receiving input, and ηh denotes optional host-side calibration. Tokenizer compatibility and target-reader alignment affect how effectively the receiver uses inherited evidence [19, 29]. The same state remains available for subsequent reads and writes. This separation calls for joint evaluation along several dimensions: 
+
+ Qh, ∆w→h, Buser , Bshared , Cserve , Crestore 
+
+. (9) Here Qh measures task quality under a declared access profile, and ∆w→h is additional target-relative loss after write trajectory w. The remaining terms measure private persistent bytes, shared assets, serving resources, and restoration cost. These are evaluation dimensions rather than a scalar objective: quality tests effective access, transfer tests continuity across consumers, and accounting measures the cost of retaining and using that experience. The remaining design question is how to give changing hosts useful access to this preserved history at low persistent cost. 
+
+4 MIGRO Architecture and Lifecycle 
+
+The architecture must locate preserved observations, deliver them within a host’s input budget, and store the growing history economically. MIGRO uses semantic addresses for lookup, evidence packets for query-specific access, and archives for persistence (Figure 3). 
+
+4.1 Shared Addresses and Exact Evidence 
+
+Related observations should be easy to retrieve together without losing their differences. In the budget example, the three revisions belong to one semantic neighborhood, but each must retain its own value and historical position [15, 16]. A common center alone would flatten their individual placement. An anchor captures what related observations share; an innovation captures where each observation lies within that shared semantic structure. Neither replaces the underlying evidence. Given a normalized public address ki, shared center μ, coordinate basis U, and innovation subspace Wδ , the writer computes 
+
+ui = U⊤(ki − μ), ei j = ∥(I −Wδ W ⊤ 
+
+> δ
+
+)( ui − A j)∥2. (10) 
+
+> 6
+
+## MIGRO 
+
+The residual ei j measures the difference outside the innovation subspace. When the best anchor satisfies the fixed reuse threshold, the writer saves a quantized local placement and reconstructs the address as 
+
+bδi = Qδ (W ⊤ 
+
+> δ
+
+(ui − Aai )) , bki = norm  U(Aai +Wδ bδi) + μ. (11) Otherwise, it creates a new quantized root with no additional innovation. Anchor references, coordinates, and scales reconstruct approximate access geometry, while independent source bindings preserve evidence [17, 28]. The quantized innovation retains individual placement without promising recovery of the original continuous address. Writing also adds contextual relationships. The current frozen host processes the incoming observation with a bounded window of earlier same-session records and infers a predecessor from their intermediate representations. All spans are computed within the current host, including records written by another model. Only the observation reference persists; hidden representations remain temporary. Appendix E.3 gives the rule. An accepted write appends its address, source binding, provenance, and available references, leaving earlier revisions independently identifiable. This design raises two empirical questions: do innovations improve access quality, and how much address storage do they save? Sections 5.2 and 5.5 address them through the quality and address-table comparisons in Figure 4d,f. 
+
+4.2 Budgeted Retrieval and Host Adaptation 
+
+Reading has two tasks: choose the evidence, then deliver it to the receiving model. Retrieval can fail by missing a relevant record or its supporting context. Delivery can fail even with the right records because models use different vocabularies, token boundaries, and embedding spaces. Retrieval constructs a bounded packet from the accumulated state. Reconstructed-address similarity and lexical matching generate candidates, followed by frozen cross-encoder reranking and diversity-aware selection of K
+
+primary relevance seeds [18, 30]. Chronological reserves keep older observations eligible, while local and reference-linked support can supplement the seeds. The final packet can therefore contain more than K records. Appendix E.4 specifies the rule. The evidence packet Eq retains attribution and chronological order under a source-token budget T :
+
+# ∑
+
+> e∈Eq
+
+|ve| + νsep (Eq) ≤ T. (12) Thus K controls primary seed selection, while T limits delivered source spans and their separators. Packet composition affects evidence use [31]; records excluded from this read remain available to later questions. Transport makes the selected source evidence usable by the current host. The same text can have different token boundaries across models, and their embedding spaces are not shared. MIGRO therefore saves canonical source IDs independently of host input embeddings and constructs receiving-host-compatible inputs at read time. Public embeddings of selected IDs yield weighted lexical hypotheses, which are candidate lexical interpretations of the source pieces. Boundary composition joins subword fragments before target tokenization and embedding lookup [19]. Appendix E.5 gives the equations. Embedding transport is MIGRO’s host input interface; text delivery followed by target tokenization is another possible interface for external memory. Here, continuous embeddings enter through the interface in Section 3.5. Optional calibration adapts transported evidence or an assistant boundary while leaving the application backbone frozen [32, 33]. Target-context fitting reserves generation space and reduces oversized packets. The retrieval and boundary-composition ablations in Figure 4a,b test these two stages separately. 
+
+4.3 Reversible Persistence and Model Handoff 
+
+Approximation makes the access structure compact; reversible coding makes the preserved state compact without changing what can be recovered. Address quantization may alter semantic coordinates. Persistence must instead recover the saved coordinates together with the evidence and historical relationships. 
+
+> 7
+
+## MIGRO 
+
+A frozen causal predictor estimates token probabilities within bounded pages; it does not rewrite observations. Arithmetic coding turns those probabilities into a reversible representation [20, 21]. For predictor-vocabulary token yp,t , decoded page-local context cp,t , and realized integer-CDF probability epφ , the content length follows 
+
+ℓcontent ≈ − ∑
+
+> p
+
+# ∑
+
+> t∈Tp
+
+log 2 epφ (yp,t | cp,t ) + ℓframing + ℓexceptions . (13) Here Tp contains the coded positions in page p, and predictive context resets at page boundaries. Surface exceptions retain tokenizer-sensitive content; source-ID exceptions preserve canonical identities when surface reconstruction and retokenization would change them. Addresses, provenance, references, and historical records are archived alongside content. Every new archive candidate is fully restored and compared with the saved state before acceptance. Selection among exact candidates, including a verified lossless fallback, considers complete encoded bytes and newly required shared dependencies. Appendix E.6 specifies the coding conditions and selection rule. Figure 4c evaluates the resulting storage savings. The restored state remains readable and extendable. A receiving host initializes its selection profile, transport, and optional calibration, then reads inherited records and adds new observations through the same schema. In the running example, both original and revised budgets remain accessible without rebuilding history through the receiver’s backbone. Algorithm 1 connects recovery to continued writing, whose effect is evaluated in Section 5.4. 
+
+4.4 Resource Model and Implementation 
+
+A small user state does not by itself determine deployment cost. MIGRO also relies on reusable representation, retrieval, and decoding assets. The relevant questions are how private bytes grow with experience and how fixed resources are shared across independent memories. Private persistent state contains recoverable evidence, addresses, provenance, references, history, and archival metadata. Shared resources include representation models, tokenizers, retrieval components, host interfaces, and decoding dependencies [34]. Temporary workspace holds decoded records, indexes, reconstructed addresses, transport tensors, and inference caches; it is accounted for separately from persistent storage. Across independent memories u, persistent deployment storage is 
+
+Bdeploy = Bshared + ∑
+
+> u
+
+Buser ,u. (14) Extending a history adds private bytes; adding independent memories amortizes fixed resources. In the reference configuration, causal prediction uses the common Qwen3-4B checkpoint, which is excluded from the method-specific asset ledger along with the software runtime; any distinct predictor dependency must be charged once. This accounting concerns method resources, rather than a complete machine installation. Section 5.5 evaluates private-state growth and shared-resource amortization separately. Appendix D.3 gives configurations and calibration settings, Appendix D.6 defines the ledger, and Appendix D.7 describes runtime costs. 
+
+5 Experiments 
+
+The experiments ask three questions about the shared experience state: Can preserved evidence be used effectively? 
+
+Quality comparisons and access ablations test whether retained observations become useful answers. Can experience survive and grow across hosts? Ordered handoffs and continued writing test inheritance and subsequent accumulation. Can exact persistence scale economically? Matched quality–storage measurements, long histories, and shared-resource accounting test the cost of preserving that experience. Figure 4 connects the three lines through complementary ablations: panels (a,d) examine memory access in Section 5.2, panels (b,e) examine transfer in Section 5.4, and panels (c,f) examine persistence in Section 5.5. 
+
+5.1 Evaluation Setup 
+
+We distinguish three execution paths. Same-host construction and reading evaluates the complete memory system under one checkpoint. State Transfer attaches a receiving host to an accumulated state. Full-History Rebuilding 
+
+> 8
+
+## MIGRO 
+
+reconstructs memory by processing the complete history at the receiver and provides a target-native reference. These paths differ in how history reaches the receiver, even when their final answer scores are similar. Storage comparisons pair quality with complete recoverable states and account separately for shared assets. LoCoMo, LongMemEval-S, MemOps, MemoryAgentBench, and BEAM-1M cover conversational recall, cross-session reasoning, evolving memory operations, incremental interaction, and long histories [1, 2, 22–24]. Memo-ryAgentBench reports a four-competency macro-average. Baselines include PlugMem, Mem0, TiMem, A-MEM, LSTMem, TransMem, and Doc-to-LoRA [9, 10, 13, 35–38]. Appendix C specifies checkpoints; Appendices D.2 and D.3 give scoring, uncertainty estimation, generation budgets, and calibration. 
+
+5.2 Memory Quality and Evidence Organization 
+
+Can the preserved history support effective answers? MIGRO scores highest on each of the five benchmarks in Table 1. Across these tasks, useful evidence may be an individual observation, a revision across sessions, or several records dispersed through a long history. Their common demand is selective access to retained information, beyond keeping that information available. Method LoCoMo LongMemEval-S MemOps MemoryAgentBench BEAM-1M                                             
+
+> Trajectory length Shorter Longer
+> PlugMem 41.89 43.20 35.09 7.76 34.11 Mem0 52.12 56.80 52.13 32.82 52.43 TiMem 49.13 48.40 50.66 18.90 51.90 A-MEM 36.20 37.80 39.78 16.72 45.66 LSTMem 10.68 26.00 52.59 6.56 28.44 TransMem 45.85 37.40 62.51 22.80 28.76 Doc-to-LoRA 14.96 12.80 15.35 11.62 30.20
+> MIGRO 54.13 68.40 66.30 35.16 55.83
+> Table 1. Qwen quality under method-native readers and budgets. The arrow spans the trajectory-length progression from LoCoMo through BEAM-1M. LSTMem uses state-only reading on LoCoMo. MemoryAgentBench reports the four-competency macro-average. Metric definitions appear in Table 11.
+
+Relevant evidence is not always the most semantically similar evidence. In Figure 4a, the full mechanism scores 54.21, removing host-derived contextual associations gives 50.48, and semantic Top-K gives 44.82. Version questions, temporal relations, and reasoning across records can require complementary observations whose value is not captured by similarity alone. The semantic Top-K condition jointly replaces the candidate-search, reranking, and support-selection pipeline, so its gap measures the contribution of this complete evidence-selection path. Observation-specific placement matters within a shared neighborhood as well. Removing address residuals reduces quality from 54.21 to 51.73 while retaining anchors and source bindings (Figure 4d). The two ablations identify distinct requirements for memory access: innovations preserve fine-grained semantic placement, while contextual selection determines which observations jointly support a question. 
+
+5.3 Model Capacity and Memory Utilization 
+
+When both memory construction and reading move to larger Qwen hosts, MIGRO improves consistently across the evaluated checkpoints, from 54.13 at 4B to 61.83 at 32B (Table 2; Figure 5). Each checkpoint builds a fresh memory and reads it with the same model. This sweep therefore measures scaling of the complete construction-and-read system. Larger hosts do not improve all memory systems proportionally. MIGRO improves at every tier, while LSTMem peaks at 8B under state-only reading. How observations are retained, organized, and presented affects whether greater model capacity translates into better memory answers. These system-level trajectories combine changes in construction and reading; they do not isolate the effect of a stronger reader on a fixed state. Appendix D.3 records the checkpoint-specific reader and refitting settings. 
+
+> 9
+
+## MIGRO Full MIGRO w/o Host Association Semantic Top-K 40 45 50 55 60 
+
+> LoCoMo
+
+54.21 
+
+50.48 44.82 
+
+(a) Evidence selection 
+
+Qwen 4B Phi Mistral 35 40 45 50 55 60   
+
+> LoCoMo
+> 54.21 53.41 49.73 48.05 45.48 39.98
+
+(b) Boundary composition  
+
+> Full interface w/o boundary composition
+
+Uncompressed Existing lossless Full selection 012
+
+> Archive size (MB)
+
+2.381 MB 0.953 MB −59.98% 0.870 MB −63.47% 
+
+Better 
+
+(c) Persistence coding 
+
+Anchor + Residual Anchor only 40 45 50 55 60 
+
+> LoCoMo
+
+54.21 51.73 
+
+(d) Address residuals 
+
+> Direct BM25 Recent None Rebuild
+
+20 30 40 50 60  
+
+> LoCoMo
+> 49.73 45.48 37.99 41.55 24.83 24.96 30.95 19.26 49.65 45.19
+
+(e) State reuse controls  
+
+> Phi Mistral
+
+0.5 1 2 5 10 
+
+Address table (MB, log scale) 
+
+40 45 50 55 60 
+
+> LoCoMo
+> A + R 54.21 Anchor only 51.73 Float32 54.67
+> 91.1% smaller address table 0.46-point LoCoMo gap
+
+Better 
+
+(f) Address representation 
+
+Performance Transfer Storage  
+
+> Mistral calibration retained in (b). (e) 740 forwards avoided per target. (a,d) Shared Full MIGRO reference. (c,f) Separate byte measurements.
+
+Figure 4. Ablations across performance (a,d), transfer (b,e), and storage (c,f). Local ablations use separately evaluated control states with a Qwen reference of 54.21; Table 1 reports 54.13 for the main-quality evaluation. Higher LoCoMo and lower storage are better; upper left is preferred in (f). Dashed bars in (e) denote target rebuilding; percentages in (c) show savings against the uncompressed archive. A + R denotes Anchor + Residual. 
+
+Host (build/read) MIGRO PlugMem Mem0 TiMem A-MEM LSTMem TransMem Doc-to-LoRA 
+
+Qwen3-4B-Instruct-2507 54.13 41.89 52.12 49.13 36.20 10.68 45.85 14.96 Qwen3-8B 55.68 34.86 54.88 46.19 44.70 19.70 46.39 12.77 Qwen3-14B 60.32 40.10 54.36 50.25 40.88 16.58 49.83 12.30 Qwen3-32B 61.83 44.66 57.16 49.24 45.38 14.35 48.03 13.18 
+
+Table 2. Same-host Qwen LoCoMo quality scaling with the complete baseline set from Table 1. Each method constructs a fresh memory for each checkpoint and reads with that same host. The 4B row reuses Table 1; target-native rebuilding scores are also used in Table 3 where applicable. LSTMem writes the full history and reads only its persistent state at every size. Bold marks the best available score at each host. 4B 8B 14B 32B   
+
+> Qwen host size
+> 10 20 30 40 50 60 65
+> LoCoMo
+> 54.13 55.68 60.32 61.83
+
+(a) Same-host scaling      
+
+> 4B 8B 14B 32B
+> Qwen host size
+> 54.13 55.52 60.37 62.33
+
+(b) Sequential Qwen upgrades        
+
+> MIGRO PlugMem Mem0 TiMem A-MEM LSTMem TransMem Doc-to-LoRA
+
+Figure 5. LoCoMo quality as Qwen hosts grow. (a) Each host constructs and reads its own memory. (b) Solid curves follow one 4B state through successive upgrades, while dashed curves show full-history rebuilding at each receiver. Both panels use the 4B references from Table 1. Tables 2 and 3 give the full comparisons. 
+
+10 MIGRO 
+
+Improving with a larger host leaves a separate question unresolved: can a stronger or different host inherit the same accumulated state? The next experiment replaces fresh construction with state reuse. 
+
+5.4 Cross-Host Transfer: Experience Beyond Its Original Model 
+
+Portability requires a receiver to use inherited observations and continue accumulating experience. We examine these requirements through ordered Qwen upgrades and two heterogeneous chains, then use matched controls to separate the contributions of memory organization, the receiving interface, and continued writing. 
+
+Access to inherited experience. Table 3 reports receiving-host answer quality across the three chains. Figure 5(b) tracks Qwen upgrades and Figure 6 shows the two cross-family chains. MIGRO leads the reported method comparisons at each receiving stage. The table’s two column groups compare memory lifecycles as well as answer quality: MIGRO, PlugMem, and Mem0 transfer existing states; TiMem, A-MEM, LSTMem, TransMem, and Doc-to-LoRA rebuild from the full history at each receiver. A useful transferred state provides evidence without repeating that historical construction through the new backbone. 
+
+State Transfer Full-History Rebuilding 
+
+Stage / path MIGRO PlugMem Mem0 TiMem A-MEM LSTMem TransMem Doc-to-LoRA 
+
+LoCoMo Qwen chain: 4B training/source stage, then 8B, 14B, and 32B 
+
+4B →8B 55.52 44.41 53.18 46.19 44.70 19.70 46.39 12.77 4B →8B →14B 60.37 46.10 57.07 50.25 40.88 16.58 49.83 12.30 4B →8B →14B →32B 62.33 49.15 57.17 49.24 45.38 14.35 48.03 13.18 
+
+Heterogeneous chain: Qwen 4B source, then Mistral 7B and Phi 
+
+Qwen 4B →Mistral 7B 45.69 38.60 44.06 41.22 37.73 11.31 7.04 11.32 Qwen 4B →Mistral 7B →Phi 49.77 36.30 44.72 28.03 29.57 16.84 18.79 14.07 
+
+Heterogeneous scale-up: Qwen 4B → Ministral 14B → Gemma 26B-A4B 
+
+Qwen 4B →Ministral 14B 57.41 46.19 47.55 41.60 42.84 10.18 22.94 11.92 4B →Ministral 14B →Gemma 26B-A4B 66.28 51.63 56.83 57.29 49.26 23.16 58.36 9.15 
+
+Table 3. LoCoMo migration QA by execution mode. MIGRO, PlugMem and Mem0 use State Transfer; TiMem, A-MEM, LSTMem, TransMem and Doc-to-LoRA use Full-History Rebuilding at each receiver. TransMem’s Qwen references come from Table 2. Doc-to-LoRA’s Ministral and Gemma results each cover all 1,986 questions. Appendix C gives exact checkpoints. Bold marks the highest score in rows with method comparisons. Qwen 4B Mistral 7B Phi           
+
+> Host in evaluation order
+> 10 20 30 40 50 60 70
+> LoCoMo
+> 54.13 45.69 49.77
+> (a) Cross-family handoff
+> Qwen 4B Ministral 14B Gemma 26B-A4B
+> Host in evaluation order
+> 54.13 57.41 66.28
+> (b) Cross-family scale-up
+> MIGRO PlugMem Mem0 TiMem A-MEM LSTMem TransMem Doc-to-LoRA
+
+Figure 6. LoCoMo quality on two cross-family paths from Qwen 4B. (a) Handoff to Mistral 7B and then Phi. (b) Scale-up to Ministral 14B and then Gemma 26B-A4B. Solid curves show inherited-state transfer and dashed curves show full-history rebuilding. Each method starts at its Table 1 score. 
+
+Heterogeneous scale-up. MIGRO carries the Qwen 4B memory state first to Ministral 14B and then to Gemma 26B-A4B. LoCoMo reaches 57.41 at the first receiving stage and 66.28 at the second, an increase of 8.87 points along the inherited-state path. The closest measured alternatives are transferred Mem0 at Ministral (47.55) and 
+
+11 MIGRO 
+
+TransMem rebuilt from full history at Gemma (58.36). MIGRO leads these references by 9.86 and 7.92 points, respectively. 
+
+Value beyond carrying a history. The core transfer controls ask whether inherited organization contributes beyond having historical text available (Figure 4e; Appendix D.2, Figure 11). The full mechanism outperforms BM25, recent-history windows, and no-memory access under every evaluated host. Against BM25, the reported paired gains are 11.74 points on Phi and 3.93 on Mistral. Retention supplies the observations, but their organization and access determine how much useful experience reaches the receiver. Direct reuse also approaches target-side rebuilding quality: 49.73 versus 49.65 on Phi, and 45.48 versus 45.19 on Mistral. Each receiver avoids 740 memory-building model forwards while still performing normal answering. This comparison identifies the operational value of the shared state: the receiver can use accumulated experience at near-rebuilding quality without reconstructing its history. Paired intervals and the complete controls appear in Appendix D.2. 
+
+Compatibility across token boundaries. The interface ablation tests a more local obstacle to inheritance (Figure 4b). Removing boundary composition lowers quality under all three hosts. On Mistral, with calibration retained, quality falls from 45.48 to 39.98. Cross-model compatibility therefore involves more than matching embedding widths: source subword fragments must be composed into lexical representations that the receiver can interpret effectively. The matched controls connect this component of the transport interface to answer quality without changing the persistent evidence. 
+
+Continued growth after handoff. A portable memory should continue evolving under its receiving host. Figure 7 shows that extending the inherited state improves access to post-handoff observations and cross-boundary evidence while retaining effective access to earlier history. Overall quality reaches 45.13, close to full-history rebuilding at 45.19, without reconstructing the pre-handoff history through the receiver. Mem0, PlugMem, A-MEM, and TiMem also benefit from continuation, while MIGRO attains the highest continued-write score in Figure 7b. LSTMem, Doc-to-LoRA, and TransMem show no gain in their overall scores when extending their first-half memories. Portability thus includes continuity of experience accumulation: model replacement changes how history is interpreted and extended while the inherited state remains the basis for future reasoning. Old history New history Cross-boundary integration             
+
+> 015 30 45 60
+> LoCoMo
+> 53.52 6.66 29.28 51.85 53.09 35.71 51.55 52.90 36.61
+> (a) MIGRO by question type
+> MIGRO PlugMem Mem0 TiMem A-MEM LSTMem TransMem Doc-to-LoRA
+> 015 30 45 60
+> 45.13 37.38 43.89 37.17 34.01 11.15 7.04 10.98
+> (b) Overall quality
+> First-half memory only Continued writing Full-History Rebuilding
+
+Figure 7. Continuity of memory evolution after handoff. (a) MIGRO’s quality on inherited, new-history, and cross-boundary questions. (b) Overall quality under three memory conditions; numbers label continued-writing scores. The continuation operations and source-state pairing are detailed in Appendix D.8. 
+
+5.5 Storage Efficiency: Fidelity Without Redundant Persistence 
+
+Storage efficiency must explain both why a state is compact and whether it can remain economical as experience grows. We connect representation and coding ablations to matched-state quality, marginal history growth, and deployment-scale sharing. 
+
+Where the byte savings come from. Figure 4c separates the basic gain from lossless coding and the additional gain from archive selection. The uncompressed archive occupies 2.381 MB; existing lossless coding reduces it 
+
+> 12
+
+## MIGRO 
+
+to 0.953 MB; full selection reduces it to 0.870 MB. Full selection saves about 63.5% against the uncompressed archive and a further 8.7% against existing lossless coding. Exact recovery is retained in every accepted encoded candidate. Address organization provides a separate saving (Figure 4f). Anchor + Residual reduces address-table bytes by 91.1% relative to float32, with a 0.46-point LoCoMo gap. The representation used to locate evidence can therefore be substantially compressed without imposing the same loss on the evidence itself. These address conditions also supply the quality ablation in panel (d); the address comparison counts semantic addresses, while the coding comparison counts the complete archive. Appendix D.6 gives their exact sizes. 
+
+Useful answers from compact states. The matched-state comparison asks whether compactness coexists with answer quality in the same memory (Table 4; Figure 8). MIGRO scores 54.13 with 1.115 MB across ten conversation states. TransMem uses 1.200 MB and scores 45.96: MIGRO gains 8.17 points while using 7.1% less storage. Mem0 scores 50.45 at 160.671 MB. Every point pairs the quality and bytes of the actual evaluated state, exposing the trade-off between short-history compactness and effective access to retained evidence. Doc-to-LoRA further separates small write increments from small states: its 4.9 bytes/token LoCoMo late-half rate coexists with 283.14 MB of accumulated private state.                            
+
+> Method LoCoMo ↑
+> (0--100) 95% CI Native memory ↓
+> (MB, ten states)
+> PlugMem 41.89 [40.01, 43.39] 92.078 Mem0 50.45 [48.81, 52.18] 160.671 TiMem 47.22 [45.70, 48.56] 10.851 A-MEM 35.29 [34.46, 36.33] 23.340 LSTMem 40.64 [39.11, 42.10] 1.871 TransMem 45.96 [44.80, 47.26] 1.200 Doc-to-LoRA 14.96 [13.83, 16.24] 283.140
+> MIGRO 54.13 [51.93, 56.22] 1.115
+
+Table 4. LoCoMo quality and native storage from the same evaluated states, under the Qwen reference host and each method’s native reader. These storage replicas are evaluated separately from Table 1. LSTMem uses the retained-history reader for this paired quality–storage measurement. Storage is summed across ten conversations; intervals cluster by conversation. 
+
+Economical growth within a history. A small snapshot matters only if the memory can continue growing economically. The LoCoMo prefixes in Figure 8 and million-token BEAM histories in Figure 9 examine this growth directly. Across the five BEAM histories, MIGRO averages 1.857 MB per million-token history and adds 1.809 bytes per token over the second half (Table 5). In the million-token comparison, TransMem’s BEAM state occupies 7.092 MB, with a late-half rate of 7.778 bytes/token. MIGRO’s lower marginal cost keeps its long-history state compact, widening the absolute storage advantage as experience accumulates.                                     
+
+> Method State at 1M MB/history ↓95% CI (MB) 500K--1M bytes/token ↓95% CI
+> PlugMem 82.871 [79.781, 85.277] 79.608 [76.162, 84.012] Mem0 125.499 [119.613, 131.087] 123.093 [115.187, 130.500] TiMem 6.166 [6.119, 6.198] 6.178 [6.114, 6.225] A-MEM 23.191 [22.914, 23.496] 23.639 [23.188, 24.073] LSTMem 4.371 [4.276, 4.437] 4.370 [4.233, 4.453] TransMem 7.092 [7.018, 7.154] 7.778 [7.709, 7.854] Doc-to-LoRA 56.625 [56.625, 56.625] 28.313 [28.308, 28.319]
+> MIGRO 1.857 [1.818, 1.886] 1.809 [1.732, 1.865]
+
+Table 5. Million-token state sizes and 500K–1M marginal cost. Means and 95% history-bootstrap intervals use the same five paired histories for every method; rates use actual source-token boundaries. 
+
+> 13
+
+## MIGRO 10 0 10 1 10 2
+
+Ten-state memory total (MB)  
+
+> 20 40 60
+> LoCoMo
+> MIGRO PlugMem TiMem Mem0 A-MEM LSTMem TransMem Doc-to-LoRA
+> Better
+
+(a) Quality and memory      
+
+> 4812 16 20 24
+
+Source tokens (K)      
+
+> 10 2
+> 10 3
+> 10 4
+> State per history (KiB)  10 10 10 972
+> Better
+
+(b) Conversation growth    
+
+> 12 16 20 24
+
+Window-end source tokens (K)    
+
+> 10 1
+> 10 2
+> 10 3
+> Added bytes / token  1772
+> Better
+
+(c) Later-history write cost 
+
+> MIGRO PlugMem TiMem Mem0 A-MEM LSTMem TransMem Doc-to-LoRA
+> 10 1
+> 10 2
+> 10 3
+> Added bytes / token
+> 4.207 410.68 49.38 820.63 113.67 8.85 4.215 4.90
+> Better
+
+(d) Second-half mean        
+
+> MIGRO PlugMem TiMem Mem0 A-MEM LSTMem TransMem Doc-to-LoRA
+
+Figure 8. LoCoMo quality and storage: (a) quality versus matched-state bytes; (b) state growth; (c) later-history marginal cost; (d) second-half mean. TransMem and Doc-to-LoRA summary measurements enter (a,d). Counts above (b,c) identify eligible conversations; available bands and bars are 95% bootstrap intervals. Fixed assets are accounted for separately. 0.0 0.5 1.0 
+
+Source tokens (M) 
+
+> 050 100
+> Native state (MB)
+> Better
+
+(a) Absolute growth   
+
+> 0.0 0.5 1.0
+
+Source tokens (M) 
+
+> 10 −2
+> 10 −1
+> 10 0
+> 10 1
+> 10 2
+> Native state (MB)
+> Better
+
+(b) Log-scale view   
+
+> 0.0 0.5 1.0
+
+Source tokens (M) 
+
+> 050 100 150
+> Added bytes / token  Better
+
+(c) Marginal write cost        
+
+> MIGRO PlugMem TiMem Mem0 A-MEM LSTMem TransMem Doc-to-LoRA
+
+Figure 9. Million-token BEAM storage: (a) absolute state growth; (b) the same measurements on a logarithmic axis; (c) added bytes per token over successive windows. Curves show complete prefix series; the Doc-to-LoRA marker shows its measured million-token endpoint; late-half averages appear in Table 5. Available bands are 95% history-bootstrap intervals. 
+
+Sharing fixed resources across histories. The deployment estimates expose a second scale of economy (Table 6; Figure 10). With 100 independent million-token memories, LSTMem has a slightly lower estimated average cost: 4.775 MB versus MIGRO’s 4.829 MB. With 1,000 memories, MIGRO falls to 2.154 MB per memory, compared with 4.411 MB for LSTMem and 8.812 MB for TransMem. TransMem’s required shared bundle is 1.720 GB. Wider sharing amortizes MIGRO’s fixed resources, making its smaller private state increasingly important. Within a history, economy depends on marginal bytes per observation. Across histories, it also depends on how widely representation, retrieval, and decoding assets are shared. The estimates combine measured state sizes with required shared resources under the accounting model in Section 4.4; they describe method-system storage. Appendix D.6 gives the complete definitions. 
+
+14 MIGRO 100 1K 10K 100K 10 1                
+
+> 10 2
+> MB per memory
+> Better
+> (a) Current resources
+> 100 1K 10K 100K
+> Better
+> (b) Required resources
+> 100 1K 10K 100K 10 0
+> 10 1
+> 10 2
+> 10 3
+> 10 4
+> Total footprint (GB)
+> Better
+> (c) Current resources
+> 100 1K 10K 100K
+> Better
+> (d) Required resources
+> Independent 1M-token memories
+> MIGRO PlugMem TiMem Mem0 A-MEM LSTMem TransMem Doc-to-LoRA
+
+Figure 10. Shared-resource estimates for independent million-token memories. Panels (a,b) show average MB per memory, and (c,d) show total method-system footprint. Panels (a,c) count current deployed resources, and (b,d) count required resources, including estimates for TransMem and Doc-to-LoRA. Each method shares one fixed asset bundle. Available bands propagate state-mean intervals. 
+
+Independent million-token memories 
+
+Method 100 1,000 10,000 100,000 
+
+PlugMem 84.237 83.008 82.885 82.873 Mem0 127.018 125.651 125.514 125.500 TiMem 7.532 6.303 6.180 6.167 A-MEM 24.557 23.328 23.205 23.193 LSTMem 4.775 4.411 4.375 4.371 TransMem 24.292 8.812 7.264 7.109 Doc-to-LoRA 73.465 58.309 56.794 56.642 
+
+MIGRO 4.829 2.154 1.887 1.860 
+
+Table 6. Estimated average storage in MB per independent million-token memory, using required method resources shared once. The private-state term uses the reported million-token endpoints. 
+
+5.6 Joint Design Implications 
+
+Evaluating long-term memory requires following experience across reads, writes, and host changes. Memory qual-ity depends on whether an access interface exposes useful relationships among retained observations. Portability includes the ability to extend inherited experience under a new host. Persistent cost has two scales: marginal growth within one history and infrastructure shared across many histories. Evaluating one snapshot or one receiving-host score misses these lifecycle properties. Figure 1a highlights six selected performance strengths. The largest gains are on LongMemEval-S multi-session QA and temporal reasoning, where MIGRO leads the strongest displayed baselines by 15.79 and 18.80 points, respectively. The transfer panel shows quality across receiving hosts, memory continuity and growth, and reuse without historical replay. Its portable-efficiency axis pairs continued-writing quality with the receiver’s private state size. The storage panel connects compact private states with economical growth: MIGRO has the lowest displayed private footprints, marginal costs over the matched half-history windows, and BEAM deployment cost, together with the highest LoCoMo score per private MB. Appendix D.8 defines the profile axes and normalization. The joint frontier in Figure 12 places continued-writing quality, rebuilding-relative quality and paired private cost in one Mistral setting. MIGRO combines the highest inherited-state answer quality with the smallest inherited-state footprint, yielding 2.60 times the best baseline’s answer quality per private MB across all eight methods. 
+
+5.7 What Remains Difficult in Long-Term Memory 
+
+On BEAM-1M, information extraction scores 66.92 and preference following 79.64, compared with 39.64 for contradiction resolution and 37.44 for event ordering (Appendix D.2, Table 12). Preserving facts is different from reconstructing their relationships. The harder questions require the reader to connect versions, recover temporal order, and combine evidence across records. Their scores do not identify one failing stage, but they expose the distance between retained observations and an accessible historical account. 
+
+> 15
+
+## MIGRO 
+
+Exact preservation keeps historical distinctions available. The remaining challenge is to make the relationships among those distinctions accessible when a question demands them. By keeping experience independent of its current reader, MIGRO provides a persistent foundation on which future memory access and reasoning can improve. 
+
+6 Conclusion 
+
+MIGRO organizes long-term memory around the continuity of experience across model changes. By separating preservation from access, it keeps historical evidence exact while allowing semantic organization and query-specific inputs to adapt. The completed evaluations connect this design to competitive question answering, effective state reuse across heterogeneous hosts, and continued writing close to full-history rebuilding, alongside compact persistence and low marginal storage growth. Quality, portability, and storage jointly determine whether accumulated experience remains useful as both the history and its consuming model change. The broader implication is a different relationship between model progress and memory growth. A model upgrade can change how earlier observations are interpreted without erasing the evidence available to future questions. Continued writing extends that history under the receiving host, making portability a continuity of accumulation rather than a one-time transfer. Preserving experience independently of its current reader leaves room for advances in retrieval and historical reasoning to improve how that experience is used. The model can change; the history that supports future reasoning can continue to grow. 
+
+References 
+
+[1] Adyasha Maharana, Dong-Ho Lee, Sergey Tulyakov, Mohit Bansal, Francesco Barbieri, and Yuwei Fang. Evaluating very long-term conversational memory of LLM agents. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 13851–13870, 2024. doi: 10.18653/v1/2024.acl-long.747. URL https: //aclanthology.org/2024.acl-long.747/. [2] Di Wu, Hongwei Wang, Wenhao Yu, Yuwei Zhang, Kai-Wei Chang, and Dong Yu. LongMemEval: Benchmarking chat assistants on long-term interactive memory. arXiv preprint arXiv:2410.10813 , 2024. URL https://arxiv.org/abs/2410.10813. [3] Yuhuai Wu, Markus N. Rabe, DeLesley Hutchins, and Christian Szegedy. Memorizing Transformers. In International Conference on Learning Representations , 2022. URL https://arxiv.org/abs/2203.08913. [4] Zeyu Zhang, Ziliang Guo, Yihang Sun, Xichong Zhang, Xixuan Hao, Zehao Lin, Yang Zhang, Xiaoyan Zhao, Tong Shen, Bo Tang, Zhi-Qin John Xu, Junchi Yan, Haofen Wang, Xu Chen, Feiyu Xiong, Zhiyu Li, and Tat-Seng Chua. Metis: Memory Foundation Model, 2026. URL https://arxiv.org/abs/2607.26760. [5] Zhiyu Li, Zeyu Zhang, Linyun Liu, Yiwei Bu, Chenyang Xi, Xichong Zhang, Yi Yu, Yu Yu, Zhichen Liu, Yuxiao Yi, Chunyu Li, Haoran Liu, Zhenkai Ding, Le Zhou, Juncheng Zhang, Boyu Chen, Zehao Lin, Guorui Li, Renyu Fu, Ji Li, Youyang Xia, Jiajun Shen, Harvey Li, Jingsong Zhou, Helan Hu, Tong Shen, Tianxiao Xu, Chenye Han, Weijie Li, Zhongquan Zhou, Hongming Xu, Yuekeng Li, Erenkai Zhu, Peng Yu, Wenhao Li, Jingyi Kang, Xixuan Hao, Xuzhou Zhu, Can Chen, Jiawei Liu, Chen Jiang, Tao Jiang, Fangwei Xiang, Zepeng Yao, Kai Chen, Guang Yang, Mingfei Lu, Chunhui Li, Zhengxuan Jiang, Bo Tang, Shiyu Zhan, Yihang Sun, Jie Chu, Wenjun Xiong, Zhenxiang Hua, Chen Lin, Detong Su, Dongyu Deng, Qiuping Ding, Guofeng Ding, Si Chen, Guohua Wen, Xu Chen, Zhi-Qin John Xu, Ying-Cong Chen, Ningyu Zhang, Haofen Wang, Muning Wen, Haotian Chen, Wentao Zhang, Xuanhe Zhou, Rita Zhang, Junchi Yan, and Feiyu Xiong. MemT-1.0: Towards Memory-Native Evolution, 2026. URL https://arxiv.org/abs/2610.26825. [6] Jingdi Lei, Di Zhang, Junxian Li, Weida Wang, Kaixuan Fan, Xiang Liu, Qihan Liu, Xiaoteng Ma, Baian Chen, and Soujanya Poria. δ -mem: Efficient Online Memory for Large Language Models, 2026. URL https://arxiv.org/abs/2605.12357. [7] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Sebastian Riedel, and Douwe Kiela. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. In Advances in Neural Information Processing Systems , volume 33, pages 9459–9474. Curran Associates, Inc., 2020. URL https://proceedings.neurips.cc/paper_files/paper/2020/file/6b493230205f780e1bc26945df7481e5-Paper.pdf. [8] Charles Packer, Sarah Wooders, Kevin Lin, Vivian Fang, Shishir G. Patil, Ion Stoica, and Joseph E. Gonzalez. MemGPT: Towards LLMs as operating systems. arXiv preprint arXiv:2310.08560 , 2023. URL https://arxiv.org/abs/2310.08560. [9] Wujiang Xu, Zujie Liang, Kai Mei, Hang Gao, Juntao Tan, and Yongfeng Zhang. A-MEM: Agentic memory for LLM agents. 
+
+arXiv preprint arXiv:2502.12110 , 2025. URL https://arxiv.org/abs/2502.12110. [10] Prateek Chhikara, Dev Khant, Saket Aryan, Taranjeet Singh, and Deshraj Yadav. Mem0: Building production-ready AI agents with scalable long-term memory. arXiv preprint arXiv:2504.19413 , 2025. URL https://arxiv.org/abs/2504.19413. [11] Zhiyu Li, Chenyang Xi, Chunyu Li, Ding Chen, Boyu Chen, Shichao Song, Simin Niu, Hanyu Wang, Jiawei Yang, Chen Tang, Qingchen Yu, Jihao Zhao, Yezhaohui Wang, Peng Liu, Zehao Lin, Pengyuan Wang, Jiahao Huo, Tianyi Chen, Kai Chen, Kehang Li, Zhen Tao, Huayi Lai, Hao Wu, Bo Tang, Zhengren Wang, Zhaoxin Fan, Ningyu Zhang, Linfeng Zhang, Junchi Yan, Mingchuan Yang, Tong Xu, Wei Xu, Huajun Chen, Haofen Wang, Hongkang Yang, Wentao Zhang, Zhi-Qin John 
+
+> 16
+
+## MIGRO 
+
+Xu, Siheng Chen, and Feiyu Xiong. MemOS: A Memory OS for AI System. arXiv preprint arXiv:2507.03724 , 2025. URL https://arxiv.org/abs/2507.03724. [12] Chuanrui Hu, Xingze Gao, Zuyi Zhou, Dannong Xu, Yi Bai, Xintong Li, Hui Zhang, Tong Li, Chong Zhang, Lidong Bing, and Yafeng Deng. EverMemOS: A Self-Organizing Memory Operating System for Structured Long-Horizon Reasoning. In Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) ,pages 45836–45853. Association for Computational Linguistics, 2026. doi: 10.18653/v1/2026.acl-long.2125. URL https://aclanthology.org/2026.acl-long.2125/. [13] Ke Yang, Zixi Chen, Xuan He, Jize Jiang, Michel Galley, Chenglong Wang, Jianfeng Gao, Jiawei Han, and ChengXiang Zhai. PlugMem: A task-agnostic plugin memory module for LLM agents. arXiv preprint arXiv:2603.03296 , 2026. URL https://arxiv.org/abs/2603.03296. [14] Ankit Goyal and Jaideep Ray. Does Your Agent’s Memory Survive a Model Upgrade? A Controlled Study of Memory Portability. arXiv preprint arXiv:2609.05339 , 2026. URL https://arxiv.org/abs/2609.05339. [15] James Cheney, Laura Chiticariu, and Wang-Chiew Tan. Provenance in Databases: Why, How, and Where. Foundations and Trends in Databases , 1(4):379–474, 2009. doi: 10.1561/1900000006. URL http://dx.doi.org/10.1561/1900000006. [16] Richard T. Snodgrass. Developing Time-Oriented Database Applications in SQL . Morgan Kaufmann Publishers, Inc., 1999. ISBN 1-55860-436-7. URL https://www2.cs.arizona.edu/~rts/publications.html. [17] H Jégou, M Douze, and C Schmid. Product Quantization for Nearest Neighbor Search. IEEE Transactions on Pattern Analysis and Machine Intelligence , 33(1):117–128, 2011. doi: 10.1109/tpami.2010.57. URL http://dx.doi.org/10.1109/TPAMI.2010.57. [18] Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey Edunov, Danqi Chen, and Wen-tau Yih. Dense Passage Retrieval for Open-Domain Question Answering. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP) , pages 6769–6781. Association for Computational Linguistics, 2020. doi: 10.18653/v1/2020.emnlp-main.550. URL https://aclanthology.org/2020.emnlp-main.550/. [19] Taku Kudo and John Richardson. SentencePiece: A simple and language independent subword tokenizer and detokenizer for Neural Text Processing. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing: System Demonstrations , pages 66–71. Association for Computational Linguistics, 2018. doi: 10.18653/v1/D18-2012. URL https://aclanthology.org/D18-2012/. [20] Ian H. Witten, Radford M. Neal, and John G. Cleary. Arithmetic coding for data compression. Communications of the ACM , 30 (6):520–540, 1987. doi: 10.1145/214762.214771. URL http://dx.doi.org/10.1145/214762.214771. [21] Grégoire Delétang, Anian Ruoss, Paul-Ambroise Duquenne, Elliot Catt, Tim Genewein, Christopher Mattern, Jordi Grau-Moya, Li Kevin Wenliang, Matthew Aitchison, Laurent Orseau, Marcus Hutter, and Joel Veness. Language modeling is compression. 
+
+arXiv preprint arXiv:2309.10668 , 2023. URL https://arxiv.org/abs/2309.10668. [22] Xixuan Hao, Zeyu Zhang, Zehao Lin, Yihang Sun, Ziliang Guo, Xichong Zhang, Yuxuan Liang, Feiyu Xiong, and Zhiyu Li. MemOps: Benchmarking lifecycle memory operations in long-horizon conversations. arXiv preprint arXiv:2607.12893 , 2026. URL https://arxiv.org/abs/2607.12893. [23] Yuanzhe Hu, Yu Wang, and Julian McAuley. Evaluating memory in LLM agents via incremental multi-turn interactions. In 
+
+The Fourteenth International Conference on Learning Representations , 2026. URL https://openreview.net/forum?id=DT7JyQ C3MR. [24] Mohammad Tavakoli, Alireza Salemi, Carrie Ye, Mohamed Abdalla, Hamed Zamani, and J. Ross Mitchell. Beyond a million tokens: Benchmarking and enhancing long-term memory in LLMs. arXiv preprint arXiv:2510.27246 , 2025. URL https://arxiv.org/abs/2510.27246. [25] Thomas M. Cover and Joy A. Thomas. Elements of Information Theory . Wiley, second edition, 2006. ISBN 9780471748823. doi: 10.1002/047174882x. URL http://dx.doi.org/10.1002/047174882X. [26] Naftali Tishby, Fernando C. Pereira, and William Bialek. The information bottleneck method. In Proceedings of the 37th Annual Allerton Conference on Communication, Control and Computing , pages 368–377, 1999. URL https://arxiv.org/abs/ph ysics/0004057. [27] Eyal Kushilevitz and Noam Nisan. Communication Complexity . Cambridge University Press, 1997. ISBN 9780511574948. doi: 10.1017/cbo9780511574948. URL http://dx.doi.org/10.1017/CBO9780511574948. [28] Artem Babenko and Victor Lempitsky. Additive Quantization for Extreme Vector Compression. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR) , pages 931–938, 2014. URL https://openaccess.thecvf.com/ content_cvpr_2014/html/Babenko_Additive_Quantization_for_2014_CVPR_paper.html. [29] Mingyuan Li, Guangsheng Yu, Xu Wang, and Shaoxiong Ji. Frozen Memory Is Not Enough: Rethinking External Memory as Extraction. arXiv preprint arXiv:2608.17050 , 2026. URL https://arxiv.org/abs/2608.17050. [30] Jade Goldstein and Jaime Carbonell. Summarization: (1) using MMR for diversity-based reranking and (2) evaluating summaries. In TIPSTER Text Program Phase III: Proceedings of a Workshop Held at Baltimore, Maryland, October 13–15, 1998 , pages 181–195, 1998. doi: 10.3115/1119089.1119120. URL https://aclanthology.org/X98-1025/. [31] Nelson F. Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio Petroni, and Percy Liang. Lost in the Middle: How Language Models Use Long Contexts. Transactions of the Association for Computational Linguistics , 12: 157–173, 2024. doi: 10.1162/tacl_a_00638. URL https://aclanthology.org/2024.tacl-1.9/. [32] Xiang Lisa Li and Percy Liang. Prefix-Tuning: Optimizing Continuous Prompts for Generation. In Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers) , pages 4582–4597. Association for Computational Linguistics, 2021. doi: 10.18653/v1/2021.acl-long.353. URL https://aclanthology.org/2021.acl-long.353/. 
+
+> 17
+
+## MIGRO 
+
+[33] Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen. LoRA: Low-Rank Adaptation of Large Language Models. In International Conference on Learning Representations , 2022. URL https://arxiv.org/abs/2106.09685. [34] Wei Zhou, Xuanhe Zhou, Shaokun Han, Hongming Xu, Guoliang Li, Zhiyu Li, Feiyu Xiong, and Fan Wu. Are We Ready For An Agent-Native Memory System? arXiv preprint arXiv:2606.24775 , 2026. URL https://arxiv.org/abs/2606.24775. [35] Kai Li, Xuanqing Yu, Ziyi Ni, Yi Zeng, Yao Xu, Zheqing Zhang, Xin Li, Jitao Sang, Xiaogang Duan, Xuelei Wang, Chengbao Liu, and Jie Tan. TiMem: Temporal-hierarchical memory consolidation for long-horizon conversational agents. arXiv preprint arXiv:2601.02845 , 2026. URL https://arxiv.org/abs/2601.02845. [36] Xianglong Shi, Ruijie Yang, Sirui Zhao, Shukang Yin, Zihao Bian, Tinghao Yi, and Enhong Chen. LSTMem: Hierarchical long short-term online memory for large language models. arXiv preprint arXiv:2609.33268v2 , 2026. URL https://arxiv.org/ab s/2609.33268v2. [37] Haodong Lei, Junming Liu, Yirong Chen, Pinlong Cai, Botian Shi, Ding Wang, and Hongsong Wang. Transmem: Transforming hidden states into memory for large language models, 2026. URL https://arxiv.org/abs/2607.29032. [38] Rujikorn Charakorn, Edoardo Cetin, Shinnosuke Uesaka, and Robert Tjarko Lange. Doc-to-loRA: Learning to instantly internalize contexts. In Forty-third International Conference on Machine Learning , 2026. URL https://openreview.net/forum?i d=iW1oBBO72S. [39] Jason Weston, Sumit Chopra, and Antoine Bordes. Memory Networks. In International Conference on Learning Representations ,2015. URL https://arxiv.org/abs/1410.3916. [40] Sainbayar Sukhbaatar, Arthur Szlam, Jason Weston, and Rob Fergus. End-To-End Memory Networks. In Advances in Neural Information Processing Systems , volume 28. Curran Associates, Inc., 2015. URL https://proceedings.neurips.cc/paper_files/p aper/2015/file/8fb21ee7a2207526da55a679f0332de2-Paper.pdf. [41] Jack W. Rae, Anna Potapenko, Siddhant M. Jayakumar, and Timothy P. Lillicrap. Compressive Transformers for Long-Range Sequence Modelling. In International Conference on Learning Representations , 2020. URL https://arxiv.org/abs/1911.05507. [42] Kevin Meng, David Bau, Alex Andonian, and Yonatan Belinkov. Locating and Editing Factual Associations in GPT. In 
+
+Advances in Neural Information Processing Systems , volume 35, pages 17359–17372. Curran Associates, Inc., 2022. doi: 10.52202/068431-1262. URL https://proceedings.neurips.cc/paper_files/paper/2022/file/6f1d43d5a82a37e89b0665b33bf3a1 82-Paper-Conference.pdf. [43] Yu Wang, Yifan Gao, Xiusi Chen, Haoming Jiang, Shiyang Li, Jingfeng Yang, Qingyu Yin, Zheng Li, Xian Li, Bing Yin, Jingbo Shang, and Julian McAuley. MEMORYLLM: Towards self-updatable large language models. In Proceedings of the 41st International Conference on Machine Learning , volume 235 of Proceedings of Machine Learning Research , pages 50453–50466. PMLR, 2024. URL https://proceedings.mlr.press/v235/wang24s.html. [44] Kelvin Guu, Kenton Lee, Zora Tung, Panupong Pasupat, and Mingwei Chang. Retrieval Augmented Language Model Pre-Training. In Proceedings of the 37th International Conference on Machine Learning , volume 119, pages 3929–3938. PMLR, 2020. URL https://proceedings.mlr.press/v119/guu20a.html. [45] Joon Sung Park, Joseph C. O’Brien, Carrie J. Cai, Meredith Ringel Morris, Percy Liang, and Michael S. Bernstein. Generative agents: Interactive simulacra of human behavior. arXiv preprint arXiv:2304.03442 , 2023. URL https://arxiv.org/abs/2304.03442. [46] Chris Latimer, Nicoló Boschi, Andrew Neeser, Chris Bartholomew, Gaurav Srivastava, Xuan Wang, and Naren Ramakrishnan. Hindsight is 20/20: Building Agent Memory that Retains, Recalls, and Reflects. arXiv preprint arXiv:2512.12818 , 2025. URL https://arxiv.org/abs/2512.12818. [47] Preston Rasmussen, Pavlo Paliychuk, Travis Beauvais, Jack Ryan, and Daniel Chalef. Zep: A Temporal Knowledge Graph Architecture for Agent Memory. arXiv preprint arXiv:2501.13956 , 2025. URL https://arxiv.org/abs/2501.13956. [48] Meriem Yacoubi, Pia Schmidt, Nenad Petrovic, Ahmed Frikha, Martin Kirchhoff, and Alois Knoll. MemoryLACE: Memory Lifecycle-Aware Consolidation and Evidence Retrieval. arXiv preprint arXiv:2609.03201 , 2026. URL https://arxiv.org/abs/26 09.03201. [49] Zihe Ye, Jingyuan Huang, Weixin Chen, and Yongfeng Zhang. H-Mem: Hybrid Multi-Dimensional Memory Management for Long-Context Conversational Agents. In Proceedings of the 19th Conference of the European Chapter of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 7756–7775. Association for Computational Linguistics, 2026. doi: 10.18653/v1/2026.eacl-long.363. URL https://aclanthology.org/2026.eacl-long.363/. [50] Shuqi Cao, Jingyi He, and Fei Tan. HiGMem: A Hierarchical and LLM-Guided Memory System for Long-Term Conversational Agents. In Findings of the Association for Computational Linguistics: ACL 2026 , pages 33853–33862. Association for Computational Linguistics, 2026. doi: 10.18653/v1/2026.findings-acl.1690. URL https://aclanthology.org/2026.findings-acl.1 690/. [51] Shuo Ji, Yibo Li, and Bryan Hooi. Memory is Reconstructed, Not Retrieved: Graph Memory for LLM Agents. In Proceedings of the 43rd International Conference on Machine Learning , volume 306, pages 51423–51444. PMLR, 2026. URL https: //proceedings.mlr.press/v306/ji26d.html. [52] Zijie Dai, Shiyuan Deng, Sheng Guan, Yizhou Tian, Xin Yao, Xiao Yan, and James Cheng. RecMem: Recurrence-based Memory Consolidation for Efficient and Effective Long-Running LLM Agents. In Findings of the Association for Computational Linguistics: ACL 2026 , pages 32353–32376. Association for Computational Linguistics, 2026. doi: 10.18653/v1/2026.finding s-acl.1619. URL https://aclanthology.org/2026.findings-acl.1619/. [53] Ahmad Yehia, Aly O. Abdelkareem, Islam Ahmed, Hesham Omran, Khaled Alashmouny, Christian Claudel, and Abduallah Mohamed. Mem++: Non-Destructive Memory for Long-Term Organizational LLM Agents. arXiv preprint arXiv:2610.02002 ,2026. URL https://arxiv.org/abs/2610.02002. 
+
+> 18
+
+## MIGRO        
+
+> [54] Jiaqi Liu, Yaofeng Su, Peng Xia, Siwei Han, Zeyu Zheng, Cihang Xie, Mingyu Ding, and Huaxiu Yao. SimpleMem: Efficient Lifelong Memory for LLM Agents. In Proceedings of the 43rd International Conference on Machine Learning , volume 306, pages 78500–78513. PMLR, 2026. URL https://proceedings.mlr.press/v306/liu26dx.html. [55] Jiajie Fu, Junwen Chen, Mengzhao Wang, Aoxiang He, Maojia Sheng, Xiangyu Ke, Yifan Zhu, and Yunjun Gao. VikingMem: A Memory Base Management System for Stateful LLM-based Applications. arXiv preprint arXiv:2605.29640 , 2026. URL https://arxiv.org/abs/2605.29640. [56] Mingxi Zou, Zhihan Guo, Langzhang Liang, Zhuo Wang, Qifan Wang, Qingsong Wen, Irwin King, Lizhen Qu, and Zenglin Xu. Remember the Decision, Not the Description: A Rate-Distortion Framework for Agent Memory. arXiv preprint arXiv:2605.10870 , 2026. URL https://arxiv.org/abs/2605.10870. [57] Weizhi Wang, Li Dong, Hao Cheng, Xiaodong Liu, Xifeng Yan, Jianfeng Gao, and Furu Wei. Augmenting language models with long-term memory. In Advances in Neural Information Processing Systems , volume 36, pages 74530–74543. Curran Associates, Inc., 2023. doi: 10.52202/075280-3259. URL https://proceedings.neurips.cc/paper_files/paper/2023/hash/ebd82 705f44793b6f9ade5a669d0f0bf-Abstract-Conference.html. [58] Yurui Chang, Yiran Wu, Qingyun Wu, and Lu Lin. MemCollab: Cross-Model Memory Collaboration via Contrastive Trajectory Distillation. arXiv preprint arXiv:2603.23234 , 2026. URL https://arxiv.org/abs/2603.23234. [59] Yasmine Omri, Ziyu Gan, Zachary Broveak, Robin Geens, Zexue He, Alex Pentland, Marian Verhelst, Tsachy Weissman, and Thierry Tambe. Agent Memory: Characterization and System Implications of Stateful Long-Horizon Workloads. arXiv preprint arXiv:2606.06448 , 2026. URL https://arxiv.org/abs/2606.06448. [60] Qwen Team. Qwen3: Think Deeper, Act Faster, 2025. URL https://qwenlm.github.io/blog/qwen3/. [61] Mistral AI. Ministral 3 14B Instruct 2512 BF16, 2025. URL https://huggingface.co/mistralai/Ministral-3-14B-Instruct-251 2-BF16. [62] Google DeepMind. Gemma 4 26B A4B IT, 2026. URL https://huggingface.co/google/gemma-4-26B-A4B-it.
+
+A Relationship to Prior Work 
+
+MIGRO connects four research threads: learned access to retained representations, external evidence separated from active context, hybrid representations with explicit preservation criteria, and interfaces that reuse memory across consumers. The distinctions concern what is stored, how it is accessed and which resources remain tied to a model. 
+
+A.1 Neural and latent memory: extending computational state 
+
+Memory Networks make addressable memory participate in inference; the end-to-end formulation learns repeated attention over supporting memories [39, 40]. Compressive Transformers extend the past through compressed activations, while Memorizing Transformers retrieve internal key–value pairs through approximate nearest-neighbor lookup [3, 41]. In both cases, the retained representation extends what the model can use beyond its ordinary active window, under conventions designed with the consuming architecture. Factual model editing changes selected weights to alter stored associations [42]. MemoryLLM, LSTMem and TransMem explore latent pools, online state accumulation or context-derived interventions as further forms of learned memory [36, 37, 43]. Their storage and update rules give retained experience different computational roles. MIGRO uses learned representations for semantic organization and interpretation, while independent source bindings define historical identity. Metis learns native memory procedures through memory-specific mid-training. Its persistent dynamic state is updated by forward computation and accessed through memory attention [4]. MemT-1.0 extends this approach with dynamic local memory, trainable hyper memory, stable token-level Gated DeltaNet-2 updates and Mixture-of-Storage capacity scaling [5]. δ -mem instead adds a compact associative matrix alongside a frozen full-attention backbone, writes with a gated delta rule, and uses the readout for low-rank attention corrections [6]. These designs make compact retained state part of active computation. MIGRO assigns a separate role to its growing canonical history: preserving exact observations that later computations can revisit. MemOS broadens the managed objects to plaintext, activation and parameter memory. Its MemCubes include provenance and versions and support composition, migration and lifecycle management [11]. This system-level view establishes that portable memory can encompass several representation types. MIGRO specifies which observation fields persist, how each host reads and extends them, and how an archive recovers the saved state. 
+
+> 19
+
+## MIGRO 
+
+A.2 Explicit and retrieval-augmented memory: separating records from active context 
+
+REALM and RAG couple neural models to externally retrieved documents, and dense passage retrieval provides learned semantic access to that corpus [7, 18, 44]. The corpus can persist independently of the model’s parameters while retrieval constructs a query-specific input. This is an established foundation for memory surviving a model instance. Agent memory extends this separation to evolving interactions. Managed recall, reflections, linked descriptors, extracted knowledge and temporal hierarchies organize an agent’s experience [8–10, 13, 35, 45]. Several such systems already retain original content or pursue model independence. The relevant comparison is therefore how retention, bounded access, continued growth and host replacement are connected, rather than whether a system uses external storage. Recent work exposes the lifecycle structure more directly. Hindsight separates world facts, experiences, entity summaries and evolving beliefs, while EverMemOS connects episodic MemCells, consolidated MemScenes and reconstructive recall [12, 46]. Zep uses time-aware facts, and MemoryLACE retains provenance-bearing textual units linked by merge, supersession and contradiction relations [47, 48]. These structures make historical relationships part of retrieval rather than leaving them implicit in an undifferentiated transcript. Other designs change the granularity or timing of access. H-Mem combines temporal and semantic trees, and HiGMem uses event-summary anchors to reach individual turns [49, 50]. MRAgent explores a Cue–Tag–Content graph during reasoning, while RecMem delays consolidation until recurrent evidence supports it and refines access to finer facts [51, 52]. Such mechanisms determine which retained evidence can be recovered economically. Long-context position effects further distinguish available records from evidence a model can use effectively [31]. MIGRO makes the delivered packet and its source-token cost explicit at this boundary. 
+
+A.3 Hybrid representation and evidence preservation: assigning fidelity 
+
+Product and additive quantization compress vector coordinates for approximate search [17, 28]. An approximate address can locate an exact object, which motivates assigning separate fidelity criteria to search geometry and source evidence. Database provenance and temporal databases provide the corresponding distinction between a current value, its origin and its historical states [15, 16]. MIGRO combines quantized address organization with explicit source attribution, record order and retained content. Mem++ is a close preservation strategy: it keeps complete dated, attributed documents and selects relevant versions at read time [53]. SimpleMem instead synthesizes compact semantic units and plans retrieval by intent; VikingMem evolves an event/entity base with topic-wise temporal compression [54, 55]. The preservation criterion matters to this comparison. MIGRO’s archive recovers the saved source IDs, coordinates and bookkeeping, while its active packet is selective. DeMem, Remember the Decision, Not the Description , measures compression through achievable decision quality under a fixed number of runtime states. Certified conflicts trigger partition refinement [56]. This is complementary to retaining canonical experience for an expanding family of future questions: runtime abstraction limits what one decision process carries, whereas durable preservation determines what future processes can revisit. Information theory distinguishes relevance-preserving abstraction from redundancy removed by a reversible code [20, 21, 25, 26]. Section 3.3 expresses preservation through query-distinguishable histories. The causal archive then exploits statistical regularity without changing that saved history. Semantic quantization changes address coordinates, selection limits the evidence packet, and lossless coding reduces archive bytes while preserving the saved state. 
+
+A.4 Portable interfaces: changing consumers around retained experience 
+
+A persistent record and a model input have different lexical conventions. Token identities, segmentation and normalization depend on the tokenizer [19]. MIGRO separates a canonical source vocabulary from the receiv-ing vocabulary and constructs target embeddings through lexical/subword hypotheses. Exact source recovery establishes what survived. Successful host interpretation establishes whether the receiver can use it. Frozen-memory extraction studies this receiving boundary by attaching an external learned table to another backbone through compatible or adapted readers [29]. Model-upgrade experiments distinguish construction losses from retrieval and interpretation failures, including repair enabled by original histories [14]. Metis also applies 
+
+> 20
+
+## MIGRO 
+
+its architecture and mid-training recipe to compatible Llama and Gemma backbones [4]. That comparison tests architectural and training transfer. MIGRO tests a complementary object: the same accumulated user state handed between receivers, with continued writes and exact saved-state restoration. Continuous prefixes and LoRA localize adaptation while keeping pretrained backbone weights frozen [32, 33]. LongMem decouples a frozen backbone from a learned SideNet reader, while TransMem and Doc-to-LoRA derive reusable latent interventions or low-rank adapters from context [37, 38, 57]. These designs show several ways to place a reusable memory or conditioning interface around a host. In MIGRO, optional calibration is a shared access asset rather than per-user experience. The evaluated Doc-to-LoRA baseline uses its stated stabilized native-window 1/N configuration. MemCollab addresses another form of transfer: contrasting model-generated reasoning trajectories to derive common task-level constraints [58]. Its reasoning abstractions concern a different retained object from MIGRO’s observations and source identities. Agent-native evaluations and phase-aware workload studies connect these representation choices to maintenance, construction, retrieval and generation cost [34, 59]. MIGRO’s accounting isolates complete private bytes, marginal history growth and shared persistent resources within that broader cost picture. Table 7 locates selected recent mechanisms by their retained objects, consuming interfaces, growth operations and preservation criteria.            
+
+> Work Evidence / organization Host boundary / growth Preservation / cost object
+> Mem++ [53] Whole dated documents; lexical--semantic retrieval. Document consumption; append later versions. Original documents; generative write calls. MemOS [11] Typed MemCubes with provenance and versions. MemCube migration, composition and lifecycle evolution. Content/metadata management; heterogeneous memory resources. Frozen-memory extraction [29] External learned table and common addressing. Frozen-source reuse with compatible or adapted target readers. Reused learned artifact; reader adaptation and QA. Model-upgrade study [14] Raw histories, retrieval chunks, notes and fixed-schema graphs. Direction-specific writer/reader swaps and source-assisted repair. Construction/access diagnostics; QA continuity and repair. MemoryLACE [48] Atomic text and provenance; sparse lifecycle relations. Evidence access across QA backbones; merge, supersession and contradiction links. Relation-aware evidence units; end-to-end runtime. VikingMem [55] Event/entity base with topic-wise timelines. Application-level memory base; event-driven state evolution. Temporal abstraction and compression; recall and latency. DeMem [56] Decision-oriented partition of history--query contexts. Decision readout; certified partition refinement. Decision distortion; Kruntime memory states.
+> MIGRO Exact source bindings; quantized anchors and innovations. Receiving-host input interface; append after handoff. Exact saved-state recovery; private and shared persistent bytes.
+
+Table 7. Selected recent mechanisms across MIGRO’s lifecycle boundaries. Paired columns identify the retained object and access structure, the consuming interface and growth operation, and the preservation criterion and resource object. 
+
+B Unified Notation 
+
+Source, coding and target tokenizers define different sequence lengths. Table 8 distinguishes their symbols alongside the state, access and storage quantities. The host profile specifies calibration and task budgets; the private state retains experience. 
+
+Table 8. Unified symbols. Address approximation occurs at writing; exact archival recovery is defined over the saved representation. 
+
+Symbol Meaning 
+
+Mn Logical persistent state after n accepted observations. 
+
+oi = ( xi, mi) Observation content and its available provenance. 
+
+hi, h, θh Writing host, reading host, and frozen host parameters. 
+
+A , D, X , P, G , V Anchors, address innovations, exact content, provenance, reference links, and retained history. 
+
+σ , τs, vi, Es Canonicalization, shared source tokenizer, exact ordered source IDs, and public source embedding table. 
+
+21 MIGRO 
+
+Symbol Meaning 
+
+ki, ui, μ,U Public semantic address, shared coordinates, center, and basis. 
+
+A j, ai,Wδ , bδi Shared anchor, assigned anchor index, innovation subspace, and saved innovation. 
+
+Wi, ρi Bounded same-session past window and chosen predecessor relation. 
+
+Eq, K, T Delivered evidence, relevance-seed count, and source-token budget. 
+
+Th, Ih, ηh Lexical/subword transport, host assembly operator, and optional calibrated residual parameters. 
+
+Ωg, τh, Eh Composed lexical hypotheses, target tokenizer, and target embedding table. 
+
+yp,t , cp,t , epφ Coding-vocabulary token, page-local causal context, and realized integer-CDF probability. 
+
+fp, Tp, bp Page framing, actually coded positions, and arithmetic bitstream. 
+
+B, Πh Shared dependency bundle and declared host access profile. 
+
+Sn Snapshot whose exact decoding restores the saved Mn.
+
+L, Buser , β Original source-body token count, complete private persistent bytes, and incremental bytes/token. 
+
+N, Bshared ,Cmemory (N) Number of independent memories, fixed method assets, and mean storage per memory after sharing. 
+
+Rn, ¯mi, Q, ∼Q Canonical evidence history, saved contextual fields, future question family, and equivalence under its evidence-determined answers. 
+
+F, Ans (q, R) Query-independent abstract encoding and answer determined by history R.
+
+Devidence , Daddress Exact-history discrepancy indicator and maximum reconstructed-address error. 
+
+ε, γq Uniform candidate-address error bound and semantic Top-K boundary margin. 
+
+C Host Checkpoints 
+
+The table lists the reference hosts used in the main comparisons and the checkpoints for Qwen quality scaling and the heterogeneous scale-up chain. Appendix D.3 describes the implemented reference interfaces. 
+
+Role Checkpoint family / model card Planned comparison 
+
+Qwen quality anchor Qwen3-4B-Instruct-2507 Main quality/storage host and the 4B starting point for same-host quality scaling. Qwen dense capacity Qwen3-4B-Instruct-2507; Qwen3-8B, Qwen3-14B, Qwen3-32B [60] Independent same-host quality scaling on four benchmarks; LoCoMo-only 4→8→14 →32 migration chain. Mistral reference host Mistral-7B-Instruct-v0.3 LoCoMo heterogeneous transfer and target-native rebuilding. Phi reference host Phi-3-mini-4k-instruct (3.8B) LoCoMo heterogeneous transfer and target-native rebuilding; execution mode follows Section 5.4. Ministral scale-up receiver Ministral-3-14B-Instruct-2512-BF16 [61] First receiving stage after Qwen3-4B-Instruct-2507. Gemma scale-up receiver gemma-4-26B-A4B-it [62] Second receiving stage after Ministral. MoE with 25.2B total and 3.8B active parameters. 
+
+Table 9. Checkpoint identities for the reference comparisons and Qwen scaling and cross-family transfer. All conditions use text-only inputs. 
+
+D Lifecycle and Reference Details 
+
+The tables below expand the revision example, benchmark measurements, reference configuration, and operational contracts. The lifecycle algorithm connects observation writes, evidence reads, snapshots, and model handoff. 
+
+D.1 Revision trace 
+
+Table 10 expands the versioned-budget example introduced in Section 2. 
+
+22 MIGRO            
+
+> Stage Host event Retained evidence Consequence for later access
+> 1A observes Budget 17; explicitly version 1; user/source identity. Bind the exact value and provenance. 2Handoff to B; B observes Budget 18; version 2. Version 1 remains. Shared addresses may relate the statements; content is not merged. 3Handoff to C; C observes Budget 19; version 3. Both earlier records remain. C adds a record in the same schema. 4Return to A; query Latest and version-1 evidence remain available. The question determines which version must support the answer.
+
+Table 10. Running revision trace, adapted from the implementation’s versioned-budget observations. Logical answer requirements are not accuracy measurements. 
+
+D.2 Benchmark measurements 
+
+Table 11 specifies the tasks and scoring used in Section 5.1.       
+
+> Benchmark Main measurement Complementary stress
+> LoCoMo [1] One all-question composite over 1,986 questions, defined in Equation 16. Speaker attribution, temporal reasoning, multi-hop recall, abstention. LongMemEval-S [2] Auxiliary-judge answer accuracy over 500 questions. Cross-session memory, temporal questions, updates, missing information. MemOps [22] Longitudinal answer accuracy over 2,006 questions; operation/state diagnostics separately. Memory lifecycle operations and evidence use across an evolving trajectory. MemoryAgentBench [23] Macro-average across four memory competencies. Incremental interaction, retrieval, test-time learning, long-range understanding, and handling revised knowledge. BEAM-1M [24] Native-category aggregation over 700 questions from 35 histories, including event ordering. Long-distance evidence and temporal consistency in million-token histories.
+
+Table 11. Task coverage and reported metrics. LongMemEval-S and MemOps use the project’s auxiliary judges. BEAM uses its category-specific aggregation, with auxiliary judging where required. All scores in the main comparison are on a 0–100 scale. 
+
+Comparison settings. All completed main-quality cells in Section 5.2 use Qwen3-4B-Instruct-2507 on the stated question sets. Each method retains its native read path and computation budget, which can differ across methods. MIGRO uses its fixed task-specific configuration, including the 2000-source-token LoCoMo reader. Target-adapted heterogeneous rebuilding settings are detailed in Appendix D.3. Storage replicas are evaluated independently: every quality–storage point pairs the score and bytes of the actual measured state. Same-evidence native-text and no-memory answers are diagnostic controls rather than substitutes for the main methods. Mistral-7B-Instruct-v0.3 and Phi-3-mini-4k-instruct are the initial heterogeneous targets. MIGRO’s reference profile uses 16 relevance seeds and a 2000-source-token evidence cap. Comparisons identify generation allowances, prompts and calibration budgets. Interface calibration uses public examples rather than benchmark answers. Zero-calibration and fixed-example conditions are separated. 
+
+Cohorts and uncertainty. Questions within a conversation, identity or source history share evidence, so un-certainty is assessed by resampling those clusters. Paired storage comparisons retain the same source clusters, and adjacent and longitudinal MemOps views belong to the same identity cluster. Calibration-seed variation is assessed separately where calibration is compared. Result records identify dataset versions, observation streams, scorers and checkpoints. The LoCoMo composite equally weights all 1,986 questions and was selected after the runs; Equation 16 defines it. BEAM’s 700-question cohort contains 100 previously inspected questions, so the remaining 600-question score is 
+
+> 23
+
+## MIGRO 
+
+also reported. The BEAM aggregate includes the native event-ordering component. Its 35-history QA cohort is separate from the five-history storage study. 
+
+MemoryAgentBench. The added benchmark uses Qwen3-4B-Instruct-2507 and reports the unweighted mean of its four competency scores. MIGRO scores 35.16, TransMem scores 22.80, and LSTMem scores 6.56. This aggregate is separate from the LoCoMo all-question score and the task-specific metrics of the other benchmarks. 
+
+Aggregate uncertainty and held-out subsets. MIGRO’s MemOps score covers 100 identities and 2,006 questions, with an identity-cluster 95% interval of [64 .51 , 68 .23 ]. Its 1,772-question unseen-identity subset scores 66.65. BEAM-1M covers 35 histories and 700 questions, with a history-cluster interval of [54 .06 , 57 .90 ]. The 600 previously uninspected questions score 55.58, with an interval of [53 .57 , 57 .70 ]. The operation and category breakdowns in Section 5.7 identify the remaining difficulty within these aggregates. 
+
+Same-host scaling settings. The same-host scaling study starts from Qwen3-4B-Instruct-2507 and extends to Qwen3-8B, Qwen3-14B and Qwen3-32B [60]. The sweep uses fixed non-thinking chat settings, evidence and answer budgets, precision and scoring. 
+
+Independent construction. For each method and checkpoint, the quality sweep begins with an empty memory, ingests the benchmark history, and answers with that same host. Observation order, access budgets and the public-example calibration allowance are fixed within each family. Each row therefore measures end-to-end quality with a memory prepared for its own host. Table 2 and Figure 5(a) report the available LoCoMo scaling results. LongMemEval-S, MemOps and BEAM-1M remain planned extensions of this same-host sweep. The continuous Qwen migration study is evaluated separately on LoCoMo in Section 5.4. 
+
+Migration comparisons and diagnostics. MIGRO, PlugMem, and Mem0 use State Transfer; TiMem, A-MEM, LSTMem, and Doc-to-LoRA use Full-History Rebuilding. The within-Qwen study uses LoCoMo only and follows a continuous chain from the Qwen training/source host through consecutive receiving stages. Target-native rebuilding results are reused where applicable, while portable methods’ same-host and transferred-state scores remain distinct. For State Transfer methods, additional loss is defined against a matched same-method target-native reference: 
+
+∆s = Qself  
+
+> hs
+
+− Qtransferred  
+
+> w1: s→hs
+
+. (15) Here Qself  
+
+> hs
+
+is the quality of that same method’s target-native state under matched history and access settings. This diagnostic separates inherited-state effects from target-model capability. Cross-method receiving-host scores do not measure this loss. Local target-rebuilding controls are available for Phi and Mistral (Figure 11). MIGRO’s completed continued-write comparison appears in Figure 7. Continued-write tests add observations after handoff and separate earlier-history QA, new-history QA, and cross-boundary integration. The transferred-state-only condition freezes the inherited memory at the boundary; the continued-writing condition appends subsequent observations to that memory; full-history rebuilding constructs target-side memory from both portions of history. The single additional migration study is a LoCoMo heterogeneous scale-up chain: Qwen3-4B-Instruct-2507 → Ministral-3-14B-Instruct-2512-BF16 → gemma-4-26B-A4B-it. The two receivers inherit state consecutively. Matched target-native references separate changes in host capability from the effects of state inheritance. State Transfer methods continue from their carried states; rebuilding methods reconstruct from the full history available at each boundary. 
+
+Matched-state LoCoMo scoring. The matched-state comparisons use the same ten LoCoMo conversations. Each operating point pairs the quality of its evaluated states with their total native bytes. The all-question composite equally weights 1,986 questions: 
+
+Qall = 1540 F1, 1:4 + 446 A5
+
+1986 , (16) Here F1, 1:4 is token F1 over categories 1–4 and A5 is the category-5 score. The composite was chosen after the runs and is used consistently in the main quality and storage tables. Storage replicas retain their own scores. Conversation-bootstrap intervals keep each conversation’s questions together. 
+
+Additional operation diagnostics. The MemOps operation-detection F1 is 53.42 and provenance support is 63.77. These diagnostics complement the answer-quality breakdown in Table 12. 
+
+> 24
+
+## MIGRO                                                                  
+
+> Benchmark Operation / capability Questions Score 95% cluster CI
+> MemOps Remember 408 73.53 [70.10, 76.96] MemOps Forget 400 72.75 [68.50, 76.75] MemOps Reflect 480 64.17 [60.41, 67.92] MemOps Update 308 62.99 [57.79, 68.18] MemOps TrajectoryOps 410 57.80 [53.17, 62.20] BEAM-1M Abstention 70 55.36 [46.41, 64.64] BEAM-1M Contradiction resolution 70 39.64 [35.71, 43.57] BEAM-1M Event ordering 70 37.44 [32.54, 42.71] BEAM-1M Information extraction 70 66.92 [57.46, 76.41] BEAM-1M Instruction following 70 75.71 [65.83, 84.05] BEAM-1M Knowledge update 70 65.00 [55.00, 75.00] BEAM-1M Multi session reasoning 70 54.39 [46.85, 62.28] BEAM-1M Preference following 70 79.64 [72.14, 86.43] BEAM-1M Summarization 70 36.61 [31.22, 41.83] BEAM-1M Temporal reasoning 70 47.62 [37.38, 58.57]
+> Table 12. MIGRO operation and capability scores under the Qwen reference configuration. Intervals cluster by MemOps identity or BEAM history. Revision, trajectory reasoning and multi-record synthesis remain more difficult than individual recall or following tasks.
+
+Boundary-composition ablation. The matched local-interface LoCoMo comparisons are Qwen 4B: 54.21 with the full interface and 53.41 without boundary composition (a 0.80-point decrease); Phi: 49.73 and 48.05 (1.68 points); and Mistral: 45.48 and 39.98 (5.50 points). Mistral retains calibration. These complete-interface scores serve as references for this local mechanism ablation and are separate from the main migration runs in Table 3. The decreases measure the contribution of boundary composition rather than target-relative transfer loss. 
+
+Core transfer controls. Fourteen conditions each contain all 1,986 LoCoMo questions. In Qwen 4B source / Phi / Mistral order, direct state reuse scores 54.21 / 49.73 / 45.48; BM25 scores 47.50 / 37.99 / 41.55; recent history scores 26.26 / 24.83 / 24.96; and no memory scores 18.90 / 30.95 / 19.26. Target-side rebuilding scores 49.65 on Phi and 45.19 on Mistral. The reported paired direct-minus-BM25 differences are +11.74 and +3.93, with intervals wholly above zero. The reported paired direct-minus-rebuilding estimates are +0.07 and +0.28, with intervals crossing zero. These supplied paired estimates are retained separately from the scores displayed to two decimal places. Direct reuse avoids 740 memory-building model forwards for each receiver; this count excludes the ordinary answer-generation stage. These local controls share full-mechanism reference scores with the boundary-composition ablation; they do not replace the main migration-chain scores in Table 3. 
+
+Continued-write comparison. Figure 7 uses three conditions evaluated under the same receiving host. In old-history / new-history / cross-boundary / overall order, transferred state without additional writes scores 53.52 / 6.66 / 29.28 / 36.94; transfer followed by continued writing scores 51.85 / 53.09 / 35.71 / 45.13; and full-history rebuilding scores 51.55 / 52.90 / 36.61 / 45.19. Continued writing avoids reconstructing the pre-handoff history at the receiver. The supplied paired cross-boundary improvement is 6.44 points with an interval above zero; paired estimates and displayed means can differ slightly through rounding. Under the same setting, PlugMem scores 33.46 with transferred state alone, 37.38 with continued writing, and 36.95 with target-side full-history rebuilding. The displayed overall gain from continued writing is 8.19 points for MIGRO and 3.92 for PlugMem; the cross-method gap increases from 3.48 to 7.75 points. 
+
+Mem0 continued-write comparison. Each of the three conditions covers all 1,986 LoCoMo questions. Mem0 scores 35.59 with transferred state alone, 43.89 after continued writing, and 44.37 with target-side full-history rebuilding. Continued writing raises the overall score by 8.30 points, leaving a 0.48-point gap to rebuilding. 
+
+LSTMem continuation from rebuilt memory. LSTMem rebuilds memory from the first half of the history before the continuation comparison. In old-history / new-history / cross-boundary / overall order, rebuilding the first half and continuing to write scores 10.41 / 12.42 / 12.51 / 11.15; retaining only the rebuilt first-half memory scores 10.64 / 12.53 / 12.67 / 11.34; and full-history rebuilding scores 10.16 / 12.71 / 12.52 / 11.16. These are rebuilding-start conditions, in contrast to the transferred-state starts for MIGRO, PlugMem, and Mem0 in Figure 7. LSTMem’s scores remain nearly flat across the three conditions. 
+
+> 25
+
+## MIGRO Direct state BM25 Recent window No memory Target rebuild 
+
+> 20 30 40 50 60
+> LoCoMo
+> 54.21
+> 47.50 26.26 18.90
+
+—
+
+(a) Qwen 4B · source    
+
+> Direct state BM25 Recent window No memory Target rebuild
+> 49.73
+> 37.99 24.83 30.95 49.65 740 memory-building forwards avoided
+
+(b) Phi    
+
+> Direct state BM25 Recent window No memory Target rebuild
+> 45.48
+> 41.55 24.96 19.26 45.19 740 memory-building forwards avoided
+
+(c) Mistral 
+
+Core transfer controls 
+
+> Direct state reuse vs. target rebuilding; answering is performed normally in both conditions.
+
+Figure 11. Core LoCoMo transfer controls, with 1,986 questions in each of 14 conditions. Host-specific panels compare direct state reuse, BM25 simple memory, recent history, no memory, and target-side rebuilding; the last is inapplicable to the Qwen source reference. Axes span 15–60. Direct reuse exceeds BM25 by the reported paired estimates of 11.74 points on Phi and 3.93 on Mistral, with paired intervals above zero. Reported direct-minus-rebuilding estimates are +0.07 and +0.28, with intervals crossing zero; plotted scores are displayed to two decimals. Each target avoids 740 memory-building forwards through direct reuse; answer generation is performed normally. 
+
+Doc-to-LoRA and TransMem continuation. In continued-writing / first-half-only / full-history-rebuilding order, Doc-to-LoRA scores 10.98 / 11.04 / 11.32, and TransMem scores 7.04 / 9.60 / 7.04. Additional writing does not increase the displayed overall score for either method in this comparison. 
+
+A-MEM and TiMem continuation. In continued-writing / first-half-only / full-history-rebuilding order, A-MEM scores 34.01 / 29.67 / 37.87, and TiMem scores 37.17 / 32.30 / 40.92. Continued writing improves their overall scores by 4.34 and 4.87 points, respectively, leaving gaps of 3.86 and 3.75 points to full-history rebuilding. Overall continuation scores are now available for all seven baselines in Figure 7b. 
+
+Incomplete comparisons. Matched rebuilding references for the heterogeneous scale-up chain are pending. The outstanding transfer comparisons include broader matched-path diagnostics and additional interface ablations. Category-level continued-writing breakdowns are available for all eight methods in the retained result files. The saved-state pairs for continuation and full-history rebuilding are complete and support Figure 12. The transfer radar uses common receiving-quality, continuation, and execution-mode dimensions; category-specific analyses remain separate. 
+
+D.3 Reference implementation profile 
+
+The reference implementation supports Qwen3-4B-Instruct-2507 (A), Phi-3-mini-4k-instruct (B) and Mistral-7B-Instruct-v0.3 (C). Application backbones, the semantic encoder, source embeddings, base lexical mappings, cross-encoder and causal predictor are frozen. Per-user writing changes the retained state. Optional rank-16 residuals are calibrated separately and shared as host-interface assets. LoCoMo uses bound/support selection for A and C. B uses support selection without discourse-edge admission and its boundary interface. C uses a fixed 64-example calibrated interface. LongMemEval uses a role-coverage reader for A, support without edges for B, and a bound reader for C; the C path has no calibration checkpoint. All use 16 relevance seeds and a 2000-source-token cap. Generation allowances are task-specific: 50 tokens for LoCoMo, 256 for LongMemEval and 384 for the general profile. The experiments identify these task-specific operating points so that changes in access are visible alongside host changes. 
+
+> 26
+
+## MIGRO 
+
+Component Reference specification Scope / consequence 
+
+Semantic address da = 384 ; innovation rank 64; reuse threshold 0.48. Shared, host-independent organization. Saved address precision Roots: 4 bits/coordinate, FP16 scale per 64-coordinate group. Innovations: int8 with FP16 scale. Saved precision is preserved by archival coding. Local writer At most 4 preceding chronological records, filtered to the same session. Zero-based layer max (0, ⌊2Lh/3⌋ − 1).One current-host local forward per batch; inputs must fit context. Candidate/reranker Up to 64 candidates; frozen MiniLM cross-encoder, 384-token pair cap, batch 32. Reference evidence-reader path; candidate policy may vary by declared reader. Seed/source budgets K = 16 ; T = 2000 source tokens including separators. Seeds differ from delivered record count; target-context fitting follows. Complementarity Redundancy coefficient 0.35. Greedy relevance/diversity selection, not global optimality. Composed transport 8 source-piece hypotheses; softmax scale 100; word beam 4; position mass threshold 0.5. Lexical/subword construction; output length is variable. Host residual Rank 16; frozen backbone. Interface assets, not per-user observations. Causal archive Qwen3-4B predictor; BF16, SDPA; 1024-token pages; 24-bit integer CDF; configured batch 128. Model/dtype/backend/batch schedule enter the decoding contract. Exact format selection Eligible legacy archive and independently restored causal candidate; charge new public dependency bytes. Explicit compaction; no latency term in this selector. 
+
+Table 13. Implementation specifications, not empirical results or architecture-wide optimal settings. 
+
+Target-built baseline settings. The heterogeneous Full-History Rebuilding comparisons use target-adapted implementations. LSTMem and Doc-to-LoRA fit target-compatible memory interfaces on 1,024 external human HotpotQA examples for four epochs (1,024 updates), with frozen backbones. LoCoMo answers are excluded from this fitting. Doc-to-LoRA retains its released down-projection target set. For the LoCoMo quality and migration comparisons, LSTMem writes every observation and answers from persistent C/D states alone. The 4B reference uses the released adapter, and Qwen 8B, 14B and 32B use target-specific refitting with the same 1,024-example, four-epoch budget. The separate matched-state storage evaluation uses LSTMem’s retained-history reader and counts the retained history in its storage total. Phi TiMem uses a context-bounded hierarchy with intermediate summaries capped at 384 tokens and hierarchy inputs capped at 1,536 tokens, while retaining the ordinary 1,024-token final-summary allowance where available. These settings identify the reported target-built variants. 
+
+> 27
+
+## MIGRO 
+
+D.4 Complete memory lifecycle 
+
+Algorithm 1 specifies writing, reading, snapshotting, restoration and host replacement as one lifecycle. Accepted writes invalidate reader workspace and cached snapshots. Handoff uses a current snapshot, restoring it through compatible shared dependencies and constructing the receiving access runtime. Ordinary saving supplies a snapshot when the cached one is stale; switching models does not itself request compaction. 
+
+Algorithm 1. MIGRO Memory Lifecycle 
+
+Inputs: shared dependencies B; supported interfaces and profiles {Πh, Ih}; chronological ob-serve/query/snapshot/handoff events. 
+
+State: retained M , current host h, optional cached snapshot S, temporary reader workspace W .1 Initialize M empty or restore a supplied snapshot; initialize runtime for h.2 for each event e do 
+
+3 if e = Observe (o) then 
+
+4 Form v = τs(σ (o)) ; encode the common semantic address. 5 Select at most the configured chronological past window, retaining same-session records. 6 Require the local input to fit the host context; forward current host once over past + o.7 Pool local spans; infer predecessor ρ if the allowed window is nonempty. 8 Assign/reuse anchor and innovation; append v, provenance, writer identity, and ρ.9 Retain earlier records and bookkeeping; invalidate S and W .10 else if e = Query (q) then 
+
+11 Build/reuse temporary address and lexical workspace from M .12 Generate candidates; rerank; select complementary seeds and eligible support under K, T .13 Recover exact source IDs and separators; embed with Es; apply Ih.14 While target input + generation reserve exceeds context, remove a delivered unit and rebuild. 15 Generate answer with frozen host; return answer and evidence metadata. 16 Clear query-local transport cache; leave M unchanged. 17 else if e = Snapshot (compact , coder ) then 
+
+18 If not compact, save the cached/default snapshot and continue to the next event. 19 Otherwise obtain eligible exact legacy candidates, including a valid retained snapshot. 20 if coder supplied and M nonempty then 
+
+21 Encode bounded causal pages, geometry, framing, and both exception layers. 22 Independently restore new causal candidate; require exact saved-state comparison. 23 Admit it to the eligible candidates. 24 end if 
+
+25 Select by actual full bytes + newly required public dependency cost; cache/save S.26 else if e = Handoff (h′) then 
+
+27 Get cached S, or create the ordinary legacy snapshot if invalidated. 28 Restore M from S with compatible B; set h ← h′.29 Recreate the receiving runtime and workspace; do not replay all history through h′.30 end if 
+
+31 end for Further Observe events use the receiving host.    
+
+> The algorithm abstracts record-at-a-time events; the implementation can batch local writer forwards. Ordinary save reuses a valid snapshot or selects the default legacy format; only explicit compaction considers the wider candidate set. New causal candidates undergo independent restore-and-compare. Snapshot restoration/index construction may scan the full state. Optional task-specific answer policies are part of Πh, not additional writes.
+
+D.5 Operational Contracts and Restoration Semantics 
+
+Table 14 separates saved-state preservation, access rules, and empirical objectives. Under compatible shared decoding dependencies, the restoration identity is 
+
+Restore (Archive (Mn; B); B) = Mn. (17) Equality is defined over saved source IDs, quantized coordinates, provenance, relations, and historical records. It preserves saved precision rather than recovering pre-quantization vectors. 
+
+28 MIGRO         
+
+> Property Contract and boundary Status
+> Saved-state recovery Restore exact source IDs, saved coordinates, provenance and history under compatible decoding dependencies. Conditional format/coding property; verify decoded candidates. Historical retention Appending an accepted observation retains earlier logical fields; archive bytes may be repacked. State/update contract; not crash-safe transactional durability. Read non-mutation Answering changes temporary caches, not the retained experience. Runtime contract. Bounded host access Budgeted evidence for queries; bounded local past for writes. Full restoration/index construction may still scan history. Access contract; not constant-time migration. Cross-host usefulness Receiving hosts answer accurately and can use revisions and provenance. Empirical objective, not implied by exact recovery. Storage advantage Lower complete bytes at a useful quality/transfer operating point. Measured quality--storage evidence in Section 5.5; broader transfer comparisons pending.
+
+Table 14. System contracts separate exact preservation, structural access rules, and claims requiring experiments. 
+
+Restoration and index construction can traverse the complete state. The archive predictor also processes content during encoding and decoding. These costs enter restoration and deployment accounting separately from rebuilding history through the receiving application’s backbone. Public decoding assets remain required dependencies outside the private user payload. 
+
+D.6 Storage Accounting and Shared Dependencies 
+
+Persistent bytes, shared method assets and temporary workspace occupy different resource boundaries. Agent-native memory studies motivate this separation by examining representation, extraction, access and maintenance together [34]. Let L count original source-body tokens, excluding metadata added by canonicalization. Complete private bytes and the marginal rate are 
+
+Buser (L) = Baddress + Bcontent + Bprovenance 
+
++ Bindex + Bframing + Bexceptions ,
+
+β (L, ∆L) = Buser (L + ∆L) − Buser (L)
+
+∆L .
+
+(18) All retained metadata enters the numerator even though it is outside the source-body denominator. Cold-archive size uses serialized file lengths. A content-only rate substitutes Bcontent and is reported as such. Resident serving state is measured separately. Equation 14 defines total persistent deployment cost across independent users. The shared term includes required encoders, tokenizers, lexical assets, rankers, host interfaces and predictor assets. A dependency is charged once when shared, including any newly required predictor. Decoded records, lexical indexes, reconstructed addresses, transport tensors and inference caches contribute temporary workspace. For N independent memories with mean private size Buser ,
+
+Bdeploy (N) = Bshared + NB user ,
+
+Cmemory (N) = Bshared 
+
+N + Buser . (19) The equation exposes two scaling effects. Extending one history incurs its marginal private cost β . Adding independent memories spreads fixed assets over a larger N while adding one private state per memory. Section 5.5 combines measured state sizes with the required method-asset ledger. The reference causal predictor uses the same Qwen3-4B-Instruct-2507 checkpoint as the common backbone. Its weights and the software runtime are outside this method-specific ledger; a separately introduced predictor would instead enter the shared term once. Online appends and cold compaction also have different costs. A write invalidates the cached snapshot, while explicit compaction may scan and recode the full state. The current lifecycle provides logical retention and exact 
+
+> 29
+
+## MIGRO 
+
+saved-state recovery. Crash-consistent transactions, deletion/unlearning and incremental neural recoding are outside the implemented contract. 
+
+Persistence-coding ablation. The uncompressed archive occupies 2,381,266 B. Existing lossless coding occupies 952,995 B, saving 59.98% relative to the uncompressed archive. Full encoding selection occupies 869,928 B, saving 63.47%. These are total archive byte counts for the supplied coding comparison. 
+
+Address-table comparison. Full float32 addresses occupy 9,036,512 B and score 54.67 on LoCoMo. Anchor + Residual occupies 802,550 B and scores 54.21; Anchor only occupies 560,516 B and scores 51.73. Anchor + Residual reduces address-table size by 91.1% relative to float32, with a 0.46-point quality gap. The Anchor + Residual and Anchor-only quality measurements are shared with the performance ablation. Address-table sizes and the archive totals above refer to different measured objects and are accounted for separately. 
+
+Matched-state comparison. MIGRO attains the highest matched-state LoCoMo score, 54.13, with 1.115 MB across ten states (Table 4; Figure 8a). Against Mem0, the strongest matched-state quality baseline, it improves the score by 3.68 points while reducing bytes by 99.3%; the paired 95% interval for the score difference is [2.49 , 5.06 ].TransMem uses 1.200 MB and scores 45.96; MIGRO gains 8.17 points while using 7.1% less storage. Against LSTMem, MIGRO uses 40.4% less space and scores 13.50 points higher. The compact representation therefore retains evidence useful to the measured answers. 
+
+Measurement scope and history prefixes. The storage line tests whether useful answers coexist with a compact state, how that state grows with history, and how fixed assets amortize across independent memories. All sizes use decimal MB ( 10 6 bytes). Native storage includes recoverable user-specific content, indexes, provenance, retained history and learned state. Each method keeps its native format; MIGRO uses its built-in codec, with no external compressor added to the baselines. Fixed method assets enter the shared-resource comparison separately. LoCoMo prefixes also show the cost of continued writing (Figure 8b–d). Each prefix compares the same eligible conversations, whose count falls as the requested history grows. Marginal rates are computed within conversations before averaging. MIGRO’s second-half cost is 4.207 bytes/token, compared with 4.215 for TransMem, 4.900 for Doc-to-LoRA, 8.847 for LSTMem, 49.385 for TiMem, 113.668 for A-MEM, 410.676 for PlugMem and 820.634 for Mem0. Five natural BEAM histories extend the storage comparison to one million source tokens each. The seven complete trajectories have 225 checkpoints per method: 44 common thresholds and a full endpoint for each history. TransMem’s full prefix series is complete; Doc-to-LoRA has all five paired core histories for the table, while its optional dense series contains 35 measurements. Actual endpoint lengths average 1,000,100.4 source tokens. Three histories extend development streams and two extend confirmation streams. This cohort measures history growth separately from the 35-history QA study. The late-history rate averages the within-history bytes added between actual 500K and 1M boundaries: 
+
+β late = 15
+
+> 5
+
+# ∑
+
+> j=1
+
+Buser , j(L j,1M ) − Buser , j(L j,500K )
+
+L j,1M − L j,500K 
+
+. (20) 
+
+Local and half-history marginal rates. TransMem’s 975K–1M local marginal is 7.240 bytes/token; its matched 500K–1M mean is 7.778 bytes/token. Doc-to-LoRA’s private LoCoMo states total 283.14 MB and score 14.96; their second-half marginal cost is 4.9 bytes/token. Its five-history BEAM mean is 56.625 MB at one million tokens. Over 975K–1M, the reported local marginal is 0.000040 bytes/token, whereas the 500K–1M mean is 28.313 bytes/token. A near-zero final-window increment can therefore coexist with a much larger accumulated state. Table 5 and the storage radar use the shared 500K–1M comparison window; the final-window value is retained as a separate diagnostic. Intervals for these two methods use 4,000 bootstrap resamples of the five histories. Doc-to-LoRA’s endpoint byte count is identical across the five histories, yielding equal lower and upper empirical interval bounds. 
+
+Paired continuation states. Figure 12 measures the saved states used by the continued-writing and full-history rebuilding runs. The paired cohort contains ten conversations and 1,986 identical question IDs in every arm. Native payloads include MIGRO snapshots; PlugMem’s persisted graph and session metadata; Mem0’s vector store and history database; A-MEM’s notes and embeddings; TiMem’s hierarchy and vectors; and LSTMem’s saved 
+
+> 30
+
+## MIGRO 
+
+C/D matrices. Doc-to-LoRA retains its per-chunk factors in this experiment. TransMem’s selected view retains its context, overflow tensors and native metadata. Other experimental control views, predictions, build logs and fixed shared weights are excluded. Completion headers use the existing LoCoMo accounting convention. All plotted continuation points use the Mistral receiving-host setting and their corresponding native saved representations. 
+
+Shared-deployment calculation. Equation 19 combines the measured million-token state means with one shared method-resource bundle. MIGRO’s required assets occupy 297.166 MB. The required shared bundles for TransMem and Doc-to-LoRA are 1.720 GB and 1.684 GB, respectively. Across N = 1,000 independent memories, the shared term contributes 0.297 MB per memory: 
+
+Cmemory (1,000 ) = 297 .166 1,000 + 1.857 = 2.154 MB/memory . (21) Figure 10 distinguishes the current deployed inventory, including unused weights, from required method resources. Both exclude the common Qwen backbone and runtime. Bands propagate uncertainty in the five-history state mean through the shared-resource arithmetic. 
+
+D.7 Runtime Complexity and Operating Conditions 
+
+Construction, retrieval and generation can shift resource costs independently of archive size [59]. With a anchors, address assignment scans residual errors in O(a(da − r)) arithmetic. Host-local writing is bounded in record count, with compute still determined by the admitted token lengths. Inputs must fit the host context; an over-context local batch is rejected. Reader construction can traverse all n records to reconstruct addresses and lexical statistics. The reference dense scan costs O(nd a), followed by bounded cross-encoder scoring and greedy seed selection. Transport adds source-vocabulary similarity and target tokenization. Generation then depends on the expanded evidence and answer length. A fixed evidence cap bounds delivered content without eliminating these preparation costs. Causal encoding and decoding process the complete predictor-token stream. Page-local context bounds each predictive window, while total reconstruction work grows with the number of pages. Compact persistence thus trades archive bytes against shared prediction and restoration work. The cold archive and the temporary serving representation serve different roles: one retains recoverable history economically, and the other supports active access. 
+
+D.8 Capability Profiles and Joint Frontiers Capability definitions and normalization. Figure 1 summarizes the three lines in separate compact panels. The performance panel highlights six selected strengths: • Cross-session reasoning: the multi-session question type in LongMemEval-S. • Temporal understanding: the temporal-reasoning question type in LongMemEval-S. • Knowledge adaptation: the knowledge-update question type in LongMemEval-S. • Learning from examples: exact match on MemoryAgentBench’s CLINC150 task with a 7,050-example demonstration context, using the common format-corrected scorer. • Long-horizon recall: information extraction in BEAM-1M. • Scale-up quality: mean same-host LoCoMo at Qwen 8B, 14B, and 32B from Table 2. Each performance spoke has its own scale, with an outer limit 5% above its best displayed score. All methods on a spoke share that limit. All eight methods have complete measurements for these settings. Table 1 provides the full benchmark comparisons. Abstention is reported separately and remains part of the full BEAM-1M aggregate in Table 1. The available abstention scores are 55.36 for MIGRO, 92.50 for LSTMem, 43.57 for TiMem, 82.86 for PlugMem, 45.71 for Mem0, 91.79 for TransMem, and 75.71 for Doc-to-LoRA. The BEAM category scores accompany the authoring files. The transfer panel highlights six aspects of using memory across hosts: 
+
+> 31
+
+## MIGRO 
+
+• Upgrade readiness: LoCoMo quality at Qwen 8B, 14B, and 32B, divided by the best displayed score at each receiver and then averaged. • Cross-family reach: the corresponding average over Mistral 7B and Phi. • History continuity: overall LoCoMo quality using only the first-half memory before subsequent writes. • Continued learning: overall LoCoMo quality after extending that memory with the second-half observations. • Portable efficiency: continued-writing quality per private MB from the matched receiving-host states in Figure 12. • Replay-free reuse: execution mode in Table 3, coded as 1 for State Transfer and 0 for Full-History Rebuilding. The first two dimensions use the receiving scores under each method’s execution mode. TransMem’s Qwen entries use the target-native construction and read results in Table 2. The continuation dimensions use Figure 7. The binary axis records the primary migration setup in Table 3. Each spoke has a separate outer limit 5% above its best displayed value. All eight methods have complete profiles. The storage panel covers the cost of keeping, using, growing and deploying memory: • Compact state. Total private MB across the ten LoCoMo conversation states. • Quality density. Matched-state LoCoMo score per private MB. • Lean appends. Added private bytes per source token over the second half of each LoCoMo conversation. • Long-horizon compactness. Private MB per million-token BEAM history. • Economical growth. Added private bytes per source token from 500K to 1M tokens in BEAM. • Deployment economy. MB per million-token BEAM memory at 1,000 independent memories, including the required shared resources amortized across them. Table 4 reports the matched private-state measurements. The storage panel includes all eight methods with complete six-dimensional profiles. MIGRO has the smallest displayed private footprints, the highest LoCoMo score per private MB, and the lowest measured marginal costs over the matched half-history windows and BEAM deployment cost. QA yield per MB uses um j = zm j / max m′ zm′ j, and a positive storage cost uses um j = min m′ Cm′ j/Cm j . Transfer values are divided by each spoke’s best displayed value for profile accounting; the display margin does not enter that normalization. All-zero or undefined references remain unranked. The storage display’s outer radius is 1.05, leaving a margin beyond the best normalized efficiency of 1.00. Raw inputs accompany the source package. The profiles summarize capabilities across tasks. The frontier preserves the measured relationship between quality, transfer and storage for one complete operating point. 
+
+Joint quality–portability–storage frontier. Figure 12 pairs continued-writing quality under Mistral with the native states used to answer the same 1,986 questions across ten conversations. The setting combines quality, portability and private storage at one operating point; fixed shared resources are accounted for separately. Color gives rebuilding-relative quality, rm = Qcontinue  
+
+> m
+
+/Qrebuild  
+
+> m
+
+, against each method’s matched full-history re-building reference. Among inherited-state methods, the joint frontier maximizes answer quality and rm while minimizing private bytes. Values above one retain observed gains over rebuilding; soft shading follows answer yield per MB. MIGRO combines the highest continued-writing quality with the smallest inherited-state footprint, retaining 99.9% of rebuilding quality. Its answer yield per MB is 2.60 times the best baseline across all eight methods. MIGRO and PlugMem form the observed joint frontier: PlugMem retains 101.2% of its own rebuilding quality at a larger footprint and lower absolute quality. Useful experience can therefore remain accessible and economical as the receiving host extends it. MIGRO, PlugMem, Mem0, A-MEM and TiMem inherit Qwen prefix states and append under Mistral. Reference squares denote LSTMem and Doc-to-LoRA’s target-built prefixes and TransMem’s view rebuilt on append. These continuation operations differ from the primary migration comparisons in Table 3; Appendix D.6 details native-state accounting. 
+
+> 32
+
+## MIGRO 0
+
+> 10
+> 20
+> 30
+> 40
+> 50
+> 55
+> 110 100 1,000
+
+Private memory (MB, reversed log scale) 
+
+> Answer quality after handoff
+
+Mem0 Mem0 
+
+> 98.9% retained 98.9% retained
+
+PlugMem PlugMem  
+
+> 101.2% retained 101.2% retained
+
+TiMem TiMem 
+
+> 90.8% retained 90.8% retained
+
+A-MEM A-MEM 
+
+> 89.8% retained 89.8% retained
+
+LSTMem LSTMem 
+
+TransMem TransMem 
+
+Doc-to-LoRA Doc-to-LoRA 
+
+MIGRO 
+
+# 2.60× QA per MB 
+
+> vs. best baseline
+> Retains 99.9% of rebuilding quality
+
+# Joint memory frontier 
+
+Continued writing after handoff   
+
+> Qwen 4B →Mistral 7B
+
+Better       
+
+> Rebuilding quality retained (%)
+> 88 92 96 100 102
+> Inherited source state Target-native start Observed frontier Shading: QA / MB
+
+Figure 12. Joint frontier on matched memory states after Qwen-to-Mistral handoff and continued writing. Higher answer quality and smaller private memory place a method farther toward the upper right. The ink stroke connects the two observed frontier points. Marker color shows quality retained relative to same-method rebuilding. Squares mark target-native references, shading follows QA/MB, and whiskers show 95% conversation-bootstrap quality intervals where available. 
+
+E Theoretical and Algorithmic Details 
+
+E.1 Proofs of the Preservation and Stability Propositions 
+
+Proof of Proposition 1. There is a question q⋆ with Ans (q⋆, R1)̸ = Ans (q⋆, R2). Its query and encoded memory are identical in the two cases. A deterministic readout produces the same answer; a randomized readout has the same output distribution. Neither can guarantee both required answers from that same input. 
+
+Proof of Proposition 2. Cauchy–Schwarz gives 
+
+|si(q) − bsi(q)| = |⟨ kq, ki −bki⟩| ≤ ∥ kq∥2∥ki −bki∥2 ≤ ε. (22) For any original Top-K member i and any nonmember j, the perturbed separation is at least bsi − bs j ≥ si − s j − 2ε ≥
+
+γq − 2ε > 0. Every member therefore remains above every nonmember. 
+
+E.2 An Information-Theoretic Illustration of Deferred Selectivity 
+
+Consider a history with Nf independent binary facts and a future question family that can request any individual fact. Every pair of different binary histories differs at some position, and a question about that position distinguishes them. A query-independent, zero-error fixed-length encoding must therefore distinguish all 2Nf histories, requiring at least Nf bits [25, 27]. Once the question supplies the requested position, one bit communicates the corresponding value. Preserving information for a family of possible future questions and delivering information for one question have different in-formation requirements. MIGRO retains a recoverable canonical history and constructs compact query-conditioned evidence packets from it. 
+
+33 MIGRO 
+
+E.3 Host-Local Reference Inference 
+
+Before addressing an observation, shared canonicalization incorporates available speaker and date information with deterministic temporal annotations. The public encoder then supplies its semantic address. For observation 
+
+i, Wi contains the same-session records admitted from a bounded chronological past window. The current host 
+
+hi processes these records together with the incoming observation. For each observation span Ii, j, the pooled normalized vector and predecessor choice are 
+
+b(hi)  
+
+> i,j
+
+= norm 1
+
+|Ii, j| ∑ 
+
+> t∈Ii,j
+
+H(hi,ℓ w)
+
+> t
+
+!
+
+, ρi = arg max 
+
+> j∈Wi
+
+⟨b(hi) 
+
+> i,i
+
+, b(hi)  
+
+> i,j
+
+⟩. (23) An empty window gives no predecessor. Every vector is computed by the same current host, including when a past record was written under a different host. Only the resulting observation reference and provenance persist. These local hints supplement independently retained source bindings. A cross-session revision can remain unlinked while its source binding remains intact. 
+
+E.4 Complementary Evidence Selection 
+
+Let Cq be the reranked candidate set and S the local set of selected relevance seeds. MIGRO uses an MMR-style rule [30] to balance query relevance and semantic redundancy: 
+
+i⋆ = arg max 
+
+> i∈Cq\S
+
+
+
+s(q, i) − λ max  
+
+> j∈S
+
+⟨bki,bk j⟩
+
+
+
+. (24) The penalty discourages repeated selection from the same semantic neighborhood. Eligible local and reference-linked support is admitted by the reader policy within the delivered-token budget. The seed limit differs from the delivered-record count, and source cues used for scoring are distinguished from exact content sent to the host. The final packet retains source attribution and chronological order. A delivered unit can be a complete observation or an exact source span under the selected policy. The relevance-seed limit K controls primary selection, while admitted support can increase the delivered-record count within the same source-token budget. 
+
+E.5 Lexical Transport and Host Input Assembly 
+
+Table 13 specifies the reference dimensions, quantization, local window and budgets. The access profile determines how that state is used for each task and host. In particular, Phi’s boundary residual changes an assistant boundary position, while the ordinary memory residual changes transported evidence embeddings. These interfaces share a role but act at different locations. Selected evidence must also enter the receiving model’s computation. MIGRO adapts it at the input boundary while keeping canonical source bindings independent of the target vocabulary. Exact source IDs first give public embeddings Zq = Es(vEq ). Transport interprets source pieces as weighted lexical hypotheses, composes groups across subword boundaries, and represents those hypotheses with the receiving tokenizer and embedding table. For lexical group g, let Ωg contain hypotheses w with weights αgw . Its transported embedding at position t is 
+
+G(h) 
+
+> g,t
+
+= ∑w∈Ωg αgw 1[t ≤ | τh(w)|] Eh(τh(w)t )
+
+∑w∈Ωg αgw 1[t ≤ | τh(w)|] . (25) Positions with insufficient hypothesis mass are omitted. The representation can change sequence length and embedding width to match the receiver’s tokenizer and input space [19]. This lexical construction produces continuous target-compatible inputs while the original source bindings remain in persistent memory. The host assembly operator combines transported evidence with the query and processes it through the frozen layers: 
+
+H(h) 
+
+> 0
+
+= Ih(q, Zq; ηh), H(h) 
+
+> ℓ+1
+
+= Fθh,ℓ (H(h) 
+
+> ℓ
+
+). (26) Optional parameters ηh adapt transported memory embeddings or an assistant input boundary, depending on the host. Calibration uses public human-authored examples while the application backbone remains frozen [32, 33]. It belongs to the access interface and is accounted for separately from private experience. 
+
+> 34
+
+## MIGRO 
+
+Target tokenization can expand the source packet. The runtime reserves generation space, checks the assembled input against the target context, and removes delivered units and rebuilds the input until it fits. Retrieval and transport thereby connect exact retained evidence to bounded host-specific computation, while indexes, transported embeddings, and generation caches remain temporary. 
+
+E.6 Causal Coding and Exact Archive Selection Exact decoding conditions. Encoding and decoding use matching predictor and coding-tokenizer versions, integer-CDF convention, page framing, numerical precision, attention backend, and batch schedule. Surface and source-ID exceptions retain tokenizer-sensitive distinctions. Each new causal candidate is independently restored and compared with the saved state before admission. MIGRO reduces persistent bytes through reversible causal coding. A frozen predictor assigns probabilities within bounded, same-scope pages, and arithmetic coding converts them into a recoverable bitstream [20, 21]. Let yp,t be a predictor-vocabulary token, cp,t = ( BOS , yp,< t ) its decoded page-local context, and epφ the realized integer-CDF probability. With framing fp, encoding and decoding satisfy 
+
+bp = ACEnc epφ (yp | fp), ACDec epφ (bp | fp) = yp. (27) Equation 13 gives the associated content-length relation. Predictive context resets at page boundaries. Framing reconstructs fixed separators; arithmetic coding represents the remaining positions. Complete archive bytes include framing and exceptions as well as the coded content. Two exception layers preserve distinctions across tokenization boundaries. Surface exceptions retain content that the coding tokenizer cannot reproduce exactly. Source-ID exceptions retain the canonical sequence when recovering the surface and retokenizing would change its source IDs. Saved addresses, provenance, reference relations, and historical records accompany the content. Each new causal snapshot is independently decoded and compared with the saved fields before acceptance. The decoding configuration is specified in Appendix E.6. A validated legacy lossless representation remains eligible. Among eligible exact archives, the system selects 
+
+c⋆ = arg min 
+
+> c∈Cexact
+
+ | Enc c(Mn)| + Bnewdep (c) . (28) using complete encoded size and newly required shared dependency bytes. This evaluates recoverable storage rather than content likelihood alone. Required predictors and other decoding assets enter the cost when introduced by the archive. Compaction is explicit. It can reorganize and recode the physical archive while preserving the logical state used by writing and reading. Evidence and saved addresses define memory identity; causal coding determines how economically that state is retained.

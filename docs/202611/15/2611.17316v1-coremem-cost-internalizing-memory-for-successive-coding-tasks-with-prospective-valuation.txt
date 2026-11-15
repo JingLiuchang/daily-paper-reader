@@ -1,0 +1,1121 @@
+Title: CoReMem: Cost-Internalizing Memory for Successive Coding Tasks with Prospective Valuation
+
+URL Source: https://arxiv.org/pdf/2611.17316v1
+
+Published Time: Fri, 13 Nov 2026 05:57:46 GMT
+
+Number of Pages: 26
+
+Markdown Content:
+## CoReMem: Cost-Internalizing Memory for Successive Coding Tasks with Prospective Valuation 
+
+Peiwen Li 1, Harshit Verma 1,* , Sophia Zhou 1,* , Haiwen Wang 1, Ngoc Bui 1,Heng Chang 2, Fei Fei 3, David van Dijk 1, Rex Ying 1
+
+> 1
+
+Yale University, 2Tsinghua University, 3Goodvision AI 
+
+> *
+
+Equal contribution. Correspondence: peiwen.li@yale.edu 
+
+Abstract 
+
+Coding agents tackle successive tasks on an evolving repository, carrying forward edits and writing memory before the next task is known. Selecting memory for unknown next tasks re-quires balancing future usefulness against the costs of writing and reading it. The actor must also decide when acting on available memory saves effort as the task unfolds. We introduce 
+
+Co ding-Re pository Mem ory ( CoReMem ), a cost-internalizing framework that guides mem-ory design and actor adaptation through mea-sured memory value on the next task. Prospec-tive segment valuation compares runs of the next task with and without individual trajectory segments from the same inherited repository state, guiding a compact memory built around 
+
+anchors : repository locations and executable checks. Actor adaptation estimates on-policy memory value within rollout groups with and without memory, using a reward that prioritizes resolution and penalizes step count in success-ful runs. Provenance-gated value credit assigns the additional value term to steps identified as using memory-supplied anchors, while every step retains outcome credit. On ChainSWE, 
+
+CoReMem raises the 27B actor’s resolve rate from 21 .0% to 25 .7% , with 17% fewer steps and 11% fewer total cache-aware tokens, in-cluding memory-module calls, relative to the untrained actor model without memory. 
+
+1 Introduction 
+
+In real-world software development, coding agents are expected to handle successive tasks on an evolv-ing repository. While prior research has primarily studied repository issues independently (Jimenez et al., 2024), recent work considers sequences of tasks on a shared, evolving repository (Jin et al., 2026). We study this successive-task setting, in which tasks arrive sequentially, each inherits the repository state left by earlier tasks, and future tasks are unknown in advance. Since this state Memory written by task 1  889 chars · 18 anchors                        
+
+> DID is_main_check() skips SIM102 under __main__
+> WHERE rules/ast_if.py:34-58 location
+> VERIFY python -m pytest tests/ -k sim102 check
+> …
+> w/o memory 13 steps
+> with memory 9 steps
+> Δ −4
+> steps
+> w/o memory ls · grep SIM102 · cat skipped
+> 4 steps
+> Locate sed -n 34,58p rules/ast_if.py WHERE
+> Edit & reproduce is_main_check()
+> Check python -m pytest tests/ -k sim102 VERIFY
+> Full suite & submit RESOLVED
+> Task 2 · a later SIM102 fix
+> 1
+> 2–5
+> 6
+> 7–9
+
+Figure 1: Memory on the next task. A memory written at the end of one flake8-simplify task hands two anchors, a location ( WHERE ) and a check ( VERIFY ), to the next task on the same repository; the post-trained actor model acts on them at steps 1 and 6 and skips the exploration it would otherwise start with (step counts illustrative). 
+
+carries over, suitable memory can let agents reuse information acquired during earlier exploration and avoid rediscovering it on unseen future tasks (Fig-ure 1). We therefore consider both what a memory is worth and how an agent can use it to reduce the cost of solving unseen future tasks. Existing memory methods for coding agents are not specifically designed for the above successive-task setting and do not reliably save effort (steps and tokens) on unseen future tasks (Figure 3). As illustrated in Figure 2, within-task methods learn to compact context for the current task, whose goal is already known (Gao et al., 2026; Li et al., 2026c). Most cross-task methods distill and transfer gen-eral experience and insights across independent tasks and repositories (Ouyang et al., 2026; Chen et al., 2025). MemOp instead accumulates mem-ory across tasks within the same repository, but since the repository state is reset between tasks in its setting, it optimizes its memory design based on gains measured on the task that produced the memory (Guo et al., 2026), rather than on its value to an unseen future task that inherits the changed 1arXiv:2611.17316v1 [cs.AI] 12 Nov 2026 Within-task memory Cross-task memory time  session 1  session 2  session 3 Context compaction memory lives inside one task SWE-MeM · CompactionRL repo 1 task 1 context 
+
+> summary context repo 2 task 2 context
+> summary context repo 3 task 3 context
+> summary context cleared cleared Nothing carries over
+
+Across repositories each task a different repo ReasoningBank · SWE-Exp repo 1 task 1 distill retrieve repo 2 task 2 distill retrieve repo 3 task 3 distill retrieve experience bank one, shared Only insights carry Same repo, reset fresh checkout each task MemOp base commit 1 base commit 2 w/ gold patch 1 base commit 3 w/ gold patch 1 gold patch 2 task 1 agent patch 1       
+
+> repo reset Memory.md ↺
+> task 2 agent patch 2
+> repo reset Memory.md ↺
+> task 3 agent patch 3 optimized for ↺gain on the same task Reset hands over the gold fix
+
+Same repo, inherited successive tasks · inherits what it wrote CoReMem base commit 1 base commit 1 + agent patch 1 base commit 1 + agent patch 1 + agent patch 2 task 1 agent patch 1     
+
+> Memory.md ↓
+> task 2 agent patch 2
+> Memory.md ↓
+> task 3 agent patch 3 optimized for ↓gain on next task Repo and memory both carry
+
+Figure 2: What crosses coding-task boundaries and where memory is valued and optimized. Existing settings keep memory within one task, transfer general experience across independent tasks, or carry memory while resetting the repository. Our setting carries both repository state and memory to unseen future tasks. The ⟲ and ↓ symbols indicate whether memory is valued and optimized on its source task or on future tasks. 
+
+repository. Given these mismatches in setting and objective, Challenge 1 is to determine, before the future task is known, what information is worth carrying across the task boundary .Memory’s value is realized only when the actor model uses it appropriately during execution. Ex-isting coding memory methods mainly optimize what is stored or retrieved, while typically leaving the model that reads it unchanged (Chhikara et al., 2025; Ouyang et al., 2026; Guo et al., 2026). Yet an agent’s information needs evolve as a task unfolds (Zhang et al., 2023; Shen et al., 2026), making task-start retrieval insufficient to determine how memory should be used during execution. Challenge 2 is therefore how to use memory efficiently during exe-cution to reduce the cost of solving unseen future tasks on the inherited repository .To address these challenges, we introduce 
+
+Co ding-Re pository Mem ory ( CoReMem ), a cost-internalizing memory framework for successive coding tasks. Specifically, prospective segment val-uation of memory addresses Challenge 1 by first formulating the prospective value of a memory at a task boundary, then valuing each part of the cur-rent task’s trajectory by what it saves on the next task, and from these values inducing, through a sys-tematic procedure, a value-guided memory design for successive coding tasks. As a result, the value concentrates in anchors , references to repository locations and to executable checks, which later also mark the steps that act on the memory. To address Challenge 2, we propose on-policy adapta-tion for memory use with provenance-gated value credit, which adapts the actor model itself to act on the memory where that saves effort, in two steps. Cost-internalizing on-policy valuation trains the ac-tor model in groups of rollouts with the memory, without it and with a misplaced memory, under a reward that charges steps inside success, so that the average gap between the rollouts with the memory and those without it exposes the memory’s value to the current actor model. For the rollouts that run with the memory, step-level provenance-gated value credit then pays the memory value to the steps whose anchors came from the memory, so that memory use is pushed by its measured value while every step keeps its outcome credit, and we show analytically that this push vanishes when the same value is paid to every step. Our contributions are summarized as follows. • We propose prospective segment valuation of memory, a systematic procedure that values each part of a trajectory by what it saves on the next task and induces a value-guided memory design for successive coding tasks. • We propose on-policy adaptation for memory use with provenance-gated value credit, which measures the memory value on-policy within each group of rollouts and passes the memory’s value directly to the steps that act on it. • On ChainSWE, a benchmark of successive tasks, CoReMem raises resolve per token over no memory by 41% on average across three different actor models. 1
+
+> 1
+
+Code is available at an anonymous link. 
+
+20 +50% +100% −10% −5% 0+5% Steps vs no memory     
+
+> Qwen3.8-27B (open-weight)
+> Full history (+7%) Mem0 (+2%) MemOp (+12%) ReasoningBank (+20%)
+> Ours (+11%)
+> 0+50% +100%
+> GPT-5.6 Luna (closed)
+> Full history (+1%) Mem0 (−4%) MemOp (−3%) ReasoningBank (−1%)
+> Ours (+9%)
+> Tokens per session vs no memory
+
+Figure 3: Steps and tokens of each memory form against no memory. Hollow marks count only the acting model’s tokens, and the arrows add the tokens of the memory module. Parentheses give the relative change in resolve rate. The star is CoReMem w/o training (§3.1), the one form near the shaded quadrant where steps and total tokens both fall. 
+
+2 Preliminaries 
+
+In this paper, we consider a repository worked on by a chain of tasks T1, . . . , T K , carried out one after another in a single persistent workspace (Jin et al., 2026). Each task runs as its own session of an 
+
+actor , the model that acts in the repository, which leaves the repository state Sk its edits produced and the trajectory τk of its actions and observations. At the boundary bk = ( Sk, τ k, T k+1 ) the state per-sists, since the next task opens the tree this one closed, while the trajectory is lost, and a memory 
+
+m = πwrite (τk), written once at the end of task 
+
+k and before Tk+1 is issued, is the only text that crosses. Unlike cross-episode memory that resets each task to a base commit (Guo et al., 2026; Fan et al., 2026a), the state here is inherited (Figure 2), so a memory cannot be checked on its own task, whose answer the repository holds. 
+
+Does existing memory save effort? We run the existing forms of cross-task memory, the full history of the earlier tasks (App. B), Mem0’s facts (Chhikara et al., 2025), MemOp’s guide-book (Guo et al., 2026) and ReasoningBank’s strategies (Ouyang et al., 2026), on the ChainSWE test set and count, for every form, the tokens of the acting model and of its memory module. Fig-ure 3 places each by its change in steps and tokens against no memory, first with the acting model’s tokens alone and then adding the tokens of the memory module (Tables 1 and 3 have every num-ber). Memory on successive tasks should lower the next task’s effort, its steps and the tokens they cost, yet no existing form reaches the quadrant where steps and total tokens both fall. Some buy resolution rather than effort, and each spends more tokens on its memory than it saves. Our aim is therefore a memory that lowers the effort of unseen future tasks without harming resolution, with what it keeps derived by valuing each part of a finished session by the effort it saves on these tasks and keeping what pays (§3.1, the star in Figure 3). 
+
+Learning objective. A memory can only point at what the next task should reuse, and effort is saved only when the actor acts on it. An actor is trained to solve a task from scratch rather than to read what an earlier task left, so it may pass over a memory that would spare it work or follow one that does not apply (Liu et al., 2024; Shi et al., 2023), and whether a memory applies becomes clear only as the actor works through the task. We therefore also adapt the actor’s parameters from 
+
+θ0 to θ = θ0 + ∆ θ. The next task’s session is then τ ∼ πθ(· | Sk, T k+1 , m ). With the memory’s form fixed (§3.1), we learn ∆θ so that on training boundaries B the next task takes fewer steps n(τ )
+
+without resolving less often than the base actor, with Eθ over bk ∈ B and τ ∼ πθ,
+
+min  
+
+> ∆θ
+
+Eθ
+
+n(τ )
+
+s.t. Eθ
+
+res( τ ) ≥ Eθ0
+
+res( τ ),
+
+(1) with res( τ ) ∈ { 0, 1} whether τ resolves Tk+1 .
+
+3 Cost-Internalizing Memory 
+
+CoReMem is cost-internalizing in the sense of Eq. (1). The effort a memory changes on the next task is measured, and that measurement enters both what the memory keeps and how the actor model is adapted to use it, in two parts (Figure 4). §3.1 defines the value of a memory on unseen future tasks and lets it guide what the memory keeps, which turns out to be anchors. §3.2 adapts the actor model to use that memory during execution, measuring the value again on-policy and paying it, through the anchors, to the steps that use the memory, on top of the outcome credit. 
+
+3.1 Prospective segment valuation of memory 
+
+To decide, before the next task is known, what to carry across a task boundary, we provide a system-atic procedure for inducing a memory design. We first define a memory’s prospective value on the 3(a) Prospective segment valuation of memory Cost-internalizing memory design On-policy adaptation for memory use                           
+
+> Prospective value of memory task k· finished task k+1 · with and without m
+> LEAVES
+> inherited tree
+> write
+> memory
+> ROLLOUT +saved = Δ
+> +VALUE = the saving
+> Segment-by-segment valuation · the whole trajectory
+> step 3 step 8 step 11 boundary
+> cut by role
+> commands repo content read test output change (diff) reasoning text outcome
+> scratch files
+> keep shorter form drop the saving lost when segment cis cut
+> Value-guided memory design memory m· the kept segments, as anchors
+> TASK BLOCK STATUS resolved TESTS ›_ pytest test_io.py exit 0
+> VERIFY ›_ make test
+> DID · WHERE · FILES io.py:42 src/io.py
+> REPO BLOCK CONTEXT · WHERE src/io/ Reader.parse
+> where to look ›_ what to run anchors
+
+(b) Cost-internalizing on-policy valuation (c) Step-level provenance-gated value credit Paired on-policy valuation CONTEXT IN own memory no memory misplaced memory            
+
+> Gsessions
+> Cost-internalizing reward resolved unresolved steps the Δof (a), measured on-policy value credit memory-driven steps
+> outcome credit every step
+> Provenance gate
+> from the memory seen before found without memory
+> ›_ make test README.md io.py:42 io.py:42
+> resolved update
+> ↻next
+> Gsessions
+> outcome credit value credit
+
+Figure 4: Overview of CoReMem. (a) Prospective segment valuation of memory. A memory m written from the trajectory τk is valued by the change ∆y (m | bk) it causes on task k+1 , run from the inherited tree Sk with and without m. Removing each of the seven segments of τk gives its value νc, and the segments that pay are kept as anchors A(m). (b) Cost-internalizing on-policy valuation. A group of G sessions mixes sessions with their own memory ( m), no memory ( ∅) and a misplaced memory ( ˜m) under the reward Ri, and bVb = ¯Rm − ¯R∅ is the memory’s value on-policy. (c) Step-level provenance-gated value credit. Only the steps that the gate ωt marks as acting on an anchor from the memory receive the value credit. 
+
+next task, and use it to find which parts of a ses-sion’s history are worth carrying because they save effort on the next task. 
+
+Prospective value of memory. In real-world de-ployment, a memory is usually written for a task not yet issued, so we value it, and train the actor to use it, on the unseen task that follows rather than on the task that produced it. Let y(m) be an outcome of the next task’s session, which runs Tk+1 from the repository state Sk that task k left, with mem-ory m in its context, namely whether it resolves, its steps or its actor tokens. The prospective value of a memory m at boundary bk is the change it causes, 
+
+∆y(m | bk) = Ey(m) − Ey(∅), (2) where m = ∅ stands for running with no memory and the expectation is over the actor’s sampling. We estimate it as b∆y(m | bk) = ¯ y(m) − ¯y(∅)
+
+from the mean outcomes of the runs, and the n
+
+candidates at a boundary share one no-memory arm, n+1 arms instead of 2n. We use this value both to attribute value across a session’s trajectory (below) and in on-policy actor training (§3.2). 
+
+Segment-by-segment valuation. We measure which parts of a trajectory are worth carrying and let the measurements guide the form (App. J). 0 1 2
+
+Commands Repo content Test output Final diff Reasoning Outcome Scratch files 
+
+> 2100000
+
+νc (steps) 
+
+−1 0
+
+> 0.05 −0.63 −0.18 −0.94 −1.14 −0.03 −0.12
+
+κc (K tokens) 
+
+> VERIFY CONTEXT + WHERE TESTS, exit codes DID + WHERE, FILES
+> dropped
+> STATUS
+> dropped
+
+Memory design 
+
+> what to run where to look checks passed where it changed –resolved or not –
+
+Next task gets Segment 
+
+Figure 5: From segment values to the memory design. 
+
+The median change in steps ( νc) and in thousand actor tokens ( κc) when one segment is removed from the current task’s trajectory (Eq. (3); 27B actor model). Blue bars mark segments whose removal adds steps. The right columns give the field each segment becomes in the memory design, kept as a main field (blue), in reduced form (light blue) or dropped (gray), and what the next task gets from each of them. 
+
+(a) Cutting the trajectory into segments. We split a trajectory into the seven segments of Figure 5, a segment being every part of the trajectory that plays one role, such as the actor’s reasoning text, its commands or the test output (Figure 9 in App. H shows a real excerpt labeled by segment). The split involves no prior knowledge about what matters, since the record of any coding agent already comes 4in these parts, the actor’s own text and commands, the observations the environment returns, the diff it leaves and the outcome (each described in App. H), and how much of each is worth keeping is left to the valuation in (b) and (c). 
+
+(b) Valuing each segment. Let M = τk be the current task’s trajectory injected whole as a mem-ory and Mc its segment c. With the prospective value of Eq. (2) at each boundary b, in steps ( s) and in actor tokens ( t), removing c from M changes 
+
+νc = med b
+
+ b∆s(M \Mc) − b∆s(M ),κc = med b
+
+ b∆t(M \Mc) − b∆t(M ). (3) In words, νc and κc are the median changes in steps and in tokens when c is removed, which shows how much of the effect of M on the next task, a saving or a cost, depends on each segment. 
+
+(c) From values to design. We keep a segment if removing it adds steps on the next task, count-ing νc as positive when it survives a permutation test corrected across segments, and drop one that only adds tokens, unless a shorter form of it saves as many steps, in which case we keep that form. Each νc is conditional on the other segments being present (Table 8 gives each), so we then check the assembled memory against M as a whole, on steps here and on resolution in deployment (§4). 
+
+Value-guided memory design. Removing the commands or the repository content read adds steps on the next task, while removing the reasoning text or the diff body adds no steps and saves tokens (Fig-ure 5). Shorter forms also work, as test commands with their exit codes save more steps than the full test output and the diff’s file list comes close to the full diff (App. J). What saves the next task effort is where to look and what to run, not the narrative, so we build the memory from the references that carry it and define them below as anchors. 
+
+Definition 1 (Anchor) . An anchor is a reference, taken from a trajectory, to a specific place in the repository, a location , or to a specific command that runs or tests the code, a check , which the next task can act on as it stands. A(x) denotes the anchors that a text x contains. Locations are file paths with their lines and code names, such as rules/ast_if.py:34-58 ,and checks are commands that run or test the code and test identifiers, such as python -m pytest tests/ -k sim102 (App. K). Following (c), the template keeps each segment in the form Figure 5 lists, the commands and the repository content as main fields, the test output, the final diff and the outcome in reduced form, and it drops the reasoning text and the scratch files (App. L). Its main components are the checks and the locations of Definition 1, which potentially help the next task save the effort of finding what to run and where to look, and they mirror the vali-dation and localization phases of Agentless (Xia et al., 2024), which resolves issues cheaply without open-ended exploration. We further organize these components into two blocks. The task block holds what concerns the current task, what it changed and checked, and the repository block holds gen-eral context, how the repository is laid out and tested. The memory keeps the whole median step saving of M with 6% of its bytes. The procedure needs only paired runs on the next task and a split of the trajectory by role, so it applies wherever tasks follow one another on shared state, and the segments and anchors above are what it yields for coding. Anchors also make the memory traceable, since they mark the steps of a later session that use it, which §3.2 builds on. 
+
+3.2 On-policy adaptation for memory use with provenance-gated value credit 
+
+To use memory efficiently during execution, at steps that are not known in advance but emerge as the task unfolds (App. G), we adapt the actor model itself, so that it acts on the memory in its context where that saves effort, as Eq. (1) asks. To separate what the memory contributes from how a session went, each training group mixes sessions with and without the memory, so the memory’s value to the current actor model is measured on-policy, and that value is credited to the steps that acted on the memory. 
+
+3.2.1 Cost-internalizing on-policy valuation Cost-internalizing reward. At a training bound-ary b = bk the current policy πθ rolls out a group of G sessions from the state Sb = Sk, with and without memory. A session is scored on whether it resolves the task and on how many steps it took, 
+
+Ri =
+
+(W − ni if session i resolves Tk+1 ,α f i otherwise, 
+
+W > n max + α, (4) 5with ni its step count, nmax the step limit, fi ∈
+
+[0 , 1] the fraction of the next task’s fail-to-pass tests that pass after the session, α the weight of that partial progress, and W a payoff for resolving that exceeds any step count plus α. Every resolved session outranks every unresolved one and effort is charged only inside success, so within a group no saving of steps outweighs a resolution, which also removes the incentive to give up early. The reward thus works toward the constraint of Eq. (1). Sessions with and without memory are scored on this same scale, so a memory is charged for the steps it adds and credited for the steps it saves and the resolutions it wins, which is what cost-internalizing means for the reward. 
+
+Paired on-policy valuation. The group mixes three kinds of sessions, named by the memory they carry. Memory-free sessions ( ∅) run with no mem-ory, own-memory sessions ( m) each carry a mem-ory of b drawn from the memories qb the frozen base actor writes for it, and one misplaced-memory session ( ˜m) carries a real memory written for an-other repository, right in form and wrong in con-tent. A policy that follows its memory blindly loses on ˜m, and one that ignores memory forgoes what 
+
+m is worth. Every session receives the ordinary group-relative advantage against the memory-free sessions of its group, 
+
+Ai 
+
+> ∅, m, ˜m
+
+= Ri − ¯R∅
+
+s
+
+> m
+
+= Ri − ¯Rm
+
+s + bVb
+
+s , (5) with ¯R∅ and ¯Rm the mean rewards of the ∅ and 
+
+m sessions and s a fixed scale (App. A). For ∅
+
+and ˜m the ordinary advantage is the whole credit, paid to every step, so acting on the misplaced mem-ory is penalized through the outcome it leads to. For m the whole credit further splits into two parts. The first is the session’s outcome credit , the advan-tage of the session against the sessions that carry a memory of b. It reflects how the session itself dealt with the task and, as in ordinary GRPO, ev-ery step receives it, which trains the session to resolve the task in fewer steps. The second is the memory’s value credit , which carries the contri-bution of the memory itself, what a memory of b
+
+is worth to the actor, since bVb = ¯Rm − ¯R∅ esti-mates Em∼qb [∆ R(m | b)] , the prospective value of Eq. (2) with the reward as the outcome y averaged over the memories of b, measured on-policy at ev-ery visit at no extra run. The value credit goes to the few memory-driven steps, as set out next. 
+
+3.2.2 Step-level provenance-gated value credit Provenance gate. To give the memory’s contribu-tion directly to the few steps that act on the memory, where it can change what the actor does, we iden-tify those steps by a per-step signal of provenance, whether what a step acts on came from the memory. A step t is one assistant message xt and the output it receives. A step of an own-memory session ( m)is memory-driven , ωt = 1 , when xt contains an anchor a (Definition 1) that comes from the mem-ory, was not seen before in the current session, and is not found without memory, 
+
+ωt = 1∃ a ∈ A (xt) : a ∈ A (m),a / ∈ A (ht), a / ∈ U b
+
+, (6) with ht the task and every message and observa-tion before step t, the injected memory excluded, and Ub the anchors that the memory-free sessions (∅) of the same group reach within their first few steps (calibration of the gate in App. G). The gate marks traceable use of the memory, not the step’s own effect on the outcome, which stays with the outcome credit of every step. 
+
+Step-level value credit. With this gate, each step 
+
+t of an own-memory session i is credited 
+
+Ai,t = Ri − ¯Rm
+
+s + ωt
+
+bVb
+
+s , (7) and each step’s tokens are trained with that step’s credit (App. A). Setting every ωt = 1 recovers the paired whole-trajectory credit of Eq. (5). 
+
+Proposition 1 (Value credit as a push on memory use) . Let Jmem  
+
+> b
+
+be the expected reward of a ses-sion with a memory m of boundary b and Vb the memory’s value under the current actor. Under the population form of Eq. (7) , the expected policy gradient on such sessions is 
+
+gm = 1 
+
+> s
+
+∇θJmem  
+
+> b
+
++ Vb
+
+> s
+
+P 
+
+> t
+
+E∇θ pt
+
+, (8) 
+
+with pt = Pθ(ωt=1 | ht, m ) the probability that step t is memory-driven, and its second term van-ishes when every ωt = 1 .
+
+The first term is the outcome learning of Eq. (4), and the second moves how often the actor acts on the memory, up where the memory pays and down where it does not; App. F derives this. 6Table 1: Cost and outcome of each memory layer for the open-weight actor models on the test set. Resolve rate and steps on linked and unlinked boundaries (App. B) and overall, cache-aware tokens per session of the actor model and of the memory module (Writer), and resolve per thousand actor or total tokens. Tags give the change against the no-memory row of the same actor model. Gray values in parentheses are medians over sessions. CoReMem w/o training is our memory on the frozen actor model and CoReMem the post-trained actor model with it; replay counts and tests are in App. B, with the definition of every column. 
+
+Memory layer Linked Unlinked Overall Tokens per session (K) Res. per K tokens 
+
+Res. (%) ↑ Steps ↓ Res. (%) ↑ Steps ↓ Res. (%) ↑ Steps ↓ Actor ↓ Writer Total ↓ Actor ↑ Total ↑
+
+Qwen3.5-9B 
+
+No memory 9.7 98.4 (91.1) 19.4 98.1 (91.2) 14.0 98.2 (91.2) 98.3 (98.9) – 98.3 (98.9) 0.152 0.152 Full history 11.4 70.0 (60.5) 17.9 76.4 (68.5) 14.2 +2% 72.8 (65.1) −26% 85.9 (79.9) – 85.9 (79.9) −13% 0.156 0.156 +3% 
+
+Mem0 12.2 94.3 (86.0) 21.8 93.1 (85.2) 16.4 +17% 93.8 (86.0) −5% 96.5 (94.8) 14.9 (14.4) 111.4 (109.1) +13% 0.175 0.151 0% 
+
+MemOp 11.9 93.5 (85.8) 19.0 96.8 (86.3) 15.0 +7% 94.9 (86.1) −3% 99.3 (96.4) 32.4 (33.1) 131.7 (131.4) +34% 0.147 0.111 −27% 
+
+ReasoningBank 12.0 92.3 (83.6) 17.9 96.7 (90.3) 14.6 +4% 94.3 (85.2) −4% 102.3 (94.0) 63.7 (65.8) 166.1 (163.1) +69% 0.143 0.088 −42% 
+
+CoReMem w/o training 12.5 95.6 (87.2) 19.2 94.6 (88.6) 15.5 +11% 95.1 (87.2) −3% 101.7 (104.6) 10.0 (7.5) 111.7 (116.5) +14% 0.140 0.128 −16% 
+
+CoReMem 14.2 70.2 (64.2) 22.2 75.4 (69.3) 17.7 +27% 72.4 (65.1) −26% 75.0 (65.4) 5.0 (2.0) 79.9 (70.8) −19% 0.236 0.222 +46% 
+
+Qwen3.8-27B-FP8 
+
+No memory 19.1 30.9 (22.8) 23.4 40.5 (30.4) 21.0 35.1 (26.0) 32.2 (24.7) – 32.2 (24.7) 0.653 0.653 Full history 20.7 27.0 (21.3) 24.6 39.8 (33.5) 22.4 +7% 32.6 (23.8) −7% 39.0 (29.5) – 39.0 (29.5) +21% 0.574 0.574 −12% 
+
+Mem0 20.1 32.5 (26.6) 23.4 40.3 (30.0) 21.5 +2% 35.9 (28.2) +2% 34.2 (25.4) 34.5 (28.4) 68.7 (53.4) +113% 0.632 0.314 −52% 
+
+MemOp 22.5 29.4 (22.2) 24.6 38.9 (36.8) 23.4 +12% 33.5 (24.8) −4% 32.3 (23.8) 18.2 (14.7) 50.4 (38.0) +57% 0.727 0.465 −29% 
+
+ReasoningBank 23.8 30.1 (24.6) 27.0 39.8 (31.8) 25.2 +20% 34.3 (27.7) −2% 32.5 (26.2) 35.0 (28.7) 67.5 (54.7) +110% 0.778 0.375 −43% 
+
+CoReMem w/o training 22.5 26.9 (21.2) 24.5 38.0 (32.9) 23.4 +11% 31.8 (22.4) −10% 30.4 (23.0) 2.0 (1.7) 32.4 (24.7) 0% 0.772 0.724 +11% 
+
+CoReMem 25.1 26.2 (18.0) 26.5 33.4 (25.0) 25.7 +22% 29.2 (20.0) −17% 26.6 (18.5) 1.9 (1.7) 28.5 (20.3) −11% 0.966 0.902 +38% 
+
+Gemma-4-31B 
+
+No memory 4.3 30.4 (23.8) 20.6 29.3 (21.7) 11.5 29.9 (23.2) 32.4 (23.9) – 32.4 (23.9) 0.353 0.353 Full history 7.4 25.7 (18.5) 17.5 29.1 (19.8) 11.8 +3% 27.2 (19.2) −9% 31.8 (25.8) – 31.8 (25.8) −2% 0.371 0.371 +5% 
+
+Mem0 4.9 28.7 (24.3) 18.3 27.4 (21.7) 10.8 −6% 28.1 (23.0) −6% 34.0 (26.4) 13.2 (13.3) 47.2 (39.2) +46% 0.322 0.230 −35% 
+
+MemOp 4.9 26.8 (20.0) 23.0 31.3 (22.5) 12.8 +12% 28.8 (20.5) −4% 34.6 (26.2) 14.9 (13.5) 49.6 (39.6) +53% 0.371 0.259 −27% 
+
+ReasoningBank 7.4 30.6 (23.3) 20.6 30.3 (22.2) 13.2 +15% 30.4 (23.0) +2% 33.0 (26.0) 32.3 (28.9) 65.3 (54.9) +102% 0.399 0.202 −43% 
+
+CoReMem w/o training 6.8 28.2 (21.3) 19.8 28.5 (23.3) 12.5 +9% 28.3 (22.0) −5% 31.0 (23.8) 2.9 (1.3) 33.9 (26.3) +5% 0.405 0.371 +5% 
+
+CoReMem 8.6 28.0 (21.8) 21.4 29.1 (22.0) 14.2 +24% 28.5 (21.8) −5% 27.2 (21.7) 2.2 (1.3) 29.3 (23.9) −9% 0.527 0.486 +38% 
+
+4 Experiments 
+
+4.1 Experimental setup 
+
+We run ChainSWE (Jin et al., 2026) in mini-swe-agent, with its 100 task chains split into a training and a test half over disjoint repositories. We compare our memory with running without memory, with the full history of earlier tasks and with three memory layers, Mem0 (Chhikara et al., 2025), MemOp (Guo et al., 2026) and Reason-ingBank (Ouyang et al., 2026), and report the re-solve rate, steps per task, tokens per session and resolve rate per token. The detailed experimental setup, including the ledger, is in App. B, and results on SWE-bench Verified, external task chains and OpenHands are in App. E. 
+
+4.2 Main results Our memory lowers effort while keeping reso-lution. With the actor model frozen, our mem-ory lowers steps on all six actor models, the open-weight ones in Table 1 and the API-served ones in Figure 6, significantly on three by 9% to 13% ,without lowering resolution, which rises on five of them and is unchanged on Opus, and at total tokens within −7% and +5% of running without memory on five of the six actor models (tests in App. B). Mem0, MemOp and ReasoningBank cost −20 −10 0 +10 +20 +30 +40 Steps vs. no memory (%) −60 −40 −20 0+20 Resolve/token vs. no memory (%) 
+
+Opus Luna DeepSeek 
+
+Claude Opus 5.5 GPT-5.6 Luna DeepSeek-V4-Flash −40 −20 0+20 Resolve per dollar vs. no memory (%) 
+
++16% +5% +18% 
+
+CoReMem w/o training Full history Mem0 MemOp ReasoningBank CoReMem w/o training Full history Mem0 MemOp ReasoningBank Claude Opus 5.5 GPT-5.6 Luna DeepSeek-V4-Flash 
+
+Figure 6: Steps, resolve per token and resolve per dollar against no memory for the API-served models. 
+
+Top, each point is one memory layer on one model, and the shaded quadrant is where a memory lowers steps and raises resolve per thousand total tokens, which 
+
+CoReMem w/o training reaches on all three models. Bottom, the change in resolve per dollar at list prices, with full numbers in Table 3 of App. D. 
+
+more tokens than our memory on five of the six actor models they run on. 
+
+Post-training internalizes the cost. Post-training lowers steps against running without memory on all three actor models, by up to 26% , at 729 31 33 23 24 25 26 27 Resolve (%)           
+
+> Qwen3.8-27B
+> M1 RL, resolve only M1+M2 M1+M2+M3
+> 50 60 70 80 90 15 16 17 18
+> Qwen3.5-9B
+> M1 RL, resolve only M1+M2 M1+M2+M3
+> −4 0+4
+> M1+M2 M1+M2+M3
+> 27B 9B
+> Memory benefit, ΔRes. (pts)
+> −4 0+4
+> Misplaced cost, ΔSteps
+> Steps per task
+> M2 Cost-internalizing post-training
+> M3 Provenance-gated value credit
+
+Figure 7: Evidence for M2 and M3. Top, steps per task and resolve rate of the with-memory arms in training order, where up and to the left is better and the larger marker is the full method. Bottom, paired differences in the memory benefit to resolve rate and in the step cost of a misplaced memory, blue for 27B and green for 9B as above, with 95% intervals. 
+
+9% to 19% fewer total tokens, and raises resolution by 22% to 27% , so resolve per total token rises by 
+
+38% to 46% , 41% on average (Table 1). Against the same memory on the untrained actor model, steps fall by a further 24% on 9B and 8% on 27B. 
+
+4.3 Detailed analysis 
+
+We further conduct ablations on the three modules of §3: what the memory layer (M1) carries that the next task acts on, whether the cost-internalizing post-training (M2) lowers effort beyond outcome learning, and whether the provenance-gated value credit (M3) changes how the actor model treats memory; w/o training runs M1 on the frozen actor model, resolve-only RL trains on the resolution term alone and M1 +M2 trains without the value credit (settings in App. A and C). 
+
+M1: the memory hands over anchors the next task uses. Our memory packs the most anchors per thousand injected characters, and the next task acts on 1.32 of them per thousand characters against 0.92 for MemOp, 0.19 for ReasoningBank and 0.14 for Mem0 (Table 2). 
+
+M2: charging steps inside success lowers effort further. Figure 7 (top) places each variant on the effort–resolution plane. Resolve-only RL low-ers steps on 27B from 32 .6 to 30 .4 and on 9B from 91 .9 to 75 .5; charging steps inside success (M1 +M2) lowers them further, to 29 .7 and 63 .8,and the full method stays at 29 .2 and 72 .4.
+
+Table 2: Anchors the next task can act on, per mem-ory layer. 27B frozen actor model, test set; an anchor is 
+
+used when it occurs only in the memory and appears in a message of the next task’s session; brackets give 95% 
+
+intervals over the test chains. 
+
+Memory layer Anchors per 1K chars Used anchors per memory Used anchors per 1K chars 
+
+Mem0 9.7 [9.4, 10.1] 0.15 [0.09, 0.21] 0.14 [0.08, 0.21] 
+
+MemOp 14.4 [13.6, 15.2] 2.06 [1.59, 2.51] 0.92 [0.72, 1.11] 
+
+ReasoningBank 8.5 [7.8, 9.1] 0.65 [0.51, 0.80] 0.19 [0.14, 0.24] 
+
+CoReMem w/o training 15.8 [15.0, 16.7] 2.24 [1.67, 2.87] 1.32 [1.00, 1.68] 
+
+M3: the value credit teaches when to act on memory. Paying the memory’s value to the steps that acted on it keeps the actor model from learning to follow any memory it is given (Figure 7, bottom): without the value credit a misplaced memory costs the 27B actor model 2.1 steps, while with it the cost shrinks to +0 .3, and the memory benefit grows from +1 .7 to +2 .3 points on 27B. 
+
+5 Related Work 
+
+Memory design and valuation. Coding memory spans cross-task experience (Ouyang et al., 2026), within-task compression and trace validation (Gao et al., 2026; Xu et al., 2026a); MemOp evaluates memory through source-task replay and VibeMem-Bench through target-aware experience (Guo et al., 2026; Fan et al., 2026a). 
+
+Memory optimization. Reinforcement learning trains memory construction with outcome rewards (Wang et al., 2025b; Yan et al., 2026c), refines credit through shared-state rerollouts (Yan et al., 2026b) and localizes it to selected turns or response tokens (Xie et al., 2026; Cao et al., 2026). Our actor adaptation routes the memory’s on-policy value to provenance-marked steps on top of the outcome credit that every step keeps (§3.2). 
+
+6 Conclusion 
+
+Memory for successive coding tasks is what one task leaves for a task it has not seen. Its worth, measured by what the next task saves when it runs with the memory and without it, concentrates in a few anchors, the locations and checks the next task would otherwise rediscover on its own. A memory built around those anchors lowers the next task’s ef-fort on six actor models, and an actor model trained on that value, paid where it acts on them, lowers effort further without lowering resolution. 8Limitations 
+
+Our main experiments use Python repositories in the mini-swe-agent harness, and post-training cov-ers the three open-weight actor models. Other pro-gramming languages and larger actor models re-main to be tested. We measure effort by steps and cache-aware tokens and do not report wall-clock latency or energy use. How memory should be accumulated and refreshed over longer repository histories is future work. 
+
+Ethical Considerations 
+
+This work uses publicly released benchmarks, built from open-source repositories, and models in ac-cordance with their licenses, and involves no hu-man participants. Every agent session runs inside the per-task container image of its benchmark. In deployment, a cross-task memory may retain repos-itory content such as file paths, commands and test output, so in private repositories it should follow the repository’s access control and retention policy, with secrets redacted before storage. As plain text, the memory can be audited and deleted. 
+
+References 
+
+Pranjal Aggarwal and Sean Welleck. 2025. L1: Control-ling How Long a Reasoning Model Thinks with Re-inforcement Learning. In Conference on Language Modeling (COLM) .Arash Ahmadian, Chris Cremer, Matthias Gallé, Marzieh Fadaee, Julia Kreutzer, Olivier Pietquin, Ah-met Üstün, and Sara Hooker. 2024. Back to Ba-sics: Revisiting REINFORCE-Style Optimization for Learning from Human Feedback in LLMs. In Pro-ceedings of the 62nd Annual Meeting of the Associa-tion for Computational Linguistics (Volume 1: Long Papers), ACL 2024 , pages 12248–12267. Association for Computational Linguistics. Anthropic. 2026a. How claude remembers your project. Documentation accessed October 12, 2026. Anthropic. 2026b. System Card: Claude Opus 5.5. Daman Arora and Andrea Zanette. 2025. Training Lan-guage Models to Reason Efficiently. arXiv preprint arXiv:2502.04463 .Ruike Cao, Fanyu Zhao, Fugen Yao, Liang Dong, Jian Xu, Yifei Zhao, Han Zhang, and Li Xiao. 2026. Mem-Calib: Benchmarking and Optimizing Memory Use in LLM Agents. arXiv preprint arXiv:2609.24259 .Silin Chen, Shaoxin Lin, Yuling Shi, Heng Lian, Xi-aodong Gu, Longfei Yun, Dong Chen, Lin Cao, Jiyang Liu, Nu Xia, and Qianxiang Wang. 2025. SWE-Exp: Experience-Driven Software Issue Reso-lution. arXiv preprint arXiv:2507.23361 .Yanjun Chen, Yirong Sun, Hanlin Wang, Jinghan Wang, Xinming Zhang, Xiaoyu Shen, Wenjie Li, and Wei Zhang. 2026. The Trace Is the State: Exact Credit Assignment for LLM Agent Teams. arXiv preprint arXiv:2603.06859 .Prateek Chhikara, Dev Khant, Saket Aryan, Taranjeet Singh, and Deshraj Yadav. 2025. Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory. In ECAI 2025 — 28th European Conference on Artificial Intelligence, Bologna, Italy, October 25–30, 2025 , volume 413 of Frontiers in Artificial Intelligence and Applications , pages 2993– 3000. IOS Press. Benjamin Cohen-Wang, Harshay Shah, Kristian Georgiev, and Aleksander Madry. 2024. ContextCite: Attributing Model Generation to Context. In Ad-vances in Neural Information Processing Systems (NeurIPS) , volume 37. DeepSeek-AI. 2026. DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence. arXiv preprint arXiv:2606.19348 .Gangda Deng, Zhaoling Chen, Zhongming Yu, Haoyang Fan, Yuhong Liu, Yuxin Yang, Dhruv Parikh, Raj-gopal Kannan, Le Cong, Mengdi Wang, Qian Zhang, Viktor Prasanna, Xiangru Tang, and Xingyao Wang. 2026a. SWE-Milestone: Evaluating AI Agents on Continuous Software Evolution. In Proceedings of the 43rd International Conference on Machine Learn-ing , volume 306 of Proceedings of Machine Learning Research , pages 23853–23890. PMLR. Yi-Xuan Deng, Xiaoqin Liu, Yi Zhang, Guo-Wei Yang, and Shuojin Yang. 2026b. Your Code Agent Can Grow Alongside You with Structured Memory. arXiv preprint arXiv:2603.13258 .Liyang Fan, Yingcheng Shi, Yongbin Li, Chenghao Sun, Xin Chen, Xander Xu, Hu Wei, Shiwen Ni, Min Yang, and Jieping Ye. 2026a. VibeMemBench: Evaluating Memory Systems for Coding Agents on Real Reposi-tory Coding Tasks. arXiv preprint arXiv:2609.23570 .Xinyi Fan, Miri Liu, Ruozhen Yang, Siru Ouyang, and Jiawei Han. 2026b. Can Agent Memory Systems Track Evolving State? arXiv preprint arXiv:2608.19652 .Lang Feng, Zhenghai Xue, Tingcong Liu, and Bo An. 2025. Group-in-Group Policy Optimization for LLM Agent Training. In Advances in Neural Information Processing Systems (NeurIPS) , volume 38. Jakob Foerster, Gregory Farquhar, Triantafyllos Afouras, Nantas Nardelli, and Shimon Whiteson. 2018. Counterfactual Multi-Agent Policy Gradients. In Proceedings of the AAAI Conference on Artificial Intelligence , volume 32. 
+
+9Shuzheng Gao, Wenhao Zeng, Zhaojian Yu, Jianqiao Wangni, Chaozheng Wang, Kai Cai, Shilin He, and Michael R. Lyu. 2026. SWE-MeM: Learning Adap-tive Memory Management for Long-Horizon Coding Agents. arXiv preprint arXiv:2606.28434 .Gemma Team, Google DeepMind. 2026. Gemma 4 model card. https://ai.google.dev/ gemma .Amirata Ghorbani and James Zou. 2019. Data Shapley: Equitable Valuation of Data for Machine Learning. In Proceedings of the 36th International Conference on Machine Learning (ICML) , volume 97 of Pro-ceedings of Machine Learning Research , pages 2242– 2251. PMLR. Thibaud Gloaguen, Niels Mündler-Sasahara, Mark Niklas Müller, Veselin Raychev, and Martin Vechev. 2026. Evaluating AGENTS.md: Are Repository-Level Context Files Helpful for Coding Agents? arXiv preprint arXiv:2602.11988 .Xinyu Guan, Qianyang Zhao, and Yuming Deng. 2026. Decision-Aware Memory Cards: Counterfactual-Inspired Context Selection and Compression for Tool-Using LLM Agents. arXiv preprint arXiv:2606.08151 .Xuehang Guo, Zora Zhiruo Wang, Qingyun Wang, Gra-ham Neubig, and Xingyao Wang. 2026. Enhancing Software Engineering Through Closed-Loop Mem-ory Optimization. arXiv preprint arXiv:2606.05646 .Tiancheng Han, Yong Li, Wuzhou Yu, Qiaosheng Zhang, and Wenqi Shao. 2026. InfoMem: Train-ing Long-Context Memory Agents with Answer-Conditioned Information Gain. arXiv preprint arXiv:2606.03329 .Anna Harutyunyan, Will Dabney, Thomas Mesnard, Mohammad Azar, Bilal Piot, Nicolas Heess, Hado van Hasselt, Greg Wayne, Satinder Singh, Doina Pre-cup, and Rémi Munos. 2019. Hindsight Credit As-signment. In Advances in Neural Information Pro-cessing Systems (NeurIPS) , volume 32. Zexue He, Yu Wang, Churan Zhi, Yuanzhe Hu, Tzu-Ping Chen, Lang Yin, Ze Chen, Tong Arthur Wu, Siru Ouyang, Zihan Wang, Jiaxin Pei, Julian McAuley, Yejin Choi, and Alex Pentland. 2026. Memor-yArena: Benchmarking Agent Memory in Interde-pendent Multi-Session Agentic Tasks. arXiv preprint arXiv:2602.16313 .Chuanrui Hu, Xingze Gao, Zuyi Zhou, Dannong Xu, Yi Bai, Xintong Li, Hui Zhang, Tong Li, Chong Zhang, Lidong Bing, and Yafeng Deng. 2026. Ever-MemOS: A Self-Organizing Memory Operating Sys-tem for Structured Long-Horizon Reasoning. arXiv preprint arXiv:2601.02163 .Yu Huo, Kun Zeng, Siyu Zhang, Yuquan Lu, Cheng Yang, Yifu Guo, and Xiaoying Tang. 2026. Re-poShapley: Shapley-Enhanced Context Filtering for Repository-Level Code Completion. In Findings of the Association for Computational Linguistics: ACL 2026 , pages 10390–10412. Association for Computa-tional Linguistics. Mehmet Iscan. 2026. Learning When to Remember: Risk-Sensitive Contextual Bandits for Abstention-Aware Memory Retrieval in LLM-Based Coding Agents. arXiv preprint arXiv:2604.27283 .Carlos E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir Press, and Karthik R. Narasimhan. 2024. SWE-bench: Can Language Models Resolve Real-world Github Issues? In The Twelfth International Conference on Learning Repre-sentations, ICLR 2024, Vienna, Austria, May 7–11, 2024 . OpenReview.net. Qirui Jin, Lingching Tung, Kenan Li, Qiyang Shi, Yushi She, Huanzhong Jia, Harrison Zhao, Ke-jing Xia, Zhenbang Du, Jiaxin Pei, Zhenyu Zhang, Zhen Qi, Yuyan Duan, Wenke Lee, and Zijian Jin. 2026. ChainSWE: Benchmarking Coding Agents on Multi-Bug Software Maintenance. arXiv preprint arXiv:2607.02606 .Thomas Joshi, Shayan Chowdhury, and Fatih Uysal. 2025. SWE-Bench-CL: Continual Learning for Cod-ing Agents. arXiv preprint arXiv:2507.00014 .Amirhossein Kazemnejad, Milad Aghajohari, Eva Porte-lance, Alessandro Sordoni, Siva Reddy, Aaron Courville, and Nicolas Le Roux. 2025. VinePPO: Refining Credit Assignment in RL Training of LLMs. In International Conference on Machine Learning (ICML) , volume 267 of Proceedings of Machine Learning Research , pages 29557–29590. PMLR. Dipesh KC and Anjila Budathoki. 2026. Hand-off Debt: The Rediscovery Cost When Coding Agents Take Over Interrupted Tasks. arXiv preprint arXiv:2606.02875 .Qinfeng Li, Yuntai Bao, Xinyan Yu, Hongze Chen, Yanming Liu, Huifeng Zhu, Yier Jin, Jintao Chen, Wenqi Zhang, and Xuhong Zhang. 2026a. At-triMem: Attribution-Guided Process Feedback for Agent Memory Construction. arXiv preprint arXiv:2607.21106 .Ruoran Li, Xinghua Zhang, Haiyang Yu, Shitong Duan, Xiang Li, Wenxin Xiang, Chonghua Liao, Xudong Guo, Yongbin Li, and Jinli Suo. 2026b. MemPO: Self-Memory Policy Optimization for Long-Horizon Agents. arXiv preprint arXiv:2603.00680 .Yujiang Li, Zhenyu Hou, Yi Jing, Jie Tang, and Yuxiao Dong. 2026c. CompactionRL: Reinforcement Learn-ing with Context Compaction for Long-Horizon Agents. arXiv preprint arXiv:2607.05378 .Zhiyu Li, Chenyang Xi, Chunyu Li, Ding Chen, Boyu Chen, Shichao Song, Simin Niu, Hanyu Wang, Ji-awei Yang, Chen Tang, Qingchen Yu, Jihao Zhao, Yezhaohui Wang, Peng Liu, Zehao Lin, Pengyuan Wang, Jiahao Huo, Tianyi Chen, Kai Chen, and 20 others. 2025. MemOS: A Memory OS for AI System. 
+
+arXiv preprint arXiv:2507.03724 .
+
+10 Hunter Lightman, Vineet Kosaraju, Yuri Burda, Harri-son Edwards, Bowen Baker, Teddy Lee, Jan Leike, John Schulman, Ilya Sutskever, and Karl Cobbe. 2024. Let’s Verify Step by Step. In International Conference on Learning Representations (ICLR) .Nelson F. Liu, Kevin Lin, John Hewitt, Ashwin Paran-jape, Michele Bevilacqua, Fabio Petroni, and Percy Liang. 2024. Lost in the Middle: How Language Models Use Long Contexts. Transactions of the Asso-ciation for Computational Linguistics , 12:157–173. Zichen Liu, Changyu Chen, Wenjun Li, Penghui Qi, Tianyu Pang, Chao Du, Wee Sun Lee, and Min Lin. 2025. Understanding R1-Zero-like training: A criti-cal perspective. arXiv preprint arXiv:2503.20783 .Lirui Luo, Kelong Mao, Heming Xia, Rongqing Li, Xinwei Yang, Luyu Chen, Kieran Wong, Yudong Guo, Xinrui Wang, Jiayin Zhu, Simiu Gu, Sulong Xu, and Cong Fang. 2026a. Coding Agent Mem-ory Post-training: Unlocking the Memory Poten-tial of Pre-trained File Operations for Long-Horizon Tasks via Reinforcement Learning. arXiv preprint arXiv:2609.34422 .Z. C. Luo, J. C. Guo, W. J. He, S. Y. Wang, J. C. Yu, F. M. Zhao, Y. Chen, T. Cao, L. Q. Liu, N. Zheng, W. Xu, J. Jiang, and Z. M. Zhao. 2026b. AdaRepair-Mem: Adaptive Experience Orchestra-tion for Repository-Level Program Repair. arXiv preprint arXiv:2609.20130 .Adyasha Maharana, Dong-Ho Lee, Sergey Tulyakov, Mohit Bansal, Francesco Barbieri, and Yuwei Fang. 2024. Evaluating Very Long-Term Conversational Memory of LLM Agents. In Proceedings of the 62nd Annual Meeting of the Association for Compu-tational Linguistics (Volume 1: Long Papers), ACL 2024 , pages 13851–13870. Association for Computa-tional Linguistics. Thomas Mesnard, Théophane Weber, Fabio Viola, Shan-tanu Thakoor, Alaa Saade, Anna Harutyunyan, Will Dabney, Tom Stepleton, Nicolas Heess, Arthur Guez, Éric Moulines, Marcus Hutter, Lars Buesing, and Rémi Munos. 2021. Counterfactual Credit Assign-ment in Model-Free Reinforcement Learning. In Pro-ceedings of the 38th International Conference on Ma-chine Learning (ICML) , volume 139 of Proceedings of Machine Learning Research , pages 7654–7664. PMLR. OpenAI. 2024. Introducing SWE-bench Verified. OpenAI. 2026a. Configuration reference. Documenta-tion accessed October 12, 2026. OpenAI. 2026b. GPT-5.6 System Card. Siru Ouyang, Jun Yan, I-Hung Hsu, Yanfei Chen, Ke Jiang, Zifeng Wang, Rujun Han, Long T. Le, Samira Daruki, Xiangru Tang, Vishy Tirumalashetty, George Lee, Mahsan Rofouei, Hangfei Lin, Jiawei Han, Chen-Yu Lee, and Tomas Pfister. 2026. Rea-soningBank: Scaling Agent Self-Evolving with Rea-soning Memory. In International Conference on Learning Representations (ICLR) .Charles Packer, Sarah Wooders, Kevin Lin, Vivian Fang, Shishir G. Patil, Ion Stoica, and Joseph E. Gonzalez. 2023. MemGPT: Towards LLMs as Operating Sys-tems. arXiv preprint arXiv:2310.08560 .Jiayi Pan, Xingyao Wang, Graham Neubig, Navdeep Jaitly, Heng Ji, Alane Suhr, and Yizhe Zhang. 2025. Training Software Engineering Agents and Verifiers with SWE-Gym. In International Conference on Ma-chine Learning (ICML) , volume 267 of Proceedings of Machine Learning Research , pages 47717–47737. PMLR. Joon Sung Park, Joseph C. O’Brien, Carrie J. Cai, Meredith Ringel Morris, Percy Liang, and Michael S. Bernstein. 2023. Generative Agents: Interactive Sim-ulacra of Human Behavior. In Proceedings of the 36th Annual ACM Symposium on User Interface Soft-ware and Technology (UIST) .Qwen Team. 2026a. Qwen3.5: Towards Native Multi-modal Agents. Qwen Team. 2026b. Qwen3.8-Max: A New Bar for Coding and Cowork. Stefano Rando, Luca Romani, Alessio Sampieri, Luca Franco, John Yang, Yuta Kyuragi, Fabio Galasso, and Tatsunori Hashimoto. 2025. LongCodeBench: Evaluating Coding LLMs at 1M Context Windows. 
+
+arXiv preprint arXiv:2505.07897 .Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang, Y. K. Li, Y. Wu, and Daya Guo. 2024. DeepSeekMath: Pushing the Limits of Mathemat-ical Reasoning in Open Language Models. arXiv preprint arXiv:2402.03300 .Lloyd S. Shapley. 1953. A Value for n-Person Games. In Harold W. Kuhn and Albert W. Tucker, editors, 
+
+Contributions to the Theory of Games, Volume II ,volume 28 of Annals of Mathematics Studies , pages 307–317. Princeton University Press. Kangning Shen, Jingyuan Zhang, Chenxi Sun, Wen-cong Zeng, and Yang Yue. 2026. Structurally aligned subtask-level memory for software engineer-ing agents. In International Conference on Machine Learning (ICML) .Freda Shi, Xinyun Chen, Kanishka Misra, Nathan Scales, David Dohan, Ed H. Chi, Nathanael Schärli, and Denny Zhou. 2023. Large Language Models Can Be Easily Distracted by Irrelevant Context. In 
+
+Proceedings of the 40th International Conference on Machine Learning , volume 202 of Proceedings of Machine Learning Research , pages 31210–31227. PMLR. 
+
+11 Weijia Shi, Xiaochuang Han, Mike Lewis, Yulia Tsvetkov, Luke Zettlemoyer, and Wen-tau Yih. 2024. Trusting Your Evidence: Hallucinate Less with Context-aware Decoding. In Proceedings of the 2024 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (Volume 2: Short Papers) ,pages 783–791. Association for Computational Lin-guistics. Noah Shinn, Federico Cassano, Ashwin Gopinath, Karthik Narasimhan, and Shunyu Yao. 2023. Reflex-ion: Language Agents with Verbal Reinforcement Learning. In Advances in Neural Information Pro-cessing Systems (NeurIPS) , volume 36. Saksham Sahai Srivastava. 2026. Causal Intervention-Based Memory Selection for Long-Horizon LLM Agents. arXiv preprint arXiv:2605.17641 .Mirac Suzgun, Mert Yuksekgonul, Federico Bianchi, Dan Jurafsky, and James Zou. 2025. Dynamic Cheat-sheet: Test-Time Learning with Adaptive Memory. 
+
+arXiv preprint arXiv:2504.07952 .Xiangru Tang, Tianrui Qin, Tianhao Peng, Ziyang Zhou, Daniel Shao, Tingting Du, Xinming Wei, Peng Xia, Fang Wu, He Zhu, Ge Zhang, Jiaheng Liu, Xingyao Wang, Sirui Hong, Chenglin Wu, Hao Cheng, Chi Wang, and Wangchunshu Zhou. 2025. Agent KB: Leveraging Cross-Domain Experience for Agentic Problem Solving. arXiv preprint arXiv:2507.06229 .Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot, and Ashish Sabharwal. 2023. Interleaving retrieval with chain-of-thought reasoning for knowledge-intensive multi-step questions. In Proceedings of the 61st Annual Meeting of the Association for Compu-tational Linguistics (Volume 1: Long Papers) , pages 10014–10037. Association for Computational Lin-guistics. Liam van der Poel, Ryan Cotterell, and Clara Meister. 2022. Mutual Information Alleviates Hallucinations in Abstractive Summarization. In Proceedings of the 2022 Conference on Empirical Methods in Natural Language Processing (EMNLP) , pages 5956–5965. Association for Computational Linguistics. Boshi Wang, Weijian Xu, Yunsheng Li, Mei Gao, Yujia Xie, Huan Sun, and Dongdong Chen. 2026. Improv-ing Code Localization with Repository Memory. In 
+
+International Conference on Learning Representa-tions (ICLR) .Guanzhi Wang, Yuqi Xie, Yunfan Jiang, Ajay Man-dlekar, Chaowei Xiao, Yuke Zhu, Linxi Fan, and Anima Anandkumar. 2024. Voyager: An Open-Ended Embodied Agent with Large Language Mod-els. Transactions on Machine Learning Research .Kuan Wang. 2026. MemDelta: Controlled Baselines and Hidden Confounds in Agent Memory Evaluation. 
+
+arXiv preprint arXiv:2606.29914 .Xingyao Wang, Boxuan Li, Yufan Song, Frank F. Xu, Xiangru Tang, Mingchen Zhuge, Jiayi Pan, Yueqi Song, Bowen Li, Jaskirat Singh, Hoang H. Tran, Fuqiang Li, Ren Ma, Mingzhang Zheng, Bill Qian, Yanjun Shao, Niklas Muennighoff, Yizhe Zhang, Binyuan Hui, and 5 others. 2025a. OpenHands: An Open Platform for AI Software Developers as Gener-alist Agents. In International Conference on Learn-ing Representations (ICLR) .Yu Wang, Ryuichi Takanobu, Zhiqi Liang, Yuzhen Mao, Yuanzhe Hu, Julian McAuley, and Xiaojian Wu. 2025b. Mem-α: Learning Memory Construc-tion via Reinforcement Learning. arXiv preprint arXiv:2509.25911 .Zora Zhiruo Wang, Jiayuan Mao, Daniel Fried, and Graham Neubig. 2025c. Agent Workflow Memory. In Proceedings of the 42nd International Conference on Machine Learning , volume 267 of Proceedings of Machine Learning Research , pages 63897–63911. PMLR. Yuxiang Wei, Olivier Duchenne, Jade Copet, Quentin Carbonneaux, Lingming Zhang, Daniel Fried, Gabriel Synnaeve, Rishabh Singh, and Sida I. Wang. 2025. SWE-RL: Advancing LLM Reasoning via Re-inforcement Learning on Open Software Evolution. 
+
+arXiv preprint arXiv:2502.18449 .Di Wu, Hongwei Wang, Wenhao Yu, Yuwei Zhang, Kai-Wei Chang, and Dong Yu. 2025. LongMemEval: Benchmarking Chat Assistants on Long-Term In-teractive Memory. In International Conference on Learning Representations (ICLR) .Yifan Wu, Lizhu Zhang, Yuhang Zhou, Mingyi Wang, Bo Peng, Serena Li, Xiangjun Fan, and Zhuokai Zhao. 2026. Remember When It Matters: Proactive Mem-ory Agent for Long-Horizon Agents. arXiv preprint arXiv:2607.08716 .Chunqiu Steven Xia, Yinlin Deng, Soren Dunn, and Lingming Zhang. 2024. Agentless: Demystifying LLM-based Software Engineering Agents. arXiv preprint arXiv:2407.01489 .Zijun Xie, Binbin Zheng, Enlei Gong, Jihua Liu, Yuyang You, Lingfeng Liu, Jiayao Tang, Guanqun Zhao, Aoqi Hu, and Zeyu Chen. 2026. ECHO: Prune to Act, Trace to Learn with Selective Turn Memory in Agentic RL. arXiv preprint arXiv:2606.31650 .Hongming Xu, Le Zhou, ZhongHe Jin, Xiang Zhang, Bo Tang, Zhiyu Li, Xuanhe Zhou, and Juncheng Zhang. 2026a. MemTrace: State-Consistent Memory for Long-Horizon Coding Agents. arXiv preprint arXiv:2610.04838 .Wujiang Xu, Zujie Liang, Kai Mei, Hang Gao, Juntao Tan, and Yongfeng Zhang. 2025. A-MEM: Agentic Memory for LLM Agents. In Advances in Neural In-formation Processing Systems (NeurIPS) , volume 38. Yue Xu, Yutao Sun, Yihao Liu, Mengyu Zhou, Jiayi Qiao, Lu Ma, Kai Tang, Wenjie Wang, Xiaoxi Jiang, 
+
+12 and Guanjun Jiang. 2026b. From Passive Retrieval to Active Memory Navigation: Learning to Use Mem-ory as a Structured Action Space. arXiv preprint arXiv:2607.05794 .Jiangze Yan, Yi Shen, Wenjing Zhang, Jieyun Huang, Zhaoxiang Liu, Ning Wang, Kai Wang, and Shiguo Lian. 2026a. HiMPO: Hindsight-Informed Memory Policy Optimization for Less-Entangled Credit in Long-Horizon Agents. arXiv preprint arXiv:2606.16285 .Sikuan Yan, Ahmed Bahloul, Ercong Nie, Susanna Schwarzmann, Riccardo Trivisonno, Volker Tresp, and Yunpu Ma. 2026b. Memory-R2: Fair Credit Assignment for Long-Horizon Memory-Augmented LLM Agents. arXiv preprint arXiv:2605.21768 .Sikuan Yan, Xiufeng Yang, Zuchao Huang, Ercong Nie, Zifeng Ding, Zonggen Li, Xiaowen Ma, Jinhe Bi, Kristian Kersting, Jeff Z. Pan, Hinrich Schütze, Volker Tresp, and Yunpu Ma. 2026c. Memory-R1: Enhancing Large Language Model Agents to Manage and Utilize Memories via Reinforcement Learning. In Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), ACL 2026 , pages 12805–12825. Association for Computational Linguistics. John Yang, Carlos E. Jimenez, Alexander Wettig, Kil-ian Lieret, Shunyu Yao, Karthik Narasimhan, and Ofir Press. 2024. SWE-agent: Agent-Computer In-terfaces Enable Automated Software Engineering. In 
+
+Advances in Neural Information Processing Systems (NeurIPS) , volume 37. John Yang, Kilian Lieret, Carlos E. Jimenez, Alexan-der Wettig, Kabir Khandpur, Yanzhe Zhang, Binyuan Hui, Ofir Press, Ludwig Schmidt, and Diyi Yang. 2025. SWE-smith: Scaling Data for Software Engi-neering Agents. arXiv preprint arXiv:2504.21798 .Yi Yang, Zhennan Chen, Yihong Zhuang, Tiehan Fan, Yinan Chen, Jian Li, Jian Yang, and Ying Tai. 2026. RoMeRL: Balancing Feedback Coverage and the Memory-Reward Trap in Self-Evolving Agent Mem-ory via Reduced-Order Utility States. arXiv preprint arXiv:2608.02508 .Yongshi Ye, Hui Jiang, Feihu Jiang, Tian Lan, Yichao Du, Biao Fu, Xiaodong Shi, Qianghuai Jia, Longyue Wang, and Weihua Luo. 2026. UMEM: Unified Memory Extraction and Management Framework for Generalizable Memory. In Proceedings of the 43rd International Conference on Machine Learning ,volume 306 of Proceedings of Machine Learning Research , pages 148411–148429. PMLR. Hongli Yu, Tinghong Chen, Jiangtao Feng, Jiangjie Chen, Weinan Dai, Qiying Yu, Ya-Qin Zhang, Wei-Ying Ma, Jingjing Liu, Mingxuan Wang, and Hao Zhou. 2025. MemAgent: Reshaping Long-Context LLM with Multi-Conv RL-based Memory Agent. 
+
+arXiv preprint arXiv:2507.02259 .Yanwei Yue, Boci Peng, Xuanbo Fan, Jiaxin Guo, Qiankun Li, and Yan Zhang. 2026. Mem-T: Den-sifying Rewards for Long-Horizon Memory Agents. 
+
+arXiv preprint arXiv:2601.23014 .Fengji Zhang, Bei Chen, Yue Zhang, Jacky Keung, Jin Liu, Daoguang Zan, Yi Mao, Jian-Guang Lou, and Weizhu Chen. 2023. RepoCoder: Repository-level code completion through iterative retrieval and gen-eration. In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing ,pages 2471–2484. Association for Computational Linguistics. Shaoqiu Zhang, Yuhang Wang, Jialiang Liang, Yul-ing Shi, Wenhao Zeng, Maoquan Wang, Shilin He, Ningyuan Xu, Siyu Ye, Kai Cai, and Xiaodong Gu. 2026a. SWE-Explore: Benchmarking how coding agents explore repositories. arXiv preprint arXiv:2606.07297 .Yikai Zhang, Jiaxin Pei, Kenan Li, Qirui Jin, Maoquan Wang, Jin Pan, Yu Kang, Shengyu Fu, Elsie Nalli-pogu, Junjie Hu, Yufan Huang, and Zijian Jin. 2026b. SWE-Edit: Rethinking Code Editing for Efficient SWE-Agent. arXiv preprint arXiv:2604.26102 .Zeyu Zhang, Xiaohe Bo, Chen Ma, Rui Li, Xu Chen, Quanyu Dai, Jieming Zhu, Zhenhua Dong, and Ji-Rong Wen. 2024. A Survey on the Memory Mecha-nism of Large Language Model based Agents. arXiv preprint arXiv:2404.13501 .Andrew Zhao, Daniel Huang, Quentin Xu, Matthieu Lin, Yong-Jin Liu, and Gao Huang. 2024. ExpeL: LLM Agents Are Experiential Learners. In Proceedings of the AAAI Conference on Artificial Intelligence ,volume 38, pages 19632–19642. Wanjun Zhong, Lianghong Guo, Qiqi Gao, He Ye, and Yanlin Wang. 2024. MemoryBank: Enhancing Large Language Models with Long-Term Memory. In Pro-ceedings of the AAAI Conference on Artificial Intelli-gence .Zijian Zhou, Ao Qu, Zhaoxuan Wu, Sunghwan Kim, Alok Prakash, Daniela Rus, Jinhua Zhao, Bryan Kian Hsiang Low, and Paul Pu Liang. 2025. MEM1: Learning to Synergize Memory and Reasoning for Efficient Long-Horizon Agents. arXiv preprint arXiv:2506.15841 .Jiayuan Zhu, Junde Wu, Minhao Hu, Shengda Zhu, Jiazhen Pan, Weixiang Shen, Yijun Yang, Fenglin Liu, Jianye Hao, Yueming Jin, Qirong Ho, and Min Xu. 2026. SWE Context Bench: A Benchmark for Context Learning in Coding. arXiv preprint arXiv:2602.08316 .
+
+13 A Training Details 
+
+Boundaries are drawn without replacement with probability proportional to (ub + ϵ) gb. Here ub
+
+is a running average of ˆpb(1 − ˆpb), where ˆpb is a running estimate of how often the memory-free sessions at b resolve, both at rate λ=0 .25 , gb drops to 0.25 after a group at b resolves nothing, and ϵ
+
+is a floor that keeps every boundary reachable. A boundary the actor always or never resolves carries no outcome contrast, and the weight peaks where a resolved and an unresolved session are equally likely. Boundaries that cannot be graded are re-moved before training, and for the 27B actor also those that no session has ever resolved. Each train-ing group runs G=8 sessions at a boundary, four with no memory, three with memories of b writ-ten by the frozen base actor, drawn from a pool of three per boundary for the 27B actor and twelve for the 9B, and one with a misplaced memory drawn from another repository. The reward of Eq. (4) uses 
+
+W =250 , with nmax =100 and α=50 for the 27B actor and nmax =200 and α=16 for the 9B, and ad-vantages use the fixed scale s=100 rather than the group’s standard deviation, which would inflate the step differences of a group that resolves everything and would give the value credit a unit that changes from group to group, whereas a fixed scale keeps 
+
+bVb/s comparable across boundaries. Dropping the standard deviation follows Dr. GRPO (Liu et al., 2025). The grouped return baseline is related to GRPO (Shao et al., 2024) and REINFORCE-style updates (Ahmadian et al., 2024); our groups addi-tionally separate memory conditions. The policy follows the advantages by policy gradient with a KL penalty to the base actor. The set Ub of Eq. (6) is collected from the first K=8 steps of the memory-free sessions. The actor is a LoRA adapter on the base actor, and with xj an assistant token, prefix j
+
+the realised history before it and N the number of assistant tokens in the update, the loss of session i
+
+is 
+
+ℓi(θ) = − 1
+
+> N
+
+X
+
+> t∈τi
+
+Ai,t 
+
+X
+
+> j∈t
+
+log πθ
+
+ xj | prefix j , c i
+
+ ,
+
+(9) with ci ∈ { ∅, m, ˜m} the memory session i ran with ( ˜m the misplaced one), Ai,t = Ai for sessions without their own memory, plus a KL penalty to the base actor with weight β=0 .2, summed over the same tokens and divided by N . For the 9B actor the policy term of a session is instead divided by its own assistant tokens and by the number of sessions in the update. Nothing is resampled for the per-step credit, and one forward and one backward pass serve both credits. The adapter has LoRA rank and alpha 16 and is trained with AdamW at a learning rate of 2×10 −4 for the 27B actor and 10 −4 for the 9B, with 3 warmup updates, gradient clipping at 
+
+1.0 and sampling temperature 1.0, for 20 updates. Training sequences are truncated at 32 K tokens for the 27B actor and 49 K for the 9B, sessions that do not return within 1,500 s and 3,600 s respectively are left out of their group, and for the 9B so are sessions that end in a repeated format error. 
+
+Training dynamics. The training reward cannot compare the two recipes, because the full method adds a step term and a value credit that resolve-only RL does not have. We therefore follow both runs on held-out sessions. Figure 8 reads the 27B actor af-ter 8, 12 , 16 and 20 updates of the full method and of resolve-only RL, which is the M1 +M2 recipe without its step term, on the 96 test sessions with the memory, with three replays per checkpoint, all in one window. Both runs sum their loss over to-kens and share learning rate, update count, group shape and memory pool. From update 12 on, the full method keeps lowering its effort, by 0.25 steps per update, while resolve-only RL stays near 30 
+
+steps and its actor tokens rise back above those of the untrained actor. At update 20 , the checkpoint of the main tables, the full method uses 2.0 fewer steps ( 95% CI [−4.1, +0 .4] ) and 6.9K fewer actor tokens ( [−11 .2, −3.1] ) than resolve-only RL, and resolves 1.0 points more ( [−2.4, +4 .5] ). 
+
+B Experimental Details 
+
+Data. ChainSWE (Jin et al., 2026) provides 100 
+
+chains of successive tasks, each chain a sequence of real issues of one repository solved in order on the tree the earlier tasks left. We split the chains by repository, without looking at any outcome, into a training half of 52 chains ( 97 boundaries) and a test half of 48 chains ( 96 boundaries), so no repository appears in both. A test boundary is linked when the files that the gold and test patches of Tk+1 touch overlap those changed by earlier gold patches of its chain ( 54 boundaries) and unlinked otherwise ( 42 ). Training and checkpoint selection use the training half and every comparison uses the test half. The external sets are described in App. E. 
+
+Actor models and harness. Six actor models run in mini-swe-agent with a 98 K-token win-14 Algorithm 1 One update of on-policy adaptation for memory use with provenance-gated value credit. 
+
+Require: actor πθ as a LoRA adapter over the frozen base πbase ; training boundaries B with estimates 
+
+ˆpb, ub and gates gb; a pool of memories per boundary written by πbase (three for 27B, twelve for 9B); a cross-repository donor pool  
+
+> 1:
+
+draw 8 boundaries without replacement with probability proportional to (ub + ϵ) gb 
+
+> 2:
+
+for each drawn boundary b do  
+
+> 3:
+
+restore Sb and run G=8 sessions of πθ on Tk+1 , four with no memory, three with memories of b,one with a misplaced memory from another repository  
+
+> 4:
+
+grade every session and score it by Eq. (4)  
+
+> 5:
+
+if every session of the group carries a grading defect then  
+
+> 6:
+
+drop the group from the update and from ˆpb and ub, and lower gb as for a group that resolves nothing  
+
+> 7:
+
+else  
+
+> 8:
+
+bVb ← ¯Rm − ¯R∅, and update ˆpb from the memory-free sessions, then ub and gb 
+
+> 9:
+
+Ai ← (Ri − ¯R∅)/s on every step of the memory-free and the misplaced-memory sessions, as in Eq. (5)  
+
+> 10:
+
+collect Ub from the first K steps of the memory-free sessions and mark ωt on every step of the own-memory sessions by Eq. (6)  
+
+> 11:
+
+Ai,t ← (Ri − ¯Rm)/s + ωt bVb/s on the own-memory sessions, as in Eq. (7)  
+
+> 12:
+
+end if  
+
+> 13:
+
+end for  
+
+> 14:
+
+update θ once on P 
+
+> i
+
+ℓi of Eq. (9) plus the KL term, over the retained sessions with nonzero credit, taken in descending mean |Ai,t | and skipping any that no longer fits, until the update’s token budget (350 K tokens for 27B, 600 K for 9B) is spent 0 8 12 16 20 28 30 32 34           
+
+> −2.0
+> Steps per session
+> 0812 16 20 25 30 35
+> −6.9K
+> Actor tokens per session (K)
+> 0812 16 20 20 25 30
+> +1.0
+> Resolve rate (%)
+> Policy updates
+> CoReMem (full method) Resolve-only RL Untrained
+
+Figure 8: Training dynamics of the 27B actor on the test sessions with the memory. Lines are means over three replays and bands their standard deviation. Update 0 is the untrained actor, also drawn as the dashed line. The number beside each panel is the paired difference at update 20 .
+
+dow, three open-weight models that we also post-train, Qwen3.5-9B (Qwen Team, 2026a), Qwen3.8-27B-FP8 (Qwen Team, 2026b) and Gemma-4-31B (Gemma Team, Google DeepMind, 2026), with a step limit of 100 for the 27B model and 200 
+
+otherwise, and three API-served models, Claude Opus 5.5 (Anthropic, 2026b), GPT-5.6 Luna (Ope-nAI, 2026b) and DeepSeek-V4-Flash (DeepSeek-AI, 2026), with a step limit of 200 .
+
+Memory layers compared. No memory runs ev-ery next task from the inherited tree with its task description alone. Full history injects the most recent part of the transcript of the earlier tasks. Mem0 (Chhikara et al., 2025), MemOp (Guo et al., 2026) and ReasoningBank (Ouyang et al., 2026) run with their official instructions and their own write and read calls, which the ledger counts on the memory side. CoReMem w/o training is our mem-ory, written by the frozen actor model at the end of each current task’s session (App. L) and injected into the next task’s session, and CoReMem is the post-trained actor model with the same memory written by itself. 15 Metrics. Resolve rate is the share of next tasks whose hidden tests pass on the working tree at the end of the session, reported overall and on the linked and unlinked boundaries. Steps is the number of assistant turns of a session, each one command. Tokens per session count every call of the session, cache-aware, the actor model’s own calls (Actor) and the calls of the memory module (Writer), with Total their sum. Resolve per token di-vides the overall resolve rate by the thousand actor or total tokens per session. For the API-served models, USD per session prices the same calls at the provider’s list rates, DeepSeek-V4-Flash at DeepSeek’s off-peak rate, a deployment-free con-version and not an expense, and resolve per USD divides the resolve rate by it. 
+
+Replays and tests. Every row is read on the mean over its replays, 12 for the frozen 9B rows, 6 to 7
+
+for 27B, 6 for DeepSeek, 3 for Gemma and Luna and 1 for Opus. Differences against the no-memory row of the same actor model are tested with paired chain-cluster bootstrap intervals over the 48 test chains, and the main text calls a difference signifi-cant when the 95% interval excludes zero. 
+
+Post-training and checkpoint rule. The 27B and 9B actor models are post-trained with LoRA at a checkpoint chosen among the few saved during a run, on the training split and by a rule fixed in advance, resolution no lower than the base actor model’s and then the fewest steps. The Gemma actor model is post-trained for 8 updates with no checkpoint selection. App. A reports the 27B actor model at every checkpoint on the test sessions. 
+
+C Ablation Details 
+
+The ablation of §4.3 and Figure 7 reads each variant with its own memory, without memory and with a misplaced memory, averaging 18 /18 /6 replays of these arms for w/o training, 18 /9/6 for M1 +M2 and 6/6/3 for the full method on 27B, and 3/3/3
+
+on 9B except the full method with 6/3/3; the 27B resolve-only arm comes from the run of App. A ( 3
+
+replays in a later window). Memory benefit pairs a variant’s with-memory arm against its own no-memory arm, and misplaced cost pairs the same actor given another repository’s memory against that no-memory arm. Intervals are paired chain-cluster bootstrap 95% intervals over the 48 test chains ( 2000 resamples, seed 0), and an interval that excludes zero is what the main text calls sig-nificant. On the frozen 27B actor model the mem-ory raises resolution from 21 .3% to 23 .4% (+2 .1[+0 .4, +3 .7] ) and lowers steps from 35 .3 to 32 .6,and a misplaced memory changes steps by −0.1[−1.7, +1 .5] . Without the value credit (M1 +M2) a misplaced memory costs the 27B actor model +2 .1
+
+steps [+0 .4, +3 .9] and with it +0 .3 [ −1.2, +2 .1] .On 9B the with-memory and no-memory arms of the untrained, M1 +M2 and full variants were read in one window, their misplaced-memory arms and the resolve-only variant in later ones. The trained variants differ from each other only in the reward and the credit rule; all share learning rate, update count, group shape, memory pool and serving path, and every variant’s untrained control shares that serving path. 
+
+D Ledger of the API-served Models 
+
+Table 3 gives the ledger of the API-served models with the list-price cost per session; the open-weight models are in Table 1 and Figure 6 summarizes the API-served ones. 
+
+E Results Beyond the Training Distribution 
+
+On SWE-bench Verified (OpenAI, 2024), one task per instance and no memory, the post-trained ac-tor model resolves 4.5 points more than its un-trained counterpart on 27B and 6.4 on 9B, with 
+
+7% and 22% fewer steps and 9% and 22% fewer actor tokens (Table 4). On two external task chains run with the frozen 27B actor model and the same memory-writing instruction as on Chain-SWE, our memory lowers steps by 29% on SWE-ContextBench (Zhu et al., 2026) and 14% on SWE-Bench-CL (Joshi et al., 2025). On SWECon-textBench, where the next task inherits the cur-rent task’s tree, it also lowers total tokens by 38% ,and the tightened instruction raises resolution by 8
+
+points over no memory; on SWE-Bench-CL, where the memory alone crosses the boundary, resolution rises by 5 points (Table E). Under the OpenHands harness (Wang et al., 2025a), with the same frozen 27B actor model and memory, our memory raises resolution by 6 points and is the one memory layer that raises resolve per token, by 11% , and the post-trained actor model raises resolution by a further 5
+
+points, to 21 .3% (Table 6). 
+
+SWE-bench Verified protocol. Standard SWE-bench Verified harness images and test com-mands; resolve is the official FAIL_TO_PASS 16 Table 3: Cost and outcome of each memory layer for the API-served models on the test set. Overall columns as in Table 1, with the list-price cost per session and resolve per dollar. 
+
+Memory layer Outcome Tokens per session (K) Res. per K tokens List price 
+
+Res. (%) ↑ Steps ↓ Actor ↓ Writer Total ↓ Actor ↑ Total ↑ USD ↓ Res. per USD ↑
+
+Claude Opus 5.5 
+
+No memory 38.5 12.6 (12.0) 21.5 (15.7) – 21.5 (15.7) 1.791 1.791 0.2370 162 Full history 40.6 +5% 10.4 (9.0) −17% 27.0 (23.5) – 27.0 (23.5) +25% 1.505 1.505 −16% 0.2384 +1% 170 +5% 
+
+Mem0 39.6 +3% 13.0 (12.0) +3% 18.7 (16.2) 16.6 (17.8) 35.4 (34.8) +64% 2.112 1.119 −37% 0.2893 +22% 137 −16% 
+
+MemOp 39.6 +3% 17.8 (12.5) +41% 21.7 (16.0) 14.4 (12.1) 36.1 (28.2) +68% 1.821 1.096 −39% 0.3630 +53% 109 −33% 
+
+ReasoningBank 40.6 +5% 14.2 (12.0) +13% 20.9 (16.8) 27.9 (24.6) 48.8 (41.3) +127% 1.939 0.832 −54% 0.4028 +70% 101 −38% 
+
+CoReMem w/o training 38.5 0% 11.8 (10.0) −6% 18.1 (13.7) 2.0 (2.0) 20.1 (15.7) −7% 2.134 1.919 +7% 0.2048 −14% 188 +16% 
+
+GPT-5.6 Luna 
+
+No memory 23.6 17.9 (16.7) 51.7 (43.7) – 51.7 (43.7) 0.461 0.461 0.0176 1349 Full history 24.0 +1% 18.6 (15.3) +4% 79.8 (66.7) – 79.8 (66.7) +54% 0.306 0.306 −34% 0.0263 +50% 918 −32% 
+
+Mem0 22.6 −4% 17.5 (15.3) −2% 49.8 (40.4) 13.0 (12.9) 62.7 (53.0) +21% 0.456 0.361 −22% 0.0199 +13% 1134 −16% 
+
+MemOp 22.9 −3% 17.5 (15.8) −2% 49.7 (38.3) 14.0 (12.6) 63.8 (49.7) +23% 0.470 0.363 −21% 0.0204 +16% 1121 −17% 
+
+ReasoningBank 23.3 −1% 17.9 (15.5) 0% 55.6 (44.8) 29.6 (26.2) 85.3 (72.0) +65% 0.419 0.273 −41% 0.0258 +47% 902 −33% 
+
+CoReMem w/o training 25.7 +9% 16.3 (14.7) −9% 48.9 (39.6) 3.6 (2.5) 52.5 (44.2) +2% 0.526 0.491 +7% 0.0181 +3% 1421 +5% 
+
+DeepSeek-V4-Flash 
+
+No memory 21.9 90.0 (87.3) 84.4 (70.6) – 84.4 (70.6) 0.262 0.262 0.0363 605 Full history 22.4 +2% 76.6 (72.4) −15% 75.8 (66.0) – 75.8 (66.0) −10% 0.297 0.297 +14% 0.0319 −12% 705 +16% 
+
+Mem0 21.9 0% 94.2 (91.9) +5% 87.5 (76.2) 12.5 (12.5) 100.0 (88.1) +18% 0.252 0.220 −16% 0.0393 +8% 558 −8% 
+
+MemOp 21.4 −2% 87.5 (85.6) −3% 81.7 (68.0) 28.8 (30.4) 110.5 (99.4) +31% 0.263 0.194 −26% 0.0396 +9% 542 −10% 
+
+ReasoningBank 23.1 +6% 97.2 (96.2) +8% 91.8 (78.4) 58.9 (62.5) 150.7 (145.3) +78% 0.256 0.155 −41% 0.0468 +29% 497 −18% 
+
+CoReMem w/o training 23.6 +8% 78.2 (77.1) −13% 75.9 (57.6) 6.4 (1.5) 82.3 (61.6) −3% 0.313 0.289 +10% 0.0330 −9% 717 +18% 
+
+Table 4: The post-trained actor on SWE-bench Verified. All 500 instances, one task each, no memory, 3 replays per row. The untrained row serves the zero-update adapter on the same path, and tags give the change against it ( ∗∗ 
+
+for a paired 99% interval that excludes zero). Raw counts tokens with no credit for caching, and Limit hit is the share of instances that end at the step limit. 
+
+Actor Checkpoint Resolve (%) ↑ Steps mean (med.) ↓ Actor tok (K) mean (med.) ↓ Raw tok (K) ↓ Limit hit (%) ↓ Res/Tok (actor) ↑
+
+Qwen3.8-27B-FP8 (Qwen Team, 2026b) untrained 69.2 ±1.9 
+
+28.3 ±0.2 
+
+(21.2) 24.7 ±0.6 
+
+(17.4) 383.0 ±15.2 7.0 ±0.4 2.80 ±0.10 
+
+post-trained 73.7 ±0.6 +7%** 26.2 ±0.3 −7%** 
+
+(20.5) 22.5 ±0.2 −9%** 
+
+(17.2) 313.7 ±1.5 −18%** 2.5 ±0.1 −64%** 3.27 ±0.05 +17%** 
+
+Qwen3.5-9B (Qwen Team, 2026a) untrained 49.1 ±2.2 
+
+90.1 ±1.3 
+
+(86.2) 93.5 ±0.4 
+
+(86.3) 2471.9 ±20.6 7.1 ±1.9 0.53 ±0.03 
+
+post-trained 55.5 ±0.3 +13%** 69.9 ±1.4 −22%** 
+
+(63.8) 72.9 ±1.3 −22%** 
+
+(64.1) 1586.1 ±70.4 −36%** 0.1 ±0.1 −99%** 0.76 ±0.02 +43%** 
+
+and PASS_TO_PASS check. No memory in ei-ther row, since a Verified instance has no ear-lier task. The untrained row is the zero-update adapter served on the same LoRA path as the trained row, not the native base, so that the serv-ing path does not enter the difference. Resolve grades the working tree at session end; grading only the submitted patch gives 68 .9 (untrained) and 73 .3 (post-trained) for 27B. The denomina-tor is all 500 instances; on the 498 whose gold patch passes the dataset’s own test command the differences are unchanged. Paired bootstrap over instances ( 10 ,000 resamples), 27B post-trained mi-nus untrained: resolve +4 .5 [+2 .4, +6 .5], steps 
+
+−2.2 [−3.1, −1.2], actor tokens −2.2K [ −3.2,
+
+−1.3], limit hits −4.5 pp [ −5.8, −3.2]; ** marks a 
+
+99% interval that excludes zero. Res/Tok is resolve (%) per thousand actor tokens. One Verified in-stance ( pydata__xarray-3305 ) also appears in a ChainSWE test chain and none in a training chain. For 9B (post-trained: the full method at the pre-registered checkpoint, after 12 updates), post-trained minus untrained: resolve +6 .4 [+4 .0,
+
++8 .8], steps −20 .2 [−22 .4, −18 .0], actor tokens 
+
+−20 .6K [ −23 .0, −18 .1], limit hits −6.9 pp [ −8.4,
+
+−5.6], and context-window exits fall from 21 .7% 
+
+to 5.8% ; the gold-validated subset gives the same differences. 
+
+External task chains and harnesses. Table E asks whether a memory the actor model writes for itself still lowers the next task’s effort on successive tasks we did not mine, on SWEContextBench with the inherited tree and on SWE-Bench-CL with the tree reset. Table 6 runs 94 of the 96 next tasks of the test split, the frozen and the post-trained 27B actor model and the same memory through OpenHands, with the harness alone changed. 17 Table 5: The memory layer off the training distribution: successive tasks of one repository on an external dataset. SWEContextBench (SCB) pairs are two-task chains of one repository in one image, the next task opening at an independent checkout from the first, so only memory crosses the border. CoReMem w/o training writes its memory under the instruction of Figure 11; we updated the writer instructions by adding that the next session starts from a new checkout without the earlier changes, that the memory should not include a summary of or reason for the changes, and that the memory should only include one clause per DID line. The adapted instructions were written after observing the first runs on the set, whose memories were getting cut off because of note length.                                                                                                          
+
+> Memory layer Linked Unlinked Overall Tokens per session (K) Res. per K tokens
+> Res. (%) ↑Steps ↓Res. (%) ↑Steps ↓Res. (%) ↑Steps ↓Actor ↓Writer Total ↓Actor ↑Total ↑
+> Qwen3.8-27B-FP8, agent without network access (n=4 replays) No memory 31.6 59.2 (61.2) 19.6 44.6 (37.5) 28.1 54.9 (54.4) 89.4 (60.8) –89.4 (60.8) 0.340 0.340 No memory, post-trained actor 33.8 51.2 (48.0) 21.4 39.9 (34.4) 30.2 +7% 47.9 (44.8) −13% 76.2 (47.8) –76.2 (47.8) −15% 0.406 0.406 +19%
+> CoReMem w/o training 36.8 40.3 (36.4) 19.6 43.2 (39.1) 31.8 +13% 41.2 (39.1) −25% 61.5 (41.4) 5.2 (2.0) 66.7 (43.4) −25% 0.561 0.517 +52%
+> CoReMem 40.4 35.7 (32.0) 16.1 34.8 (29.9) 33.3 +19% 35.4 (30.4) −35% 57.6 (35.1) 4.0 (1.9) 61.6 (37.2) −31% 0.628 0.583 +71%
+
+Table 6: Memory layers under the OpenHands har-ness. The 27B actor model on 94 of the 96 next tasks of the test split, mean of two runs, frozen in the upper rows and post-trained in the last row, where it is served through its LoRA adapter. Tokens are raw counts per session with no credit for prefix caching, memory mod-ule included, and do not compare with Table 1. 
+
+Memory layer Resolve (%) Steps Tokens (K) Resolve per M tokens No memory 10.6 33.8 897 11.9 Full history 14.9 41.8 1704 8.8 Mem0 11.2 38.3 1176 9.5 MemOp 14.4 38.5 1273 11.9 ReasoningBank 21.8 48.0 1943 11.3 
+
+CoReMem w/o training 16.5 38.6 1240 13.3 
+
+CoReMem 21.3 45.9 1647 13.0 
+
+F Proof of Proposition 1 
+
+Full statement. Fix a boundary b with memories 
+
+qb and veto set Ub, let Jmem 
+
+b (θ) = Eqb Em[R] be the expected reward of a session that runs with a memory of b and Vb = Jmem 
+
+b − E∅[R] the mem-ory’s value under the current actor. Under the credit 
+
+At = ( R−Jmem 
+
+b )/s +ωt Vb/s , the population form of Eq. (7), the expected policy-gradient update on sessions that carry a memory of b reads 
+
+gm = 1
+
+s ∇θJmem 
+
+b (θ)+ Vb
+
+s
+
+X
+
+t
+
+Eqb Em
+
+h
+
+∇θPθ(ωt = 1 | ht, m )
+
+i
+
+,
+
+where the gradient in the second term acts on the policy at step t with the history ht held fixed. Be-cause ωt depends on the step and its history and not on θ, the expected score of the steps it selects is the gradient of the probability of selecting them, so the memory’s value pushes how often the actor acts on the memory. Paid to every step instead, the same value multiplies E[∇θ log πθ(τ | m)] = 0 
+
+and teaches nothing about memory use. 
+
+Setup. Fix the current parameters θ and condition on one memory m ∼ qb; the statement follows by averaging over m, whose distribution does not depend on θ. A session τ ∼ πθ(· | Sb, m ) is a finite sequence of steps, at each of which the actor emits a message xt after a history ht, and the environment’s responses do not depend on θ. The provenance ωt = ω(xt, h t) ∈ { 0, 1} of Eq. (6) is a deterministic function of the message, its history and the veto set, and does not depend on θ. Write 
+
+Jm = Em[R] for the expected reward under this m,take Jmem 
+
+b and Vb as in the proposition, constants that do not depend on the sampled m, and hold the veto set fixed. 
+
+Proof of Proposition 1. The per-step credit defines the ascent direction gm =
+
+Em
+
+ P 
+
+t At∇θ log πθ(xt | ht, m ) with 
+
+At = (R − Jmem 
+
+b )/s + ωtVb/s , which the loss of Eq. (9) follows up to the normalisation discussed below. For the first part, the environment does not depend on θ, so P
+
+t ∇θ log πθ(xt | ht, m )
+
+is the score of the session, its mean is zero, and 
+
+Em
+
+(R − Jmem 
+
+b ) P
+
+t ∇θ log πθ(xt | ht, m ) =
+
+∇θJm, and averaging over m ∼ qb gives ∇θJmem 
+
+b .For the second, conditioning on ht and using that 
+
+ω does not depend on θ,
+
+Eω(xt, h t) ∇θ log πθ(xt | ht, m ) ht
+
+
+
+= X
+
+x
+
+ω(x, h t) ∇θπθ(x | ht, m )= ∇θPθ(ωt = 1 | ht, m ),
+
+and taking the expectation over ht, summing over t
+
+and averaging over m ∼ qb yields the second term, with the constant Vb passing through the average. Under whole-trajectory credit ωt is replaced by 18 one, the same conditioning gives P 
+
+> x
+
+∇θπθ(x |
+
+ht, m ) = ∇θ1 = 0 for every t, and the memory’s value contributes nothing. 
+
+Remark on the cancellation. At every step 
+
+∇θPθ(ωt = 1 | ht, m ) + ∇θPθ(ωt = 0 | ht, m ) = 0. Paying the memory’s value to every step there-fore adds, to the push toward the memory-driven actions, an equal and opposite push toward all the others, and the two cancel in expectation while both remain in the variance. The gated credit pays the first and withdraws the second. 
+
+Remark on the sample baselines. In training the two expectations are group means. On a memory-driven step the credit is (Ri − ¯R∅)/s , whose base-line is computed from other sessions and is inde-pendent of the one it is subtracted from. On every other step the baseline ¯Rm includes the session itself, which scales the expected contribution of those steps by 1 − 1/n m, with nm=3 the number of own-memory sessions in the group, and leaves its direction unchanged. Under whole-trajectory credit the same self-inclusion turns the value term into 1 
+
+> nms
+
+∇θJm, a rescaling of the outcome gradi-ent with no push specific to memory-driven steps. The loss of Eq. (9) sums each step’s credit over its tokens and divides by the update’s token count, so for the 27B actor its gradient is the per-step estima-tor of the proposition scaled by a positive constant. The own-memory sessions of a group carry differ-ent memories of b, so bVb estimates the value of a memory for b written by the base actor, averaged over those memories, which the proposition states with qb.
+
+G Provenance Calibration 
+
+The gate of Eq. (6) reads the whole assistant mes-sage of a step, its reasoning text and its command, so an anchor named in the reasoning text counts as much as one in the command, and each anchor is credited at its first use. We calibrate provenance as training uses it, with the sibling veto over the first 
+
+8 steps, on the post-trained 27B actor’s held-out sessions with its own memories ( 288 sessions over three replays). Under a real memory 3.46% of steps carry provenance and 169 of the 288 sessions have at least one. Memory-free sessions scored against the memory they would have seen give a leakage null of 1.61% of steps, and misplaced memories give 1.05% . Credited steps concentrate late in a trajectory, with deciles 7 to 9 at about twice the rate of deciles 4 to 6 (ratio 2.02 [1 .52 , 2.78] ), where the actor runs tests and the anchors it uses come from the memory’s TESTS and VERIFY lines. Steps that match the memory early, when the actor opens the files it names, are mostly steps that memory-free sessions also take, so the veto removes about 
+
+88% of them and leaves about 3% of credited steps in the first decile. 
+
+The early-window veto. The window K was fixed before the arm was trained, on the 480 own-memory rollouts of an earlier training run. With no veto 5.5% of steps are memory-driven, with the veto over the first 8 steps of the memory-free ses-sions 1.9% , and with a veto over their whole length 
+
+0.65% . Memory-free sessions have a median of 
+
+26 steps, so the first 8 are an early prefix, and a veto over their whole length would remove most of what the memory supplied. In practice, a test command the memory lists is memory-driven at the step that first runs it, and not if the session ran it earlier or the memory-free sessions reach it in their first steps; a memory-free session has ω ≡ 0.
+
+Why not a likelihood ratio. The natural alter-native weights a step by the ratio of its message’s likelihood with and without the memory in con-text. This alternative is related to context attribu-tion (Cohen-Wang et al., 2024) and to probability contrasts used in context-aware decoding (Shi et al., 2024) and PMI-based summarization (van der Poel et al., 2022); their targets are attribution or faith-fulness rather than executable-task effort. On this actor that ratio carries no signal. In a pilot of 36 
+
+sessions on the 27B actor its AUC is 0.506 for real against the null, and the weight moves with mes-sage length rather than with message content. A flat ratio next to a sharp anchor match says that the memory changes a few actions rather than condi-tioning the whole distribution, which is why the credit signal is provenance and not likelihood. 
+
+H Segments of a Trajectory 
+
+Each step of a trajectory is an assistant message, made of reasoning text and a shell command, fol-lowed by the output of that command. The com-mand goes to the commands segment together with the exit code of its step, and the output goes to one segment by what produced it, under rules fixed before the study (the first match wins). Output of a command that prints a diff ( git diff , git show , a patch file) goes to the change segment; out-19 put of a test runner ( pytest , tox , unittest 
+
+and the like), of a script written in the session or of inline Python that contains an assert goes to the test segment; all other output goes to the repository segment, including that of linters such as flake8 ,which the list does not name. The change the task left in the tree joins the change segment. The out-come and the scratch files come from the boundary, not from the transcript, and harness format mes-sages ( 0.05% of the material) are left out. Each segment is cut to a fixed quota ( 4,000 characters, 
+
+200 for the outcome and 800 for scratch files), so a segment is the same text in every arm that contains it. None of these assignments reads what the text says, since each segment is read off what the har-ness records, the assistant message, the command and its exit code, its output, the diff and the end of the session. Table 7 defines the seven segments with an example from one real session, shown in Figure 9. Three compressed forms are valued alongside the segments and decide how a kept segment is written: the failing commands with their output (here steps 1 and 2, a search that found nothing and a grep on a missing file), the tests with their exit codes but no output, and the file list of the change. The exit code is recorded once per step, so when a command pipes into tail (steps 9 and 10) it is the code of the pipeline, and the test’s own result is in its output. The example comes from the first task of a three-task chain on flake8-simplify in the training split, run by the frozen 27B actor. The memory it wrote in its last turn is the one in Fig-ure 10, and its lines trace back to the trajectory as follows. FILES and the WHERE of DID come from the change, whose added lines sit exactly at lines 34 –58 of ast_if.py . STATUS comes from the outcome and TESTS from the full test run of step 10. The two VERIFY lines are the commands of steps 9 and 8 with their exit codes. The CONTEXT lines come from the repository con-tent read in step 3 (one rule file per AST node type, SIM102 in ast_if.py ) and in steps 4 to 6 (constants.py , utils.py ), and from the test output of step 10 ( 90 passed, 2 xfailed ). None of the reasoning text reaches the memory. 
+
+I Segment and Field Tests 
+
+App. J reads the result of every segment into a line of the memory (Table 8). Rerun on the training half alone, the segment conditions support the same choices for the commands, the repository content, the tests and the reasoning text, with Shapley val-ues (Shapley, 1953; Ghorbani and Zou, 2019) of 
+
++3 .09 , +2 .67 and +2 .40 steps for the first three and a negative one for the reasoning text, and test commands with their exit codes alone save +4 .03 
+
+steps. The memory also lowers steps on two exter-nal sets (App. E). The step differences quoted in §3.1 are medians with BH-adjusted p∗=.0070 for the commands ( 56 /27 ) and p∗=.0302 for the repos-itory content read ( 52 /34 ). Against the material it replaces, the memory keeps the whole median step saving on linked boundaries, 2 of 2 steps, with 6% 
+
+of its bytes ( 1,056 against 17 ,320 characters) and a ratio interval of [0 .50 , 2.00] , which meets a reten-tion margin of 0.50 , and gives up no measurable step ( 47 /39 , p=.48 ). 
+
+J From Raw History to the Memory 
+
+This appendix records how each line of the CoRe-Mem memory was obtained from the raw session, and where each decision came from. The deriva-tion ran in five steps. The first three are mechanical, the fourth arranges the fields into the memory’s two blocks, and the fifth validates the result. Table 8 maps every segment measurement to the line it produced. 
+
+Step 1, segments. The current task’s session is split by the role each piece of text plays, namely the agent’s reasoning (C1), the commands it issued (C2), the repository content it read (C3), the feed-back of its tests (C4), the change it left (C5), its outcome (C6) and its scratch files (C7). The out-come segment is cut in two, the outcome the writer can observe and the verdict of the hidden tests, and the latter may never enter a memory. Three compressed forms are added as probes, the fail-ing commands with their output, the diff’s file list, and the test commands with their exit codes but no output. 
+
+Step 2, values. Each segment subset is valued by replaying the next task from the fixed state the current task left (§3.1). The subsets are no seg-ment, all segments twice, all but one segment and one segment alone, plus the three probes. A seg-ment’s carried share is the fraction of the whole material’s median step saving that it keeps when injected alone. The readings below are on linked boundaries (App. B) unless stated otherwise. 20 Part of the trajectory behind the memory of Figure 10, labeled by segment 
+
+[step 3] REASONING TEXT: THOUGHT: It's a directory. Let me look at the rules directory. 
+
+COMMAND: cd /flake8-simplify && ls flake8_simplify/rules/ && grep -rn "SIM102" flake8_simplify/ [exit 0] 
+
+REPOSITORY CONTENT: 
+
+__init__.py ast_assign.py [...] ast_if.py [...] flake8_simplify/rules/ast_if.py:12: SIM102 = "SIM102 Use a single if-statement instead of nested if-statements" flake8_simplify/rules/ast_if.py:34: errors.append((node.lineno, node.col_offset, SIM102)) [... steps 4-6 read ast_if.py, constants.py and utils.py ...] 
+
+[step 7] REASONING TEXT: THOUGHT: Now I'll add a helper function and use it in get_sim102. Let me edit the file. 
+
+COMMAND: cd /flake8-simplify && python - <<'EOF' [exit 0] path = "flake8_simplify/rules/ast_if.py" [...] def is_main_check(node: ast.If) -> bool: """Check if the if-statement is `` if __name__ == "__main__": `` .""" [...] EOF 
+
+TEST OUTPUT (the script contains an assert): 
+
+done 
+
+[step 8] REASONING TEXT: THOUGHT: Now let me verify the fix works with a test script. 
+
+COMMAND: cd /flake8-simplify && cat > /tmp/test_sim102.py <<'EOF' [exit 0] if __name__ == "__main__": if foo(): pass EOF python -m flake8 --select=SIM102 /tmp/test_sim102.py; echo "exit: $?" cat > /tmp/test_sim102b.py <<'EOF' if a: if b: pass EOF python -m flake8 --select=SIM102 /tmp/test_sim102b.py; echo "exit: $?" 
+
+REPOSITORY CONTENT (flake8 is not a test runner): 
+
+exit: 0/tmp/test_sim102b.py:1:1: SIM102 Use a single if-statement instead of nested if-statements exit: 1
+
+[step 9] REASONING TEXT: THOUGHT: The fix works. The `__main__ ` case no longer triggers, while normal nested ifs still do. Let me run the existing test suite for SIM102 to ensure nothing breaks. 
+
+COMMAND: cd /flake8-simplify && python -m pytest tests/ -k "sim102" -q 2>&1 | tail -20 [exit 0] 
+
+TEST OUTPUT: 
+
+[...] 4 passed, 88 deselected in 0.37s 
+
+[step 10] REASONING TEXT: THOUGHT: All SIM102 tests pass. Let me run the full test suite to be safe. 
+
+COMMAND: cd /flake8-simplify && python -m pytest tests/ -q 2>&1 | tail -5 [exit 0] 
+
+TEST OUTPUT: 
+
+[...] 90 passed, 2 xfailed in 0.48s 
+
+[step 11] REASONING TEXT: THOUGHT: All tests pass. Let me create the patch. 
+
+COMMAND: cd /flake8-simplify && git diff -- flake8_simplify/rules/ast_if.py > patch.txt && cat patch.txt [exit 0] 
+
+FINAL DIFF: 
+
+--- a/flake8_simplify/rules/ast_if.py +++ b/flake8_simplify/rules/ast_if.py @@ -31,10 +31,33 @@ def get_sim102(node: ast.If) -> List[Tuple[int, int, str]]: if not is_pattern_1: return errors + if is_main_check(node): + return errors [...] 
+
+OUTCOME: Submitted, 12 steps 
+
+SCRATCH FILES: /tmp/test_sim102.py, /tmp/test_sim102b.py (gone at the next task); patch.txt (kept) 
+
+Figure 9: A real trajectory split into segments (flake8-simplify, training split, frozen 27B actor). Verbatim except 
+
+[...] cuts and the omitted command fences; segment labels and step numbers are ours. 
+
+21 Segment What it holds In the example session (Figure 9) 
+
+Reasoning text The actor’s own text in each step, outside the command “Now let me verify the fix works with a test script.” (step 8) Commands Every command the actor ran, in order, with the shell exit code of its step ( 0 for success, nonzero for failure) 
+
+python -m pytest tests/ -k "sim102" -q [exit 0] (step 9); a grep on a file that does not exist [exit 2] (step 2) Repository content Output of commands that read or search the repository, and of any other command that is not a test The file list of flake8_simplify/rules/ and the two lines of ast_if.py that mention SIM102 (step 3); the flake8 warning on the negative case (step 8) Test output Output of test runners, of scripts written in the session and of inline Python with an assert 4 passed, 88 deselected (step 9); 90 passed, 2 xfailed (step 10) Change The diff the task left in the tree, and output of commands that print a diff 
+
+23 added lines in ast_if.py that define 
+
+is_main_check and call it (step 11) Outcome How the session ended, its exit status and step count Submitted after 12 steps Scratch files Paths the session’s commands wrote, by shell redirection or from Python, and whether each still exists when the next task starts 
+
+/tmp/test_sim102.py and 
+
+/tmp/test_sim102b.py (gone), patch.txt at the repository root (kept) 
+
+Table 7: The seven segments of a trajectory. The first five partition the transcript, and the last two come from the boundary. 
+
+Step 3, inventory and constraints. A decision program turns the values into the list of fields and the constraints on how each is written. It emitted 
+
+VERIFY , CONTEXT , DID , TESTS and a one-line reason field, and fixed four constraints. The loca-tion of a change is written as anchors with its diff body banned, a failed check stays a VERIFY entry with its nonzero exit code, a test result is the exit code of its command, and the hidden-test verdict never appears. 
+
+Step 4, layout. The fields go into two blocks. The task block opens with FILES , the files the session modified or tested, and holds STATUS , VERIFY 
+
+and DID , which describe this session’s task; the repository block holds the CONTEXT facts that hold for any task. The reasoning segment carried no step value, so the reason field was dropped, and 
+
+TESTS was merged into the STATUS line. 
+
+Step 5, validation. The memory is compared with the raw material it replaces and keeps its whole median step saving with 6% of its bytes (App. I). 
+
+Scope of the procedure. Steps 2 and 5 use only paired replay and the next task’s cost, so they apply wherever sessions follow one another on persistent state. Steps 1 and 3 need a split of the session by role and a definition of an anchor, which on Chain-SWE are the seven segments and the locations and checks of Definition 1. 
+
+K Anchors 
+
+Definition 1 is implemented as a string matcher, the same one that marks memory-driven steps in §3.2.2. A text is split into tokens, and a token is an anchor when it falls into one of the four kinds of Ta-ble 9. Three filters keep generic strings out. Tokens shorter than six characters are dropped, as are to-kens whose every part is a common English or shell word ( command-line , pytest ), and scaffold-ing found in nearly every repository ( setup.py ,
+
+conftest.py , reproduce.py and paths un-der /tmp ). A path:lines reference is matched on its path, so the line range in a memory guides the next task without being required for a match. For provenance (Eq. (6)) the memory’s anchors are further reduced to those absent from the session so far and from what the memory-free sessions of the same group reach in their first eight steps. 
+
+Table 9: The four kinds of anchor. Examples are from the memory in Figure 10 except the node id, whose form is shown.                 
+
+> Kind Role Rule Example
+> File path location has a /and a letter, or a code extension
+> flake8_simplify/ rules/ast_if.py
+> Symbol location snake, camel, dotted or hyphenated, not all common words
+> is_main_check ,
+> ast.Constant
+> Test node id check contains :: , its path and name also count
+> tests/test_x.py:: test_y
+> Command token check non-flag token inside a command or a
+> VERIFY /TESTS field
+> flake8 ,sim102
+
+L Memory Templates 
+
+Our memory is written by the acting model itself, in a final turn appended to the session that ends a task, under the instruction in Figure 11, repro-duced verbatim from the deployed file (SHA-256 22 Segment Measurement on linked boundaries Decision Line of the memory 
+
+C1 reasoning Deleting it costs no step (34 helped, 45 hurt) and saves 1.14K tokens ( p=.023 )Step 3 kept a reason field; Step 4 dropped it None; the instruction forbids reasons and summaries C2 commands Deleting it costs a median 2 steps (56/27, BH p∗=.0070 ); alone it carries the whole saving; the failing commands alone carry half Kept; failed checks stay in it with their exit code 
+
+VERIFY exact command [exit 
+
+N ] | COVERS paths C3 repository content Deleting it costs a median step (52/34, BH 
+
+p∗=.0302 ) and saves 0.63K tokens Kept as located facts CONTEXT fact | WHERE 
+
+path:lines, in the repository block C4 test feedback Test commands with exit codes beat the full test output by a median step (53/30, BH p∗=.045 )A test result is the exit code of its command 
+
+TESTS last full test command [last exit N ]; no pasted output C5 change Deleting the diff body costs no step (47/44) and saves 0.94K tokens ( p=.021 ); the file list matches the full diff ( p=.097 )Anchors only, body banned DID one clause | WHERE 
+
+path:lines (symbols); the change is committed and is not restated C6 outcome No effect overall (45/33); helps when the current task resolved (24/11) Observable part kept, hidden-test verdict banned; Step 4 places it in the task block 
+
+STATUS submitted, stopped or no change, inside the task block C7 scratch 38% of the paths a session writes sit under 
+
+/tmp and are gone by the next command; the manifest carries no step value (36/48) No line; a validity rule on 
+
+VERIFY VERIFY runs unchanged from the repository root, with no 
+
+/tmp and no cd 
+
+Table 8: From segments to lines. Results of the segment study (App. I). Counts are boundaries where the segment helped and hurt the next task. BH marks the multiplicity correction across segments. 
+
+A memory written in-session by the 27B actor (flake8-simplify, training split)                                                                                                                        
+
+> FILES: flake8_simplify/rules/ast_if.py STATUS: submitted |TESTS: python -m pytest tests/ -q [exit 0] VERIFY: python -m pytest tests/ -k sim102 -q [exit 0] |COVERS: flake8_simplify/rules/ast_if.py VERIFY: python -m flake8 --select=SIM102 /tmp/test_sim102.py [exit 0] |COVERS: flake8_simplify/rules/ast_if.py DID: added is_main_check() to skip SIM102 when outer if is `if __name__ == "__main__": `|WHERE: flake8_simplify/rules/ast_if.py:34-58 (get_sim102, is_main_check) CONTEXT: rules live in flake8_simplify/rules/*.py, one file per AST node type; SIM102 is in ast_if.py |WHERE: flake8_simplify/rules/ast_if.py CONTEXT: tests run via `python -m pytest tests/ -q `;full suite is 90 passed, 2xfailed |WHERE: tests/ CONTEXT: to_source() in utils.py uses astor; constants AST_CONST_TYPES/STR_TYPES cover both ast.Constant and legacy ast.Str/ast.Num |WHERE: flake8_simplify/constants.py
+> Anchors the matcher extracts (18). Locations: flake8_simplify/rules/ast_if.py ,flake8_simplify/rules ,ast_if.py ,
+> flake8_simplify/constants.py ,constants.py ,utils.py ,is_main_check ,get_sim102 ,AST_CONST_TYPES/STR_TYPES ,
+> STR_TYPES ,ast.Constant ,ast.Str/ast.Num ,ast.Num .Checks: flake8 ,sim102 ,SIM102 ,test_sim102.py ,
+> tmp/test_sim102.py .
+
+Figure 10: A real memory and its anchors. The memory has 889 characters and 18 anchors. 
+
+02a36ea0... ). A malformed memory gets one corrective retry, and a session that still ends without a valid memory has it written in a separate call. 
+
+M Design Choices and Their Alternatives 
+
+This section sets out the alternatives to three design choices and what the paper’s own measurements say about them. 
+
+Adapting the actor rather than training a sep-arate memory reader. A separate reader, or a retrieval policy, decides what memory to hand the actor, either before the task or between its steps. In our setting the memory is short, at most ten lines, and already sits in the actor’s context, so the open question is not which memory to show but whether and when the actor acts on it. Which steps use the memory emerges as the task unfolds. What a coding agent needs is often not evident from the task description and surfaces as it ex-plores and executes, so a single retrieval keyed on the task input falls short of multi-step repository exploration (Trivedi et al., 2023; Yang et al., 2024; Zhang et al., 2026a), retrieval from the unfinished code alone misses what a draft reveals (Zhang et al., 2023), and memory retrieved per subtask during execution outperforms memory retrieved by whole-task similarity (Shen et al., 2026). Under the de-tector that training uses, credited steps concentrate late in a trajectory, where the actor runs the tests 23 Memory-Writing Instruction (final turn of the session) 
+
+Your work on this task is over; nothing you write now is executed. Write a MEMORY NOTE for whoever works on this repository next. This is the last turn of the session. 
+
+What the next session has, and what it does not: 
+
+- It starts in the same working tree. Every change of this session is already committed, so it can read the diff itself (git show HEAD). Do NOT restate the diff. - It runs every command in a fresh shell from the repository root: nothing under /tmp, no cd, and no environment variable survives from one command to the next. - It may be working on a DIFFERENT task than this session. It cannot see this conversation. The note has two blocks. Write the TASK block first and mark its scope explicitly. 
+
+=== TASK BLOCK (applies only if the next task touches the files listed in FILES) === FILES: <every file this session modified or ran tests for, comma-separated, verbatim paths> 
+
+STATUS: <submitted | stopped at step limit | no code change> | TESTS: <last full test command> [last exit N] 
+
+VERIFY: <exact command as issued, runnable from the repository root in a fresh shell> [exit N] | COVERS: 
+
+<path>[, <path>] 
+
+VERIFY: <...> (one line per distinct command that checked something; keep the ones that FAILED too, with their nonzero exit code; most recent last) 
+
+DID: <what changed, one clause> | WHERE: <path:lines (symbols)> (anchors only; never paste diff hunks) 
+
+=== REPO BLOCK (facts that hold for any task in this repository) === CONTEXT: <repository fact the next session would otherwise rediscover: how tests are run, layout, conventions, environment quirks> | WHERE: <path:lines or the command that showed it> 
+
+Rules: 
+
+- Copy paths, commands, symbol names and test ids VERBATIM from this session; never invent, round, or add a directory prefix that was never printed. - A command that failed is worth recording exactly as much as one that passed: write its real exit code. Never round or invent an exit code. - VERIFY commands must run unchanged from the repository root in a fresh shell: a repository test command (pytest path or test id) or a self-contained python -c. Never reference /tmp, a script that is not in the repository, or a prior cd. If the only check was a scratch script, write the repository test command that covers the change instead, or VERIFY: none | COVERS: <changed files>. - STATUS and DID describe THIS session's task only. They belong under FILES so that a session on unrelated files can skip them; never phrase them as facts about the repository. - Do not write why you did things, do not summarise the conversation, do not quote test output. Test results are carried by exit codes, not by pasted text. - Write CONTEXT lines only for facts this session actually established (a command that showed them, a file that states them). Never add a CONTEXT line to fill the block. - At most 10 lines and 1200 characters in total. There is no fixed priority among the line types and no requirement to emit every type: spend the budget where THIS session's material actually warrants it. - Output the note ONLY. No command, no code fence, no THOUGHT text, no explanation, and do not restate these instructions. This turn runs nothing. 
+
+Line-start rule , restated because it is the most common failure: every line of your output must begin with one of exactly FILES:, STATUS:, VERIFY:, DID:, CONTEXT:. TESTS, WHERE and COVERS are NEVER line starts -- they occur only as " | " continuations inside one of those five lines. 
+
+Shape of a finished note (placeholders, not values to copy): FILES: <path>, <path> 
+
+STATUS: <submitted|stopped at step limit|no code change> | TESTS: <command> [exit <N>] 
+
+VERIFY: <command> [exit <N>] | COVERS: <path> 
+
+DID: <one clause> | WHERE: <path>:<lines> (<symbol>) 
+
+CONTEXT: <repository fact> | WHERE: <path>:<lines> 
+
+Figure 11: The instruction under which the actor writes its memory, verbatim from the deployed file. It states what the next session can see, fixes the memory’s two blocks and five line types, sets the rules and shows the finished shape. Bold, shading and gray placeholders are ours. 
+
+24 the memory names, while early steps that match the memory are mostly steps the actor takes with-out any memory (App. G). A reader that selects memory up front cannot see this, and a reader that re-selects at every step would need the same per-step signal we give the actor. We therefore adapt the actor itself and pay the measured value to the steps that use the memory. Retrieval stays compati-ble with this choice, since a retrieval policy decides what memory enters the context and the adaptation changes what the actor does with it. Related con-trollers decide when to inject reminders (PMA; Wu et al., 2026), whether to retrieve or abstain (RSCB-MC; Iscan, 2026), and how to navigate memory at different granularities (NapMem; Xu et al., 2026b). These choices concern memory access, whereas our update targets execution after a short memory is already present. 
+
+A LoRA adapter rather than a separate model or full fine-tuning. A separate memory model leaves the actor untouched but cannot change how it acts on memory, and full fine-tuning can move the actor’s general coding behaviour. A LoRA adapter on frozen base weights is the middle ground, a low-rank update that bounds how far the actor moves while letting it adapt its use of memory. Whether general capability survives is a measurement, not a property of the adapter. On SWE-bench Verified, with no memory in context, the adapted 27B and 9B actors resolve 4.5 and 6.4 points more than their untrained counterparts with 7% and 22% fewer steps (Table 4), so on this benchmark the adaptation cost no general capability. 
+
+Paying the value through provenance rather than leaving it to the outcome reward. Out-come reward already favours whatever raises R,including a good use of memory, but it spreads one scalar over every step of a session, and the steps that use the memory are about three percent of them (App. G). Proposition 1 shows that paid to every step the measured value is a baseline, while paid through the gate it becomes a push on how often the actor acts on the memory, sized and signed by the on-policy measurement. Figure 7 compares this credit with whole-trajectory credit under the same reward. A gate read from how much the memory raised a step’s likelihood is the natural alternative to anchor provenance and carried no signal on this actor (App. G). 
+
+N Related Work 
+
+Agent memory beyond coding. Agent memory encompasses reflective feedback and extracted ex-perience (Shinn et al., 2023; Zhao et al., 2024), reusable workflows and executable skills (Wang et al., 2025c, 2024), and adaptive inference-time experience (Suzgun et al., 2025; Tang et al., 2025). Other systems organize episodic or conversational information through reflection, retrieval, memory hierarchies and linked records (Park et al., 2023; Zhong et al., 2024; Packer et al., 2023; Xu et al., 2025). MemOS and EverMemOS address memory organization and lifecycle management (Li et al., 2025; Hu et al., 2026); Zhang et al. (2024) survey the broader design space. 
+
+Memory for coding agents. Memory systems keep different forms of experience: Mem0 extracts facts from conversations (Chhikara et al., 2025), ReasoningBank and SWE-Exp distill lessons from past trajectories (Ouyang et al., 2026; Chen et al., 2025), Repository Memory and MemCoder mine commit history for localization and development knowledge (Wang et al., 2026; Deng et al., 2026b), and MemOp maintains a per-repository guidebook with a trained writer (Guo et al., 2026). These ap-proaches emphasize retained experience or repos-itory knowledge; our setting additionally carries the actual edited repository state. AdaRepair-Mem selects repair experience by coverage, qual-ity and repair stage (Luo et al., 2026b). Repos-itory context files also require empirical evalua-tion: AGENTS.md studies find that added instruc-tions need not improve success and can increase cost (Gloaguen et al., 2026). Persistent project in-formation appears in deployed assistants through Claude Code’s auto memory and Codex’s cross-session memory generation and injection (An-thropic, 2026a; OpenAI, 2026a). Within one task, SWE-MeM and CompactionRL learn context com-pression jointly with issue resolution (Gao et al., 2026; Li et al., 2026c), and the concurrent Mem-Trace re-validates stored execution traces against the evolving repository (Xu et al., 2026a); these memories do not outlive the task. CAMG-RL like-wise learns file-based memory operations across context boundaries within an episode (Luo et al., 2026a). Between the two lies the boundary a de-ployed agent meets, a memory written before the next task is known and read in the repository state the last task left. 25 Broader memory evaluation. LoCoMo and LongMemEval test long-term conversational mem-ory (Maharana et al., 2024; Wu et al., 2025), StateMemBench tests evolving-state tracking (Fan et al., 2026b), and MemoryArena couples mem-ory with interdependent multi-session actions (He et al., 2026). LongCodeBench evaluates long-context code comprehension and repair (Rando et al., 2025). These settings probe memory reten-tion and use, while our evaluation measures the effort saved on an unseen coding task from inher-ited repository state. 
+
+Evaluating memory on executable tasks. SWE-bench grades each issue from its own snapshot (Jimenez et al., 2024), whereas ChainSWE chains fixes in a shared workspace (Jin et al., 2026) and SWE-Milestone reports resolve falling from above 80% to 38% once state is carried (Deng et al., 2026a); SWEContextBench and Handoff Debt study reuse across related issues and the cost of resuming an interrupted one (Zhu et al., 2026; KC and Budathoki, 2026). Memory-specific evalua-tions isolate the retained information: MemOp reruns the source task with and without a candi-date memory (Guo et al., 2026), VibeMemBench pairs memory-off and memory-on runs of one tar-get whose history is summarised with the target in view (Fan et al., 2026a), and Decision-Aware Memory Cards score evidence by a heuristic esti-mate of its effect on the next action (Guan et al., 2026). Related proxies include interventions on candidate memories for answer quality (Srivastava, 2026), answer-conditioned information gain (Han et al., 2026), and Shapley-based context filtering for code completion (Huo et al., 2026). MemDelta emphasizes controlled model and retrieval compar-isons and write-path cost accounting (Wang, 2026). These evaluations complement our paired runs of an unseen next task from the inherited tree, which measure resolution and effort and attribute savings to trajectory segments (§3.1). 
+
+Learning memory construction and use. Rein-forcement learning has been applied to both sides of the memory interface. Writers are trained from outcome reward or neighbourhood-level marginal utility (Wang et al., 2025b; Yan et al., 2026c; Ye et al., 2026), with finer credit from rerolling at a shared memory state (Yan et al., 2026b), hindsight-filtered utility on writing tokens (Yan et al., 2026a), or token-level attribution (Li et al., 2026a); RoMeRL notes the outcome-broadcast trap but treats paired rollouts as infeasible (Yang et al., 2026). On the reading side, ECHO routes outcome credit to the turns a policy selects back into context (Xie et al., 2026), and MemCalib localises credit by atom ablation (Cao et al., 2026). End-to-end memory learning also includes recurrent consoli-dation in MEM1 (Zhou et al., 2025), chunk-wise processing in MemAgent (Yu et al., 2025), self-memory policies in MemPO (Li et al., 2026b), and operation-tree credit in Mem-T (Yue et al., 2026). These methods optimize different memory inter-faces and credit granularities. Our contribution pairs on-policy valuation on executable next tasks with provenance-gated routing of the additional memory-value term, while retaining outcome credit at every step (§3.2). 
+
+Credit assignment beyond memory. Classical RL assigns hindsight credit to past actions (Haru-tyunyan et al., 2019) or uses counterfactual base-lines to separate action contributions (Foerster et al., 2018; Mesnard et al., 2021). For language mod-els, process supervision supplies intermediate la-bels (Lightman et al., 2024), VinePPO estimates step values with sampled continuations (Kazem-nejad et al., 2025), GiGPO groups repeated states for local advantages (Feng et al., 2025), and C3 replays downstream continuations after message interventions in agent teams (Chen et al., 2026). These methods address action or message utility; our provenance gate identifies traceable memory use and routes measured memory value without estimating each step’s causal effect. 
+
+Efficient coding and policy training. SWE-Gym and SWE-smith expand executable training tasks and agent trajectories (Pan et al., 2025; Yang et al., 2025), while SWE-RL trains on software-evolution data (Wei et al., 2025). SWE-Edit re-duces overhead through editing-interface decom-position (Zhang et al., 2026b); L1 and efficient-reasoning RL shape generation length and infer-ence compute (Aggarwal and Welleck, 2025; Arora and Zanette, 2025). These approaches complement our focus on information reuse and memory use across task boundaries. 26

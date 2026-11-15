@@ -48,7 +48,7 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-14</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-15</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
     <strong class="dpr-home-dashboard-count">共 17 篇</strong>
@@ -58,7 +58,7 @@
     <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>13</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-14 23:01:33 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-15 23:27:30 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日完成17篇论文筛选，精读4篇、速读13篇，重点聚焦智能体信息组织与稀疏信号调查两大基准。最值得看的是《InfoOrgBench》（9.0/10）与《LEGION》（9.0/10）：前者检验智能体能否把零散信息整合成清晰层级，后者评测其在对抗噪声下的稀疏信号调查能力。普通读者可优先精读这两篇基准，再结合速读中的自演化记忆与个性化检索方向，理解智能体能力评测的脉络。</p>
+<p>今日梳理17篇AI代理研究，精读4篇、速读13篇，重点关注代理记忆进化与全双工语音任务协调。最值得看的是具身代理通过“复盘片段、提炼经验”实现简单记忆进化（8.0/10），以及Joi-Bench-Task用交互仿真评测全双工语音代理的任务协调（8.0/10）。普通读者可先读这两篇精读，再按兴趣浏览速读中代理记忆后训练与LLM协作评测方向。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -81,9 +81,9 @@
     <strong class="dpr-home-dashboard-count">4 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="InfoOrgBench: Can Agents Turn Scattered Information into Coherent Hierarchies?">InfoOrgBench: Can Agents Turn Scattered Information into Coherent Hierarchies?</span></li><li><span class="dpr-home-dashboard-paper-title" title="LEGION: Benchmarking Language Agents on Sparse-Signal Investigation Under Adversarial Noise">LEGION: Benchmarking Language Agents on Sparse-Signal Investigation Under Adversarial Noise</span></li><li><span class="dpr-home-dashboard-paper-title" title="TurnFlow: Benchmarking User-State Reasoning in Multi-Turn LLM Agents via Scene-Guided User Simulation">TurnFlow: Benchmarking User-State Reasoning in Multi-Turn LLM Agents via Scene-Guided User Simulation</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Review the Episodes, Refine the Lessons: Simple Memory Evolution for Embodied Agents">Review the Episodes, Refine the Lessons: Simple Memory Evolution for Embodied Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Joi-Bench-Task: Benchmarking Task Coordination in Full-duplex Voice Agents through Interactive Simulation">Joi-Bench-Task: Benchmarking Task Coordination in Full-duplex Voice Agents through Interactive Simulation</span></li><li><span class="dpr-home-dashboard-paper-title" title="BioXArena-Pro: a research-grade benchmark for autonomous biomedical machine learning agents">BioXArena-Pro: a research-grade benchmark for autonomous biomedical machine learning agents</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>2</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>2</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -94,9 +94,9 @@
     <strong class="dpr-home-dashboard-count">13 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="From Reflection to Co-Evolution: Self-Evolving Agents with Locally Verified Memory">From Reflection to Co-Evolution: Self-Evolving Agents with Locally Verified Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="TransMem: Transition-Aware Retrieval for Evolving Personal Memory">TransMem: Transition-Aware Retrieval for Evolving Personal Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="Hybrid Product Search Without the Copy: Lexical, Semantic and Filtered Retrieval Served Directly from a Data Lake">Hybrid Product Search Without the Copy: Lexical, Semantic and Filtered Retrieval Served Directly from a Data Lake</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Publications as benchmarks: auditing AI agents on spatial transcriptomics alignment">Publications as benchmarks: auditing AI agents on spatial transcriptomics alignment</span></li><li><span class="dpr-home-dashboard-paper-title" title="Coding Agent Memory Post-Training II: Unlocking the Memory Potential of Pre-trained File Operations for Long-Horizon Tasks via On-Policy Distillation">Coding Agent Memory Post-Training II: Unlocking the Memory Potential of Pre-trained File Operations for Long-Horizon Tasks via On-Policy Distillation</span></li><li><span class="dpr-home-dashboard-paper-title" title="PARLEY: Evaluating LLM Collaboration Through Cooperative Asymmetric Puzzles">PARLEY: Evaluating LLM Collaboration Through Cooperative Asymmetric Puzzles</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>7</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>6</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>7</strong></span><span class="dpr-home-dashboard-tag">agent <strong>6</strong></span></div>
 </section>
 </div>
 
