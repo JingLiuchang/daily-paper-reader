@@ -1,0 +1,994 @@
+Title: CarryOn: Learning What to Keep in Context for Long-Horizon LLM Agents
+
+URL Source: https://arxiv.org/pdf/2611.17808v1
+
+Published Time: Mon, 16 Nov 2026 01:49:59 GMT
+
+Number of Pages: 31
+
+Markdown Content:
+# CarryOn: Learning What to Keep in Context for Long-Horizon LLM Agents 
+
+Lihuan Li 1 Ruiyi Yang 1* Jiru Wang 1* Yifan Duan 1
+
+Xiachong Lin 1 Hao Xue 2 Yang Song 1 Flora Salim 1
+
+> 1
+
+University of New South Wales, Sydney, Australia 
+
+> 2
+
+The Hong Kong University of Science and Technology (Guangzhou), Guangzhou, China 
+
+> {lihuan.li,ruiyi.yang,jiru.wang,yifan.duan,xiachong.lin}@unsw.edu.au {yang.song1,flora.salim}@unsw.edu.au haoxue@hkust-gz.edu.cn
+
+Abstract 
+
+Long-horizon LLM agents can coordinate tools and applications to complete complex, multi-step tasks. As their interaction histories grow, effective context management becomes essen-tial for reliable and efficient execution. Existing methods reduce context through summariza-tion, pruning, or history selection. However, shorter contexts do not necessarily support bet-ter decisions: summaries can omit exact de-tails needed for later actions, while retaining entire interactions can carry substantial irrel-evant information. We propose CarryOn, a lightweight context manager that pairs com-pact execution state with fine-grained, source-linked evidence. A learned selector and adap-tive retention policy keep relevant evidence available without additional LLM calls for con-text management. We introduce two com-plementary evaluation metrics: Sα prioritizes task success while accounting for resource use, and normalized cost per success (NCS) measures the resources spent per successful task. Across AppWorld, OfficeBench, and Tau2 Telecom with three LLM Actors, Car-ryOn achieves 75.7% macro-averaged task suc-cess, exceeding the strongest baseline by 6.7 percentage points. It also achieves the best average scores on both metrics. Project repos-itory: https://anonymous.4open.science/ r/CarryOn-0816/ .
+
+1 Introduction 
+
+Long-horizon agents built on large language mod-els (LLMs) (Yao et al., 2022; Hu et al., 2025; Wang et al., 2024c) have made substantial progress in solving complex, multi-step tasks. These capa-bilities support applications ranging from every-day digital tasks (Trivedi et al., 2024) to office workflows (Wang et al., 2024b) and customer sup-port (Barres et al., 2025). The payment task in the 
+
+> *Ruiyi Yang and Jiru Wang contributed equally as co-second authors.
+
+upper left of Figure 1, for example, requires an agent to identify coworkers, check and refill a bal-ance, and send payments. As such tasks progress, observations and intermediate results accumulate, increasing the cost of repeatedly processing history. Yet later actions may depend on details obtained many steps earlier. This has motivated context-management methods that limit context growth while preserving information needed for contin-ued execution (Hu et al., 2025; Kang et al., 2025; Zhou et al., 2026). Some approaches fine-tune the acting LLM to manage its own memory during task execu-tion (Zhou et al., 2026; Jiang et al., 2026; Wang et al., 2026b). External context managers instead construct the Actor’s input by summarizing, prun-ing, or selecting interaction histories, without fine-tuning the Actor (Kang et al., 2025; Pan et al., 2024; Zhang and Sun, 2026). As illustrated in the middle left of Figure 1, retaining all history increases input cost, while compression or selection can omit evi-dence needed later. Selecting complete interactions may also retain unrelated records. The challenge is to keep task progress concise while making the specific evidence needed for each action available. We propose CarryOn , a lightweight context manager that separates progress tracking from evi-dence selection. Like carry-on luggage, it keeps es-sential evidence within reach for the actions ahead. The Actor records progress and next steps in a com-pact control state, while an evidence manager se-lects fine-grained units from original observations and preserves their source references. A learned selector and adaptive retention policy determine which evidence the Actor receives at each step, al-lowing earlier records to be brought back when they become relevant. In the lower left of Figure 1, the compact state tracks progress toward the pay-ments, while coworker records obtained at step 9 are available at step 33 to complete the transfers 1arXiv:2611.17808v1 [cs.CL] 13 Nov 2026 Existing context management 
+
+> Keep all: high input cost
+> Compress / select: needed evidence may be omitted
+
+CarryOn: Carry what matters   
+
+> Fine-grained evidence units Compact control state
+> 7 coworkers found
+> Balance = $140
+> Next: pay each coworker $20
+> …
+> Available 24 steps later
+> Step 9 Step 33
+
+A long task 
+
+> Send $20 to each of my coworkers
+> via venmo with a note, "For Lunch".
+> Refill venmo balance if you need to.
+> task + obs.
+> Learned selector
+> Paid $20 to
+
+Figure 1: CarryOn: carry what matters. Left: Context-management challenges and CarryOn’s separation of compact task state from fine-grained evidence. Right: Success–efficiency comparison (top) and task-success gains over the strongest baseline, averaged by benchmark or Actor (bottom). 
+
+after a balance refill. We evaluate CarryOn on AppWorld, Of-ficeBench, and Tau2 Telecom with three LLM Actors. Averaged equally across benchmarks and Actors, CarryOn achieves 75.7% task success, ex-ceeding Full History by 13.3 percentage points and the strongest overall baseline, SWE-Pruner, by 6.7 percentage points. In the upper right of Figure 1, CarryOn achieves the highest S0.8, a score defined in Section 4.3 that emphasizes task success while accounting for token and Actor-call costs. CarryOn also achieves the lowest mean normalized cost per success (NCS), at 0.792. The lower right shows higher mean success than the strongest baseline when results are averaged by benchmark or by Ac-tor. Our main contributions are: 1. We introduce CarryOn, a lightweight external context manager that supports reliable long-horizon task execution with compact working context, without fine-tuning the Actor. 2. We separate persistent progress tracking from action-specific evidence selection. Fine-grained original observations can be revisited as action requirements change, preserving task continuity and access to exact details without additional LLM calls for context management. 3. Experiments on three benchmarks demon-strate CarryOn’s effectiveness and cross-Actor generalization. We support this evaluation with two complementary metrics: Sα priori-tizes success while accounting for cost, and NCS measures resource cost per successful outcome. 
+
+2 Related Work 
+
+2.1 Long-Horizon LLM Agents 
+
+Reliable long-horizon execution requires agents to turn goals into sequences of actions and adjust them using environment feedback. Agents interleave rea-soning and action (Yao et al., 2022) and use exe-cutable code to compose tool calls and respond to feedback (Wang et al., 2024a). Reflection on pre-vious attempts and state-driven workflows further structure execution (Shinn et al., 2023; Wu et al., 2024). A complementary direction reuses success-ful experience as executable skills or reusable work-2flows (Wang et al., 2023, 2024c). Hierarchical working memory further organizes ongoing execu-tion around subgoals (Hu et al., 2025). Evaluations that measure task length by human completion time highlight the difficulty of sustaining reliable exe-cution (Kwa et al., 2025). CarryOn supports long-horizon execution by adapting the Actor’s context to the information needed at each decision step. 
+
+2.2 Context Management for LLM Agents 
+
+Context management aims to keep useful infor-mation accessible within a limited working con-text. One approach uses a context manager separate from the Actor to construct its input through com-pression, selection, or structured memory. Prompt compression removes less informative content us-ing language-model scores or learned token clas-sifiers (Li et al., 2023; Jiang et al., 2023; Pan et al., 2024), while query-aware compression pri-oritizes information relevant to the current ques-tion (Jiang et al., 2024; Xu et al., 2024). Dia-logue systems also maintain memory by recur-sively summarizing previous exchanges (Wang et al., 2025b). For agents, learned observation pro-cessing and history summarization reduce the ma-terial passed to the Actor (Lee et al., 2025; Kang et al., 2025), whereas learned retention preserves selected action–observation steps (Zhang and Sun, 2026). Dependency-structured memory addition-ally connects past steps to the earlier information they rely on, supporting selective retrieval and sum-marization (Wu et al., 2026). Another line trains the acting LLM to man-age and use memory through recurrent consoli-dation, progress-aware retention, or indexed re-trieval (Zhou et al., 2026; Jiang et al., 2026; Wang et al., 2026b). ReSum-GRPO trains the Actor to continue from summarized contexts (Wu et al., 2025). Our work focuses on external context man-agement. CarryOn selects fine-grained fragments from original observations and can revisit previ-ously omitted evidence, while maintaining a sepa-rate compact state for task progress. 
+
+3 Method: CarryOn 
+
+CarryOn maintains an execution context that com-bines compact task state with selected evidence from the interaction history. The control state provides a concise account of progress and next steps, while selected evidence preserves the con-crete details needed for action. An evidence man-ager adapts this working context to the current de-cision, and the Actor uses it to act and update its state. Figure 2 organizes the method into four re-gions: History (1), Evidence selection (2), Acting 
+
+(3), and Selector training (bottom). Experimental configurations appear in Section 4.2. 
+
+3.1 Problem Formulation 
+
+At decision step t, let q denote the task, Ht the in-teraction archive, ot the current public observation, and mt the current control state. Let Wt be the se-lected older evidence and Rt the recent interactions always included in context. The Actor receives 
+
+Xt = Compose( q, m t, W t, R t). (1) Here, Compose also includes system instructions and tool definitions. The Actor jointly produces an action at and a proposed state update emt+1 . The accepted update carries progress forward, while the action and its observation extend Ht.
+
+3.2 History and Evidence Units 
+
+Summarizing observations can omit exact details, while retaining whole interaction steps can include many unrelated records (Kang et al., 2025; Zhang and Sun, 2026). CarryOn therefore selects obser-vation fragments independently. In region 1 ( His-tory ) of Figure 2, the Archive stores raw action– observation steps, and Split [i] divides observations into units such as individual records. Each unit re-tains its original content, a reference to its source interaction, and the action that produced the obser-vation. Unselected evidence remains in the archive for later decisions. 
+
+3.3 Evidence Selection 
+
+Evidence can be essential even when its wording differs from the task. In region 2 ( Evidence selec-tion ) of Figure 2, the Learned selector evaluates historical units through relevance ranking and next-action use prediction. 
+
+Selector scores. The selector uses the task q and current observation ot, shown as Task + Latest obs. , to assess each historical unit u. It receives two scores: 
+
+rt(u) = fϕ(q, o t, u ),pt(u) = σ gϕ(q, o t, u ). (2) Here, ϕ denotes the selector parameters. The func-tion fϕ produces the relevance score rt(u) for or-dering candidates. The function gϕ produces a raw 3Selector training         
+
+> Successful trajectories Candidates at each step Future-use labels LoRA fine-tuning Frozen selector
+> Official train splits Past steps →
+> Evidence candidates
+> ✓Used later
+> − Not used later
+> Qwen3-Reranker-0.6B
+> Pairwise ranking
+> Score fine-grained units
+> in
+> ②at test time
+> Task +
+> Latest obs.
+> On action + observation blocks
+
+③ Acting 
+
+> Selected units
+> Latest step
+
+Actor context     
+
+> Task
+> Control state
+> New state ≤ 128 𝑡𝑜𝑘𝑒𝑛𝑠
+> done
+> open
+> next
+> 7 coworkers found
+> pay each $20
+> create_transaction ×7
+> answer_mode none
+> known_apis venmo, phone
+
+LLM Actor 
+
+> Action
+
+① History  ② Evidence selection 
+
+> E1
+> E32 (latest step)
+
+Archive 
+
+Evidence units 
+
+> Split [i]
+> E9
+> Task + Latest obs.
+
+Learned 
+
+selector 
+
+Pack within budget  
+
+> Not selected this step
+> Environment
+> Next call
+> create_transaction (…) ×7
+> Mobile apps
+> Office tools
+> Customer service
+> Action + observation
+> On fine-grained units
+
+Figure 2: CarryOn overview. (1) History: The archive supplies fine-grained observation units. (2) Evidence selection: The selector ranks units using the task and latest observation. (3) Acting: The Actor combines selected evidence, recent history, and compact state to act and update its state. Selector training (bottom): Annotation citations and later evidence use supervise ranking of action–observation blocks. The frozen selector scores finer evidence units at test time. 
+
+next-action use score, and the sigmoid σ maps it to 
+
+pt(u) ∈ [0 , 1] , the predicted probability that u will be used in the next action. 
+
+Temporary evidence expansion. Evidence needs change as a task progresses. A fragment excluded from the base evidence pack may still be needed for the next action. Temporary evidence expansion makes it available for the current decision, helping the Actor proceed without repeating earlier interactions. The Pack within budget stage forms a base pack Pt by ranking older units with rt(u) under budget B, after reserving space for recent interactions Rt. The next-action use probability pt(u) then identifies additional units to retain: 
+
+Dt = {u ∈ Ut \ Pt : pt(u) ≥ τ },Wt = Pt ∪ Dt, (3) where Ut contains older candidates outside Rt, τ
+
+is the expansion threshold, and Dt contains the ad-ditional units. This expansion can exceed the base budget and is recomputed at each decision step as evidence needs change. The final evidence Wt
+
+follows the green arrow into region 3 ( Acting ) of Figure 2. Appendix B.1 gives the budget account-ing and full algorithm. 
+
+3.4 Acting with State and Evidence 
+
+A compact state tracks what to do next, while evidence supplies the concrete values needed to act, such as account identifiers, file paths, or user-provided facts (Appendix F). In the payment ex-ample in region 3 ( Acting ) of Figure 2, the state records that seven coworkers have been found and should each receive $20, while evidence supplies the recipients’ account identifiers. 
+
+Context and state update. The Actor context 
+
+brings these representations together with the task and Latest step (Eq. 1). The LLM Actor jointly produces Action and New state . In our implemen-tation, the Actor’s bounded MEMORY update has five fields: done records completed work, open 
+
+remaining obligations, next the next operation, 
+
+answer_mode whether a returned value is required, and known_apis previously inspected APIs. The blue Next call arrow carries the accepted state into 4the next decision. Executing the action in the Envi-ronment adds new evidence through the Action + observation return path. 
+
+Adaptive recent retention. Recent interactions provide the context needed to continue execution and correct invalid responses. CarryOn always re-tains the latest interaction and extends this recent window when the Actor produces an invalid action or state update. This adjusts the Latest step input in region 3 of Figure 2. Interactions outside this win-dow remain candidates for selection. Appendix B.1 specifies the acceptance and retention rules. 
+
+3.5 Selector Training 
+
+Successful trajectories show how earlier evidence supports later actions. The bottom Selector train-ing region of Figure 2 uses these trajectories from official training splits to supervise selection. At the Future-use labels stage, evidence cited in state annotations or used in later actions provides pos-itive ranking examples. Candidates with neither signal serve as weak negatives. Next-action use labels identify evidence used in the immediately following action. The LoRA fine-tuning stage (Hu et al., 2021) first adapts a pretrained reranker for pairwise ranking. For a positive block u+ and a weak negative block 
+
+u− from the same decision step, the loss is 
+
+ℓrank = log  1 + exp( γ + r− − r+) , (4) where r+ = rt(u+) and r− = rt(u−) are their relevance scores, and γ is the ranking margin. We then jointly optimize this ranking objective and binary cross-entropy for next-action use prediction: 
+
+ℓuse = −y log p − (1 − y) log(1 − p), (5) where p = pt(u) and y ∈ { 0, 1} labels whether block u is used in the immediately following ac-tion. Both stages use complete action–observation blocks, matching the evidence references in the an-notations. At test time, the Frozen selector scores individual fragments in region 2. Appendix B.2 gives the labeling and optimization details. 
+
+3.6 CarryOn-E: Local Deployment 
+
+As a local deployment extension, CarryOn-E dis-tills a 27B CarryOn Actor into a 9B student while keeping the context manager fixed, with the train-ing procedure and results in Appendix I. 
+
+4 Experimental Setup 
+
+4.1 Datasets and Baselines 
+
+We evaluate CarryOn on AppWorld (Trivedi et al., 2024), OfficeBench (Wang et al., 2024b), and the Telecom domain of Tau2-Bench (Barres et al., 2025), covering cross-application tasks, office workflows, and conversational customer support. The evaluation sets contain 168, 95, and 40 tasks, respectively, with success determined by each benchmark’s official evaluator. We compare against Full History, FIFO-5, and Retrieval, as well as LLMLingua-2 (Pan et al., 2024), ACON (Kang et al., 2025), and SWE-Pruner (Wang et al., 2026a) for compression and pruning. AGORA (Zhang and Sun, 2026) pro-vides a learned history-selection baseline. Dataset splits and baseline configurations are given in Ap-pendix A. 
+
+4.2 Experimental Configuration 
+
+We evaluate Claude Sonnet 5, 1 Qwen3.8-27B, 2
+
+and Gemma-4-31B. 3 For each benchmark, we reuse the same trained CarryOn selector across all three Actors. ACON transfers prompts opti-mized with Claude as the Actor. AGORA transfers Claude-labeled scorers to Qwen and Gemma on all three benchmarks. LLMLingua-2 and SWE-Pruner, like CarryOn, use external models with-out Actor-specific retraining. The CarryOn selec-tor uses Qwen3-Reranker-0.6B, with offline state annotations and evidence references generated by Claude Sonnet 5. Context budgets, training set-tings, and execution interfaces are detailed in Ap-pendix A. 
+
+4.3 Evaluation Metrics 
+
+Context management should support successful task completion while controlling execution cost. Success alone does not reveal the resources re-quired (Kapoor et al., 2024), while low total cost can reflect early failure. We therefore report Suc-cess with two complementary measures: Sα em-phasizes task capability while accounting for cost, and normalized cost per success (NCS) measures the resources spent per successful outcome. Task Goal Completion (TGC), reported as Success (%) in the tables, is 100 s/N , where s is the number of 
+
+> 1https://www.anthropic.com/news/ claude-sonnet-5
+> 2https://huggingface.co/Qwen/Qwen3.8-27B
+> 3https://huggingface.co/google/gemma-4-31B-it
+
+5successful tasks among all N evaluation tasks. All cost measures include successful and failed tasks. Tokens count submitted inputs and returned out-puts, including inputs rejected for exceeding the context limit. 
+
+Success–efficiency score. Motivated by joint quality–efficiency evaluation (Chi et al., 2026), we define Sα to emphasize task success while reward-ing efficient execution. We first discount success by normalized mean token and Actor-call costs, then combine this score with Success: 
+
+S0 = TGC 1 + 12 ¯T /B T + 12 ¯C/B C
+
+, (6) 
+
+Sα = α TGC + (1 − α) S0. (7) Here ¯T and ¯C are mean system request tokens and Actor calls over all N tasks. The reference values BT and BC are the corresponding Full His-tory means on the same task set. We report S0.8,assigning 80% weight to Success and 20% to its cost-discounted counterpart. This keeps task com-pletion central while rewarding lower resource use. Higher scores are better. 
+
+Normalized cost per success. Averaging costs only over successful trajectories omits the re-sources spent on failures. Following the cost-of-pass perspective (Wang et al., 2025a), we define NCS by dividing total costs by the number of suc-cesses and normalizing these ratios against Full History (FH): 
+
+NCS = 12
+
+C/s CFH /s FH + 12
+
+T /s T FH /s FH . (8) Here C and T are total Actor calls and system request tokens over all N tasks, including fail-ures, and s is the successful-task count. NCS equally weights relative calls and tokens per suc-cess. Lower values are better, with Full History equal to 1. NCS emphasizes resource efficiency and is interpreted alongside Success. Scores are calculated within each dataset–Actor setting before averaging settings equally. Token components and additional accounting details ap-pear in Appendix D.1. 
+
+5 Results and Analysis 
+
+5.1 Main Results 
+
+Table 1 compares CarryOn with seven baselines across three benchmarks and three Actors. Car-ryOn achieves the highest mean Success (75.7%) and S0.8 (68.45), together with the lowest mean NCS (0.792). It ranks first in Success in seven comparisons and ties for first in one, achieves the highest S0.8 in eight, and has the lowest NCS in six. The same frozen selector is reused within each benchmark (Section 3.5). Separating evidence selection from action generation enables cross-Actor reuse: one frozen selector supports gains across different Actors. CarryOn also retains the highest mean Sα and lowest mean NCS as their respective weights vary over [0 , 1] (Appendix D.2). On AppWorld, CarryOn leads in Success and 
+
+S0.8 for all three Actors. The largest improve-ment over the strongest baseline occurs with Qwen, where Success rises from SWE-Pruner’s 68.5% to 84.5%. This is consistent with the state–evidence division in Section 3.4: compact state tracks un-finished work, while selected evidence supplies exact values for tool calls. The drop in Success when state is removed (Section 5.4) supports the role of progress tracking alongside evidence selec-tion. Section 5.2 shows how earlier records remain available for later actions. OfficeBench shows the clearest gains in resource efficiency. CarryOn achieves the highest S0.8 and lowest NCS for every Actor, while leading in Suc-cess for Claude and Gemma and matching Full History for Qwen. Both methods complete 66.3% of Qwen tasks, but CarryOn raises S0.8 from 59.68 to 62.04 and lowers NCS from 1.000 to 0.476. This is the intended benefit of selecting individual obser-vation fragments (Section 3.2): limiting repeated history while keeping the source records needed for ongoing work. Compact state preserves progress as the selected evidence changes (Section 3.4), sup-porting continued execution with a smaller working context. On Tau2 Telecom, CarryOn leads all three met-rics with Qwen and Gemma. For Gemma, Suc-cess reaches 77.5%, compared with 65.0% for the strongest baseline, SWE-Pruner, while NCS falls from 0.864 to 0.782. Here the state–evidence division supports dialogue: state tracks pending diagnostic steps, while evidence preserves cus-tomer reports and tool-returned account facts. The recorded example in Appendix F shows these two inputs guiding the next response. With Claude, LLMLingua-2 achieves higher Success (80.0% vs. 75.0%). Gains also appear across different task groups. Averaged across Actors, CarryOn exceeds the strongest baseline within each group by 12.28 and 6Dataset Method Claude Sonnet 5 Qwen3.8-27B Gemma-4-31B Success (%) ↑                                                                                                                                                                                                                             
+
+> S0.8
+> ↑
+> NCS
+> ↓
+> Success (%) ↑
+> S0.8
+> ↑
+> NCS
+> ↓
+> Success (%) ↑
+> S0.8
+> ↑
+> NCS
+> ↓
+> Full History 43.5 39.11 1.000 65.5 58.93 1.000 53.6 48.21 1.000 FIFO-5 42.9 37.62 1.592 53.6 47.83 1.410 48.8 43.96 1.084 Retrieval 11.9 10.24 8.549 44.0 38.50 2.525 28.6 24.80 3.636 AppWorld LLMLingua-2 21.4 19.20 2.195 44.6 39.90 1.658 41.7 37.77 1.127 ACON 70.2 62.84 0.688 53.0 47.08 1.553 48.8 44.01 1.063 AGORA 55.4 48.31 1.376 41.1 36.65 1.862 39.3 34.71 1.899 SWE-Pruner 79.2 70.57 0.652 68.5 59.24 1.970 69.0 62.17 0.769 CarryOn 79.8 71.71 0.556 84.5 73.06 1.634 72.0 64.20 0.885 Full History 63.2 56.84 1.000 66.3 59.68 1.000 51.6 46.42 1.000 FIFO-5 57.9 53.17 0.751 53.7 48.41 1.191 54.7 49.96 0.728 Retrieval 49.5 44.67 1.207 51.6 45.87 1.592 34.7 31.14 1.593 OfficeBench LLMLingua-2 64.2 59.22 0.625 60.0 54.48 0.942 53.7 49.66 0.577 ACON 67.4 61.96 0.629 63.2 57.54 0.841 57.9 53.40 0.565 AGORA 49.5 44.55 1.263 46.3 41.31 1.682 38.9 34.87 1.453 SWE-Pruner 62.1 57.03 0.703 63.2 56.61 1.129 61.1 56.14 0.569
+> CarryOn 69.5 64.36 0.530 66.3 62.04 0.476 66.3 62.30 0.338
+> Full History 75.0 67.50 1.000 80.0 72.00 1.000 62.5 56.25 1.000 FIFO-5 72.5 64.61 1.234 87.5 78.46 0.976 60.0 53.96 1.056 Retrieval 42.5 36.58 4.050 72.5 64.49 1.361 35.0 30.42 3.375 Tau2 Telecom LLMLingua-2 80.0 71.81 0.982 80.0 72.00 0.999 47.5 42.57 1.419 ACON 72.5 65.41 0.991 87.5 79.03 0.858 55.0 48.87 1.433 AGORA 62.5 54.90 1.859 50.0 42.91 3.896 32.5 28.34 3.417 SWE-Pruner 70.0 63.06 1.053 82.5 74.05 1.018 65.0 58.85 0.864
+> CarryOn 75.0 67.07 1.121 90.0 81.46 0.803 77.5 69.87 0.782
+
+Table 1: Main results across three benchmarks and three Actors. Bold marks the best result for each benchmark and Actor, including ties. 
+
+9.72 percentage points on AppWorld easy and medium tasks, 8.60 points on OfficeBench L3, and 6.25 points on Tau2 MMS tasks. Performance in the remaining groups is broadly comparable to their strongest baselines, with the complete breakdown in Appendix H. 
+
+5.2 Evidence Retention for Long-Term Dependencies 
+
+The ranking objective in Eq. 4 teaches the selector to favor evidence cited in state annotations or used in later actions. At each decision, CarryOn recom-putes the relevance score rt(u) using the task and current observation (Section 3.3), allowing previ-ously omitted evidence to be selected again. Fig-ure 4 shows that evidence obtained at least ten Actor steps earlier accounts for 30.7% of selections in AppWorld, 31.2% in OfficeBench, and 48.8% in Tau2 Telecom. In 40.2% of task runs, evidence is selected again after being omitted for one or more steps. The payment case in Appendix G.1 illus-trates the role of relevance ranking: a previously omitted card record returns to the base evidence pack, and the Actor uses its details to add the card and refill the balance. Relevance ranking brings earlier evidence back when action requirements change. 
+
+Temporary evidence expansion adds records pre-dicted to be used in the next action (Eq. 3). It supplements the base pack in 4.4% of Actor steps on AppWorld and 12.2% on OfficeBench. In an AppWorld example, expansion restores an omitted contact record, and the Actor immediately uses its phone number to send a message (Appendix G.3). 
+
+5.3 More Efficient Agent Trajectories CarryOn completes more tasks with fewer tool calls on average. It has the lowest mean Actor and tool calls (Figure 3), using 10.1% fewer tool calls than Full History with comparable Actor calls and higher Success (Table 1), consistent with state tracking pending work and selection enabling evi-70 10 20 30      
+
+> Mean calls per task ↓
+> Full History FIFO-5 Retrieval LLMLingua-2 ACON AGORA SWE-Pruner
+> CarryOn
+> 15.12 19.54 29.18 16.55 16.81 28.38 16.57
+> 14.99
+> (a) Actor calls
+> 010 20 30
+> Mean calls per task ↓
+> 18.38 24.08 29.60 19.50 20.74 27.73 20.57
+> 16.53
+> (b) Tool calls
+
+Figure 3: Mean calls per task, averaged equally across benchmarks and Actors. Failed tasks are included. 0 25 50 75 100              
+
+> Share of selected evidence (%) AppWorld OfficeBench Tau2
+> 30.8 38.5 24.8 5.9
+> 35.0 33.8 22.9 8.3
+> 24.8 26.4 26.2 22.6
+> Evidence age (Actor steps): 1–4 5–9 10–19 20+
+
+Figure 4: Age of evidence selected by CarryOn, ex-cluding automatic recent retention. Percentages pool selection events across Actors within each benchmark. 
+
+dence reuse (Section 3.4). 
+
+5.4 Key Component Ablations 
+
+Table 2 compares four variants on AppWorld with Claude. w/o MEMORY removes control state and reduces Success most, from 79.8% to 66.1%. Ranking only removes next-action train-ing and temporary evidence expansion, yielding 76.8%. Fine-grained training uses individual units labeled by later API-call reuse, without state-annotation citations, and achieves 73.2%. Recency packing replaces learned selection and temporary expansion with the most recent units under the same base budget, yielding 76.2%. CarryOn leads all three metrics. Compact state and learned evi-dence selection are complementary, outperform-ing either state removal or recency-based selection. 
+
+5.5 MEMORY Capacity Sensitivity 
+
+On AppWorld, capacities of 64, 128, and 256 proxy tokens yield 130, 134, and 131 successes, respec-tively (Table 3). The 128-token setting achieves the highest Success and S0.8, while 256 tokens achieve the lowest NCS. The smaller 64-token state is trun-cated more often. A larger state does not consis-
+
+Method Success (%) ↑ S0.8 ↑ NCS ↓
+
+w/o MEMORY 66.1 58.72 0.824 Ranking only 76.8 69.09 0.568 Fine-grained training 73.2 65.68 0.629 Recency packing 76.2 68.36 0.603 
+
+CarryOn 79.8 71.71 0.556 
+
+Table 2: Component and training variants on AppWorld with Claude Sonnet 5. Bold marks the best result. 
+
+tently improve task success. Appendix C provides the full results. 
+
+6 Conclusion 
+
+CarryOn separates compact progress tracking from fine-grained evidence selection, keeping exact ob-servations available as action requirements change. Experiments across three benchmarks and three Ac-tors demonstrate its effectiveness and cross-Actor generalization. CarryOn achieves 75.7% mean task success, exceeding the strongest baseline by 6.7 percentage points, and leads both S0.8 and NCS on average. These results support adapting evidence to each decision while maintaining concise task state for long-horizon execution. 
+
+Limitations 
+
+Our evaluation covers three benchmarks with text-based interactions. Extending CarryOn to visual or multimodal observations would require adapting how evidence is represented and selected. We train a separate selector for each benchmark and reuse it across Actors. Generalization to new environments, particularly those with different tool interfaces and observation structures, remains to be explored. In real-world applications, retained observations 8may contain sensitive information, while missing or misinterpreted evidence may lead to incorrect actions. Deployment therefore requires appropriate access controls for stored history and user confir-mation for consequential actions. 
+
+References 
+
+Victor Barres, Honghua Dong, Soham Ray, Xujie Si, and Karthik Narasimhan. 2025. τ 2-Bench: Evaluat-ing conversational agents in a dual-control environ-ment. arXiv preprint arXiv:2506.07982 .Han Chi, Jiaxin Qi, Yan Cui, Baisheng Lai, and Jian-qiang Huang. 2026. Agentmeter: Evaluating model-cli matching for cli-based local task-solving agents. 
+
+arXiv preprint arXiv:2606.21140 .Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen. 2021. Lora: Low-rank adap-tation of large language models. arXiv preprint arXiv:2106.09685 .Mengkang Hu, Tianxing Chen, Qiguang Chen, Yao Mu, Wenqi Shao, and Ping Luo. 2025. Hiagent: Hier-archical working memory management for solving long-horizon agent tasks with large language model. In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 32779–32798. Haitao Jiang, Lin Ge, Hengrui Cai, and Rui Song. 2026. Pabu: Progress-aware belief update for efficient llm agents. arXiv preprint arXiv:2602.09138 .Huiqiang Jiang, Qianhui Wu, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. 2023. Llmlingua: Compressing prompts for accelerated inference of large language models. In Proceedings of the 2023 conference on empirical methods in natural language processing ,pages 13358–13376. Huiqiang Jiang, Qianhui Wu, Xufang Luo, Dongsheng Li, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. 2024. Longllmlingua: Accelerating and enhancing llms in long context scenarios via prompt compression. In 
+
+Proceedings of the 62nd Annual Meeting of the As-sociation for Computational Linguistics (Volume 1: Long Papers) , pages 1658–1677. Minki Kang, Wei-Ning Chen, Dongge Han, Huseyin A Inan, Lukas Wutschitz, Yanzhi Chen, Robert Sim, and Saravan Rajmohan. 2025. Acon: Optimizing context compression for long-horizon llm agents. 
+
+arXiv preprint arXiv:2510.00615 .Sayash Kapoor, Benedikt Stroebl, Zachary S Siegel, Nitya Nadgir, and Arvind Narayanan. 2024. Ai agents that matter. arXiv preprint arXiv:2407.01502 .Thomas Kwa, Ben West, Joel Becker, Amy Deng, Katharyn Garcia, Max Hasin, Sami Jawhar, Megan Kinniment, Nate Rush, Sydney Von Arx, et al. 2025. Measuring ai ability to complete long tasks. arXiv preprint arXiv:2503.14499 , 352. Dongjun Lee, Juyong Lee, Kyuyoung Kim, Jihoon Tack, Jinwoo Shin, Yee Whye Teh, and Kimin Lee. 2025. Learning to contextualize web pages for enhanced decision making by llm agents. In International Con-ference on Learning Representations , volume 2025, pages 81039–81072. Yucheng Li, Bo Dong, Frank Guerin, and Chenghua Lin. 2023. Compressing context to enhance inference ef-ficiency of large language models. In Proceedings of the 2023 conference on empirical methods in natural language processing , pages 6342–6353. Zhuoshi Pan, Qianhui Wu, Huiqiang Jiang, Menglin Xia, Xufang Luo, Jue Zhang, Qingwei Lin, Victor Rühle, Yuqing Yang, Chin-Yew Lin, et al. 2024. Llmlingua-2: Data distillation for efficient and faithful task-agnostic prompt compression. In Findings of the As-sociation for Computational Linguistics: ACL 2024 ,pages 963–981. Stéphane Ross, Geoffrey Gordon, and Drew Bagnell. 2011. A reduction of imitation learning and struc-tured prediction to no-regret online learning. In Pro-ceedings of the fourteenth international conference on artificial intelligence and statistics , pages 627– 635. JMLR Workshop and Conference Proceedings. Noah Shinn, Federico Cassano, Ashwin Gopinath, Karthik Narasimhan, and Shunyu Yao. 2023. Re-flexion: language agents with verbal reinforcement learning. In Advances in Neural Information Process-ing Systems , volume 36, pages 8634–8652. Curran Associates, Inc. Harsh Trivedi, Tushar Khot, Mareike Hartmann, Ruskin Manku, Vinty Dong, Edward Li, Shashank Gupta, Ashish Sabharwal, and Niranjan Balasubramanian. 2024. Appworld: A controllable world of apps and people for benchmarking interactive coding agents. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 16022–16076. Guanzhi Wang, Yuqi Xie, Yunfan Jiang, Ajay Man-dlekar, Chaowei Xiao, Yuke Zhu, Linxi Fan, and Anima Anandkumar. 2023. Voyager: An open-ended embodied agent with large language models. arXiv preprint arXiv:2305.16291 .Ningning Wang, Xavier Hu, Pai Liu, He Zhu, Yue Hou, Heyuan Huang, Shengyu Zhang, Jian Yang, Jiaheng Liu, Ge Zhang, et al. 2025a. Efficient agents: Building effective agents while reducing cost. arXiv preprint arXiv:2508.02694 .Qingyue Wang, Yanhe Fu, Yanan Cao, Shuai Wang, Zhiliang Tian, and Liang Ding. 2025b. Recur-sively summarizing enables long-term dialogue mem-ory in large language models. Neurocomputing ,639:130193. 
+
+9Xingyao Wang, Yangyi Chen, Lifan Yuan, Yizhe Zhang, Yunzhu Li, Hao Peng, and Heng Ji. 2024a. Exe-cutable code actions elicit better llm agents. arXiv preprint arXiv:2402.01030 .Yuhang Wang, Yuling Shi, Mo Yang, Rongrui Zhang, Shilin He, Heng Lian, Yuting Chen, Siyu Ye, Kai Cai, and Xiaodong Gu. 2026a. Swe-pruner: Self-adaptive context pruning for coding agents. arXiv preprint arXiv:2601.16746 .Zhenting Wang, Huancheng Chen, Jiayun Wang, and Wei Wei. 2026b. Memex (rl): Scaling long-horizon llm agents via indexed experience memory. arXiv preprint arXiv:2603.04257 .Zilong Wang, Yuedong Cui, Li Zhong, Zimin Zhang, Da Yin, Bill Yuchen Lin, and Jingbo Shang. 2024b. Officebench: Benchmarking language agents across multiple applications for office automation. arXiv preprint arXiv:2407.19056 .Zora Zhiruo Wang, Jiayuan Mao, Daniel Fried, and Graham Neubig. 2024c. Agent workflow memory. 
+
+arXiv preprint arXiv:2409.07429 .Xixi Wu, Kuan Li, Yida Zhao, Liwen Zhang, Litu Ou, Huifeng Yin, Zhongwang Zhang, Xinmiao Yu, Dingchu Zhang, Yong Jiang, et al. 2025. Resum: Un-locking long-horizon search intelligence via context summarization. arXiv preprint arXiv:2509.13313 .Yating Wu, Yuhao Zhang, Sayan Ghosh, Sourya Basu, Anoop Deoras, Jun Huan, and Gaurav Gupta. 2026. Contextweaver: Selective and dependency-structured memory construction for llm agents. arXiv preprint arXiv:2604.23069 .Yiran Wu, Tianwei Yue, Shaokun Zhang, Chi Wang, and Qingyun Wu. 2024. Stateflow: Enhancing llm task-solving through state-driven workflows. arXiv preprint arXiv:2403.11322 .Fangyuan Xu, Weijia Shi, and Eunsol Choi. 2024. Re-comp: Improving retrieval-augmented lms with con-text compression and selective augmentation. In In-ternational Conference on Learning Representations ,volume 2024, pages 43478–43502. Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and Yuan Cao. 2022. React: Synergizing reasoning and acting in language models. arXiv preprint arXiv:2210.03629 .Haoran Zhang and Zhaohua Sun. 2026. Agora: Adapter-grounded observation-action retention for inference-free prompt compression in llm agents. arXiv preprint arXiv:2605.26596 .Zijian Zhou, Ao Qu, Zhaoxuan Wu, Sunghwan Kim, Alok Prakash, Daniela Rus, Bryan Kian Hsiang Low, and Paul Liang. 2026. Mem1: Learning to syner-gize memory and reasoning for efficient long-horizon agents. In International Conference on Learning Representations , volume 2026, pages 58413–58438. 
+
+10 A Experimental Details 
+
+This appendix provides the dataset splits, configura-tion settings, and execution interfaces summarized in Section 4. 
+
+A.1 Benchmarks and Task Splits 
+
+AppWorld (Trivedi et al., 2024) uses the offi-cial test_normal split of 168 tasks, comprising 57 easy, 48 medium, and 63 hard tasks. Of-ficeBench (Wang et al., 2024b) uses the ACON-public test set of 95 tasks, comprising 42 L1, 22 L2, and 31 L3 tasks with 209 planned evaluator con-ditions. Tau2 Telecom (Barres et al., 2025) uses the official 40-task test set. We retain the benchmarks’ native tasks, tools, and official success criteria. Car-ryOn selector training uses successful trajectories from the official training splits, as described in Ap-pendix B.2. 
+
+A.2 CarryOn and Execution Configuration Models and computation. Each local training job uses one NVIDIA H100 GPU. The selector has 0.6B parameters, while the Qwen and Gemma Ac-tors have 27B and 31B, respectively; CarryOn-E uses a 9B student. For the reported selectors, the two training stages together take approximately 4.87, 0.59, and 0.79 hours on AppWorld, Of-ficeBench, and Tau2, respectively, estimated from training logs. These are single-GPU wall times, excluding trajectory generation and evaluation. We report a single run per setting. 
+
+Context construction. We use a base evidence budget of B = 16 ,384 characters and a temporary evidence expansion threshold of τ = 0 .5. The MEMORY capacity is 128 proxy tokens, counted locally as words and punctuation symbols. The recent-evidence window retains the newest inter-action after an accepted response and the two newest otherwise, limited to available history. Han-dling of public interaction boundaries follows Ap-pendix B.1. The budget covers the base evidence pack. 
+
+Selector training. The selector backbone is Qwen3-Reranker-0.6B. We use Claude Sonnet 5 to generate the offline state annotations and their evi-dence references. The pairwise ranking margin is 
+
+γ = 0 .2. Training objectives and label construction are specified in Appendix B.2. 
+
+Execution interfaces. Actors use benchmark-specific action and output interfaces. Tau2 pairs the Actor with a Haiku 4.5 User simulator. The Actor and selector receive only public interactions, excluding private simulator state. 
+
+A.3 Baseline Configurations 
+
+We retain each method’s context construction and evaluate the resulting systems on the same task sets. Cost accounting is described in Appendix D.1. 
+
+Simple history baselines. Full History retains the complete interaction history. FIFO-5 retains the five most recent action–observation pairs. Re-trieval selects four historical interactions using 
+
+text-embedding-3-large and includes the latest interaction. FIFO-5 and Retrieval follow the imple-mentations in ACON (Kang et al., 2025). 
+
+LLMLingua-2. We use LLMLingua-2 (Pan et al., 2024) as a local history compressor with a fixed keep rate of 0.3. 
+
+ACON and AGORA. ACON (Kang et al., 2025) uses LLM-based context compression. AGORA (Zhang and Sun, 2026) uses a learned scorer to select historical interactions. 
+
+SWE-Pruner. We use benchmark-adapted SWE-Pruner models (Wang et al., 2026a) with a pruning threshold of 0.4. Observations are pruned when the Actor provides a focus and otherwise retained. 
+
+B Execution and Selector Training Details 
+
+This appendix expands the execution and training procedures in Section 3. 
+
+B.1 Context Assembly and Recent Retention Base budget accounting. With base evidence budget B and rendered character count c(·), recent interactions Rt leave the following capacity for older units: 
+
+Bold  
+
+> t
+
+= max {0, B − c(Rt)}. (9) After reserving space for recent interactions, Car-ryOn selects older evidence in order of relevance, skipping units that exceed the remaining budget. If several selected fragments come from the same observation, the action that produced it is included only once. Recent interactions are always retained, even when they exceed the base budget. Tempo-rary expansion can add further evidence. CarryOn rebuilds the evidence pack at each step to reflect changing needs. 11 Algorithm 1 CarryOn execution loop                                                                                      
+
+> Require: Task q, frozen selector ϕ, budget B, threshold τ
+> 1: Initialize archive H0, state m0, observation o0
+> 2: t←0
+> 3: while task execution continues do
+> 4: Rt←recent interactions under adaptive retention 5: Ut←evidence units from Htoutside Rt
+> 6: Compute rt(u), p t(u)for u∈Ut
+> using q, o t(Eq. 2) 7: Bold
+> t←max {0, B −c(Rt)}
+> 8: Pt←units selected by decreasing rt(u)
+> within Bold
+> t, skipping units that do not fit 9: Dt← { u∈Ut\Pt:pt(u)≥τ}
+> 10: Wt←Pt∪Dt
+> 11: Xt←Compose( q, m t, W t, R t)
+> 12: (at,emt+1 )←Actor( Xt)
+> 13: Set mt+1 to the bounded update, or mtif invalid 14: Submit atand observe public feedback ot+1
+> 15: Extend Htwith (at, o t+1 )to form Ht+1
+> 16: t←t+ 1
+> 17: end while
+
+Adaptive recent retention. CarryOn always re-tains the latest interaction. At the next decision, it extends the recent window if the action fails validation or the MEMORY update is invalid or truncated. Otherwise, it uses the standard window. Unparseable updates preserve the previous state. Interactions leaving the window remain available for learned selection. Window lengths are given in Appendix A.2. 
+
+Execution loop. Algorithm 1 summarizes the three upper regions of Figure 2. Valid state updates are bounded by the state capacity, while invalid updates preserve the previous state. 
+
+B.2 Selector Supervision and Optimization Training examples and labels. We construct ex-amples at intermediate decision boundaries of suc-cessful trajectories from the official training splits. In the block-supervised path, each candidate is an earlier complete action–observation block. Rank-ing positives combine evidence references in offline state annotations with observed evidence-use sig-nals. AppWorld traces which earlier observations supply values to the next tool call. OfficeBench matches earlier evidence to arguments of the next action. Tau2 tracks evidence reuse in subsequent public interactions. For next-action use prediction, positive labels are restricted to evidence linked to the immediately following action. Uncited and unused evidence is treated as a weak negative. Offline labels use subsequent public inter-actions, while selector inputs contain the task and observations available at the current decision. 
+
+Scoring architecture and objectives. The func-tions fϕ and gϕ in Eq. 2 share a pretrained back-bone with separate instructions for relevance rank-ing and next-action use prediction. The latter uses a learned linear head. The sigmoid is σ(z) = 1/(1 + exp( −z)) . The initial training stage adapts the reranker with LoRA using the pairwise rank-ing loss in Eq. 4. The backbone and margin are specified in Appendix A.2. The subsequent stage jointly optimizes this ranking objective and the next-action use loss in Eq. 5. This stage updates the ranker adapter as well as the new head. Whole-block training preserves the units refer-enced by the offline annotations. At deployment, the same query and candidate interface scores the finer units from Section 3.2, each paired with the action that produced its source observation. This transfers block-level supervision to fragment se-lection without requiring a separate annotation for every fragment. 
+
+C MEMORY Capacity Sensitivity 
+
+Figure 5 and Table 3 compare control-state capaci-ties of 64, 128, and 256 proxy tokens on AppWorld with Claude. Each setting is evaluated once on all 168 tasks, with the evidence budget, selector, and retention policy held fixed. The default capacity of 128 tokens achieves the highest Success and S0.8. Increasing capacity to 256 gives the lowest NCS and reduces calls and token use, while the 64-token state is truncated more often. The results illustrate how state capacity affects both task completion and resource use. 
+
+D Detailed Results and Resource Use 
+
+The following tables expand Table 1, with results grouped by benchmark and Actor. 
+
+D.1 Evaluation and Cost Accounting 
+
+TGC and Success report completed tasks out of all evaluated tasks. Requirements reports passed checks out of all task requirements in AppWorld. Conditions reports passed checks out of the con-ditions evaluated in OfficeBench. Tau2’s average reward equals its success rate under single-run eval-uation. Calls reports Actor calls in AppWorld and Of-ficeBench. For Tau2, A/U/C denotes Actor, User, and compressor calls. Token counts are reported in millions. AppWorld and OfficeBench report Actor tokens under Input and Output, while Total 12 64 128 256 76 78 80 82          
+
+> 77.38
+> 79.76
+> 77.98
+> (a) Success (%) ↑
+> 64 128 256 66 68 70 72 74
+> 69.48
+> 71.71
+> 70.24
+> (b) S0.8 ↑
+> 64 128 256 0.50 0.55 0.60 0.65
+> 0.585
+> 0.556 0.548
+> (c) NCS ↓
+> MEMORY capacity (proxy tokens)
+
+Figure 5: MEMORY capacity sensitivity on AppWorld with Claude. Dashed lines mark the default capacity of 128 proxy tokens.                            
+
+> Capacity Success (%) ↑S0.8↑NCS ↓Calls Tokens (M) Truncations 64 77.4 69.48 0.585 3,163 25.507 284 128 79.8 71.71 0.556 3,098 24.906 48 256 78.0 70.24 0.548 3,001 23.920 8
+
+Table 3: MEMORY capacity sensitivity on AppWorld with Claude. Capacity is measured in proxy tokens. 
+
+also includes compression and retrieval-embedding requests. Tau2 token counts additionally include the User simulator. Tokens processed by the local models used for selection or pruning in CarryOn, AGORA, LLMLingua-2, and SWE-Pruner are ex-cluded. 
+
+D.2 Metric Weight Sensitivity 
+
+To assess whether the overall ranking depends on metric weights, we vary each weight from 0 to 1. Figure 6(a) varies the success weight α in Sα,keeping the token and call weights within S0 fixed. Panel (b) varies the token weight w in NCS, assign-ing weight 1 − w to calls in Eq. 8. Task outcomes and resource totals remain fixed throughout. Car-ryOn retains the highest mean Sα and lowest mean 
+
+NCS w across both ranges, showing that its overall lead is stable under these weight changes. 
+
+E Context and Execution Cost Across Actors 
+
+Figures 7–9 compare all eight methods using the runs in Table 1. Each point averages the first n
+
+tasks in a fixed benchmark order, including fail-ures, and the final point gives the full-set mean. The horizontal axis shows the number of evaluated tasks. A task’s peak input is its largest submitted Actor input, including fixed prompts. Task-level peaks are averaged arithmetically and plotted on logarith-mic axes, with matching scales across Actors. Tool calls follow Appendix D.1. Over the complete OfficeBench task set, Car-ryOn matches or exceeds the best baseline Success while using the fewest Actor and tool calls per task for each Actor. On AppWorld, it improves Success and lowers mean peak input relative to Full History for all three Actors. On Tau2 with Qwen, it in-creases Success from 80% to 90% while reducing mean Actor calls from 19.05 to 15.00 relative to Full History. On Tau2, CarryOn has higher mean peak input than Full History. 13 0.0 0.2 0.4 0.6 0.8 1.0  
+
+> Success weight α
+> 020 40 60 80
+> Mean  Sα "
+
+(a) Success–efficiency weighting      
+
+> 68.45
+> 00.25 0.5 0.75 1
+> Token weight w
+> 01234
+> Mean NCS w #
+
+(b) Resource-cost weighting 
+
+> 0.792
+> Full History FIFO-5 Retrieval LLMLingua-2 ACON AGORA SWE-Pruner CarryOn
+
+Figure 6: Sensitivity to metric weights. Scores are averaged equally across benchmarks and Actors. Dashed lines mark the default weights. 
+
+Method TGC ↑ Requirements Calls Input (M) Output (M) Total (M) Full History 73/168 774/1,077 2,727 27.253 0.314 27.567 FIFO-5 72/168 498/1,077 5,369 31.839 0.456 32.296 Retrieval 20/168 232/1,077 7,284 47.792 0.569 55.497 LLMLingua-2 36/168 499/1,077 3,572 23.199 0.363 23.562 ACON 118/168 950/1,077 3,608 22.485 0.369 24.857 AGORA 93/168 723/1,077 6,012 35.196 0.684 35.881 SWE-Pruner 133/168 993/1,077 3,148 33.318 0.386 33.705 CarryOn 134/168 962/1,077 3,098 24.114 0.792 24.906 
+
+Table 4: Detailed AppWorld results with Claude Sonnet 5. 
+
+Method TGC ↑ Requirements Calls Input (M) Output (M) Total (M) Full History 110/168 790/1,077 1,361 9.386 3.295 12.681 FIFO-5 90/168 669/1,077 1,674 9.674 3.997 13.672 Retrieval 74/168 577/1,077 2,279 14.017 4.830 21.854 LLMLingua-2 75/168 574/1,077 1,630 8.491 4.996 13.487 ACON 89/168 666/1,077 1,797 8.818 4.737 15.127 AGORA 69/168 552/1,077 1,664 7.867 6.244 14.111 SWE-Pruner 115/168 844/1,077 2,839 19.201 6.589 25.791 CarryOn 142/168 914/1,077 3,255 18.864 4.305 23.169 
+
+Table 5: Detailed AppWorld results with Qwen3.8-27B. 
+
+Method TGC ↑ Requirements Calls Input (M) Output (M) Total (M) Full History 90/168 767/1,077 2,401 16.740 1.386 18.126 FIFO-5 82/168 735/1,077 2,820 13.088 1.434 14.522 Retrieval 48/168 454/1,077 5,231 24.511 1.858 30.800 LLMLingua-2 70/168 692/1,077 2,428 11.984 1.459 13.443 ACON 82/168 772/1,077 2,650 12.721 1.311 15.109 AGORA 66/168 666/1,077 4,103 17.054 2.459 19.513 SWE-Pruner 116/168 918/1,077 2,467 16.213 1.080 17.293 CarryOn 121/168 906/1,077 2,983 19.010 1.623 20.633 
+
+Table 6: Detailed AppWorld results with Gemma-4-31B. 
+
+14 Method TGC ↑ Conditions Calls Input (M) Output (M) Total (M) Full History 60/95 113/148 1,484 29.454 0.410 29.864 FIFO-5 55/95 101/141 1,744 5.680 0.336 6.016 Retrieval 47/95 69/117 2,384 6.793 0.313 8.483 LLMLingua-2 61/95 124/158 1,569 6.067 0.286 6.353 ACON 64/95 131/162 1,574 7.385 0.272 8.410 AGORA 47/95 93/141 2,381 10.735 0.461 11.196 SWE-Pruner 59/95 117/153 1,501 10.733 0.373 11.106 CarryOn 66/95 136/165 1,284 8.643 0.340 8.983 
+
+Table 7: Detailed OfficeBench results with Claude Sonnet 5. 
+
+Method TGC ↑ Conditions Calls Input (M) Output (M) Total (M) Full History 63/95 128/160 1,531 10.807 1.668 12.475 FIFO-5 51/95 93/137 1,970 6.638 1.375 8.013 Retrieval 49/95 85/131 2,230 8.411 1.422 12.729 LLMLingua-2 57/95 104/142 1,716 5.729 1.554 7.282 ACON 60/95 116/151 1,611 4.387 1.856 6.845 AGORA 44/95 83/134 2,221 9.631 1.589 11.220 SWE-Pruner 60/95 125/160 1,585 11.834 2.067 13.901 CarryOn 63/95 129/161 935 3.504 0.742 4.246 
+
+Table 8: Detailed OfficeBench results with Qwen3.8-27B. 
+
+Method TGC ↑ Conditions Calls Input (M) Output (M) Total (M) Full History 49/95 93/139 1,518 29.123 0.977 30.100 FIFO-5 52/95 105/148 2,110 3.442 1.242 4.684 Retrieval 33/95 60/122 2,938 4.264 1.285 6.338 LLMLingua-2 51/95 118/162 1,575 3.849 1.067 4.915 ACON 55/95 111/151 1,669 3.926 0.950 5.114 AGORA 37/95 69/127 2,986 5.408 1.447 6.855 SWE-Pruner 58/95 129/166 1,690 6.004 1.031 7.034 CarryOn 63/95 139/171 1,078 4.137 0.659 4.796 
+
+Table 9: Detailed OfficeBench results with Gemma-4-31B. 
+
+Method Success Pass 1 /Avg. Reward Calls A/U/C Input (M) Output (M) Total (M) Full History 30/40 0.750 665/853/0 13.287 0.136 13.423 FIFO-5 29/40 0.725 816/963/0 15.385 0.171 15.556 Retrieval 17/40 0.425 1,621/1,301/0 28.615 0.276 28.891 LLMLingua-2 32/40 0.800 694/878/7 13.977 0.145 14.122 ACON 29/40 0.725 641/799/2 12.647 0.135 12.782 AGORA 25/40 0.625 1,087/1,075/0 19.423 0.234 19.657 SWE-Pruner 28/40 0.700 638/820/0 13.363 0.136 13.499 CarryOn 30/40 0.750 676/825/0 16.175 0.276 16.451 
+
+Table 10: Detailed Tau2 Telecom results with Claude Sonnet 5. A/U/C denote Actor, User, and compressor calls. 
+
+15 Method Success Avg. Reward Calls A/U/C Input (M) Output (M) Total (M) Full History 32/40 0.800 762/890/0 12.619 0.305 12.924 FIFO-5 35/40 0.875 818/981/0 13.385 0.340 13.725 Retrieval 29/40 0.725 995/975/0 14.615 0.386 15.002 LLMLingua-2 32/40 0.800 778/885/5 12.361 0.260 12.621 ACON 35/40 0.875 730/859/3 11.607 0.276 11.883 AGORA 20/40 0.500 2,042/1,623/0 27.498 0.805 28.303 SWE-Pruner 33/40 0.825 800/871/0 13.289 0.289 13.578 CarryOn 36/40 0.900 600/761/0 12.746 0.415 13.161 
+
+Table 11: Detailed Tau2 Telecom results with Qwen3.8-27B. A/U/C denote Actor, User, and compressor calls. 
+
+Method Success Pass 1 /Avg. Reward Calls A/U/C Input (M) Output (M) Total (M) Full History 25/40 0.625 561/647/0 8.658 0.224 8.882 FIFO-5 24/40 0.600 601/649/0 8.231 0.256 8.487 Retrieval 14/40 0.350 1,187/657/0 14.266 0.513 14.779 LLMLingua-2 19/40 0.475 622/659/5 9.075 0.239 9.314 ACON 22/40 0.550 719/765/5 10.747 0.263 11.010 AGORA 13/40 0.325 1,087/960/0 13.921 0.430 14.351 SWE-Pruner 26/40 0.650 504/608/0 7.775 0.215 7.990 CarryOn 31/40 0.775 510/633/0 8.755 0.393 9.148 
+
+Table 12: Detailed Tau2 Telecom results with Gemma-4-31B. A/U/C denote Actor, User, and compressor calls. 1 84 168 025 50 75 100                       
+
+> AppWorld
+> Success (%)
+> 184 168 110 100
+> Mean peak input (k tokens; log scale)
+> 184 168 015 30 45
+> Mean Actor calls
+> 184 168 050 100 150
+> Mean Tool calls
+> 147 95 025 50 75 100
+> OfficeBench
+> 147 95 110 100 1000 147 95 010 20 30 147 95 0816 24 120 40 025 50 75 100
+> Tau2 Telecom
+> 120 40 110 100 120 40 020 40 60 120 40 010 20 30
+
+Evaluated tasks (fixed order) 
+
+> Full History FIFO-5 Retrieval LLMLingua-2 ACON AGORA SWE-Pruner CarryOn
+
+Figure 7: Claude Sonnet 5: Success and resource use across three benchmarks, averaged over fixed-order task prefixes. 
+
+16 1 84 168 025 50 75 100 
+
+> AppWorld
+
+Success (%) 
+
+1 84 168 110 100 
+
+Mean peak input (k tokens; log scale) 
+
+1 84 168 015 30 45 
+
+Mean Actor calls 
+
+1 84 168 050 100 150 
+
+Mean Tool calls 
+
+1 47 95 025 50 75 100 
+
+> OfficeBench
+
+1 47 95 110 100 1000 1 47 95 010 20 30 1 47 95 0816 24 1 20 40 025 50 75 100 
+
+> Tau2 Telecom
+
+1 20 40 110 100 1 20 40 020 40 60 1 20 40 010 20 30 
+
+Evaluated tasks (fixed order) 
+
+Full History FIFO-5 Retrieval LLMLingua-2 ACON AGORA SWE-Pruner CarryOn Figure 8: Qwen3.8-27B: Success and resource use across three benchmarks, with the same metrics and task order as Figure 7. 
+
+17 1 84 168 025 50 75 100 
+
+> AppWorld
+
+Success (%) 
+
+1 84 168 110 100 
+
+Mean peak input (k tokens; log scale) 
+
+1 84 168 015 30 45 
+
+Mean Actor calls 
+
+1 84 168 050 100 150 
+
+Mean Tool calls 
+
+1 47 95 025 50 75 100 
+
+> OfficeBench
+
+1 47 95 110 100 1000 1 47 95 010 20 30 1 47 95 0816 24 1 20 40 025 50 75 100 
+
+> Tau2 Telecom
+
+1 20 40 110 100 1 20 40 020 40 60 1 20 40 010 20 30 
+
+Evaluated tasks (fixed order) 
+
+Full History FIFO-5 Retrieval LLMLingua-2 ACON AGORA SWE-Pruner CarryOn Figure 9: Gemma-4-31B: Success and resource use across three benchmarks, with the same metrics and task order as Figure 7. 
+
+18 (a) OfficeBench: calendar to spreadsheet               
+
+> Control state
+> done headers, rows 2–3
+> open row 4, all columns
+> next continue filling row 4
+> answer_mode none
+> known_apis calendar, excel
+> Evidence Step 2
+> Strategy by Charlie
+> Start 14:10
+> Action Step 21
+> Introductions by Linda 13:00 Agenda by Davide 13:30 Strategy by Charlie 14:10
+> set_cell(row 4, column 2)
+
++(b) Tau2: diagnosing an MMS issue        
+
+> Control state
+> done customer verified, roaming on
+> open MMS issue
+> next check status bar
+> answer_mode none
+> known_apis get_customer_by_phone, get_details_by_id
+> Evidence
+> Roaming ON
+> Airplane icon
+> Action Step 6
+> Please turn off Airplane Mode.
+
++Figure 10: Control state and evidence across environments. (a) An earlier calendar record supplies a spreadsheet value. (b) Account information and a new user report support the next diagnostic reply. Text and timestamps are abbreviated. 
+
+F Control State and Evidence Across Environments 
+
+The following examples from recorded Claude Son-net 5 trajectories show how control state and ev-idence support actions in OfficeBench and Tau2 (Figure 10). 
+
+F.1 OfficeBench: Transferring a Calendar Agenda to a Spreadsheet 
+
+In Figure 10(a), the Actor is transferring a calendar agenda to a spreadsheet. The control state records completed headers and rows 2–3, with row 4 still in progress. The evidence pack retains the calendar record obtained at step 2, which gives 14:10 as the start time of “Strategy by Charlie.” At step 21, the Actor uses this value to fill row 4, column 2. 
+
+F.2 Tau2: Continuing a Customer-Service Diagnosis 
+
+In Figure 10(b), a customer cannot send MMS mes-sages while abroad. The control state records that the customer has been verified, roaming is enabled, and the MMS issue remains open. It identifies checking the status bar as the next diagnostic step. The available evidence includes the account record and the customer’s new report of an airplane icon. This report lets the Actor advance the diagnosis: at step 6, it asks the customer to turn off Airplane Mode. 
+
+G Evidence Reuse and Case Studies 
+
+G.1 Long-Term Evidence Retention and Reselection Coverage and counting. We use the designated CarryOn runs reported in the main table, including successful and unsuccessful trajectories. All 909 trajectories and 14,419 Actor calls have complete selection records. Each occurrence of a selected unit at an Actor decision is counted once. Figure 4 pools these occurrences within each benchmark. Age is the number of Actor steps since the source interaction, so the latest observation has age one. For Tau2, we map a unit to the first Actor bound-ary at which it enters the archive. The distribution includes older evidence selected by the learned manager, including temporary expansion, and ex-cludes automatically retained recent evidence. On Tau2, these age statistics cover the 13 of 120 trajec-tories that invoke learned selection. The remaining trajectories retain the full history within the base budget. 
+
+Evidence reselection. We count a reselection when previously visible evidence is omitted from the evidence pack for at least one decision and later selected again. 
+
+Retention and reselection statistics. Table 13 reports the share of selected evidence originating 19 Step 21 
+
+> Card details obtained
+> Original Discover record
+> Step 26–28
+> Temporarily omitted
+> Outside the evidence pack
+> Step 29
+> Reselected and used
+> Add the Discover card
+> Step 30
+> Balance refilled
+> Add $100 using the new card
+> Step 33
+> Payments completed
+> Send $20 to each of 7 coworkers
+> same Discover-card record, selected again
+
+Figure 11: A payment-card record returns to the evi-dence pack and is used to add a card, refill the balance, and complete the payments. 
+
+at least ten Actor steps earlier and the number of task runs in which evidence is selected again after leaving the pack. Such reselection occurs in 365 of 909 trajectories (40.2%), showing that evidence can return to the working context after being omit-ted. The following payment example shows how the Actor uses a reselected card record to add a payment card and refill the balance. 
+
+Payment case. Figure 11 traces a payment-card record from its initial observation to its later selec-tion and use. For task f861c32_2 , the Discover record ( E021/$/2 ) is obtained at step 21 and vis-ible at steps 22–25. It is absent at steps 26–28 and returns through learned ranking at step 29, out-side both recent retention and temporary expansion. The saved action at step 29 selects the Discover en-try from the previously stored card list and passes its six fields to add_payment_card . The tool re-turns card ID 479, which the next action uses to add $100 to the balance. Seven successful payment receipts follow at step 33, and the trajectory passes the official completion check. 
+
+G.2 Comparative Case Studies 
+
+We examine three AppWorld tasks, comparing Car-ryOn with ACON using Claude Sonnet 5 in Cases 1 and 3, and with SWE-Pruner using Gemma-4-31B in Case 2. 
+
+Case 1: preserving a complete payment-request list. The task is to approve all payment requests from roommates in the current month. Nine of the 47 pending requests qualify (Figure 12). ACON’s compressed summary omits IDs 6137 and 6131, and the Actor approves only the remaining seven requests, passing six of seven requirements. Car-ryOn retains the filtered nine-ID list as evidence and corrects the expected request count in its state from eight to nine. It ultimately approves all nine requests and passes all seven requirements. 
+
+Case 2: preserving note details. The task is to copy yesterday’s habit log into a new note for today, changing only the homemade-meals entry from no to yes (Figure 13). SWE-Pruner filters the tags and pinned status from the returned note. The Actor updates the meal entry correctly but omits these two fields when creating the new note, passing seven of nine requirements. CarryOn retains the original note with both fields and copies them alongside the updated content, passing all nine requirements. 
+
+Case 3: updating an expense note. The task is to add the current month’s expenses to a note whose entries are ordered newest first. CarryOn keeps the original note as evidence, inserts the new month directly below the header, and passes all ten requirements. ACON also updates the note correctly but fails the final answer check, passing nine of ten. 
+
+G.3 Temporary Evidence Expansion 
+
+In this AppWorld example with Gemma, the Actor must text a favorite recipe’s name to the user’s hus-band. The earlier contact record does not fit within the remaining base budget, but the selector predicts that it is needed for the next action. Temporary evidence expansion therefore adds it beyond the base budget (Section 3.3). 
+
+> [26] Observe husband's contact phone_number = <number> [31] Base budget: nearly full [=================== ] Base pack: contact omitted Next-action use: 0.695 > 0.5 Expansion: add contact record Action: send recipe name to <number> Feedback: "Text message sent." Outcome: task completed successfully
+
+The expansion restores the contact record for the current decision, and the Actor uses its phone number in the same step. 
+
+H Performance Across Task Groups 
+
+Figure 14 summarizes Success across task groups. Tables 14–16 report all methods and Actors, re-taining each dataset’s original denominators. App-World difficulty, OfficeBench level, and Tau2 per-sona describe different task properties. Tau2 issue type and persona are two partitions of the same 40 tasks. 20 Benchmark Actor Task runs Selected evidence 
+
+≥ 10 steps old (%) Runs with evidence reselection AppWorld Claude 168 31.4 96/168 AppWorld Qwen 168 32.5 94/168 AppWorld Gemma 168 27.6 105/168 OfficeBench Claude 95 40.5 22/95 OfficeBench Qwen 95 19.2 22/95 OfficeBench Gemma 95 28.0 13/95 Tau2 Telecom Claude 40 81.7 2/40 Tau2 Telecom Qwen 40 28.4 11/40 Tau2 Telecom Gemma 40 – 0/40 
+
+Table 13: Long-term evidence retention and reselection. Evidence age is measured in Actor steps, with repeated selections counted separately. The last column reports runs with evidence selected again after leaving the pack, out of all runs, including failures. “–” indicates no learned-selection events. Case 1: approving roommates' payment requests                       
+
+> ACON Compressed summary 7 of 9 kept 6168 6149 6151 6145 6143 6137 6138 6139 6131 2 omitted
+> Action
+> Approve 7 requests, then stop
+> ✗6 / 7 requirements
+> CarryOn Evidence 9 matching requests
+> 6168 6149 6151 6145 6143 6137 6138 6139 6131
+> Action
+> Approve all 9 state: 8 →9
+> ✓7 / 7 requirements
+
+Figure 12: Case 1 (AppWorld, Claude Sonnet 5). ACON’s summary omits two qualifying requests, shown with dashed outlines, while CarryOn retains the complete list. Case 2: copy yesterday's habit log, changing only homemade meals from no to yes            
+
+> SWE-Pruner Pruned observation
+> note_id content tags pinned
+> tags and pinned filtered
+> Action
+> create_note(title, content)
+> ✗7 / 9 requirements
+> CarryOn Evidence
+> note_id content tags pinned
+> tags and pinned kept
+> Action
+> create_note(…, tags, pinned)
+> ✓9 / 9 requirements
+
+Figure 13: Case 2 (AppWorld, Gemma-4-31B). Dashed outlines mark fields filtered by SWE-Pruner and preserved by CarryOn. Fractions report passed task requirements. 
+
+I CarryOn-E 
+
+CarryOn-E explores local deployment by replac-ing the LLM Actor in region 3 of Figure 2 with a smaller model while keeping the selector and reten-tion policy fixed. We distill a frozen Qwen3.8-27B CarryOn Actor into a Qwen3.5-9B student using supervised fine-tuning followed by DAgger-style distillation. 
+
+I.1 Training Procedure 
+
+Given Actor context X, the student policy πθ learns the teacher’s visible response v = ( v1, . . . , v L),containing the MEMORY update and an action in the environment’s required format. We minimize the response loss 
+
+ℓactor = − 1
+
+L
+
+LX
+
+j=1 
+
+log πθ(vj | X, v <j ), (10) 21 Easy Medium Hard 020 40 60 80 100 
+
+> Mean success (%)  95.91 83.63
+
+Δ +12.28 pp 
+
+> 79.17 69.44
+
+Δ +9.72 pp  
+
+> 62.96 64.02
+
+Δ −1.06 pp   
+
+> vs SWE-Pruner vs SWE-Pruner vs SWE-Pruner
+
+(a) AppWorld    
+
+> L1 L2 L3
+> 73.02 73.81
+
+Δ −0.79 pp  
+
+> 69.70 68.18
+
+Δ +1.52 pp 
+
+> 58.06 49.46
+
+Δ +8.60 pp   
+
+> vs ACON vs ACON vs Full History
+
+(b) OfficeBench    
+
+> MMS Mobile data Service 020 40 60 80 100
+> Mean success (%)
+> 60.42 54.17
+
+Δ +6.25 pp  
+
+> 96.30 96.30
+
+Δ 0.00 pp  
+
+> 93.33 95.56
+
+Δ −2.22 pp   
+
+> vs FIFO-5 vs Full History vs FIFO-5
+
+(c) Tau2 Telecom: Issue type    
+
+> Easy Hard None
+> 88.10 83.33
+
+Δ +4.76 pp  
+
+> 74.36 74.36
+
+Δ 0.00 pp 79.49 79.49 
+
+Δ 0.00 pp   
+
+> vs Full History vs FIFO-5 vs ACON
+
+(d) Tau2 Telecom: User persona 
+
+CarryOn Strongest baseline Figure 14: Success by task group, averaged across Actors. The strongest baseline is selected separately for each group. ∆ denotes the difference in percentage points. 
+
+Actor Method Easy Medium Hard Overall Claude Sonnet 5 Full History 34/57 21/48 18/63 73/168 Claude Sonnet 5 FIFO-5 49/57 17/48 6/63 72/168 Claude Sonnet 5 Retrieval 16/57 1/48 3/63 20/168 Claude Sonnet 5 LLMLingua-2 24/57 7/48 5/63 36/168 Claude Sonnet 5 ACON 48/57 36/48 34/63 118/168 Claude Sonnet 5 AGORA 48/57 23/48 22/63 93/168 Claude Sonnet 5 SWE-Pruner 47/57 40/48 46/63 133/168 Claude Sonnet 5 CarryOn 52/57 41/48 41/63 134/168 Qwen3.8-27B Full History 38/57 30/48 42/63 110/168 Qwen3.8-27B FIFO-5 37/57 29/48 24/63 90/168 Qwen3.8-27B Retrieval 33/57 24/48 17/63 74/168 Qwen3.8-27B LLMLingua-2 37/57 22/48 16/63 75/168 Qwen3.8-27B ACON 37/57 28/48 24/63 89/168 Qwen3.8-27B AGORA 31/57 21/48 17/63 69/168 Qwen3.8-27B SWE-Pruner 47/57 32/48 36/63 115/168 Qwen3.8-27B CarryOn 57/57 46/48 39/63 142/168 Gemma-4-31B Full History 47/57 23/48 20/63 90/168 Gemma-4-31B FIFO-5 44/57 21/48 17/63 82/168 Gemma-4-31B Retrieval 30/57 15/48 3/63 48/168 Gemma-4-31B LLMLingua-2 44/57 15/48 11/63 70/168 Gemma-4-31B ACON 42/57 22/48 18/63 82/168 Gemma-4-31B AGORA 43/57 12/48 11/63 66/168 Gemma-4-31B SWE-Pruner 49/57 28/48 39/63 116/168 Gemma-4-31B CarryOn 55/57 27/48 39/63 121/168 
+
+Table 14: Successful tasks by AppWorld difficulty. 
+
+22 Actor Method L1 TGC L2 TGC L3 TGC Passed/checked Unchecked Claude Sonnet 5 Full History 31/42 12/22 17/31 113/148 61 Claude Sonnet 5 FIFO-5 31/42 13/22 11/31 101/141 68 Claude Sonnet 5 Retrieval 32/42 10/22 5/31 69/117 92 Claude Sonnet 5 LLMLingua-2 33/42 14/22 14/31 124/158 51 Claude Sonnet 5 ACON 30/42 17/22 17/31 131/162 47 Claude Sonnet 5 AGORA 26/42 10/22 11/31 93/141 68 Claude Sonnet 5 SWE-Pruner 31/42 14/22 14/31 117/153 56 Claude Sonnet 5 CarryOn 32/42 16/22 18/31 136/165 44 Qwen3.8-27B Full History 32/42 14/22 17/31 128/160 49 Qwen3.8-27B FIFO-5 29/42 10/22 12/31 93/137 72 Qwen3.8-27B Retrieval 32/42 8/22 9/31 85/131 78 Qwen3.8-27B LLMLingua-2 32/42 14/22 11/31 104/142 67 Qwen3.8-27B ACON 32/42 14/22 14/31 116/151 58 Qwen3.8-27B AGORA 25/42 7/22 12/31 83/134 75 Qwen3.8-27B SWE-Pruner 31/42 13/22 16/31 125/160 49 Qwen3.8-27B CarryOn 30/42 15/22 18/31 129/161 48 Gemma-4-31B Full History 29/42 8/22 12/31 93/139 70 Gemma-4-31B FIFO-5 27/42 12/22 13/31 105/148 61 Gemma-4-31B Retrieval 25/42 6/22 2/31 60/122 87 Gemma-4-31B LLMLingua-2 27/42 11/22 13/31 118/162 47 Gemma-4-31B ACON 31/42 14/22 10/31 111/151 58 Gemma-4-31B AGORA 22/42 8/22 7/31 69/127 82 Gemma-4-31B SWE-Pruner 30/42 14/22 14/31 129/166 43 Gemma-4-31B CarryOn 30/42 15/22 18/31 139/171 38 
+
+Table 15: Successful tasks and evaluator coverage by OfficeBench level. Unchecked conditions were not evaluated. 
+
+Actor Method Easy Hard None MMS Mobile data Service Claude Sonnet 5 Full History 11/14 10/13 9/13 6/16 9/9 15/15 Claude Sonnet 5 FIFO-5 9/14 9/13 11/13 7/16 7/9 15/15 Claude Sonnet 5 Retrieval 5/14 6/13 6/13 5/16 4/9 8/15 Claude Sonnet 5 LLMLingua-2 13/14 10/13 9/13 8/16 9/9 15/15 Claude Sonnet 5 ACON 11/14 8/13 10/13 5/16 9/9 15/15 Claude Sonnet 5 AGORA 9/14 9/13 7/13 6/16 6/9 13/15 Claude Sonnet 5 SWE-Pruner 10/14 9/13 9/13 7/16 9/9 12/15 Claude Sonnet 5 CarryOn 12/14 9/13 9/13 8/16 8/9 14/15 Qwen3.8-27B Full History 13/14 10/13 9/13 10/16 8/9 14/15 Qwen3.8-27B FIFO-5 14/14 11/13 10/13 13/16 7/9 15/15 Qwen3.8-27B Retrieval 9/14 9/13 11/13 9/16 7/9 13/15 Qwen3.8-27B LLMLingua-2 13/14 9/13 10/13 11/16 8/9 13/15 Qwen3.8-27B ACON 13/14 10/13 12/13 12/16 9/9 14/15 Qwen3.8-27B AGORA 7/14 6/13 7/13 8/16 4/9 8/15 Qwen3.8-27B SWE-Pruner 12/14 8/13 13/13 10/16 9/9 14/15 Qwen3.8-27B CarryOn 13/14 11/13 12/13 13/16 9/9 14/15 Gemma-4-31B Full History 11/14 7/13 7/13 4/16 9/9 12/15 Gemma-4-31B FIFO-5 8/14 9/13 7/13 6/16 5/9 13/15 Gemma-4-31B Retrieval 3/14 5/13 6/13 3/16 1/9 10/15 Gemma-4-31B LLMLingua-2 7/14 6/13 6/13 2/16 6/9 11/15 Gemma-4-31B ACON 8/14 5/13 9/13 3/16 7/9 12/15 Gemma-4-31B AGORA 4/14 4/13 5/13 4/16 2/9 7/15 Gemma-4-31B SWE-Pruner 9/14 9/13 8/13 6/16 7/9 13/15 Gemma-4-31B CarryOn 12/14 9/13 10/13 8/16 9/9 14/15 
+
+Table 16: Successful Tau2 tasks by user persona and issue type. 
+
+23 Overall results                       
+
+> Dataset Success (%) Completed/total Actor calls Tokens (M) AppWorld 47.0 79/168 4,961 30.982 OfficeBench 46.3 44/95 1,219 7.311 Tau2 Telecom 67.5 27/40 998 19.473
+> Success by task group
+> Dataset Grouping Success (%); completed/total AppWorld Difficulty Easy 70.2 (40/57) Medium 62.5 (30/48) Hard 14.3 (9/63) OfficeBench Level L1 50.0 (21/42) L2 50.0 (11/22) L3 38.7 (12/31) Tau2 Telecom Issue type MMS 75.0 (12/16) Mobile data 88.9 (8/9) Service 46.7 (7/15) Tau2 Telecom User persona Easy 71.4 (10/14) Hard 61.5 (8/13) None 69.2 (9/13)
+
+Table 17: CarryOn-E (9B) results across benchmarks and task groups. 
+
+where θ denotes the student’s LoRA parameters, L
+
+is the response length in tokens, and v<j contains the preceding response tokens. Initial supervised fine-tuning uses context–response pairs D0 from successful teacher trajectories on training tasks to obtain θ0. The loss is computed only over response tokens. A student can reach states that are absent from successful teacher trajectories. To train on these states, we apply DAgger-style distillation (Ross et al., 2011). In each round, the student performs training tasks using CarryOn to construct its con-text. The teacher provides a response for each visited context, including those from unsuccess-ful rollouts. These context–response pairs form 
+
+Bk, which is added to the accumulated dataset to further train the student: 
+
+Dk = Dk−1 ∪ B k,θk ← FineTune( θk−1, Dk). (11) Here, FineTune continues the student’s LoRA adapter on the accumulated data using Eq. 10, which averages over target tokens. Training bal-ances examples across tasks or source trajectories. 
+
+I.2 Training and Evaluation Settings 
+
+The student is initialized from Qwen3.5-9B and evaluated on all three datasets. Each aggregation round trains for one epoch over the accumulated data. The reported models use six rounds on Ap-pWorld, seven on OfficeBench, and five on Tau2. Student inference uses non-thinking mode, and dis-tillation uses only training-split tasks. Estimated cumulative training wall times, including initial supervised fine-tuning and all aggregation rounds leading to the reported models, are 54.00, 23.06, and 54.28 hours on AppWorld, OfficeBench, and Tau2, respectively, using one H100 GPU per train-ing job. These estimates exclude rollout collection and teacher labeling. 
+
+I.3 Local Deployment Results 
+
+CarryOn-E offers a smaller-model deployment op-tion by reducing the Actor from 27B to 9B parame-ters while reusing CarryOn’s selector and retention policy. Distillation trains the local Actor to gen-erate actions and update task state from the same state–evidence interface. Table 17 reports 47.0%, 46.3%, and 67.5% Suc-cess on AppWorld, OfficeBench, and Tau2 Tele-com, respectively. On AppWorld, the 9B Ac-tor completes 70.2% of easy tasks and 62.5% of medium tasks, showing that it can handle many tasks at these difficulty levels. On Tau2, it com-pletes 75.0% of MMS tasks and 88.9% of mobile-data tasks. 24 J Prompt Templates 
+
+We provide the Actor instructions, annotation prompts, and selector input formats in the accompanying code. Braced placeholders below denote runtime inputs. Benchmark task descriptions, tool documentation, and domain policies are supplied by the corresponding environment. 
+
+J.1 AppWorld Actor 
+
+The benchmark’s task prompt is followed by selected action–observation messages in chronological order. The following instruction is appended to the last user message, with the current state substituted for 
+
+{working_memory} ((empty) initially). 
+
+**Bounded working-memory protocol** Your entire response must remain valid Python. On the first line, write exactly one single-line Python comment in this form: # MEMORY: done=...; open=...; next=...; answer_mode=none|value; known_apis=... Replace this memory every turn and keep the text after `# MEMORY: ` within 128 tokens. Preserve task progress, the next intended operation, whether the task asks for a returned value, and API endpoint names already inspected. Do not copy passwords, access tokens, long IDs, lists, or tool receipts into memory; exact values remain available in retained raw evidence. After the memory comment, output one small executable Python action. Do not add prose or Markdown outside Python. Current working memory: {working_memory} 
+
+J.2 OfficeBench Actor 
+
+The system message supplies the environment configuration and available apps. The task workspace replaces the default path at runtime. 
+
+System message. 
+
+Today is {date} ({weekday}). The current time is {time}. You are an AI assistant for user {username}. You can help solve the task step by step. You can interact with an operation system and use apps to solve the task. You must follow the instructions and use the given dictionary format to call APIs. You can only generate one action at a time. You can find files for your task in `/testbed/data `. If you do not know the filenames, switch to shell and list the directory. You have following apps installed in the system: {introductions} 
+
+User message layout. 
+
+## Task {task} ## Selected exact execution evidence {evidence} ## Current action space {action_instructions} {execution_context} ## Output protocol {output_protocol} 
+
+25 Evidence format. 
+
+[{evidence_id}] ACTION: {action} [{evidence_id}] OBSERVATION: {observation} 
+
+For a partially selected observation, the second line is: 
+
+[{evidence_id}] SELECTED OBSERVATION: {fragments} 
+
+An empty history is rendered as (no prior evidence) .
+
+Action space before selecting an app. 
+
+Available apps: {available_apps} Choose one app: {'app':'system','action':'switch_app','target_app':APP} 
+
+Action space within an app. 
+
+Current app: {current_app} Available actions: {action_demos} - switch app: {'app':'system','action':'switch_app','target_app':APP}; other apps={alternatives} - finish non-question: {'app':'system','action':'finish_task','answer':'None'} - finish question: {'app':'system','action':'finish_task','answer':ANSWER} 
+
+Execution context. 
+
+## Execution context Task workspace / default output directory: "{default_directory}" Current working directory: "{current_directory}" For an output requested by filename only, use the task workspace unless the task specifies another location. Relative filesystem paths resolve from the current working directory. App-managed storage still follows its tool schema. Treat file paths, account names and other identifiers as case-sensitive. Copy the exact identity from the task or public evidence; do not substitute the current assistant user for a person named in the task. If unresolved, use an available tool to check rather than guess or normalize spelling. A successful tool receipt confirms that operation, not all task requirements. Keep uncertain requirements in open. Do not mark the action you are about to execute as already done. Before finish_task, compare the requested outcomes with public receipts: object, location and content. Check missing evidence with existing tools; do not blindly reread every result. Keep all five MEMORY fields inside one JSON string. Never place done/open/next/answer_mode/known_apis at the outer JSON level. For shell commands, a string (or singleton string list) is a shell program; a multi-element string list is literal argv. Redirection and pipes belong in a program string or an explicit shell command, not as literal argv entries. 
+
+Output protocol. 
+
+Return exactly one valid JSON object and no prose, Markdown, XML tags, or code fences. Use this exact outer schema: {"memory":"done=...; open=...; next=...; answer_mode=none|value; known_apis=...", "action":{"app":"...","action":"..."} }
+
+`action ` MUST be a nested JSON object, never a quoted string. Include every argument required by one currently available OfficeBench action. Example switch action: {
+
+26 "memory":"done=none; open=complete the task; next=open shell; answer_mode=none; known_apis=shell", "action":{"app":"system","action":"switch_app","target_app":"shell"} }The memory must be at most 128 proxy tokens. Replace it each turn. Keep progress, open work, next operation, answer mode, and recently needed app actions. Never put long IDs, files, lists, or raw receipts in memory; exact values stay in evidence. Current memory: {working_memory} 
+
+The initial memory value is none yet . Without MEMORY, the output instruction is: 
+
+Return exactly one native OfficeBench action dictionary and no prose or Markdown. 
+
+J.3 Tau2 Actor 
+
+The Actor uses Tau2’s system instructions and domain policy, followed by the three CarryOn instruction blocks below. Tool schemas are provided through the model’s native tool interface. 
+
+Benchmark system message. 
+
+<instructions> You are a customer service agent that helps the user according to the <policy> provided below. In each turn you can either: - Send a message to the user. - Make a tool call. You cannot do both at the same time. Try to be helpful and always follow the policy. Always make sure you generate valid JSON only. </instructions> <policy> {domain_policy} </policy> 
+
+State update. 
+
+Using working memory without losing the user's goal MEMORY is a revisable index into the public history, not a substitute for the domain policy or a complete procedure. Keep the existing five fields within 128 tokens, using information available before the current response. - done: Note completed work and its observed scope. Giving instructions is not the same as the user carrying them out. Attribute user reports as reports. - open: Preserve the unresolved user outcome, the relevant pending prerequisite or result, and who must act. Finishing your planned checks does not resolve the outcome. Do not drop the goal merely because your previous plan is empty. - next: State one revisable next step, not a commitment to the previous plan. If an attempted fix leaves the outcome unresolved, reconsider the applicable policy and its prerequisite references. A cause absent from MEMORY has not thereby been ruled out. Before declaring the available procedure exhausted, distinguish a documented limit from a step you have not checked. - answer_mode and known_apis: Keep their original meanings. Knowing an endpoint does not mean it was called or that its operation succeeded. Use public results to revise the note. Guide user-owned actions through the documented procedure; do not infer access to private user tools or receipts. Keep usable confirmations instead of restarting completed checks. When the evidence is sufficient, act directly. Follow the policy when resolution is confirmed or the request needs transfer; do not loop just to keep open nonempty. Keep the original reply/tool-call protocol. No extra fields, calls or separate verification pass are required. 
+
+Historical statements. 
+
+27 AGENT_STATEMENT records what you previously requested or committed to; it does not certify whether that work is pending or completed. Use the public replies and actual tool receipts to update your existing working memory, retaining the source and scope of confirmations. 
+
+Output protocol. 
+
+Bounded CarryOn working-memory protocol: Every response must provide the same five fields: done, open, next, answer_mode, known_apis. Replace the state each turn. Use 'none' for an empty field. Keep the complete serialized state within 128 tokens. Preserve task progress, the next intended operation, whether a returned value is needed, and names of tool endpoints already inspected. Do not copy passwords, access tokens, long IDs, lists, or tool receipts into memory. Exact values remain in raw evidence. There are two output channels for this SAME private control state: 1. Customer reply: start visible text with exactly one line: # MEMORY: done=...; open=...; next=...; answer_mode=none|value; known_apis=... Then provide the normal customer-facing reply. A MEMORY line alone is invalid. 2. Native tool call: provide the required _carryon_memory STRING inside the tool arguments, alongside the tool's normal arguments. Its value is: done=...; open=...; next=...; answer_mode=none|value; known_apis=... Do not repeat MEMORY in a text block and do not include customer-facing prose on a tool turn. Call exactly one supplied function using its native channel. The runtime removes private control metadata before giving a reply to the customer or executing the unchanged environment tool. MEMORY is not customer prose, a separate tool action, an observation, or evidence that work succeeded. Do not output tool calls as Python, JSON text, Markdown, or a code fence. All existing Tau2 policy and tool-ownership rules apply to the public action. 
+
+Tool argument description. 
+
+Required private control state: done=...; open=...; next=...; answer_mode=none|value; known_apis=... . All five fields nonempty; use none when empty. Single line, at most 128 tokens. Removed before tool execution. 
+
+Selected evidence is supplied as alternating action and observation messages. The final message also includes: 
+
+Current working memory: {working_memory} 
+
+The initial memory is (empty) . Control metadata is removed before a response reaches the user or a tool executes. 
+
+J.4 Offline State Annotation 
+
+These prompts produce the state annotations and evidence citations used for selector training. The annotation schema is richer than the Actor’s bounded five-field MEMORY. The following is the shared AppWorld template. 
+
+Annotation instruction. 
+
+You label VERIFIED EXECUTION STATE for a tool-using agent from an officially successful AppWorld trajectory. The trajectory is visible in hindsight, but the state after step t must contain only claims supported by the task and tool evidence at steps <= t. Return one complete state for every supplied external action, in the same order. Return JSON only, with no markdown. Use these terms precisely: - execution_invariants: long-lived task rules, scope predicates, completeness conditions, preconditions, postconditions, and termination conditions. - open_obligations: concrete work that remains at this point in the episode. - verified_facts: environment facts actually supported by tool evidence. 
+
+28 - tool_evidence: concise receipts tying a state claim to one or more step IDs. Maintain state sequentially rather than independently summarizing each step. Processed IDs and completed work accumulate unless a later receipt explicitly invalidates them. Never replace an accumulated set with only the newest item. Remaining IDs shrink only when there is evidence that an item is processed or out of scope. Preserve exact entity IDs, record IDs, filenames, pagination cursors, collection members, errors, and mutation receipts when future execution can depend on them. A successful API response is evidence that the call returned successfully; it is not automatically proof that the overall goal or all side effects are complete. Mark unverified effects uncertain. For pagination or enumeration, do not mark exhausted merely because one page was returned. Exhaustion requires evidence such as an empty terminal page, a documented terminal cursor, or the trajectory's API semantics proving there is no next page. Keep the current cursor and collected IDs. For mutations, distinguish intended targets, processed targets, remaining targets, and effects that have been re-queried or otherwise verified. For answer tasks, preserve the evidence needed to compute the answer and the required answer format. An execution invariant has status open, satisfied, violated, or unknown. "satisfied" requires cited evidence; "unknown" is required when evidence is insufficient. required_before names the action class or condition that cannot safely occur first. Open obligations are dynamic: add newly discovered work, update it as evidence arrives, and remove or close it only when supported. state_update describes the transition from the preceding state: - initialize: the first state; - update: material state was added, changed, or closed; - preserve: the latest action adds evidence but does not materially change the maintained state; - abstain: the observation does not justify a state claim; - reject: a tempting claim is contradicted by the available evidence. The added, updated, closed, and rejected arrays contain short field-level descriptions, not hidden reasoning. termination_supported is true only when no required obligation remains open, all necessary collections are exhausted, required mutations or answers are verified, uncertain effects cannot invalidate success, and the current history contains evidence for the task's completion conditions. Do not infer it just because the next expert action would complete the task. The response shape is exactly: {"task_id": "...", "initial_state": { "step_id": 0, "state_update": { "mode": "initialize", "added": [], "updated": [], "closed": [], "rejected": [] }, "execution_invariants": [], "verified_facts": {"items": []}, "tool_evidence": [], "collection_state": { "processed_ids": [], "remaining_ids": [], "next_cursor": null, "exhausted": false }, "open_obligations": [], "uncertain_effects": [], "termination_supported": false }, "transitions": [ {"step_id": 1, "state_update": { "mode": "initialize|update|preserve|abstain|reject", "added": [], "updated": [], "closed": [], "rejected": [] }, "execution_invariants": [ {"invariant": "...", "status": "open|satisfied|violated|unknown", "evidence_step_ids": [1], 
+
+29 "required_before": "..." }], "verified_facts": { "items": [ {"fact": "human readable fact name", "value": "exact compact JSON or text value", "evidence_step_ids": [1] }]}, "tool_evidence": [ {"evidence": "...", "evidence_step_ids": [1]} ], "collection_state": { "processed_ids": [], "remaining_ids": [], "next_cursor": null, "exhausted": false }, "open_obligations": [], "uncertain_effects": [], "termination_supported": false }]}Use empty arrays/objects when a category is inapplicable. Keep states compact but execution-sufficient. Every evidence_step_ids value must be an integer no larger than the transition's step_id. Produce exactly one transition for each supplied step and copy its integer step_id exactly. initial_state is z0=f(task): infer only task-derived execution invariants and open obligations. Its verified_facts and tool_evidence must be empty, and it must not cite any tool step because no tool action has executed yet. If an initial invariant uses an evidence_step_ids field for schema consistency, that list must be empty. Represent initial verified_facts exactly as {"items":[]}. 
+
+For OfficeBench, AppWorld is replaced by OfficeBench , and the following instruction is appended: 
+
+OfficeBench adaptation: each supplied step is one actually executed native OfficeBench action and its complete public environment observation. Cite these step IDs, not internal lines or list items. Do not invent file contents or effects that the public observations do not establish. Native finish_task is not proof that the task requirements are satisfied. 
+
+For Tau2, AppWorld is replaced by Tau2 Telecom , followed by: 
+
+Tau2 public-conversation adaptation: each step contains one actual Actor public response or native tool-call message, followed by all its public tool receipts and public user replies up to the next Actor decision. A step is one indivisible evidence block. Cite whole step IDs, never internal list items. The first public request is the only task instruction supplied. User statements are claims, not verified tool facts. Tool execution does not prove that a user performed an instructed device action. Do not infer hidden device state, private user actions, identity correctness, task success, or evaluator requirements. Use only the public prefix through each labeled step. Future responses must not justify an earlier state. Distinguish unresolved obligations, user reports, and direct tool observations. Terminal dialogue is not verification of success. 
+
+Annotation input. The user message is a JSON object containing task_id , task_instruction ,and official_success_trajectory . The trajectory contains steps ; Tau2 also includes 
+
+initial_public_prefix . AppWorld includes tool_schemas when available. These fields are filled from the training trajectory. Output fields and types follow the JSON structure specified above. 30 J.5 Selector Input Format 
+
+The reranker receives a system instruction and a query–document pair. The query contains the task and current observation; the document contains the candidate action and observation. The next-action head uses the same input format with its own task instruction. 
+
+Shared system instruction. 
+
+Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no". 
+
+User input. 
+
+<Instruct>: {instruction} <Query>: task: {task} current observation: {current_observation} <Document>: action: {candidate_action} observation: {candidate_observation} 
+
+OfficeBench reverses the action and observation lines in the document. The input uses Qwen chat delimiters and ends with: 
+
+<|im_end|> <|im_start|>assistant <think> </think> 
+
+Ranking: AppWorld and OfficeBench. 
+
+For a long-horizon tool agent, rank whether this exact prior action-observation block should remain visible for correct future execution. 
+
+Ranking: Tau2. 
+
+For a long-horizon tool agent, rank whether this exact prior dialogue or tool-evidence unit should remain visible for correct future execution. 
+
+Next-action use: AppWorld and OfficeBench. 
+
+For a tool-using agent, judge whether this exact prior evidence supplies an API specification, credential, ID, cursor, path, or runtime value needed by the agent's immediately next executable action. 
+
+Next-action use: Tau2. 
+
+For a dual-control dialogue agent, judge whether this exact prior visible evidence is needed by the immediately next decision: to parameterize an agent tool call, issue or complete a user-side instruction or commitment, verify an authoritative effect, or resolve an open obligation. Do not predict general future usefulness. 
+
+J.6 CarryOn-E Teacher Context 
+
+The teacher receives the student’s saved context before the action, using the same Actor instructions and state–evidence interface. Its response is appended as the supervised assistant target. Initial supervised examples similarly pair the teacher’s recorded context with its response. Training uses the model’s chat template and supervises only the selected assistant responses. 31

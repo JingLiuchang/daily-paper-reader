@@ -1,0 +1,875 @@
+Title: HorizANN: Elastically Scaling Vector Search with Ghost Edges
+
+URL Source: https://arxiv.org/pdf/2611.19077v1
+
+Published Time: Tue, 17 Nov 2026 01:43:21 GMT
+
+Number of Pages: 14
+
+Markdown Content:
+# HorizANN: Elastically Scaling Vector Search with Ghost Edges 
+
+# Talika Gupta ∗
+
+Univ. of Illinois Urbana-Champaign talikag2@illinois.edu 
+
+# Yunqi Li ∗
+
+Univ. of Illinois Urbana-Champaign yunqili4@illinois.edu 
+
+# Aditya Kunte 
+
+Univ. of Illinois Urbana-Champaign akunte2@illinois.edu 
+
+# Claire Lin 
+
+Univ. of Illinois Urbana-Champaign csl12@illinois.edu 
+
+# Supawit Chockchowwat 
+
+CMKL University, Thailand supawit@cmkl.ac.th 
+
+# Daniel Waddington 
+
+IBM Research, USA daniel.waddington@ibm.com 
+
+# Hubertus Franke 
+
+IBM Research, USA frankeh@us.ibm.com 
+
+# Yongjoo Park 
+
+Univ. of Illinois Urbana-Champaign yongjoo@illinois.edu 
+
+## ABSTRACT 
+
+Approximate nearest neighbor search (ANNS) is fundamental to modern data-intensive AI applications such as retrieval-augmented generation, recommendation systems, and semantic search. Among existing indexing methods, graph-based indexes emerge as the state of the art due to their superior recall-throughput tradeoffs. Scal-ing these indexes to multiple machines requires partitioning the data and building indexes on each. However, when new machines are added or removed, the data must be repartitioned and the in-dexes reconstructed from scratch, making horizontal scaling costly at billion scale. In this work, we present HorizANN , a distributed graph-based ANNS system that scales horizontally without requir-ing full index reconstruction. To achieve this, we introduce ghost edges, a mechanism for preserving cross-partition connectivity as partition boundaries change during repartitioning. By reusing the structural information that would otherwise be discarded during repartitioning, HorizANN avoids costly full index reconstruction. As the index grows from 100M vectors on one worker to 1B vectors on ten workers, HorizANN inserts each 100M vectors within 2.5 hours and sustains 3.4–3.5K queries per second at 0.998 Recall@10. 
+
+Artifact Availability: 
+
+The source code, data, and/or other artifacts have been made available at https://github.com/illinoisdata/HorizANN-VLDB2027. 
+
+## 1 INTRODUCTION 
+
+Modern AI applications—ranging from large-scale recommenda-tion engines [11, 24] to retrieval-augmented generation (RAG) pipelines [8, 23, 31]—rely fundamentally on Approximate Nearest Neighbor Search (ANNS) to navigate billions of high-dimensional vectors through various types of indexes such as KD-trees [7] and random projection trees [12], hash-based methods such as locality-sensitive hashing [2, 25], cluster-based methods such as inverted file indexes (IVF) [28], and graph-based methods (e.g., HNSW [32], NSG [18]). To handle these immense workloads, state-of-the-art production systems such as Milvus [40] and Weaviate [38] partition datasets into subindexes and distribute them across clusters on each worker node. When a system indexes millions of new vectors daily or faces highly variable workloads, expanding or shrinking cluster capacity without service interruption is critical. 
+
+> ∗Both authors contributed equally to this work.
+
+However, these existing systems are horizontally inelastic : they cannot dynamically add or remove worker nodes. The core problem with existing distributed graph-based systems is that they statically assign vectors to worker nodes , partitioning data permanently at con-struction time. Whenever worker nodes are added or removed, the new vector-worker assignment shifts partition boundaries, invali-dating the local graph structures and forcing subindexes to undergo full reconstruction from scratch [9, 40]. At billion-scale, this full index rebuilding takes hours and frequently requires partitions to be taken offline [36, 46]. 1 Because current architectures lack a mech-anism to dynamically redistribute data across an evolving topology, distributed graph indexes remain bottlenecked by a costly choice between resource underutilization and severe service downtime. To eliminate this inelasticity, our goal is to design a distributed graph-based ANNS system that supports dynamic repartitioning —the ability to seamlessly redistribute vector data across an altering number of worker nodes without full index reconstruction. Real-izing such an elastic, horizontally scalable architecture, however, requires overcoming two fundamental challenges: (1) Structural Dependency of Graph-based Index. Unlike cluster-based indexes (such as IVF) [10, 28, 33, 46] where independent vectors are mapped strictly to independent centroids and can be predictably moved to-gether, vectors in a graph index are bound by structural proximity edges established through expensive beam search [14, 32]. Naively repartitioning across a new topology discards these cross-boundary edges, and re-establishing them later requires repeating the costly search phase entirely. (2) Multi-Worker Query Routing Bottle-necks. To maintain high throughput during cluster resizing, queries must be routed selectively. While broadcasting to all workers elimi-nates the performance benefits of partitioning [19], under-routing or inaccurate partition selection risks missing relevant local struc-tures and severely degrading recall [6]. To address these challenges, this work introduces HorizANN , a distributed graph-based ANNS system that scales horizontally with-out index reconstruction (Table 1). (1) HorizANN tackles the first challenge—structural dependency—through a structure-preserving repartitioning mechanism that maintains both intra- and inter-partition edge information. When partition boundaries shift during a cluster resize, edges crossing the boundaries are preserved as ghost 
+
+> 1A naive way to reduce downtime is to block inserts and let a replica serve queries while full repartitioning runs. However, this complicates the system design and raises operational costs. 1arXiv:2611.19077v1 [cs.DB] 14 Nov 2026
+
+Table 1: Comparison with prior systems. HorizANN is the only graph-based distributed system supporting incremental indexing, online horizontal scaling and dynamic partitioning without index reconstruction.                                                                     
+
+> Group System Index Partitioning Dyn. Repart. Incr. Index Scale-out Key Limitation
+> Single-Node SPANN IVF (disk) –✗✗–Static partitions SPFresh IVF (disk) LIRE split/merge ✓✓–Single-node only Ada-IVF IVF Lazy, query-aware ✓✓–Single-node only FreshDiskANN Graph –✗✓–Single-node only OdinANN Graph –✗✓–Single-node only Distributed DistributedANN Graph (Vamana) Random KV sharding ✗✓✗Full KV resharding SPIRE Hier. IVF Hierarchical, LIRE ✗✓✗Graph only for routing Harmony Hybrid (vec + dim) Static ✗✗✓No graph index; no updates CoTra Graph (proximity) Static ✗✗✗Static; RDMA-dependent
+> HorizANN (Ours) Graph (HNSW) Dynamic (elastic) ✓✓✓–
+
+edges rather than being discarded. These ghost edges are safely stored but bypassed during search, imposing zero query overhead. When vectors are subsequently redistributed, and the endpoints of a ghost edge reside in the same partition, the edge is reacti-vated, restoring structural graph connectivity without re-executing a beam search. (2) To address the second challenge—multi-worker query routing, HorizANN maintains a lightweight seed index built over a representative subset of the data. Queries first probe this seed index to accurately identify relevant partitions and are then executed exclusively on those partitions, avoiding global broadcast while preserving high recall. In summary, we make the following contributions: 1. Horizontally Scalable Graph Index. We present HorizANN ,an incremental distributed graph-based ANNS system that scales horizontally. As the index grows from 100M vectors on one worker to 1B vectors on ten workers, HorizANN sustains 3.4–3.5K QPS at Recall@10 of 0.998. 2. Horizontal Index Repartitioning. Based on the concept of ghost edges, we introduce a split-and-merge algorithm that repartitions graph indexes without reconstruction by preserv-ing cross-partition connectivity. As the index grows to 500M vectors on 6 workers, repartitioning takes only 15% of the total build time. 3. Implementation and Evaluation. We provide an open-source implementation [22] and evaluate HorizANN on three 1B-vector datasets in a distributed cluster, showing efficient incremental insertion with dynamic repartitioning within 2.5 hours per 100M vectors, while baselines fail to reach 1B. The rest of this paper is organized as follows. §2 motivates our work, and §3 overviews HorizANN . §4 describes distributed indexing and querying, and §5 presents split-and-merge repartitioning. §6 evaluates HorizANN , §7 discusses related work, and §8 concludes. 
+
+## 2 MOTIVATION 
+
+We motivate the design of HorizANN by demonstrating the impor-tance of graph-based indexes (§2.1) and highlighting the fundamen-tal limitations of conventional index repartitioning (§2.2). 
+
+## 2.1 The Necessity of Distributed Graphs 
+
+Graph-based vector indexes are one of ANNS, critical for the re-trieval stage of many applications like recommendation systems, semantic search, cybersecurity, and bioinformatics [5]. In particular, retrieval-augmented generation (RAG) has become the standard ar-chitecture for grounding 2 large language models in external knowl-edge [31]. We hence quantify how downstream task quality relies on retrieval recall by evaluating 1,000 queries from HotpotQA [48]—a multi-hop benchmark requiring two supporting documents—using Gemini 2.5 Flash. We simulate varying retrieval qualities by ran-domly introducing irrelevant documents to question answering. As shown in Figure 2, downstream QA accuracy (EM, i.e., exact match) scales quadratically (𝑟 2) with retrieval recall 𝑟 due to the multi-hop dependency. At 𝑟 = 0.90, EM drops from a baseline of 23.2% down to 17.7% (approximating 0 .90 2 = 81% of maximum effectiveness). More generally, tasks requiring 𝑘 independent pieces of evidence exhibit an 𝑟 𝑘 performance decay, making ultra-high recall non-negotiable as application reasoning complexity grows. Therefore, the strict recall-accuracy relationship calls for the adop-tion of graph-based indexes like HNSW, which can offer higher accuracy than other methods (e.g., IVF) [3], when all graph data can fit in memory. Albeit the necessity, dynamically scaling graph-based indexes into multiple worker nodes remains under-explored. In distributed environments, horizontally scaling cluster-based indexes such as IVF variants is well-understood [33, 46] because vectors are mapped independently to disconnected centroids. On the other hand, han-dling inter-partition edges for graph-based indexes is non-trivial: vectors are explicitly bound by proximity edges. Filling the archi-tectural gap between graph-level retrieval performance and cluster-level horizontal elasticity remains an open and critical problem. 
+
+## 2.2 The Breakdown of Naive Repartitioning 
+
+To illustrate why cluster resizing breaks graph structures, con-sider an initial two-worker distributed HNSW cluster where a third worker is introduced to balance the storage (Figure 1). For clar-ity, the example shows a single graph layer; every layer of HNSW breaks in the same way. To avoid a full global index reconstruction, an elastic system must partition local graphs and migrate the desig-nated subgraphs to the new worker. This process directly fractures the index structure.  
+
+> 2Grounding means that a language model gives evidence-based answers.
+> 2
+
+Intra-partition Cross-partition Missing nearest-neighbor Unreachable 
+
+Complete Rebuild on 3 Workers    
+
+> Worker 1 Worker 3 Worker 2
+> 𝑣 1
+> 𝑣 2
+> 𝑣 3
+> 𝑣 4
+> 𝑣 5
+> 𝑣 6𝑣 7
+> 𝑣 8
+> 𝑣 9
+> 𝑣 10
+
+(a) Ideal Before: 2 Workers   
+
+> Worker 1 Worker 2
+> 𝑣 1
+> 𝑣 2
+> 𝑣 3
+> 𝑣 4
+> 𝑣 5
+> 𝑣 6𝑣 7
+> 𝑣 8
+> 𝑣 9
+> 𝑣 10
+> Migrate
+
+After: 3 Workers    
+
+> Worker 1 Worker 3 Worker 2
+> 𝑣 1
+> 𝑣 2
+> 𝑣 3
+> 𝑣 4
+> 𝑣 5
+> 𝑣 6𝑣 7
+> 𝑣 8
+> 𝑣 9
+> 𝑣 10
+
+(b) Naive repartitioning 
+
+Figure 1: Repartitioning a graph index from 2 to 3 workers. Vertex colors mark the worker each vector belongs to after repartitioning. (a) Ideal: each worker rebuilds its graph from scratch: every vector links to its nearest neighbors on that worker. (b) Naive repartitioning keeps only the edges between vectors on the same worker: it does not maintain cross-partition edges (red), which link nearest neighbors on different workers. When repartitioning moves both ends of a cross-partition edge onto one worker, that nearest-neighbor edge is missing there (dotted). Here 𝑣 7 is left with no edges on Worker 3, so greedy routing cannot reach it (dashed).    
+
+> 0.40.60.81010 20 30 40 50
+
+Retrieval Recall ( 𝑟 )Performance (%)  Precision F1 Answer Recall EM 
+
+Figure 2: Retrieval recall vs. downstream QA performance on HotpotQA (1,000 queries). Curves exhibit quadratic decay (≈ 𝐶 · 𝑟 2, dashed grey curve shown for F1), confirming that multi-hop downstream reasoning collapses rapidly under sub-optimal retrieval recall. 
+
+Under a centralized setting, a graph-based index operates by navigating a network of proximity edges . Queries traverse from an entry point through the graph, moving progressively closer to the target vector by following these edges to nearer neighbors. While the specific algorithms used to construct these edges vary across different graph indexes, they all share this fundamental reliance on continuous edge connectivity for successful routing. However, when graphs are repartitioned across a distributed cluster, this core routing mechanism is directly disrupted. 
+
+Problem 1: Fractured Routing and Dropped Recall. As conceptu-alized in Figure 1, proximity edges frequently cross the boundaries of the newly assigned partitions. When data points migrate, these cross-boundary edges are severed. For instance, if vectors move to a new worker node, their existing incoming and outgoing edges to vectors remaining on the original worker are discarded. Because graph-based ANNS’s greedy routing relies entirely on continuous edge connectivity to navigate closer to a query’s neighborhood, these severed boundaries form routing dead ends. When a query searches these fractured, disjoint subgraphs, it cannot traverse the missing links, causing retrieval recall to collapse toward zero. 
+
+> Control Plane Data Plane
+> Client
+> Main Node
+> Query Router Aggregator Metadata Mgr
+> Worker ( 𝑤 1)HNSW Index
+> Repartitioner
+
+...    
+
+> Worker ( 𝑤 𝑛 )HNSW Index
+> Repartitioner
+> 1234123
+> Search (𝑞, 𝐾 )Insert (𝑣 )
+
+Figure 3: HorizANN system architecture. The Control Plane (Main Node) coordinates request routing, aggregation, and metadata. The Data Plane (Workers) maintains local HNSW partitions and repartitioning logic. Solid and dashed arrows denote query and insertion data flows, respectively. 
+
+Problem 2: Catastrophic Reconstruction Costs. Re-establishing the missing graph connectivity through standard means requires re-inserting the migrated vectors, incurring unnecessary recom-putation costs. This requires re-running expensive beam searches for every vector in the altered partitions to locate valid proximity neighbors. At billion-scale, this index reconstruction takes hours which may degrade overall system availability or double the re-source allocation. An elastic ANNS system must therefore find a way to preserve cross-partition proximity edges across dynamic cluster shifts with-out executing recurrent, full-scale graph builds. HorizANN achieves this balance by natively retaining these cross-partition boundaries during repartitioning. 
+
+> 3
+
+## 3 SYSTEM OVERVIEW 
+
+This section outlines the design of HorizANN , defining the external user interface (§3.1) and the internal architecture (§3.2). We then discuss the logical data model that HorizANN represents (§3.3) and the design goals it achieves (§3.4). 
+
+## 3.1 User Interface 
+
+HorizANN provides a high-level abstraction that consists of five operations. They allow users to interact with a horizontally scal-able vector index as if it were a single, local data structure. From the user’s perspective, the system maintains a global collection of vectors V ⊂ R𝑑 ; we denote a vector by 𝑣 ∈ R𝑑 and a query by 𝑞 ∈ R𝑑 . This design effectively hides the complexities of the distributed architecture like query routing, data partitioning, and result aggregation. 
+
+Data Maintenance. Data maintenance is performed through in-cremental operations that keep the index synchronized with the application’s evolving state. A user invokes Insert (𝑣 ) to add a new vector 𝑣 ∈ R𝑑 to the global collection V. This is typically called when new searchable entities, such as user profiles, docu-ment embeddings, or product features, are generated. Conversely, Delete (𝑣 ) is used to remove a specific vector from V. This ensures the vector is immediately pruned from the search space and will no longer appear in later searches. 
+
+Search. The primary mechanism for retrieval is the Search (𝑞, 𝐾 )
+
+operation, which enables similarity-based discovery. By providing a query vector 𝑞 ∈ R𝑑 and a parameter 𝐾 , the user requests the 𝐾 
+
+most similar vectors in V relative to 𝑞 . The system identifies the global top-𝐾 approximate nearest neighbors and returns them as a single ranked list. 
+
+Resource Management. HorizANN also exposes administrative operations for elastic scaling. A user can call AddWorker (𝑤 ) to integrate a new compute and storage resource into the cluster. This is typically prompted by the growth of V toward memory limits or a need to increase search throughput under high query loads. Similarly, RemoveWorker (𝑤 ) allows for the decommissioning of a resource for cost optimization during periods of lower demand. 
+
+## 3.2 System Architecture 
+
+HorizANN follows a manager-worker architecture (Figure 3) com-prising a single main node that coordinates multiple workers to transparently expose a unified vector index. The main node coordinates client requests and cluster member-ship across three core components: (1) Metadata Manager : Main-tains cluster topology, partition centers {𝑐 𝑖 }𝑘 𝑖 =1 for the assignment function 𝜋 (𝑣 ) = arg min 𝑖 ∥𝑣 − 𝑐 𝑖 ∥, per-worker vector counts, and a reservoir sample of vectors for re-clustering upon scaling (§5.3). (2) Query Router : Determines candidate partitions likely to contain the nearest neighbors of a query vector, backed by an auxiliary seed HNSW index over sampled representative points (§4.3). (3) Aggre-gator : Gathers local search candidates from probed workers and merges them into a global top-𝐾 ranked result. Each worker 𝑤 𝑖 stores a disjoint partition 𝑉 𝑖 of the vector col-lection V (Ð𝑖 𝑉 𝑖 = V, 𝑉 𝑖 ∩ 𝑉 𝑗 = ∅ for 𝑖 ≠ 𝑗 ) centered at 𝑐 𝑖 . Each worker maintains a local HNSW index 𝐻 𝑖 over 𝑉 𝑖 (§3.3), structur-ing its graph into active edges connecting co-located vectors and 
+
+ghost edges capturing cross-partition proximity relationships (§4.1). Additionally, each worker hosts a repartitioner that executes local split and merge operations during scaling (§5.2), reactivating ghost edges into active edges without full graph reconstruction. 
+
+Data Flow. Request execution across these components proceeds in three flows: (1) Query : The client submits Search (𝑞, 𝐾 ) to the main node. The query router queries its seed index to identify the target subset of partitions P ( 𝑞 ) nearest to 𝑞 . Probed workers execute local HNSW search in parallel, and the aggregator merges the returned local candidates into the global top-𝐾 nearest neighbors returned to the client. (2) Insertion and Deletion : For Insert (𝑣 ), the main node evaluates 𝜋 (𝑣 ) and routes 𝑣 to worker 𝑤 𝜋 (𝑣 ) for local insertion, additionally querying neighboring workers to establish ghost edges that preserve the KNN property (§4.2). For Delete (𝑣 ), the request is routed to 𝑤 𝜋 (𝑣 ) for lazy pruning. (3) Elastic Scaling : When triggered by capacity threshold 𝜏 or administrative operations (AddWorker / RemoveWorker), the metadata manager recomputes partition centers via balanced 𝑘 -means. Workers execute local splits, transfer migrating child indexes, and merge incoming indexes via ghost edge reactivation (§5). 
+
+## 3.3 Logical Data Model 
+
+HorizANN logically represents a Hierarchical Navigable Small World (HNSW) graph [32], albeit a physically distributed one across work-ers. Note that HorizANN ’s techniques also apply to other graph-based indexes such as NSG [18] and Vamana [27]. 
+
+Data Structure. HNSW is a graph based index that combines small-world graphs [30] and skip-lists [35] to create a multi-layer structure for efficient similarity search. The HNSW index 𝐻 over vectors V consists of layers 𝐿 0, 𝐿 1, . . . , with each layer being a graph 𝐺 = (𝑉 , 𝐸 ) whose vertices are vectors, i.e., 𝑉 ⊆ V . Each edge 
+
+(𝑢, 𝑣 ) ∈ 𝐸 connects vectors that are likely near each other. Each 𝑣 is assigned a level ℓ (𝑣 ) at insertion and appears in layers 𝐿 0, . . . , 𝐿 ℓ (𝑣 ) ,so 𝑉 = V on 𝐿 0 and 𝑉 shrinks on upper layers. A vertex keeps at most 2 𝑀 out-edges in 𝐿 0 and 𝑀 in each upper layer, and search starts from the entry point , a vector with the highest level. Unless stated otherwise, the techniques in this paper treat every layer in the same way, so we describe them on a single layer. 
+
+Construction. HNSW is built incrementally. Each inserted vector 
+
+𝑣 is assigned a random maximum layer ℓ (𝑣 ). The algorithm searches for nearest neighbors at each layer from 𝐿 ℓ (𝑣 ) down to 𝐿 0, and adds edges connecting the new node to up to 𝑀 neighbors per layer. 
+
+Search. Given a query vector 𝑞 , search traverses layers top-to-bottom. At each layer, greedy traversal moves to the neighbor closest to 𝑞 until no improvement is found; this node becomes the entry point for the next layer. Upper layers locate the neighborhood, and the bottom layer returns the final top-𝐾 candidates. 
+
+KNN Property. Each vertex in HNSW is connected to a subset of its approximate nearest neighbors found by beam search; we refer to this as the KNN property . Greedy search relies on this property to move progressively closer to the query. 
+
+> 4
+
+## 3.4 Design Goals 
+
+HorizANN is designed to achieve four design goals. (i) Consistent Accuracy : HorizANN as a distributed system maintains nearly con-sistent recall as index and cluster size grow. (ii) Efficient Reparti-tioning : HorizANN quickly adapts itself with changing workers and workload, avoiding a full index reconstruction. (iii) Throughput Scale-up : HorizANN ’s query throughput scales with the number of workers, enabling the system to handle increased load by adding machines. (iv) Online Repartitioning : HorizANN continues to serve queries during repartitioning, sustaining throughput comparable to that before repartitioning. 
+
+## 4 HORIZONTAL INDEXING 
+
+This section describes how HorizANN organizes and operates its distributed index over a given set of workers. We first define the distributed index structure, whose ghost edges preserve the KNN property (§3.3) across partition boundaries (§4.1). We then describe how vectors are partitioned, inserted, and deleted while preserving this property (§4.2), and how a query is routed to only the relevant partitions and aggregated into a global result (§4.3). How the index adapts when workers join or leave the cluster is deferred to §5. 
+
+## 4.1 Distributed Index Structure 
+
+HorizANN partitions vectors across workers, and each worker 𝑤 𝑖 
+
+maintains a local HNSW index over its partition 𝑉 𝑖 . Following §3.3, we describe a single layer, on which 𝑤 𝑖 stores a graph 𝐺 𝑖 = (𝑉 𝑖 , 𝐸 𝑖 )
+
+consisting of the out-edges of its vertices. HorizANN divides these edges into two types: 
+
+𝐸 active  
+
+> 𝑖
+
+= {( 𝑢, 𝑣 ) ∈ 𝐸 𝑖 : 𝑣 ∈ 𝑉 𝑖 },𝐸 ghost  
+
+> 𝑖
+
+= {( 𝑢, 𝑣 ) ∈ 𝐸 𝑖 : 𝑣 ∉ 𝑉 𝑖 }.
+
+Active edges connect vectors on the same worker and are traversed by search. Ghost edges connect a vector to vectors on other workers; they are stored but never traversed, so each worker searches its local HNSW index alone. Ghost edges arise in two ways: insertion connects a new vector to its nearest neighbors on other workers (§4.2), and repartitioning turns an active edge into a ghost edge when its endpoints are moved apart (§5). 
+
+## 4.2 Distributed Insertion and Deletion 
+
+HorizANN supports incremental insertions and deletions of vectors to the distributed index. The distributed index consists of local HNSW indexes, one per worker, where each worker owns a spatially coherent partition of the vector space. 
+
+Partitioning. Vectors are partitioned across workers using bal-anced 𝑘 -means clustering on a sample of points sampled using reser-voir sampling [39], where 𝑘 is the number of workers. Each worker 
+
+𝑤 𝑖 is associated with a cluster center 𝑐 𝑖 obtained from 𝑘 -means. We define the partition assignment function 𝜋 : R𝑑 → { 1, . . . , 𝑘 } as: 
+
+𝜋 (𝑣 ) = arg min  
+
+> 𝑖
+
+∥𝑣 − 𝑐 𝑖 ∥
+
+A vector 𝑣 is assigned to worker 𝑤 𝜋 (𝑣 ) , the worker whose center is nearest to 𝑣 . This ensures semantic locality within partitions, enabling efficient query routing (§4.3).      
+
+> 123456020 40 60
+> # partitions containing ground-truth top-10 neighbors Queries (%)
+> 5 partitions (mean 1.96) 10 partitions (mean 2.73)
+
+Figure 4: Distribution of partitions containing ground-truth top-10 neighbors on SIFT1M. Ground-truth neighbors for most queries lie in only a few partitions, with the count varying across queries. 
+
+Insertion. To insert vector 𝑣 , the main node routes 𝑣 to worker 
+
+𝑤 𝜋 (𝑣 ) , which inserts 𝑣 into its local HNSW index and creates active edges to 𝑣 ’s approximate nearest neighbors within the partition. A vector near a partition boundary, however, may have some of its nearest neighbors on other workers. The main node therefore also sends 𝑣 to the other workers selected by the query router (§4.3); each of them searches its local index for 𝑣 ’s nearest neighbors, and 𝑤 𝜋 (𝑣 ) stores the results as ghost edges of 𝑣 . Active and ghost edges together approximate 𝑣 ’s neighborhood across partitions, so insertion preserves the KNN property (§3.3). 
+
+Deletion. To delete vector 𝑣 , the Main node routes the request to worker 𝑤 𝜋 (𝑣 ) . The local HNSW index lazily deletes 𝑣 . Subsequent searches skip deleted vectors. 
+
+Bulk Build. Given a collection of 𝑛 vectors and 𝑘 workers, HorizANN 
+
+builds the distributed index by first partitioning vectors using the assignment function 𝜋 , then constructing local HNSW indexes in parallel on each worker. Since partitions are disjoint, no coordina-tion is required. Construction time is 𝑂 (( 𝑛 /𝑘 ) log (𝑛 /𝑘 )) per worker. The Main node batches insertions to increase throughput, and each local HNSW index processes a received batch concurrently. 
+
+## 4.3 Distributed Query 
+
+With the index partitioned across several partitions, effective query-ing requires finding the smallest number of partitions which contains the true nearest neighbors for a given query. 
+
+In a small scale experiment, we partitioned the SIFT1M dataset (1 million embeddings, 128 dimensional) into 10 and 5 partitions and measured, for each query, how many partitions contain at least one true top-10 neighbor. Figure 4 shows the results. On average, true neighbors reside in only a few partitions, indicating that a small number of probes 𝑛 probe suffices for high recall. A constant 𝑛 probe 
+
+is also wasteful, since it varies across queries. This motivates the need for a query-aware router which routes a query 𝑞 to only the most relevant partitions, to avoid under or over routing. 
+
+Query Router. A key challenge in distributed ANNS is routing queries to relevant partitions. For systems with many small parti-tions (e.g. IVF with 10 6 partitions of 10 3 points each), representing each partition by its centroid suffices. However, in our setting of 
+
+> 5
+
+fewer partitions with large sizes, centroid based routing performs poorly, as large partitions exhibit heterogeneous internal structure that a single point cannot capture [19]. Gottesbüren et al. [19] addresses this via hierarchical clustering within each partition to build representative points and indexes them for fast retrieval. We adopt a simpler approach suited to incremental settings: maintain a reservoir sample [39] of data points indexed via HNSW. This seed index is the query router. As vectors arrive, we maintain a reservoir sample R ⊂ V of size 
+
+𝑚 (typically 0 .01% of the dataset). Each sampled point 𝑣 is annotated with its current partition assignment 𝜋 (𝑣 ). This assignment changes after each repartitioning operation. We build an HNSW index 𝐼 seed 
+
+over R for fast approximate search. Given a query 𝑞 ∈ R𝑑 and desired result size 𝐾 , we first deter-mine which partitions to probe. Let 𝑘 seed be the retrieval param-eter (typically 𝑘 seed = 𝐾 ). We search 𝐼 seed for the 𝑘 seed approxi-mate nearest neighbors 𝑄 ⊆ R of 𝑞 , then route 𝑞 to all partitions 
+
+P ( 𝑞 ) = Ð𝑥 ∈𝑄 {𝜋 (𝑥 )} .Our approach differs from [19] in two aspects: (1) we use sampled data points as representatives, avoiding the cost of hierarchical k-means clustering in each partition, and (2) repartitioning does not require recomputing representatives; reservoir sampling maintains the sample in 𝑂 (1) amortized time per insertion, so representatives update naturally as data arrives or partitions change. In contrast, k-means-based representatives must be recomputed from scratch. 
+
+Aggregator. Each probed worker performs local HNSW search and returns its local top-𝐾 candidates; the Aggregator merges these results to produce the global top-𝐾 nearest neighbors. 
+
+## 5 HORIZONTAL INDEX SCALING 
+
+While §4 assumes a given set of workers, HorizANN must also adapt as workers join or leave the cluster. This capability serves two of our design goals (§3.4): Throughput Scale-up , since newly added workers absorb a share of the data and query load, and Efficient Repartitioning , since the cluster must reach its new configuration without a full index reconstruction. Both hinge on repartitioning ,the process of redistributing data across a potentially changing number of workers. This section formalizes the repartitioning prob-lem on a single layer (§5.1), presents HorizANN ’s split-and-merge mechanism, which extends naive repartitioning with ghost edges, first on a single layer and then on all layers of HNSW (§5.2), de-scribes when repartitioning is triggered and how data moves when workers are added or removed (§5.3), and explains how HorizANN 
+
+keeps serving queries while repartitioning is in progress (§5.4). 
+
+## 5.1 Problem Formulation 
+
+Following §3.3, each local index 𝐻 𝑖 consists of one graph per layer, and we write 𝐺 (𝑙 ) 
+
+> 𝑖
+
+for its layer-𝑙 graph. We first consider a single layer and drop the superscript, so worker 𝑖 holds a graph 𝐺 𝑖 =
+
+(𝑉 𝑖 , 𝐸 𝑖 ) whose edges 𝐸 𝑖 encode proximity relationships discovered by beam search during insertion; §5.2 extends repartitioning to all layers. The distributed index is then G = {𝐺 1, . . . , 𝐺 𝑘 } over the vector set V = Ð𝑘 𝑖 =1 𝑉 𝑖 . When a worker is added or removed, 
+
+HorizANN recomputes the partition centers for the new worker count 𝑘 ′ (§5.3), which yields a new partition assignment function 
+
+𝜋 ′. We formalize repartitioning as follows. 
+
+Algorithm 1: HorizANN Repartitioning on Single Layer 
+
+Input: Local indexes 𝐺 1, . . . , 𝐺 𝑘 of one layer; new partition assignment function 𝜋 ′ (§5.3) 
+
+Output: New local indexes 𝐺 ′
+
+> 1
+
+, . . . , 𝐺 ′ 
+
+> 𝑘 ′
+> 1
+
+foreach worker 𝑖 ∈ { 1, . . . , 𝑘 } do in parallel  
+
+> 2
+
+{𝐺 𝑖 |1, . . . , 𝐺 𝑖 |𝑘 ′ } ← Split( 𝐺 𝑖 , 𝜋 ′);  
+
+> 3
+
+Transfer each 𝐺 𝑖 |𝑗 to worker 𝑗 ; // kept if 𝑗 = 𝑖  
+
+> 4
+
+foreach worker 𝑗 ∈ { 1, . . . , 𝑘 ′ } do in parallel  
+
+> 5
+
+𝐺 ′ 
+
+> 𝑗
+
+← Merge( 𝐺 1 |𝑗 , . . . , 𝐺 𝑘 |𝑗 );  
+
+> 6
+
+return 𝐺 ′
+
+> 1
+
+, . . . , 𝐺 ′ 
+
+> 𝑘 ′
+
+; 
+
+> 7
+
+Function Split( 𝐺 𝑖 , 𝜋 ′) 
+
+> 8
+
+foreach 𝑗 ∈ { 1, . . . , 𝑘 ′ } do  
+
+> 9
+
+𝑉 𝑖 |𝑗 ← { 𝑣 ∈ 𝑉 𝑖 : 𝜋 ′ (𝑣 ) = 𝑗 }; 
+
+> 10
+
+𝐸 𝑖 |𝑗 ← {( 𝑢, 𝑣 ) ∈ 𝐸 𝑖 : 𝑢 ∈ 𝑉 𝑖 |𝑗 }; 
+
+> 11
+
+mark (𝑢, 𝑣 ) ∈ 𝐸 𝑖 |𝑗 active if 𝑣 ∈ 𝑉 𝑖 |𝑗 , and ghost otherwise;  
+
+> 12
+
+return 𝐺 𝑖 |𝑗 = (𝑉 𝑖 |𝑗 , 𝐸 𝑖 |𝑗 ) for 𝑗 = 1, . . . , 𝑘 ′; 
+
+> 13
+
+Function Merge( 𝐺 1 |𝑗 , . . . , 𝐺 𝑘 |𝑗 ) 
+
+> 14
+
+𝑉 ′ 
+
+> 𝑗
+
+← Ð𝑘 𝑖 =1 𝑉 𝑖 |𝑗 ; 𝐸 ′ 
+
+> 𝑗
+
+← Ð𝑘 𝑖 =1 𝐸 𝑖 |𝑗 ; 
+
+> 15
+
+mark (𝑢, 𝑣 ) ∈ 𝐸 ′ 
+
+> 𝑗
+
+active if 𝑣 ∈ 𝑉 ′ 
+
+> 𝑗
+
+, and ghost otherwise;  
+
+> 16
+
+prune active edges of each vertex to the degree bound;  
+
+> 17
+
+return 𝐺 ′ 
+
+> 𝑗
+
+= (𝑉 ′ 
+
+> 𝑗
+
+, 𝐸 ′ 
+
+> 𝑗
+
+);Problem 1 (Repartitioning). Given a distributed index G =
+
+{𝐺 1, . . . , 𝐺 𝑘 } over V and a new partition assignment function 𝜋 ′ :
+
+R𝑑 → { 1, . . . , 𝑘 ′ }, construct a distributed index G′ = {𝐺 ′
+
+> 1
+
+, . . . , 𝐺 ′ 
+
+> 𝑘 ′
+
+}
+
+in which each 𝐺 ′ 
+
+> 𝑗
+
+= (𝑉 ′ 
+
+> 𝑗
+
+, 𝐸 ′ 
+
+> 𝑗
+
+) is a graph index over the vectors 𝑉 ′ 
+
+> 𝑗
+
+=
+
+{𝑣 ∈ V : 𝜋 ′ (𝑣 ) = 𝑗 }.
+
+A good solution is fast to compute and preserves search accuracy, that is, G′ should be about as accurate as indexes built from scratch on 𝑉 ′ 
+
+> 1
+
+, . . . , 𝑉 ′ 
+
+> 𝑘 ′
+
+. Naive repartitioning (§2.2) cannot achieve both. It drops cross-partition edges, which hurts accuracy. And restoring them requires re-inserting every affected vector, which is slow. 
+
+## 5.2 Elastic Repartition Mechanism 
+
+Instead of discarding cross-partition edges, HorizANN takes a dif-ferent approach: it preserves and reuses them to construct the new edge sets {𝐸 ′
+
+> 1
+
+, 𝐸 ′
+
+> 2
+
+, . . . , 𝐸 ′ 
+
+> 𝑘 ′
+
+} at a repartitioning. 
+
+Repartitioning on Single Layer. Algorithm 1 repartitions one layer 𝐺 𝑖 in two steps. Each worker 𝑖 calls Split to divide its local index 𝐺 𝑖 by destination worker (line 2). Each subindex carries every outgoing edge (𝑢, 𝑣 ) of its vectors. (𝑢, 𝑣 ) stays active only if 𝑣 lies in the same subindex. (line 11). Then each worker transfers each subindex 𝐺 𝑖 |𝑗 to its destination 𝑗 (line 3). Merge combines the subindexes that worker 𝑗 receives into 𝐺 ′ 
+
+> 𝑗
+
+(line 5). It reactivates every ghost edge whose ends are now both on worker 𝑗 (line 15). This reconnects subindexes from different source workers without re-inserting their vectors, while the remaining ghost edges are kept for later repartitionings. Finally, vertices whose active degree exceeds the bound are pruned with the HNSW neighbor selection heuristic (line 16). Figure 5 illustrates this procedure.                             
+
+> 6Active Ghost Reactivated Subindex New worker
+> Before: 2 Workers
+> Worker 1 Worker 2
+> 𝑣 1
+> 𝑣 2
+> 𝑣 3
+> 𝑣 4
+> 𝑣 5
+> 𝑣 6𝑣 7
+> 𝑣 8
+> 𝑣 9
+> 𝑣 10
+> Split
+> After Split
+> Worker 1 Worker 2
+> 𝐺 1|1𝐺 1|3𝐺 2|3𝐺 2|2
+> 𝑣 1
+> 𝑣 2
+> 𝑣 3
+> 𝑣 4
+> 𝑣 5
+> 𝑣 6𝑣 7
+> 𝑣 8
+> 𝑣 9
+> 𝑣 10
+> Transfer
+> After Transfer
+> Worker 1 Worker 3 Worker 2
+> 𝐺 1|1𝐺 1|3𝐺 2|3𝐺 2|2
+> 𝑣 1
+> 𝑣 2
+> 𝑣 3
+> 𝑣 4
+> 𝑣 5
+> 𝑣 6𝑣 7
+> 𝑣 8
+> 𝑣 9
+> 𝑣 10
+> Merge
+> After Merge: 3 Workers
+> Worker 1 Worker 3 Worker 2
+> 𝑣 1
+> 𝑣 2
+> 𝑣 3
+> 𝑣 4
+> 𝑣 5
+> 𝑣 6𝑣 7
+> 𝑣 8
+> 𝑣 9
+> 𝑣 10
+
+Figure 5: Repartitioning with Split and Merge (Algorithm 1) on the example of Figure 1. The left panel shows the index before repartitioning; vertex colors show the new assignment 𝜋 ′ (§5.3), with Worker 3 (green) as the added worker. Split divides the index of each worker 𝑊 𝑖 into one subindex 𝐺 𝑖 |𝑗 per destination worker 𝑊 𝑗 (shaded), and edges between different subindexes become ghost edges. Each worker 𝑊 𝑖 then transfers every subindex 𝐺 𝑖 |𝑗 with 𝑗 ≠ 𝑖 to 𝑊 𝑗 . Merge combines the subindexes each worker receives and reactivates (red) the ghost edges whose ends are both on it ( 𝑣 5–𝑣 7 and 𝑣 6–𝑣 7). 
+
+Extending to HNSW. HorizANN repartitions each HNSW index 
+
+𝐻 𝑖 by running Algorithm 1 on every layer independently, with 𝐺 𝑖 
+
+taken to be its layer-𝑙 graph 𝐺 (𝑙 ) 
+
+> 𝑖
+
+. We write 𝐻 𝑖 |𝑗 for the subindex of 
+
+𝐻 𝑖 assigned to worker 𝑗 , which consists of the layer graphs 𝐺 (𝑙 ) 
+
+> 𝑖
+
+|𝑗 .All layers of a vector 𝑣 go to the same worker 𝜋 ′ (𝑣 ), so 𝑣 ’s level ℓ (𝑣 )
+
+remains unchanged. Merge prunes each layer to its own degree bound: 2 𝑀 edges on 𝐿 0 and 𝑀 on the upper layers. Besides running Split and Merge on every layer, HorizANN needs two additional steps. First, a vector in 𝐻 𝑖 |𝑗 has no active 𝐿 0 edge if none of its 𝐿 0
+
+neighbors falls into 𝐻 𝑖 |𝑗 . After the transfer, worker 𝑗 holds 𝐻 𝑖 |𝑗 and reinserts such vectors into it before Merge. Second, each worker 𝑗 
+
+sets the entry point of 𝐻 ′ 
+
+> 𝑗
+
+to one of its highest-level vectors. 
+
+Ghost Edge Storage. Ghost edges are stored on disk and used only during repartitioning, to save memory during normal operation. For each vertex 𝑣 , we store pairs (𝑢, 𝑑 (𝑣, 𝑢 )) where 𝑑 (𝑣, 𝑢 ) is the distance between 𝑢 and 𝑣 . On each layer, a vertex keeps at most as many ghost edges as its degree bound (2 𝑀 on 𝐿 0 and 𝑀 above). 
+
+## 5.3 Dynamic Repartition Actuators 
+
+HorizANN repartitions the index in two cases: the cluster automat-ically adds a worker when a partition exceeds the size threshold 𝜏 ,and an operator can also add or remove a worker manually. 
+
+Worker Addition. Adding a worker proceeds in three steps. Firstly, the main node maintains a sample of vectors via reservoir sampling [39] from the input stream and runs balanced 𝑘 -means on it to compute 𝑘 +1 centers and broadcasts to all workers. Secondly, each worker derives the new assignment 𝜋 ′ from these centers and repar-titions its index 𝐻 𝑖 under 𝜋 ′ (§5.2); only vectors whose assignment changes leave their worker. Lastly, workers update vector counts. The main node updates the routing index to include the new worker. 
+
+Worker Removal. Removing a worker follows the similar proce-dure as adding with reversed data flow. The main node computes 
+
+𝑘 −1 centers. The departing worker splits its index and distributes subindexes to remaining workers. After remaining workers merges received subindexes, the departing worker deregisters. 
+
+## 5.4 Online Repartition 
+
+To keep serving queries during repartitioning, we extend the design in §5.3 into an online protocol, under which each query is answered entirely by the indexes either before or after repartitioning. Taking worker addition as an example, we describe the protocol below. 
+
+Repartitioning Protocol Design. The key idea is to assign each query an epoch , the version of the indexes that serves it. The main node tags each query on arrival with the epoch of its current routing index, and each worker answers the query with its index of that epoch. While the cluster moves from epoch 𝑒 to 𝑒 +1, the main node and every worker keep their indexes of both epochs, so queries tagged with 𝑒 keep using the old indexes while the new ones are built. The protocol performs this move in three stages, starting once the workers receive the new centers (§5.3): 
+
+• Prepare. Each worker loads its ghost edges and runs Split, which only reads its current index 𝐻 𝑖 , so 𝐻 𝑖 keeps serving epoch 
+
+𝑒 ; the worker writes the outgoing subindexes to disk and starts its staged index 𝐻 ′ 
+
+> 𝑖
+
+from 𝐻 𝑖 |𝑖 . Meanwhile, the main node prepares the routing index of epoch 𝑒 +1 by relabeling each sampled vector 
+
+𝑥 with 𝜋 ′ (𝑥 ), leaving routing index of epoch 𝑒 unchanged. 
+
+• Transfer and commit. Once every worker has prepared, each worker 𝑖 transfers its outgoing subindexes and merges the in-coming ones into its staged index 𝐻 ′ 
+
+> 𝑖
+
+(Algorithm 1). Once all workers have finished merging, each worker commits its staged index 𝐻 ′ 
+
+> 𝑖
+
+as its new index for epoch 𝑒 +1, while keeping 𝐻 𝑖 for the queries still routed under epoch 𝑒 . The main node then switches the routing index to epoch 𝑒 +1 and waits for the in-flight queries of 𝑒 to finish, after which the third stage begins. 
+
+• Retire and persist. Each worker free its old index 𝐻 𝑖 and persist the ghost edges of new index 𝐻 ′ 
+
+> 𝑖
+
+, and the main node drops the routing index of epoch 𝑒 and refreshes the vector counts. Since queries move to epoch 𝑒 +1 only when the main node switches its routing index, a failure before that point is simple to undo. The main node aborts epoch 𝑒 +1 and the workers drop their staged indexes 𝐻 ′ 
+
+> 𝑖
+
+.
+
+Insertion during Repartitioning. The main node buffers inser-tions that arrive during repartitioning and replays them through the normal insertion path (§4.2) once the new indexes are committed,                         
+
+> 7100 200 300 400 500 600 700 800 900 1000 10 1
+> 10 2
+> 10 3
+> OOM Timeout (24 h)
+> Total Inserted vectors (M) Time Per-Phase (min)  SIFT1B
+> HorizANN Harmony SPTAG
+> 100 200 300 400 500 600 700 800 900 1000 10 1
+> 10 2
+> 10 3
+> OOM Timeout (24 h)
+> Total Inserted vectors (M) SPACEV1B
+> HorizANN Harmony SPTAG
+> 100 200 300 400 500 600 700 800 900 1000 10 1
+> 10 2
+> 10 3
+> OOM Timeout (24 h)
+> Total Inserted vectors (M) IBM1B
+> HorizANN Harmony SPTAG
+
+Figure 6: Incremental insertion on three 1B datasets. HorizANN maintains consistent per-phase insertion time (within 49–148 minutes). In contrast, Harmony encounters out-of-memory (OOM) errors, while SPTAG experiences timeouts. Table 2: Datasets used in evaluation.                     
+
+> Dataset Source Size Dim. Type Queries
+> SIFT INRIA 1B 128 uint8 10,000 SPACEV Big-ANN’21 1B 100 int8 10,000 IBM1B Real embeddings 1B 128 int8 10,000
+
+so that they are inserted into the new indexes and sampled into the routing index like any other insertion. 
+
+## 6 EVALUATION 
+
+We evaluate HorizANN on billion-scale datasets, comparing against state-of-the-art distributed vector search systems. Our experiments reveal the following findings: 
+
+• Incremental Insertion. During incremental index construc-tion from 0 to 1B vectors, HorizANN consistently inserts each successive 100M vectors in 49–148 minutes while baselines fail to insert all vectors. (§6.2) 
+
+• Higher Search Performance. HorizANN achieves the highest QPS at every Recall@10 up to 0.99 on all three datasets, with 2.1–3.9 × the QPS of SPTAG and 9–21 × that of Harmony at Recall@10 = 0.95. (§6.3) 
+
+• Horizontal Scalability. As the cluster grows from 1 to 10 work-ers and the index grows from 100M to 1B vectors, HorizANN 
+
+achieves a 2.4–3 × increase in query throughput while maintain-ing consistent recall across cluster sizes. (§6.4) 
+
+• Repartitioning Efficiency. Growing the index from 0 to 500M vectors and from 1 to 6 workers, repartitioning takes 15% of total build time, and at most 14 minutes in one pass. (§6.5) 
+
+• Online Repartitioning. HorizANN keeps serving queries dur-ing repartitioning: when 500M vectors are repartitioned from 5 to 6 workers, throughput averages 84% of its pre-repartitioning level and Recall@10 stays at 0.98. (§6.6) 
+
+• Bounded Per-Worker Memory. As the index grows to 1B vectors, each worker’s peak memory stays below 214 GiB, and ghost edges add at most 16% to the index memory. (§6.7) 
+
+## 6.1 Experimental Setup 
+
+Hardware. All experiments run on CloudLab [17] using c6320 nodes at the Clemson cluster, each with two 14-core Intel Xeon E5-2683 v3 CPUs (2.0 GHz, 28 cores total), 256 GiB RAM, and two 1 TB SATA HDDs, connected via 10 Gbps Ethernet. We use 12 machines for billion-scale datasets. 
+
+Datasets. Table 2 presents the datasets. SIFT [29] and SPACEV [36] are standard billion-scale benchmarks. We further generate IBM1B, a synthetic dataset of 1 billion 128-dimensional vectors sampled from a Gaussian Mixture Model with 300 components which learnt from real world embeddings. 
+
+Baselines. We compare against two distributed vector search sys-tems. SPTAG [9] is Microsoft’s ANN library; we use its SPFresh [46] index, which organizes vectors into posting lists via SPANN-style [10] hierarchical balanced clustering and supports in-place updates. For a fair comparison, we place SPTAG ’s on-disk index on a 180–200 GiB RAM disk (sized per dataset) on each worker, so that its entire index resides in memory. Harmony [45] partitions data using a hy-brid of dimension-based and vector-based strategies with adaptive query routing. 
+
+Hyperparameters. All workers build HNSW indexes with 𝑀 =32 and ef con =200. We vary ef search (default 500) and routing fan-out 
+
+𝑘 seed (default 10) to trace QPS–recall curves. We report Recall@10 and throughput in queries per second (QPS), measuring over 10K queries with brute-force ground truth. 
+
+## 6.2 Index Build Time 
+
+This experiment aims to show that HorizANN efficiently indexes a growing dataset incrementally as the cluster expands, which existing systems fail to do. 
+
+Setup. We grow each index from 0 to 1B vectors in ten phases of 100M vectors each. HorizANN starts with a single worker; after each phase except the last, we add one worker and trigger reparti-tioning, so the cluster grows from 1 to 10 workers. The reported insertion time includes repartitioning time. In addition, we use batch insertion with a batch size of 5K. For Harmony , as it does not support incremental insertion, we conduct a bulk build at each phase with the same number of workers as HorizANN . For SPTAG ,we extend it so that each worker builds an initial index on half of its shard and incrementally inserts the other half in batches via SPFresh’s in-place updates. The reported insertion time includes SPFresh’s background split time. We disable the reassignment for faster insertion and insert all 100M vectors in one phase to a specific worker with a batch size of 10K. For each phase, Figure 6 reports          
+
+> 80.85 0.90.95 110 10 2
+> 10 3
+> 10 4
+> 10 5
+> Recall@10 QPS SIFT100M
+> HorizANN Harmony SPTAG
+> 0.85 0.90.95 110 10 2
+> 10 3
+> 10 4
+> 10 5
+> OOM
+> Recall@10 SPACEV100M
+> HorizANN Harmony SPTAG
+> 0.85 0.90.95 110 10 2
+> 10 3
+> 10 4
+> 10 5
+> OOM
+> Recall@10 IBM100M
+> HorizANN Harmony SPTAG
+
+Figure 7: Recall@10–QPS trade-off on 100M-scale datasets (because baselines failed on 1B). HorizANN achieves the highest QPS on all three 100M-scale datasets up to a Recall@10 of 0.99, with 1.4–3.9 × the QPS of SPTAG and 5–27 × that of Harmony at 0.99. 
+
+the time to insert the next 100M vectors. We cap the time to build each full index at 24 hours. 
+
+Results. HorizANN inserts each 100M vectors in 49–148 minutes across the three datasets. More importantly, its per-phase time does not grow with the dataset size and worker counts. In contrast, both baselines fail to reach 1B vectors. SPTAG exceeds the 24-hour limit while inserting 300M vectors for SIFT1B and SPACEV1B, and 100M vectors for IBM1B. Harmony runs out of memory at 300M vectors on SIFT1B and IBM1B, and 400M on SPACEV1B. 
+
+Analysis. HorizANN keeps its per-phase time nearly consistent be-cause each worker will hold only about 100 million vectors through-out the entire insertion process. For example, after the last repar-titioning on IBM1B, worker sizes range from 78M to 104M. Each new 100M-vector block is spread over all current workers, so the insertion work per batch shrinks as the cluster grows, from 240 ms to 58 ms per 5K-vector batch on IBM1B between the first and the last phase. SPTAG cannot move vectors between shards, so a single worker must absorb each 100M-vector block while the other work-ers stay idle. On a single worker, SPFresh slows down as the shard grows. Building the initial index over the first 50M vectors already takes 7.8–8.6 hours, the time per 1M inserted vectors then rises from 88 s to 1,074 s on IBM1B as more vectors are inserted, waiting for background splits adds another 8.5 hours, so insertion on IBM1B reaches 24-hour cap in the first phase. Harmony has no incremental path, so each phase rebuilds the index over all vectors inserted so far. The build is dominated by assigning each vector to its nearest centroid (80–86% of the build time), which compares every vector against all √𝑁 centroids and thus grows as 𝑁 1.5; it runs on the main node alone, so it does not shrink as workers are added. Its main node also runs out of memory once the dataset reaches about 40B vector components (300M 128-dimensional vectors from SIFT1B and IBM1B, and 400M 100-dimensional vectors from SPACEV1B), regardless of the number of workers. 
+
+## 6.3 Search Performance 
+
+This experiment aims to show that HorizANN achieves higher search performance than existing distributed systems, despite its support for elasticity. 
+
+Setup. Because Harmony fails to build an index on any of the three 1B datasets, we evaluate search performance on the first 100M vectors of each dataset with 10 workers. For HorizANN , we perform queries in batches of 5K on the incrementally built index, and each worker searches in parallel on all its cores. We vary ef search and 
+
+𝑘 seed . For SPTAG , we bulk-build each shard’s index over its 10M vectors. Its client sends queries in 64 threads, and the aggregator forwards each query to every shard which serves requests with 28 threads. We vary SearchInternalResultNum , the number of postings each query searches on each shard. Harmony builds an IVF index with √𝑁 = 10 ,000 lists, takes the whole query set as one batch, and pipelines it in groups of 2,000 queries through 5 teams of 2 workers, each using all its cores. We vary 𝑛 probe only. Figure 7 presents the Recall@10–QPS curves. 
+
+Results. Up to a Recall@10 of 0.99, HorizANN achieves the highest Recall@10 at a given QPS, or equivalently, the highest QPS at a given Recall@10. Across the three datasets, at Recall@10 = 0.95, 
+
+HorizANN delivers 2.1–3.9 × the QPS of SPTAG and 9–21 × that of 
+
+Harmony . At 0.99, its advantage is 1.4–3.9 × over SPTAG and 5–27 ×
+
+over Harmony on SIFT100M and IBM100M, while Harmony cannot reach 0.98 on SPACEV100M before running out of memory. 
+
+Analysis. First, as demonstrated in §4.3, HorizANN partitions data with balanced k-means, so each worker holds a cluster of nearby vectors, and the main node routes each query only to the few partitions that hold its nearest routing samples. In con-trast, SPTAG broadcasts every query to all workers, therefore every query consumes work on every machine. Second, within a parti-tion HorizANN runs an in-memory graph search whose cost grows slowly with the search budget, whereas SPTAG and Harmony scan entire posting lists or IVF lists, whose cost grows linearly with 
+
+SearchInternalResultNum or 𝑛 probe . Across the three datasets, raising 𝑛 probe from 10 to 100 cuts Harmony ’s QPS by 5.1–6.1 ×,and raising SearchInternalResultNum from 8 to 96 cuts SPTAG ’s QPS by 2.4–3.1 ×, while HorizANN already exceeds 0.95 recall at its smallest ef search of 500 on all three datasets. 
+
+## 6.4 Scalability 
+
+This experiment aims to show that HorizANN ’s query throughput grows as workers are added, while its recall is preserved. 
+
+Setup. We apply the same incremental index building setup as §6.2. After the insertion of each phase ends, we run 10K queries to measure the throughput as QPS with default parameters. And we perform the additional search sweep at 100M, 200M, 500M and 1B vectors to measure the Recall@10–QPS curve in the same way as §6.3. Figure 8 reports the details.                
+
+> 9100 200 300 400 500 600 700 800 900 1000 0123·10 4
+> Indexed vectors (M) QPS SIFT1B SPACEV1B IBM1B
+> (a) QPS after each 100M-vector block is inserted.
+> 0.985 0.990 0.995 1.000 10 2
+> 10 3
+> 10 4
+> 10 5
+> Recall@10 QPS 100M 200M 500M 1B
+> (b) Recall@10–QPS curves on SIFT as the index grows.
+
+Figure 8: Scalability of HorizANN as the index grows from 100M to 1B vectors and the cluster from 1 to 10 workers. (a) Query throughput increases 2.4–3.0 × on the three datasets. (b) Recall@10 on SIFT1B stays consistent. 
+
+Results. The QPS increases 2.4 – 3.0 × from 100M to 1B vectors across three datasets (Figure 8a), which shows HorizANN can easily scale up to larger datasets and clusters. Four curves nearly over-lap with each other (Figure 8b), which means HorizANN ’s search performance won’t change as cluster and index sizes change. 
+
+Analysis. Because each query is routed to only a few workers and each worker’s index stays at about 100M vectors from 1 to 10 workers, each batch of 5K queries is spread over more workers at the same cost per query. As a result, the time the workers spend on a batch falls by 3.4–3.6 ×, which means the busiest worker’s share drops from all 5K queries to about 1.4–1.5K. End to end, a batch takes 0.56–1.18 s on 1 worker and 0.23–0.39 s on 10 workers. This is less than 3.4–3.6 × because each batch also spends 66–90 ms on routing, merging results and client communication. This part takes 6–14% of the batch time at 100M but 21–38% at 1B. In addition, as the cluster grows, the nearest neighbors of each query spread over more workers. To keep a comparable recall, a larger cluster needs a higher 𝑘 seed and ef search , which costs QPS. As analyzed above, the extra workers absorb this work, so the four curves in Figure 8b nearly overlap at high recall: at Recall@10 of 0.998, QPS stays at 3.4–3.5K from 100M to 1B. 
+
+## 6.5 Repartitioning Efficiency 
+
+This experiment aims to show that HorizANN repartitions its index quickly, at a small cost relative to index building. 
+
+Setup. We apply the same incremental index building setup as in §6.2. We build the index on SIFT1B up to 500M vectors (using up to             
+
+> 060 120 180 240 300 0100 200 300 400 500 600
+> 4.1min ( 7%)
+> 6.5min ( 12 %)
+> 10 .1min ( 15 %)
+> 12 .0min ( 18 %)
+> 14 .0min ( 22 %) Total repartitioning: 46 .7min ( 15 .1%)
+> Time (min) Inserted vectors (M)
+
+Figure 9: Insertion and repartitioning of HorizANN on the first 500M vectors of SIFT1B. Each bar is one repartitioning, labelled with its duration and its share of the phase. Each repartitioning finishes within 14 minutes, and together they take 15% of the total build time to 500M vectors. Table 3: Repartitioning time on SIFT by phase, in seconds. Planning on the main node (sampling and balanced 𝑘 -means, 1–4 s) is not included. Transfer & commit takes 53–64% of each repartitioning, and every stage grows with the index as ghost edges accumulate. †Measured while queries ran con-tinuously (discussed in §6.6).                         
+
+> Vectors Prepare Transfer & commit Retire & persist Total (s) 100M 66.7 156.1 21.5 244.3 200M 95.8 243.4 48.2 387.4 300M 139.3 388.2 78.7 606.2 400M 166.8 460.0 91.5 718.2 500M †254.7 446.4 135.0 836.1
+
+6 worker nodes) and record the repartitioning time for each 100M vector phase. 
+
+Results. Figure 9 presents the absolute time of repartitioning in minutes and its share of each phase. The repartitioning time grows from 4 minutes (100M vectors) to 14 minutes (500M vectors), and it takes from 7% of total insertion time to 22% of total insertion time. Table 3 shows the stage-wise time consumption of repartitioning in each phase. Transfer & commit accounts for the largest share of repartitioning time, during which workers stream split subindexes to one another and merge incoming subindexes. 
+
+Analysis. Repartitioning time grows with the dataset size, mainly because the number of ghost edges grows. As described in §4.2, 
+
+HorizANN inserts each vector into its resident worker, and uses the routing index to find other workers that may hold its nearest neigh-bors. It searches these workers for the vector’s nearest neighbors and builds ghost edges, which are stored on its resident worker. Therefore, the number of vectors with ghost edges on each worker keeps increasing. On the first worker, the share of vectors with ghost edges grows from 14% after the repartitioning at 100M to 59% after the one at 500M, and its ghost store grows from 0.5 to 17 GiB. As a result, each worker spends more time loading ghost edges from disk ( Prepare ), activating the ghost edges of each vector while merging indexes (line 15 in Algorithm 1, Transfer & commit ), and persisting them back to disk ( Retire & persist ). 
+
+Limitation. Repartitioning takes about 2.5 more minutes with ev-ery 100M vectors, while the insertion time of a phase stays flat (§6.2).            
+
+> 10 −50510 15 20 0510 15 20 Repartitioning 123456
+> Time since repartitioning started (min) QPS (K)
+
+Figure 10: Query throughput of HorizANN around the repar-titioning at 500M vectors of SIFT1B, from 6 minutes before it starts to 6 minutes after it ends. Boxes 1 – 6 mark the throughput valleys. On average, HorizANN retains 84% of its pre-repartitioning QPS while repartitioning. 
+
+With far more vectors or workers (e.g., 10B vectors or 50 workers), repartitioning will eventually take longer than insertion in some phase. Dropping ghost edges that are unlikely to be reactivated could bound this cost, which we leave to future work. 
+
+## 6.6 Online Repartitioning 
+
+This experiment aims to show that HorizANN sustains high query throughput and recall while repartitioning. 
+
+Setup. We apply the same setup as in §6.5. During the repartition-ing phase at 500M vectors, we continuously issue queries from a client and record the QPS prior to repartitioning for 6 minutes. Next, we initiate the repartitioning process to add the sixth worker, while maintaining the ongoing query operations from the client. Once repartitioning is complete, we conduct another 6-minute period to measure the QPS following the repartitioning (all measured under default parameters). 
+
+Results. Figure 10 shows the query throughput before, during, and after repartitioning on 500M vectors. HorizANN answer queries during repartitioning with 11.7K QPS on average (84% of the 14.0K QPS before repartitioning), while Recall@10 stays at 0.98. And there are several QPS drops (marked as 1 – 6 ). 
+
+Analysis. Search and repartitioning share the CPU cores of each worker, so throughput drops whenever workers run a compute-heavy repartitioning step. In 1 , all five workers split their index at the same time. In 2 and 3 , workers copy the vectors they keep into a new index, four workers at once in 2 , and the last one in 3 . In 4 , transfer starts and every worker merges the vectors it receives at the same time. In 5 , two workers merge the largest pieces they receive. Outside these drops, throughput stays at 93– 94% of its pre-repartitioning level: loading and saving ghost edges are primarily disk-bound rather than CPU-bound, and after 5 , only the new worker continues merging and does not yet serve queries. Finally, 6 corresponds to the main node switching to the new routing index, so throughput falls below 1K QPS for a moment right after the switch. Subsequently, as worker nodes release the old index, throughput drops again.                 
+
+> Worker mean Worker min–max Node RAM SIFT1B SPACEV1B IBM1B
+> 250 500 750 1000 064 128 192 256
+> Indexed vectors (M) Peak mem. (GiB)
+> (a) SIFT1B
+> 250 500 750 1000 064 128 192 256
+> Indexed vectors (M) Peak mem. (GiB)
+> (b) SPACEV1B
+> 250 500 750 1000 064 128 192 256
+> Indexed vectors (M) Peak mem. (GiB)
+> (c) IBM1B
+> 250 500 750 1000 0510 15 20
+> Indexed vectors (M) Overhead (%)
+> (d) Ghost edges
+
+Figure 11: Memory consumption of HorizANN as the in-dexed collection grows. (a)–(c): peak memory per worker (line: mean; band: min–max across workers); the dashed line marks the memory of one node. (d): ghost-edge memory rel-ative to index memory, summed over all workers except the first and last phases. As the index grows 10 × to 1B vectors, the mean per-worker peak memory grows only 1.8 × and stays within 83% of a node’s RAM. Ghost edges add 11–16% mem-ory overhead from 400M vectors onward. 
+
+## 6.7 Memory Usage 
+
+This experiment aims to show that HorizANN keeps per-worker memory bounded as the index grows, with a low memory overhead from ghost edges. 
+
+Setup. We apply the same incremental index building setup as §6.2. For each worker, we track the peak memory usage reached since its startup; this value is read at the end of repartitioning in each phase. We also measure the ghost edges memory overhead, by recording the memory consumption right before and after loading ghost edges for each worker. So the ghost edges overhead is the total extra memory that loading adds on all workers, divided by their total memory before loading. 
+
+Results. Figure 11a–Figure 11c show the trends of per-worker peak memory as the index grows on three datasets. The highest per-worker peak across all phases is 207 GiB on SIFT1B, 213 GiB on SPACEV1B and 204 GiB on IBM1B, at most 83% of the 256 GiB node RAM; this peak is reached in the repartitioning after 800M vectors (600M on IBM1B). From 100M to 1B vectors, the mean per-worker peak grows about 1.8 × from 84–90 GiB to 153–166 GiB, while the dataset grows by 10 ×. Figure 11d shows the memory overhead of ghost edges. From 400M vectors onward, ghost edges add 11–16% to the workers’ memory, and this does not grow as workers join. 
+
+Analysis. A worker usually reaches its peak memory while merg-ing the index pieces it receives, at a median of 50–60 GiB above its 
+
+> 11
+
+memory at the end of insertion. As described in §5.4, while merging, the worker still keeps its old index to serve queries, in addition to the staged index and the index piece it is merging. This extra memory is released once the old index is retired. The share of ghost edges in memory stays about the same: although ghost edges keep growing (§6.5), the index grows at the same pace. 
+
+## 7 RELATED WORK 
+
+We organize related work into single-node vector indexes whose graph structures, streaming update mechanisms, and clustering designs inform our local worker architecture (§7.1), and distributed vector search systems spanning sharded, global-graph, and hybrid partitioning paradigms (§7.2). 
+
+## 7.1 Single-Node Systems 
+
+Graph-Based Indexes. Graph-based indexes answer queries by greedy traversal over neighbor links and lead in-memory ANNS in recall and throughput [3, 5, 42]. In-memory designs include NSG [18] and HNSW [32], while disk-resident designs such as DiskANN [27] and Starling [41] store the graph on SSD to reach bil-lion scale on one machine. These systems provide the foundational index structure that HorizANN distributes across workers. 
+
+Incremental Indexing. Streaming graph indexes either buffer in-sertions and periodically merge them into the on-disk graph [37] or update the graph in place [20, 44]. Deletions and updates further require repairing neighbor links, since frequent updates otherwise leave vertices unreachable [43, 44]. These repairs are confined to a single graph on one machine. HorizANN ’s ghost edges instead preserve cross partition links as vectors migrate between workers. 
+
+Cluster-Based Indexes. IVF-style indexes such as SPANN [10] keep centroids in memory and posting lists on disk. Because vectors in different clusters share no edges, these indexes can cheaply split and merge clusters online to handle updates and query skew [33, 34, 46]. HorizANN adopts a similar split/merge pattern, inspired by SPFresh’s LIRE [46], but must additionally preserve graph edges that cross partition boundaries. 
+
+## 7.2 Distributed Systems 
+
+Sharded Approaches. Sharded approaches partition the dataset and build an independent index per partition [4, 13, 16]. Their recall depends on partitioning and routing, which prior work improves by co-locating near neighbors [15, 19, 21] and by routing with centroid indexes [13] or error bounds [50]. However, they assume static partitions, whereas HorizANN repartitions dynamically and keeps its router up-to-date via reservoir sampling [39]. 
+
+Global Graph Approaches. Global graph approaches build one graph over all vectors and spread it across machines [1, 49, 51] or a disaggregated memory pool [26]. Search hops therefore cross ma-chines. Prior work reduces the communication cost with RDMA [51], asynchronous I/O [49], or near-data processing [26]. However, re-mote hops remain on the search path. HorizANN instead keeps each local search within one worker and retains cross-worker edges as ghost edges without traversing them. 
+
+Hybrid Approaches. SPIRE [47] introduces a hierarchical IVF structure with accuracy-preserving recursive construction. It iden-tifies a balanced partition granularity to avoid read-cost explosion. However, SPIRE uses a proximity graph only at the root level to route queries, while its leaf partitions are IVF-style posting lists on SSD that are scanned rather than traversed. Harmony [45] takes a different approach, combining dimension-based and vector-based partitioning to balance workloads under skewed query distribu-tions. Its cost model adaptively selects partitioning strategies per query, achieving high throughput across diverse workloads. How-ever, Harmony uses static partitioning without support for dynamic repartitioning or incremental updates. 
+
+## 8 CONCLUSION 
+
+We presented HorizANN , a distributed graph-based ANNS system that achieves horizontal elasticity without full index reconstruc-tion. By introducing ghost edges to retain cross-partition proximity relationships on disk with zero search-time overhead, HorizANN 
+
+enables an online split-and-merge repartitioning protocol that reac-tivates dormant edges as partition boundaries shift, paired with a lightweight reservoir-sampled seed index for selective query rout-ing. Across three billion-scale datasets, HorizANN scales incremen-tally from 1 to 10 workers with stable per-phase insertion times while existing systems time out or exhaust memory, delivers up to 3.9 × and 27 × higher query throughput than SPTAG and Har-mony at Recall@10 of 0.99, achieves 2.4–3.0 × throughput scale-up with consistent accuracy, and sustains query throughput across repartitioning with at most 16% ghost-edge memory overhead. 
+
+## REFERENCES                             
+
+> [1] Philip Adams, Menghao Li, Shi Zhang, Li Tan, Qi Chen, Mingqin Li, Zengzhong Li, Knut Risvik, and Harsha Vardhan Simhadri. 2025. DISTRIBUTEDANN: Ef-ficient Scaling of a Single DISKANN Graph Across Thousands of Computers. arXiv:2509.06046 [cs.DC] https://arxiv.org/abs/2509.06046 [2] Alexandr Andoni, Piotr Indyk, Thijs Laarhoven, Ilya Razenshteyn, and Ludwig Schmidt. 2015. Practical and optimal LSH for angular distance. In Proceedings of the 29th International Conference on Neural Information Processing Systems - Vol-ume 1 (Montreal, Canada) (NIPS’15) . MIT Press, Cambridge, MA, USA, 1225–1233. [3] Martin Aumüller, Erik Bernhardsson, and Alexander Faithfull. 2020. ANN-Benchmarks: A benchmarking tool for approximate nearest neighbor algorithms.
+> Inf. Syst. 87, C (Jan. 2020), 13. https://doi.org/10.1016/j.is.2019.02.006 [4] Ilias Azizi, Karima Echihabi, and Themis Palpanas. 2023. ELPIS: Graph-Based Similarity Search for Scalable Data Science. Proc. VLDB Endow. 16, 6 (Feb. 2023), 1548–1559. https://doi.org/10.14778/3583140.3583166 [5] Ilias Azizi, Karima Echihabi, and Themis Palpanas. 2025. Graph-Based Vector Search: An Experimental Evaluation of the State-of-the-Art. Proc. ACM Manag. Data 3, 1, Article 43 (Feb. 2025), 31 pages. https://doi.org/10.1145/3709693 [6] Dmitry Baranchuk, Artem Babenko, and Yury Malkov. 2018. Revisiting the Inverted Indices for Billion-Scale Approximate Nearest Neighbors. In Computer Vision – ECCV 2018: 15th European Conference, Munich, Germany, September 8–14, 2018, Proceedings, Part XII (Munich, Germany). Springer-Verlag, Berlin, Heidelberg, 209–224. https://doi.org/10.1007/978-3-030-01258-8_13 [7] Jon Louis Bentley. 1975. Multidimensional binary search trees used for associative searching. Commun. ACM 18, 9 (Sept. 1975), 509–517. https://doi.org/10.1145/ 361002.361007 [8] Sebastian Borgeaud, Arthur Mensch, Jordan Hoffmann, Trevor Cai, Eliza Ruther-ford, Katie Millican, George Bm Van Den Driessche, Jean-Baptiste Lespiau, Bog-dan Damoc, Aidan Clark, Diego De Las Casas, Aurelia Guy, Jacob Menick, Roman Ring, Tom Hennigan, Saffron Huang, Loren Maggiore, Chris Jones, Albin Cas-sirer, Andy Brock, Michela Paganini, Geoffrey Irving, Oriol Vinyals, Simon Osindero, Karen Simonyan, Jack Rae, Erich Elsen, and Laurent Sifre. 2022. Im-proving Language Models by Retrieving from Trillions of Tokens. In Proceed-ings of the 39th International Conference on Machine Learning (Proceedings of Machine Learning Research) , Kamalika Chaudhuri, Stefanie Jegelka, Le Song, Csaba Szepesvari, Gang Niu, and Sivan Sabato (Eds.), Vol. 162. PMLR, 2206–2240. https://proceedings.mlr.press/v162/borgeaud22a.html
+> 12
+
+[9] Qi Chen, Haidong Wang, Mingqin Li, Gang Ren, Scarlett Li, Jeffery Zhu, Jason Li, Chuanjie Liu, Lintao Zhang, and Jingdong Wang. 2018. SPTAG: A library for fast approximate nearest neighbor search . Retrieved October 31, 2026 from https://github.com/Microsoft/SPTAG [10] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li, Mao Yang, and Jingdong Wang. 2021. SPANN: highly-efficient billion-scale approximate nearest neighbor search. In Proceedings of the 35th International Conference on Neural Information Processing Systems (NIPS ’21) . Curran Associates Inc., Red Hook, NY, USA, Article 398, 14 pages. [11] Paul Covington, Jay Adams, and Emre Sargin. 2016. Deep Neural Networks for YouTube Recommendations. In Proceedings of the 10th ACM Conference on Recommender Systems (Boston, Massachusetts, USA) (RecSys ’16) . Association for Computing Machinery, New York, NY, USA, 191–198. https://doi.org/10.1145/ 2959100.2959190 [12] Sanjoy Dasgupta and Yoav Freund. 2008. Random projection trees and low dimensional manifolds. In Proceedings of the Fortieth Annual ACM Symposium on Theory of Computing (Victoria, British Columbia, Canada) (STOC ’08) . Association for Computing Machinery, New York, NY, USA, 537–546. https://doi.org/10. 1145/1374376.1374452 [13] Shiyuan Deng, Xiao Yan, K.W. Ng Kelvin, Chenyu Jiang, and James Cheng. 2019. Pyramid: A General Framework for Distributed Similarity Search on Large-scale Datasets. In 2019 IEEE International Conference on Big Data (Big Data) . 1066–1071. https://doi.org/10.1109/BigData47090.2019.9006219 [14] Wei Dong, Charikar Moses, and Kai Li. 2011. Efficient k-nearest neighbor graph construction for generic similarity measures. In Proceedings of the 20th International Conference on World Wide Web (Hyderabad, India) (WWW ’11) .Association for Computing Machinery, New York, NY, USA, 577–586. https: //doi.org/10.1145/1963405.1963487 [15] Yihe Dong, Piotr Indyk, Ilya Razenshteyn, and Tal Wagner. 2020. Learning Space Partitions for Nearest Neighbor Search. arXiv:1901.08544 [cs.LG] https: //arxiv.org/abs/1901.08544 [16] Ishita Doshi, Dhritiman Das, Ashish Bhutani, Rajeev Kumar, Rushi Bhatt, and Niranjan Balasubramanian. 2021. LANNS: a web-scale approximate nearest neighbor lookup system. Proc. VLDB Endow. 15, 4 (Dec. 2021), 850–858. https: //doi.org/10.14778/3503585.3503594 [17] Dmitry Duplyakin, Robert Ricci, Aleksander Maricq, Gary Wong, Jonathon Duerig, Eric Eide, Leigh Stoller, Mike Hibler, David Johnson, Kirk Webb, Aditya Akella, Kuangching Wang, Glenn Ricart, Larry Landweber, Chip Elliott, Michael Zink, Emmanuel Cecchet, Snigdhaswin Kar, and Prabodh Mishra. 2019. The Design and Operation of CloudLab. In 2019 USENIX Annual Technical Conference (USENIX ATC 19) . USENIX Association, Renton, WA, 1–14. https://www.usenix. org/conference/atc19/presentation/duplyakin [18] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast approximate nearest neighbor search with the navigating spreading-out graph. Proc. VLDB Endow. 12, 5 (Jan. 2019), 461–474. https://doi.org/10.14778/3303753.3303754 [19] Lars Gottesbüren, Laxman Dhulipala, Rajesh Jayaram, and Jakub Łącki. 2025. Unleashing Graph Partitioning for Large-Scale Nearest Neighbor Search. Proc. VLDB Endow. 18, 6 (Feb. 2025), 1649–1662. https://doi.org/10.14778/3725688. 3725696 [20] Hao Guo and Youyou Lu. 2026. OdinANN: Direct Insert for Consistently Stable Performance in Billion-Scale Graph-Based Vector Search. In 24th USENIX Confer-ence on File and Storage Technologies (FAST 26) . USENIX Association, Santa Clara, CA, 133–147. https://www.usenix.org/conference/fast26/presentation/guo [21] Gaurav Gupta, Tharun Medini, Anshumali Shrivastava, and Alexander J. Smola. 2022. BLISS: A Billion scale Index using Iterative Re-partitioning. In Proceedings of the 28th ACM SIGKDD Conference on Knowledge Discovery and Data Mining 
+
+(Washington DC, USA) (KDD ’22) . Association for Computing Machinery, New York, NY, USA, 486–495. https://doi.org/10.1145/3534678.3539414 [22] Talika Gupta, Yunqi Li, Aditya Kunte, Claire Lin, Supawit Chockchowwat, Daniel Waddington, Hubertus Franke, and Yongjoo Park. 2026. HorizANN: Source Code. Retrieved October 30, 2026 from https://github.com/illinoisdata/HorizANN-VLDB2027 [23] Kelvin Guu, Kenton Lee, Zora Tung, Panupong Pasupat, and Ming-Wei Chang. 2020. REALM: retrieval-augmented language model pre-training. In Proceedings of the 37th International Conference on Machine Learning (ICML’20) . JMLR.org, Article 368, 10 pages. [24] Jui-Ting Huang, Ashish Sharma, Shuying Sun, Li Xia, David Zhang, Philip Pronin, Janani Padmanabhan, Giuseppe Ottaviano, and Linjun Yang. 2020. Embedding-based Retrieval in Facebook Search. In Proceedings of the 26th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining (Virtual Event, CA, USA) (KDD ’20) . Association for Computing Machinery, New York, NY, USA, 2553–2561. https://doi.org/10.1145/3394486.3403305 [25] Piotr Indyk and Rajeev Motwani. 1998. Approximate nearest neighbors: towards removing the curse of dimensionality. In Proceedings of the Thirtieth Annual ACM Symposium on Theory of Computing (Dallas, Texas, USA) (STOC ’98) . Association for Computing Machinery, New York, NY, USA, 604–613. https://doi.org/10. 1145/276698.276876 [26] Junhyeok Jang, Hanjin Choi, Hanyeoreum Bae, Seungjun Lee, Miryeong Kwon, and Myoungsoo Jung. 2023. CXL-ANNS: Software-Hardware Collaborative Memory Disaggregation and Computation for Billion-Scale Approximate Nearest Neighbor Search. In 2023 USENIX Annual Technical Conference (USENIX ATC 23) .USENIX Association, Boston, MA, 585–600. https://www.usenix.org/conference/ atc23/presentation/jang [27] Suhas Jayaram Subramanya, Fnu Devvrit, Harsha Vardhan Simhadri, Ravishankar Krishnawamy, and Rohan Kadekodi. 2019. DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node. In Advances in Neural Information Pro-cessing Systems , H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett (Eds.), Vol. 32. Curran Associates, Inc. https://proceedings.neurips. cc/paper_files/paper/2019/file/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Paper.pdf [28] Herve Jegou, Matthijs Douze, and Cordelia Schmid. 2011. Product Quantization for Nearest Neighbor Search. IEEE Trans. Pattern Anal. Mach. Intell. 33, 1 (Jan. 2011), 117–128. https://doi.org/10.1109/TPAMI.2010.57 [29] Hervé Jégou, Romain Tavenard, Matthijs Douze, and Laurent Amsaleg. 2011. Searching in one billion vectors: re-rank with source coding. arXiv:1102.3828 [cs.IR] https://arxiv.org/abs/1102.3828 [30] Jon Kleinberg. 2000. The small-world phenomenon: an algorithmic perspective. In 
+
+Proceedings of the Thirty-Second Annual ACM Symposium on Theory of Computing 
+
+(Portland, Oregon, USA) (STOC ’00) . Association for Computing Machinery, New York, NY, USA, 163–170. https://doi.org/10.1145/335305.335325 [31] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-augmented generation for knowledge-intensive NLP tasks. In Proceedings of the 34th Inter-national Conference on Neural Information Processing Systems (Vancouver, BC, Canada) (NIPS ’20) . Curran Associates Inc., Red Hook, NY, USA, Article 793, 16 pages. [32] Yu A. Malkov and D. A. Yashunin. 2020. Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs. 
+
+IEEE Transactions on Pattern Analysis and Machine Intelligence 42, 4 (April 2020), 824–836. https://doi.org/10.1109/TPAMI.2018.2889473 [33] Jason Mohoney et al. 2024. Incremental IVF Index Maintenance for Streaming Vector Search. arXiv preprint arXiv:2411.00970 (2024). [34] Jason Mohoney, Devesh Sarda, Mengze Tang, Shihabur Rahman Chowdhury, Anil Pacaci, Ihab F. Ilyas, Theodoros Rekatsinas, and Shivaram Venkataraman. 2025. Quake: Adaptive Indexing for Vector Search. In 19th USENIX Symposium on Operating Systems Design and Implementation (OSDI 25) . USENIX Association, Boston, MA, 153–169. https://www.usenix.org/conference/osdi25/presentation/ mohoney [35] William Pugh. 1990. Skip lists: a probabilistic alternative to balanced trees. 
+
+Commun. ACM 33, 6 (June 1990), 668–676. https://doi.org/10.1145/78973.78977 [36] Harsha Vardhan Simhadri, George Williams, Martin Aumüller, Matthijs Douze, Artem Babenko, Dmitry Baranchuk, Qi Chen, Lucas Hosseini, Ravishankar Kr-ishnaswamy, Gopal Srinivasa, Suhas Jayaram Subramanya, and Jingdong Wang. 2022. Results of the NeurIPS’21 Challenge on Billion-Scale Approximate Nearest Neighbor Search. arXiv:2205.03763 [cs.LG] https://arxiv.org/abs/2205.03763 [37] Aditi Singh, Suhas Jayaram Subramanya, Ravishankar Krishnaswamy, and Har-sha Vardhan Simhadri. 2021. FreshDiskANN: A Fast and Accurate Graph-Based ANN Index for Streaming Similarity Search. arXiv preprint arXiv:2105.09613 
+
+(2021). [38] The Weaviate Authors. 2025. Weaviate: An open-source, cloud-native vector database . Retrieved October 31, 2026 from https://github.com/weaviate/weaviate [39] Jeffrey S. Vitter. 1985. Random sampling with a reservoir. ACM Trans. Math. Softw. 11, 1 (March 1985), 37–57. https://doi.org/10.1145/3147.3165 [40] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li, Xiangyu Wang, Xiangzhou Guo, Chengming Li, Xiaohai Xu, Kun Yu, Yuxing Yuan, Yinghao Zou, Jiquan Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang, Yihua Mo, Jun Gu, Ruiyi Jiang, Yi Wei, and Charles Xie. 2021. Milvus: A Purpose-Built Vector Data Management System. In Proceedings of the 2021 In-ternational Conference on Management of Data (Virtual Event, China) (SIGMOD ’21) . Association for Computing Machinery, New York, NY, USA, 2614–2627. https://doi.org/10.1145/3448016.3457550 [41] Mengzhao Wang, Weizhi Xu, Xiaomeng Yi, Songlin Wu, Zhangyang Peng, Xi-angyu Ke, Yunjun Gao, Xiaoliang Xu, Rentong Guo, and Charles Xie. 2024. Starling: An I/O-Efficient Disk-Resident Graph Index Framework for High-Dimensional Vector Similarity Search on Data Segment. Proceedings of the ACM on Management of Data 2, 1 (March 2024), 1–27. https://doi.org/10.1145/3639269 [42] Mengzhao Wang, Xiaoliang Xu, Qiang Yue, and Yuxiang Wang. 2021. A Com-prehensive Survey and Experimental Comparison of Graph-Based Approximate Nearest Neighbor Search. arXiv:2101.12631 [cs.IR] https://arxiv.org/abs/2101. 12631 [43] Wentao Xiao, Yueyang Zhan, Rui Xi, Mengshu Hou, and Jianming Liao. 2024. Enhancing HNSW Index for Real-Time Updates: Addressing Unreachable Points and Performance Degradation. arXiv:2407.07871 [cs.IR] https://arxiv.org/abs/ 2407.07871 
+
+> 13
+
+[44] Haike Xu, Magdalen Dobson Manohar, Philip A. Bernstein, Badrish Chan-dramouli, Richard Wen, and Harsha Vardhan Simhadri. 2025. In-Place Up-dates of a Graph Index for Streaming Approximate Nearest Neighbor Search. arXiv:2502.13826 [cs.IR] https://arxiv.org/abs/2502.13826 [45] Qian Xu, Feng Zhang, Chengxi Li, Lei Cao, Zheng Chen, Jidong Zhai, and Xi-aoyong Du. 2025. HARMONY: A Scalable Distributed Vector Database for High-Throughput Approximate Nearest Neighbor Search. Proc. ACM Manag. Data 3, 4, Article 249 (Sept. 2025), 28 pages. https://doi.org/10.1145/3749167 [46] Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li, Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, and Mao Yang. 2023. SPFresh: Incremental In-Place Update for Billion-Scale Vector Search. In Proceedings of the 29th Symposium on Operating Systems Principles (Koblenz, Germany) (SOSP ’23) . Association for Computing Machinery, New York, NY, USA, 545–561. https: //doi.org/10.1145/3600006.3613166 [47] Yuming Xu, Qianxi Zhang, Qi Chen, Baotong Lu, Menghao Li, Philip Adams, Mingqin Li, Zengzhong Li, Jing Liu, Cheng Li, and Fan Yang. 2025. Scal-able Distributed Vector Search via Accuracy Preserving Index Construction. arXiv:2512.17264 [cs.DC] https://arxiv.org/abs/2512.17264 [48] Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William Cohen, Ruslan Salakhutdinov, and Christopher D. Manning. 2018. HotpotQA: A Dataset for Diverse, Explainable Multi-hop Question Answering. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing , Ellen Riloff, David Chiang, Julia Hockenmaier, and Jun’ichi Tsujii (Eds.). Association for Computational Linguistics, Brussels, Belgium, 2369–2380. https://doi.org/10. 18653/v1/D18-1259 [49] Kun Yu, Jiabao Jin, Xiaoyao Zhong, Peng Cheng, Lei Chen, Zhitao Shen, Jingkuan Song, Hengtao Shen, and Xuemin Lin. 2025. Approximate Nearest Neighbor Search of Large Scale Vectors on Distributed Storage. arXiv:2510.17326 [cs.DB] https://arxiv.org/abs/2510.17326 [50] Zili Zhang, Chao Jin, Linpeng Tang, Xuanzhe Liu, and Xin Jin. 2023. Fast, Ap-proximate Vector Queries on Very Large Unstructured Datasets. In 20th USENIX Symposium on Networked Systems Design and Implementation (NSDI 23) . USENIX Association, Boston, MA, 995–1011. https://www.usenix.org/conference/nsdi23/ presentation/zhang-zili [51] Xiangyu Zhi, Meng Chen, Xiao Yan, Baotong Lu, Hui Li, Qianxi Zhang, Qi Chen, and James Cheng. 2026. CoTra: Towards Efficient and Scalable Distributed Vector Search with RDMA. Proc. ACM Manag. Data 4, 1, Article 20 (April 2026), 27 pages. https://doi.org/10.1145/3786634
