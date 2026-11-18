@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-17</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-18</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 10 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 14 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>6</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>10</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-17 02:28:29 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-18 01:41:56 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>2026-11-17 日报共整理10篇论文，其中精读4篇、速读6篇，重点覆盖文档编辑智能体与向量检索扩容。最值得关注的是《WordInferBench》对“智能体能否从Word上下文推断编辑方式”的评估，以及《HorizANN》用幽灵边弹性扩容向量搜索；想深入可先精读这两篇9分论文，普通读者可顺手翻看Omni-Workspace和ControlHarbor两份基准速览。</p>
+<p>今日完成 14 篇论文筛选，精读 4 篇、速读 10 篇，重点集中在检索索引与向量查询优化。最值得看的是 UniGraph（9.0/10）提出的动态稠密-稀疏统一图索引，以及 CapCover Filter（8.0/10）的语义近似成员查询思路。普通读者可先读这两篇精读，再用速读中的智能体评测类论文补充应用视角。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -81,9 +81,9 @@
     <strong class="dpr-home-dashboard-count">4 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="WordInferBench: Can Agents Infer How to Edit from Word Document Context?">WordInferBench: Can Agents Infer How to Edit from Word Document Context?</span></li><li><span class="dpr-home-dashboard-paper-title" title="HorizANN: Elastically Scaling Vector Search with Ghost Edges">HorizANN: Elastically Scaling Vector Search with Ghost Edges</span></li><li><span class="dpr-home-dashboard-paper-title" title="We Are What We Remember: Mental-State-Driven Memory for Long-Term Character Dialogue">We Are What We Remember: Mental-State-Driven Memory for Long-Term Character Dialogue</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="UniGraph: A Unified Graph-based Index for Dynamic Hybrid Dense-Sparse Vector Retrieval">UniGraph: A Unified Graph-based Index for Dynamic Hybrid Dense-Sparse Vector Retrieval</span></li><li><span class="dpr-home-dashboard-paper-title" title="CapCover Filter: Semantic Approximate Membership Queries over Embeddings">CapCover Filter: Semantic Approximate Membership Queries over Embeddings</span></li><li><span class="dpr-home-dashboard-paper-title" title="HEAMS: Holistic Evaluation of Agent Memory Systems">HEAMS: Holistic Evaluation of Agent Memory Systems</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>2</strong></span><span class="dpr-home-dashboard-tag">agent <strong>1</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>2</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +91,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">6 篇</strong>
+    <strong class="dpr-home-dashboard-count">10 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Omni-Workspace: Benchmarking Omni-Modal AI Assistants on Multimodal Workspace Tasks">Omni-Workspace: Benchmarking Omni-Modal AI Assistants on Multimodal Workspace Tasks</span></li><li><span class="dpr-home-dashboard-paper-title" title="ControlHarbor: A Benchmark for Control Design by Coding Agents">ControlHarbor: A Benchmark for Control Design by Coding Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Interpreting Coding Agents Through Their Behavioral Trajectories">Interpreting Coding Agents Through Their Behavioral Trajectories</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Orbit AI: Evaluating Tool-Augmented Agents For Enterprise Question Answering">Orbit AI: Evaluating Tool-Augmented Agents For Enterprise Question Answering</span></li><li><span class="dpr-home-dashboard-paper-title" title="Behavioral Assurance for Socially Deployed AI Agents">Behavioral Assurance for Socially Deployed AI Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Bioformer-RetroMAE: retrieval-oriented pretraining of a compact biomedical language model for literature search">Bioformer-RetroMAE: retrieval-oriented pretraining of a compact biomedical language model for literature search</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>6</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 </div>
 

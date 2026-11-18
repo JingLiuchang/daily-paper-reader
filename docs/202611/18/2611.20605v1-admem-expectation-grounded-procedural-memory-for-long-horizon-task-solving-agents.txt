@@ -1,0 +1,543 @@
+Title: AdMem: Expectation-Grounded Procedural Memory for Long-Horizon Task-Solving Agents
+
+URL Source: https://arxiv.org/pdf/2611.20605v1
+
+Published Time: Tue, 17 Nov 2026 04:40:40 GMT
+
+Number of Pages: 20
+
+Markdown Content:
+# AdMem: Expectation-Grounded Procedural Memory for Long-Horizon Task-Solving Agents 
+
+Runzhe Wang 
+
+Princeton University 
+
+Huilin Lu 
+
+Amazon 
+
+Shengjie Liu 
+
+Amazon 
+
+Li Dong 
+
+Amazon 
+
+Zhihuai Zhu 
+
+Arm 
+
+# Abstract 
+
+An agent that carries memory across tasks is only as good as the entries it keeps. We begin from an observation that is easy to reproduce and uncomfortable for the field: naively accumulating cross-task experience can make an agent worse 
+
+than one with no memory at all. On AgentBoard, a workflow-induction memory solves fewer tasks than a memoryless ReAct agent in seven of eight domains, and a per-step procedural store with no surrounding structure loses half of ReAct’s completions on Jericho. We argue that the missing ingredients are per-action credit assignment and an explicit life cycle for stored entries, and present AdMem, which supplies both. Before each action the actor commits to an expected outcome; a concurrently running critic scores the realized outcome against that expectation and writes a procedural entry carrying a binary reward and a reflection, so credit lands on the action that earned it and no environment reward is required. Each entry then carries a scalar utility, updated online under a noisy-OR reward model, that ranks retrieval jointly with context similarity and drives eviction and merging, giving the store a forgetting and consolidation policy instead of unbounded growth. Across 707 tasks in eight AgentBoard domains AdMem solves 441 against 388 for ReAct and 312 for the workflow-induction baseline — a pooled gain significant under a two-sided Fisher exact test, concentrated in the domains that supply transferable cross-task structure. All memory stays human-readable text, which is what makes the failures above diagnosable — and, as we discuss, also makes the store an auditable but attackable surface. 
+
+# 1 Introduction 
+
+Large Language Models (LLMs) [Brown et al., 2020, Chowdhery et al., 2023, Guo et al., 2025, Touvron et al., 2023] have improved rapidly at reasoning and tool use, yet still struggle with long multi-turn tasks that require remembering, organizing, and applying knowledge across sessions or large inputs [Zhang et al., 2025]. Two research directions have emerged [Wu et al., 2025]: 
+
+architectural memory , built into the network through added layers or modules [Xu et al., 2026], and symbolic or textual memory that the model reads and writes explicitly. This paper is about the second, and specifically about a question the second direction makes it possible to ask: not how much experience an agent can store, but which of it is worth keeping. Parametric memory extends the model’s effective context: End-to-End Memory Networks [Sukhbaatar et al., 2015] introduced differentiable attention over an external memory, and later work [Berges et al., 2025, Behrouz et al., 2025, Munkhdalai et al., 2024] learns long-term memory modules that retain historical context while keeping training parallelizable. These buy speed and differentiability at the cost of inspectability: what has been remembered is distributed over weights or a compressive state, so it cannot be read, attributed, or deleted item by item. That trade-off is decisive here, because the central failure we report is an agent storing the wrong experience and re-using it: diagnosing it required reading the offending entries, and fixing it required a policy that can remove a specific one. We therefore keep every entry as readable text. 
+
+> 40th Conference on Neural Information Processing Systems (NeurIPS 2026). Workshop: Agents in the Wild: Safety, Security, and Beyond. arXiv:2611.20605v1 [cs.AI] 16 Nov 2026
+
+Textual stores are inspectable and tool-friendly, but need well-designed policies to be effective and bounded. Prior systems fine-tune models to read and write knowledge triples [Modarressi et al., 2025, 2023], foreground human control over adding, merging, and deleting entries [Huang et al., 2023], page virtual context with explicit CRUD [Packer et al., 2023], consolidate units extracted from running conversations [Chhikara et al., 2025, Zhou et al., 2026], decay episodic histories on a forgetting curve [Zhong et al., 2024], and compress context by learned overwriting or sub-task chunks [Yu et al., 2026, Hu et al., 2025]. As a group they already hold most of the vocabulary a memory life cycle needs — writing, consolidation, decay, deletion — but instantiate it for facts about the world and the user, where an entry’s value is roughly its correctness. Our entries are recommendations about how to act , whose value is whether following them helped, and that is not observable at write time. That gap is the domain of procedural memory: in the classical cognitive division [Tulving, 1985, Cohen et al., 1997, Wu et al., 2025] it holds knowledge of how to do things rather than the semantic and episodic content above. Cast into the language-agent setting [Sumers et al., 2023, Gao et al., 2026], the LLM is the decision maker and the prompt is its control flow, so procedural memory is whatever text conditions the next action. Agent Workflow Memory (AWM) [Wang et al., 2025] induces reusable workflows from past successes in web navigation [Deng et al., 2023, Zhou et al., 2024]; Mem p [Fang et al., 2026] distills experience into granular instructions and higher-level templates [Xie et al., 2024, Shridhar et al., 2021]; Buffer of Thoughts [Yang et al., 2024] stores distilled thought templates; and MIRIX [Wang and Chen, 2025] and Agent KB [Tang et al., 2025] organize structured memory types or strategy–log pairs under a multi-agent controller [Mialon et al., 2024, Jimenez et al., 2024]. A parallel line writes memory from evaluated outcomes rather than successes alone: Reflexion [Shinn et al., 2023] turns task failure into a verbal reflection, ExpeL [Zhao et al., 2024] accumulates insights from successful and failed trajectories, Generative Agents [Park et al., 2023] maintains a reflection hierarchy, and the most recent work — ReasoningBank [Ouyang et al., 2026], Memento [Zhou et al., 2025], and agentic context engineering [Zhang et al., 2026] — makes reusable reasoning strategy the stored unit. AdMem shares its goal with that line and differs in two specific ways that the rest of the paper is about. Where credit is assigned. These systems evaluate a trajectory or a task and write an entry from the verdict, so the reward is task-level and arrives once, after many actions — the credit-assignment problem in its usual form. AdMem instead requires the actor to state, before each action, what it expects that action to accomplish, and has a critic score the realized outcome against that expectation as soon as the relevant observations arrive. Credit lands on the action that earned it, with no environment reward needed. What happens to an entry afterwards. Where these systems do keep post-write bookkeeping — helpfulness counters, deduplication, a value per stored case — it is updated from the task-level verdict and is a separate quantity from the score retrieval ranks by. AdMem gives each procedural entry one scalar utility with an explicit probabilistic meaning — the probability that following it makes the current action succeed — estimated online from the per-action rewards of the paragraph above, and ranks retrieval by that same quantity, with eviction and merging following from the retrieval statistics it drives. The store thus has a life cycle — write, evaluate, consolidate, forget — closed by one estimated number rather than a write path plus side counters. This matters more than it may appear, because unmanaged accumulation is not merely suboptimal. In our experiments a workflow-induction memory ends up below a memoryless ReAct control in seven of eight AgentBoard domains, and an ablation of our own system that keeps the procedural store but removes the planning and scoping structure around it loses half of ReAct’s completions on Jericho. An independent streaming benchmark reports the same for workflow-induction memory in a four-backbone evaluation [Wei et al., 2025]. A memory that cannot be evaluated and cannot be forgotten is a liability whenever the domain supplies less transferable structure than the write policy assumes. Our contributions are: • Expectation-grounded credit assignment for procedural memory: the actor commits to an expected outcome before acting, and a concurrent critic turns the expectation–outcome comparison into a per-action binary reward plus a reflection, with no environment reward required (Section 2.2). • An explicit life cycle for the long-term store : a per-entry utility updated online under a noisy-OR reward model, ranking retrieval jointly with context similarity and driving 2Environment Actor 
+
+> Critic Long-Term Memory Store
+> <Task instructions> <Task tools> <Memory tools> <Task STM> <Retrieved LTM>
+> Semantic Heap Episodic Stack
+> Observation Action
+> Task STM Action Expectation Observation Procedural entries + per-action rewards Semantics & episodics Retrieved LTM
+
+Figure 1: Information flow between the environment, the actor, the critic, and the long-term memory store. The three modules run in separate threads: the actor never blocks on the critic, so memory writing and evaluation overlap with acting. The actor’s short-term memory (STM) holds the task instructions, the task and memory tool specifications, and the current task’s short-term trace, with environment facts surfaced through a priority-ranked semantic heap and event summaries through a scope-ordered episodic stack (Section 2.3); retrieved long-term memory (LTM) enters the same context. Every action the actor sends to the critic carries the expectation the actor committed to before acting, which is what the critic scores the realized outcome against; the resulting per-action reward travels to the store alongside the new procedural entry and updates the utilities of the entries that were retrieved for that action (Section 2.4). frequency-based eviction and agreement-based merging, so the store forgets and consolidates rather than growing without bound (Section 2.4). • A short-term memory scoped as a sub-goal stack , cleared at task boundaries, bounding the actor’s context and giving the critic well-delimited units to evaluate (Section 2.3). • An empirical result with a negative half : across 707 tasks in eight domains, cross-task procedural memory without these mechanisms is significantly worse than no memory at all, while AdMem is significantly better, with gains concentrated where cross-task structure exists (Section 3). 
+
+# 2 Methodology 
+
+2.1 Setting, notation, and framework 
+
+An agent solves a series of tasks by interacting with an environment in turns; in round t it emits an action at and the environment returns an observation ot. The environment may comprise human users, other agents, or tool-calling infrastructure. Each task is its own environment episode, but the agent’s memory is not reset between tasks — the setting of a deployed assistant, and the reason a single lifelong horizon, rather than a task, is the right unit of analysis. The agent carries a memory st
+
+and acts by conditioning an LLM on a context ct assembled from that memory, at ∼ πLLM (· | ct).Vanilla baselines for multi-turn benchmarks [Ma et al., 2024] take ct = st = [ a1, o 1, . . . , a t, o t], the full trajectory, which stresses long-context reasoning as tasks grow. Prior work responds along two axes: context compaction , keeping st short enough for one window, and retrieval , placing only part of the memory into ct. These correspond to short-term and long-term memory, and AdMem uses both: st = ( sshort  
+
+> t
+
+, M ), where sshort  
+
+> t
+
+is per-task and M persists across tasks. AdMem runs three modules concurrently (Figure 1), only the first of which is a decision-making agent. The actor is the LLM agent that interacts with the environment; it maintains sshort  
+
+> t
+
+, updated every turn and cleared when the task ends, by which point anything worth keeping has been written to 
+
+M . The long-term memory store is a retrieval index over M that also owns the management policy of Section 2.4; it performs no reasoning of its own beyond LLM-mediated updating of semantic entries. The critic is a second LLM instance on the memory write path: it caches each action together with the actor’s stated expectation, waits until the relevant observations have arrived, then scores the action and writes the resulting procedural entry. It never emits an environment action. The store holds three kinds of entry, M = MS ⊕ ME ⊕ MP , following the standard cognitive division [Tulving, 1985, Cohen et al., 1997]: MS , semantic — facts and general knowledge about the environment and the tasks, such as what a tool returns or what a field name means; ME , episodic 
+
+3— summaries of past events in the agent’s own interaction history; and MP , procedural — decision-making guidance extracted from past actions, recording for each action taken and outcome observed whether the outcome met the stated expectation and advanced the task, and what a better action would have been. Semantic and episodic entries are comparatively easy to form: an LLM summarizes facts and events as the task runs. Procedural entries are harder for two reasons. First, an action cannot be judged until the observations it was supposed to produce have arrived, possibly many turns later — concluding a sub-goal plan requires everything that happened inside the sub-goal. Second, the environment supplies no per-action reward, and in the lifelong setting may supply none at all. AdMem resolves both at once: the actor must state the expected purpose or result of every action 
+
+before taking it, and the critic buffers the action until its outcomes land and then judges it against that expectation. Within the actor, the two non-procedural memory types are surfaced in different structures, shown in-side the actor box in Figure 1. The semantic heap is an unordered, priority-ranked pool: environment facts have no natural sequence, are read by relevance to the current context, and the highest-scoring ones are surfaced first. The episodic stack is ordered and scoped: event summaries are pushed as the task descends into sub-goals and read most-recent-first, so the actor sees the events of the sub-goal it is currently inside before older ones, and a scope’s episodic entries are compressed together when that scope is concluded (Section 2.3). Both structures draw on one fixed prompt allowance, so what they expose is what the actor gets to reason over. 
+
+2.2 Pipeline and expectation-grounded credit assignment 
+
+Algorithms 1 and 2 in Appendix A give the two loops, and Figure 1 the information flow between them. The actor owns all communication with the environment and consumes what the store returns; besides acting, it can call planning tools that both structure the task and delimit the units the critic will later judge. The critic owns the procedural write path: for each action it receives the pre-action context, the action, the actor’s committed expectation, and the realized outcome, then condenses these, proposes a better alternative, and labels the record with a reward rk ∈ { 0, 1} according to whether the outcome met the expectation and advanced the task. Two properties distinguish this from writing memory from task-level verdicts. First, the reward is per action : an action taken thirty steps in is judged on its own outcomes, so a good action inside a failed task is not penalized and a lucky one inside a successful task is not rewarded. Second, it requires no environment signal , coming instead from a comparison against a commitment made before acting, available in any environment that returns observations. That the standard is fixed before the outcome is known is what makes this more than after-the-fact self-assessment. The planning tools give the critic well-formed units to wait for (full tool specifications in Appendix E). 
+
+Plan for the task is written before the first action and its entry is emitted at the task’s end, once every observation bearing on the plan has arrived; add sub-goal and conclude sub-goal push and pop a scope, and the sub-goal planning action’s entry takes everything between push and pop as its observations; act carries an explicit expectation and its entry is emitted after the immediate observation; think emits reasoning into short-term memory and changes nothing. Pushing and popping thus lets the actor explore the environment as a tree while giving the pending queue a natural closing condition: a record is judgeable exactly when its scope closes. Whenever the critic emits a reward it also forwards the identities of the procedural entries that were retrieved for that action — the only channel by which the store learns whether its own recommendations were any good. 
+
+2.3 Short-term memory: scoping and compaction 
+
+The actor needs to attend to the current goal without re-reading the whole task; the critic needs a delimited execution trace to summarize. Both are served by one structure borrowed from program execution: a running stack. The live frame holds the current sub-goal and the plan the actor made for it; turns outside it are compressed into summaries by the actor’s own LLM, so the actor sees the current scope at full resolution and everything above it compressed, and resumes the parent objective when the frame is popped. Sub-goal and task boundaries are also scope boundaries in the memory-safety sense. Popping a sub-goal compresses its turns, so raw observations from a concluded scope are no longer verbatim in the actor’s context; ending a task clears short-term memory entirely, 4and nothing survives into the next task except what the critic or the semantic/episodic summarizer wrote to the long-term store. Cross-task carryover is therefore mediated by summarization rather than by raw trajectory, which bounds context growth and, as Section 4 discusses, what raw environment text can reach a later task. 
+
+2.4 Long-term memory: retrieval, utility, and life cycle 
+
+The store holds M and owns both retrieval and the entry life cycle. • Retrieval. Semantic and episodic entries are retrieved by dense similarity to the current context. Procedural entries are ranked by a product of their estimated utility and their context similarity, defined below, so that an entry must be both relevant and previously effective in order to be surfaced. Procedural entries are additionally hard-scoped by the action space they were recorded under: an entry is eligible only when the set of legal tools matches, so advice formed in one action space is never surfaced in another. • Consolidation. Two procedural entries are merged into one when the retriever cannot distinguish them: we score a pair by how often they are retrieved together among the rounds in which either one is retrieved, and merge above 1 − ϵm, once at least one of the two has accumulated enough retrievals for that rate to mean something. Scoring on co-retrieval rather than on raw round-by-round agreement is what keeps two merely cold entries from looking mutually indistinguishable. Semantic entries are consolidated differently — an LLM edits the existing entry when a new fact refines or contradicts it, rather than appending a second entry. • Forgetting. Once an entry has been resident long enough for its statistics to be meaningful, it is removed from the retrieval index if its retrieval frequency falls below a threshold ϵe > 0.Because ranking is utility-weighted, an entry whose utility estimate has fallen stops being retrieved and is then evicted; low utility causes forgetting through the retrieval channel rather than by a direct reward threshold. This is the system’s forgetting policy, and its absence is, we argue in Section 3, a large part of why unmanaged procedural memory ends up below a memoryless baseline. • Provenance. Each procedural entry retains its originating context and action, the critic’s reflection, its binary success label, and its current utility, so it is traceable to the action that produced it and inspectable as text — which is how the failure modes in Section 3 were identified. Retrieval is thus the hinge of the life cycle: consolidation and forgetting are both computed from retrieval statistics, so we estimate, rather than assume, how useful each entry is. We give each procedural entry m ∈ MP a scalar utility vm ∈ [0 , 1] measuring whether following its suggestion helps. At an actor step with context ct and retrieved entries Mt = [ m(1)  
+
+> t
+
+, . . . , m (n) 
+
+> t
+
+] the critic eventually returns rt ∈ { 0, 1}, and we model that reward as a noisy-OR (Appendix B): the action succeeds if any retrieved entry helped, or if it would have succeeded unaided with probability p0.Entry i helps with probability vm(i)
+
+> t
+
+ψ(ct)⊤ψ(c(i)), where ψ is the retriever’s normalized embedding map, c(i) is the stored context of entry m(i) 
+
+> t
+
+, and the similarity is clipped to [0 , 1] . An entry therefore helps only if its advice is sound and its originating situation resembles the present one, which is what that product encodes; the model has one parameter per entry plus the global p0, which is what makes it affordable to keep online for a growing store. Each observed reward licenses an update to vm(1) 
+
+> t
+
+, . . . , v m(n)
+
+> t
+
+, which we perform by ascending the noisy-OR log-likelihood one observation at a time; Appendix B gives the model and the update in full. The update is asymmetric by construction, since a noisy-OR emits 0 only if every cause failed: a failed action drives all of its retrieved entries down, each by an amount scaled by how well its stored context matched, while a successful one distributes credit in proportion to how likely each entry was to be the cause. Retrieval then selects the top-n entries by 
+
+score( m | ct) = vm ψ(ct)⊤ψ(cm), (1) the same quantity the reward model uses — the retriever ranks by the model’s own estimate of the probability that the entry will help here. Newly written entries start at vm = 1 , in the spirit of optimism in the face of uncertainty: an untried entry gets a chance to be retrieved so that it can acquire the statistics that will keep or evict it. 5Domain AlfWorld BabyAI Jericho PDDL Number of tasks 134 112 20 60 Metric C P C P C P C PReAct 49.3% 0.6586 97.3% 0.9732 40.0% 0.4002 33.3% 0.5537 AWM 47.0% 0.5467 92.9% 0.9375 10.0% 0.2227 43.3% 0.6407 
+
+AdMem 63.4% 0.7755 100.0% 1.0000 45.0% 0.5569 76.7% 0.9069 
+
+Domain Tool-query Academic Tool-query Weather WebShop ScienceWorld Number of tasks 20 20 251 90 Metric C P C P C P C PReAct 70.0% 0.8365 60.0% 0.8565 42.2% 0.7507 58.9% 0.8258 AWM 55.0% 0.8185 25.0% 0.7529 29.1% 0.7012 31.1% 0.6324 
+
+AdMem 95.0% 0.9671 75.0% 0.9036 41.4% 0.7645 56.7% 0.8447 
+
+Table 1: Task completeness (C, the fraction of tasks solved) and average progress (P, the mean of the per-task progress score pi ∈ [0 , 1] ) on the eight AgentBoard domains, using Claude Haiku 4.5 as the backbone for every method. Bold marks the best value in each column. Each domain is a fixed task set of the size given in the second row, so completion counts are recoverable exactly from C (e.g. 
+
+63 .4% of 134 is 85 tasks); we use those counts for the Fisher exact tests reported in the text. Each configuration is streamed once over the task set in a single lifelong episode. On the three 20-task domains a single task is worth 5.0 points of C, which is why we base per-domain conclusions on the tests rather than on the point differences alone.                      
+
+> Method Tasks solved / 707 95% CI on C Macro-avg. C Domains ≥ReAct ReAct 388 (54.9%) [51.2, 58.5] 56.4% —AWM 312 (44.1%) [40.5, 47.8] 41.7% 1 of 8
+> AdMem 441 (62.4% )[58.7, 65.9] 69.2% 6 of 8
+
+Table 2: Aggregate view of Table 1 over all 707 tasks. Intervals are Wilson 95% binomial intervals on the pooled completion rate. Macro-avg. C weights the eight domains equally rather than by task count; we report both because WebShop and ScienceWorld together hold 48% of the tasks. Against ReAct, the pooled difference is significant for AdMem ( +53 tasks, two-sided Fisher exact p = 5 × 10 −3)and significant in the negative direction for AWM ( −76 tasks, p = 7 × 10 −5). Because all three methods are run over the same 707 tasks, both comparisons are paired; both remain significant under the least favorable exact McNemar test consistent with these margins ( p = 0 .03 and p = 5 × 10 −3
+
+respectively, Appendix C). 
+
+# 3 Experiments 
+
+3.1 Setup 
+
+We evaluate AdMem under streaming multi-task conditions intended to approximate a deployed task-solving agent: the agent meets a domain’s tasks one after another in a single lifelong episode, and its long-term store is never reset between tasks. We use the eight domains bundled with AgentBoard [Ma et al., 2024], spanning embodied household tasks (AlfWorld), grid-world instruction following (BabyAI), interactive fiction (Jericho), symbolic planning (PDDL), tool calling (Tool-query Academic and Weather), web navigation (WebShop), and scientific experimentation (ScienceWorld). Within a domain every method receives the same system prompt (Appendix E) and the unmodified AgentBoard task instructions, and is run over the full task set. We report AgentBoard’s two native metrics: task completeness C, the fraction of tasks solved, and average progress P , the mean over tasks of a per-task progress score pi ∈ [0 , 1] with pi = 0 for no progress and pi = 1 for completion. Claude Haiku 4.5 is the backbone for the actor, the critic, and the semantic/episodic summarizer in every configuration, including the baselines, so all comparisons hold the backbone fixed; decoding is greedy (temperature 0, top-p 1) and each task is capped at 30 environment steps, as recorded in the run configuration. Long-term retrieval is dense retrieval over the stored context field of each 6Domain Jericho First epoch Jericho Second epoch Jericho Third epoch Metric C P C P C PReAct 40.0% 0.4002 - - - -STP 40.0% 0.4553 - - - -LTP 20.0% 0.4257 25.0% 0.4775 30.0% 0.4743       
+
+> AdMem 45.0% 0.5569 50.0% 0.6578 60.0% 0.6820
+
+Table 3: Component ablation on Jericho (20 tasks), Claude Haiku 4.5. STP : short-term planning and context management only, with all long-term recall removed. LTP : the long-term procedural store only — per-step retrieval with critic-generated reflections and the reward-based utility retained — with short-term planning and context management removed. AdMem : all components. STP and ReAct are single-epoch by construction, since neither carries anything across tasks. For LTP and AdMem the task set is streamed again each epoch without resetting the long-term store, so the epoch axis measures accumulation rather than repetition of a fixed store; entry utilities carry over with the store, so an entry that proved unhelpful in an earlier epoch enters the next one already down-weighted. entry using text-embedding-3-small embeddings, L2-normalized so that the inner product is a cosine. Procedural entries are ranked by the utility-weighted score of Equation (1) and the top n = 3 
+
+above an inclusion threshold of 0.1 are returned; episodic entries are ranked by similarity alone, also with n = 3 , while the consolidated semantic entry is injected in full. The life-cycle constants of Section 2.4 are fixed in the implementation rather than set per domain: ϵe = ϵm = 0 .01 , with an entry becoming eligible for eviction only after 500 retrieval rounds of residence and for merging after 100 ;the sub-goal stack is capped at depth 3, and the actor’s short-term window holds 30 messages before the oldest turns of the live frame are compressed. The utility step size is η = 10 −3, new entries enter at ˆvm = 1 , and the implementation runs the p0 = 0 special case of the reward model (Appendix B). We compare against two baselines. ReAct [Yao et al., 2023] is the no-cross-task-memory control: it interleaves reasoning and acting within a task and starts every task from scratch. AWM [Wang et al., 2025] is the closest published system to our setting — procedural memory induced online from the agent’s own trajectories and reused on later tasks — and is therefore the informative comparison for the question this paper asks. We do not port conversational-memory systems such as Mem0 [Chhikara et al., 2025], MemGPT [Packer et al., 2023], or MIRIX [Wang and Chen, 2025]: those retrieve over accumulated dialogue and documents, and adapting them here would require choosing what a memory unit is for an environment step and what the retrieval query is at action time, so the numbers would characterize our port rather than the original systems. The role a reflection-memory baseline would play is instead filled from inside our own system by the LTP ablation of Table 3, which retrieves critic-written reflections at every step with no planning or scoping structure around them. 
+
+3.2 Cross-task memory is not free 
+
+The headline of Table 1 is not only that AdMem leads, but where the cross-task memory baseline ends up. AWM solves fewer tasks than the memoryless ReAct control in seven of the eight domains, and 312 of 707 tasks against ReAct’s 388 — a 10 .7-point drop in pooled completeness, significant under a two-sided Fisher exact test ( p = 7 × 10 −5, Table 2). The same pattern appears inside our own system: the LTP ablation of Table 3, which keeps the procedural store, critic reflections, and reward-based utility but removes planning and scoping, solves 4 of 20 Jericho tasks against ReAct’s 
+
+8.AWM is not mis-ported: it beats ReAct on PDDL in this very table ( 43 .3% versus 33 .3% ), so the mechanism does fire where the domain supplies reusable structure [Zheng et al., 2024, Wang et al., 2024]. Two properties of induction-from-successes explain the rest. First, AWM induces workflows online from its own trajectories, so a wrong induction — a step order that happened to work once, a precondition read as universal — is written with the same confidence as a right one, and a single pass gives no held-out signal that would catch it, a gap self-judgement cannot close [Huang et al., 2024, Stechly et al., 2025]; AdMem’s critic shares that limit, but its entries remain revisable as later outcomes update their utility. Second, AWM has no removal policy: a badly generalizing workflow stays and is re-retrieved for the rest of the run, so one bad induction is a persistent rather than transient cost. Under a coarse success signal such inaccuracies compound, and regulating entry quality rather 7than accumulating more of it recovers the loss [Xiong et al., 2026]; an inapplicable entry distracts rather than sitting inert [Shi et al., 2023]. AWM was validated on web navigation, where consecutive tasks share page structure; most AgentBoard domains lack that regularity. A streaming benchmark of self-evolving memory reports the same pattern for this class of method: AWM falls below a ReAct control on its multi-turn suite for three of four backbones ( 0.49 against 0.57 mean success on Claude 3.7 Sonnet) and below the no-memory baseline on its single-turn suite for all four [Wei et al., 2025]. The design question is therefore not how to store more experience but which to keep — which motivates the per-action credit assignment and entry life cycle of Section 2.4. 
+
+3.3 Main results 
+
+AdMem solves 441 of 707 tasks against 388 for ReAct and 312 for AWM (Table 2), and matches or exceeds ReAct on completeness in six of eight domains while achieving the best average progress in all eight. We treat the pooled comparison over all 707 tasks as the primary endpoint and the eight per-domain tests as a multiplicity-corrected breakdown. Because each domain is a fixed-size task set, completion counts are exact and we test each with a two-sided Fisher exact test. Pooled, the gain is 
+
++7 .5 points ( p = 5 × 10 −3), with a Wilson 95% interval of [58 .7, 65 .9] against [51 .2, 58 .5] for ReAct. Since every method is run over the same task set that comparison is paired, and over every pairing consistent with the observed margins the least favorable exact McNemar test still gives p = 0 .03 
+
+(Appendix C), so the pooled conclusion does not rest on the pairing being favorable. Across the eight domain tests, PDDL survives Holm–Bonferroni correction at α = 0 .05 — 46 of 60 tasks against 20 
+
+of 60 , +43 .3 points, p = 3 × 10 −6 against a threshold of 6.3 × 10 −3, and p = 5 × 10 −4 under the same worst-case pairing — while AlfWorld, 85 of 134 against 66 of 134 (+14 .2 points, p = 0 .03 ), is nominally significant but does not survive correction. We therefore rest the domain-level claim on PDDL. Both have transferable structure: PDDL tasks share an action schema and AlfWorld tasks reuse the same household affordances, so a reflection about a mis-ordered pick-and-place transfers to a later task. On WebShop and ScienceWorld, AdMem does not lead on completeness. The margin in each case is two tasks — 104 versus 106 of 251 and 51 versus 53 of 90 — indistinguishable from zero ( p = 0 .93 
+
+and p = 0 .88 ), with Wilson intervals that overlap almost completely ( [35 .5, 47 .6] versus [36 .3, 48 .4] 
+
+on WebShop), while AdMem attains the higher average progress in both ( 0.7645 versus 0.7507 ;
+
+0.8447 versus 0.8258 ). We read these as parity on completion with a small edge on partial progress, and note the contrast with AWM, which loses 13 .1 and 27 .8 points on the same task sets: what these columns support is that AdMem’s structure prevents the collapse unmanaged cross-task memory produces where transfer is weak, not that it gains there. These are also the domains where transferable structure is thinnest — each WebShop task targets a different product with a different attribute set, so carryover is closer to distraction than to a reusable recipe, the regime where top-ranked but inapplicable retrievals measurably hurt [Cuconasu et al., 2024]. The three 20-task domains behave as expected but carry little weight on their own — the +25 .0
+
+points on Tool-query Academic ( 19 of 20 against 14 ) reaches only p = 0 .09 . Table 2 gives both the pooled and the equally-weighted domain average rather than the flattering one: they differ ( +7 .5
+
+against +12 .8 points) because WebShop and ScienceWorld hold 48% of the tasks, and the pooled figure is the conservative reading. 
+
+3.4 Which components matter 
+
+Table 3 decomposes the system on Jericho into (i) acting and planning with short-term memory management (STP) and (ii) the long-term procedural store (LTP), and additionally streams the task set for three epochs to test whether accumulation pays off over a longer horizon. The two halves behave asymmetrically. STP raises average progress over ReAct ( 0.4553 against 0.4002 ) at equal completeness, and is single-epoch by construction: nothing crosses task boundaries, so there is no horizon over which it could improve. LTP is the weaker half in isolation — 4, 5, then 6 of 20 tasks across the three epochs, below ReAct’s 8 at every epoch. It improves with accumulation, but the trend does not carry it to the memoryless baseline within three epochs, so the long-term store on its own is net-negative on this domain rather than a transient warm-up cost. Assembled, the two halves reverse that: AdMem improves monotonically, 9 → 10 → 12 of 20 tasks, ending +20 .0 points above ReAct. This is the paper’s clearest claim about the architecture: the 8procedural store is only useful inside the planning and scoping structure, which turns a net-negative store into a net-positive one. It also answers the simpler-baseline question: LTP retains the critic’s reflections and the reward-derived utility, so it is if anything a strengthened reflection-memory agent, and it is the weakest arm in the table. With 20 tasks the per-epoch differences are individually underpowered (LTP versus AdMem at epoch three is 6 against 12 , p = 0 .11 ), and the contrast is between two halves of the system rather than individual mechanisms. 
+
+3.5 Cost 
+
+The design prioritizes long-horizon performance over minimal per-step cost. Multi-threading keeps memory encoding, management, and the critic’s write path off the actor’s critical path, but the pipeline still spends extra planning turns and background LLM calls. As a rough worst case, per-step wall-clock is about 2× the vanilla LLM agent’s with about 3× the LLM calls — a bound set by the easiest domains, where any fixed overhead looks large in ratio. Extra memory-side calls are not the differentiator: AWM and the LTP ablation also pay them, and both land below ReAct. 
+
+# 4 Memory as an attack surface 
+
+Keeping memory in readable text is what makes the diagnosis in Section 3 possible, and the same property makes the store a durable, attacker-reachable channel. The dataflow follows from the architecture: environment text enters the critic prompt as an action’s realized outcome, becomes a procedural entry, and is later retrieved into the actor’s context before it acts — so any text the environment can emit reaches a later task’s action selection, and unlike a payload confined to one context window a written entry persists and is re-retrieved. This is indirect prompt injection [Greshake et al., 2023] applied to a store the agent writes itself, close to demonstrated poisoning of agent memory and RAG stores [Chen et al., 2024]. Two of our own choices bear on this: vm = 1 grants a new entry maximum retrieval priority before any evidence exists, and the utility signal is produced by an LLM reading environment text. The life cycle also supplies the defenses — unhelpful entries are evicted, provenance is retained, tool-set scoping bounds reach, and a readable store can be audited — so eviction is a defense and vm = 1 a vulnerability within one policy. Appendix D gives the full dataflow, defenses, and caveats; we report no adversarial evaluation and make no robustness claim. 
+
+# 5 Limitations 
+
+Our evidence is one run per configuration on one backbone. We compensate where the data allows — completion counts on fixed task sets support Fisher exact tests and Wilson intervals — but this is not a full seed sweep, and the three 20-task domains are underpowered by construction. A caveat specific to the memory arms is that each is one coupled stream, so their binomial intervals are anti-conservative; we therefore report the variance inflation each load-bearing conclusion tolerates before crossing 
+
+α = 0 .05 , a design effect of 4.2 for the negative result and 5.9 for the PDDL gain (Appendix C). The component ablation separates the acting/planning half from the long-term half on one domain, so we do not claim how much of the gain is attributable to expectation-grounded reward, to utility-based eviction, or to context scoping. 
+
+# 6 Conclusion 
+
+We asked which experience a task-solving agent should keep. Procedural memory induced from successes leaves an agent below a memoryless control on seven of eight AgentBoard domains; AdMem answers with per-action credit against a pre-committed expectation and a per-entry utility governing the entry life cycle. The mechanism that lets memory help where transfer exists is the one that keeps it from hurting where it does not. 
+
+# References 
+
+Ali Behrouz, Peilin Zhong, and Vahab Mirrokni. Titans: Learning to memorize at test time. In 
+
+Advances in Neural Information Processing Systems , volume 38. Curran Associates, Inc., 2025. doi: 10.52202/085713-3786. 9Vincent-Pierre Berges, Barlas Oguz, Daniel Haziza, Wen-tau Yih, Luke Zettlemoyer, and Gargi Ghosh. Memory layers at scale. In Forty-second International Conference on Machine Learning ,2025. Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, et al. Language models are few-shot learners. In Advances in Neural Information Processing Systems ,volume 33, pages 1877–1901. Curran Associates, Inc., 2020. Zhaorun Chen, Zhen Xiang, Chaowei Xiao, Dawn Song, and Bo Li. AgentPoison: Red-teaming LLM agents via poisoning memory or knowledge bases. In Advances in Neural Information Processing Systems (NeurIPS) , 2024. Prateek Chhikara, Dev Khant, Saket Aryan, Taranjeet Singh, and Deshraj Yadav. Mem0: Building production-ready AI agents with scalable long-term memory. In ECAI 2025: 28th European Confer-ence on Artificial Intelligence , volume 413 of Frontiers in Artificial Intelligence and Applications ,pages 2993–3000. IOS Press, 2025. doi: 10.3233/FAIA251160. Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, Parker Schuh, Kensen Shi, Sasha Tsvyashchenko, Joshua Maynez, Abhishek Rao, Parker Barnes, Yi Tay, Noam Shazeer, Vinodkumar Prabhakaran, Emily Reif, Nan Du, Ben Hutchinson, Reiner Pope, James Bradbury, Jacob Austin, Michael Isard, Guy Gur-Ari, Pengcheng Yin, Toju Duke, Anselm Lev-skaya, Sanjay Ghemawat, Sunipa Dev, Henryk Michalewski, Xavier Garcia, Vedant Misra, Kevin Robinson, Liam Fedus, Denny Zhou, Daphne Ippolito, David Luan, Hyeontaek Lim, Barret Zoph, Alexander Spiridonov, Ryan Sepassi, David Dohan, Shivani Agrawal, Mark Omernick, Andrew M. Dai, Thanumalayan Sankaranarayana Pillai, Marie Pellat, Aitor Lewkowycz, Er-ica Moreira, Rewon Child, Oleksandr Polozov, Katherine Lee, Zongwei Zhou, Xuezhi Wang, Brennan Saeta, Mark Diaz, Orhan Firat, Michele Catasta, Jason Wei, Kathy Meier-Hellstern, Douglas Eck, Jeff Dean, Slav Petrov, and Noah Fiedel. PaLM: Scaling language model-ing with pathways. Journal of Machine Learning Research , 24(240):1–113, 2023. URL 
+
+http://jmlr.org/papers/v24/22-1144.html .Neal J Cohen, Russell A Poldrack, and Howard Eichenbaum. Memory for items and memory for relations in the procedural/declarative memory framework. Memory , 5(1-2):131–178, 1997. Florin Cuconasu, Giovanni Trappolini, Federico Siciliano, Simone Filice, Cesare Campagnano, Yoelle Maarek, Nicola Tonellotto, and Fabrizio Silvestri. The power of noise: Redefining retrieval for RAG systems. In Proceedings of the 47th International ACM SIGIR Conference on Research and Development in Information Retrieval , pages 719–729. ACM, 2024. doi: 10.1145/3626772. 3657834. Xiang Deng, Yu Gu, Boyuan Zheng, Shijie Chen, Sam Stevens, Boshi Wang, Huan Sun, and Yu Su. Mind2web: Towards a generalist agent for the web. In Advances in Neural Information Processing Systems 36 (NeurIPS 2023) Datasets and Benchmarks Track , volume 36, pages 28091–28114. Curran Associates, Inc., 2023. doi: 10.52202/075280-1220. Runnan Fang, Yuan Liang, Xiaobin Wang, Jialong Wu, Shuofei Qiao, Pengjun Xie, et al. Memp: Exploring agent procedural memory. In Findings of the Association for Computational Linguistics: ACL 2026 , pages 17490–17502, San Diego, California, United States, 2026. Association for Computational Linguistics. doi: 10.18653/v1/2026.findings-acl.866. Huan-ang Gao, Jiayi Geng, Wenyue Hua, Mengkang Hu, Xinzhe Juan, Hongzhang Liu, Shilong Liu, Jiahao Qiu, Xuan Qi, Qihan Ren, Yiran Wu, Hongru Wang, Han Xiao, Yuhang Zhou, Shaokun Zhang, Jiayi Zhang, Jinyu Xiang, Yixiong Fang, Qiwen Zhao, Dongrui Liu, Cheng Qian, Zhenhailong Wang, Minda Hu, Huazheng Wang, Qingyun Wu, Heng Ji, and Mengdi Wang. A survey of self-evolving agents: What, when, how, and where to evolve on the path to artificial super intelligence. Transactions on Machine Learning Research , 2026. ISSN 2835-8856. URL 
+
+https://openreview.net/forum?id=CTr3bovS5F . Survey Certification. Kai Greshake, Sahar Abdelnabi, Shailesh Mishra, Christoph Endres, Thorsten Holz, and Mario Fritz. Not what you’ve signed up for: Compromising real-world LLM-integrated applications with indirect prompt injection. In Proceedings of the 16th ACM Workshop on Artificial Intelligence and Security (AISec) , pages 79–90, 2023. 10 Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Peiyi Wang, Qihao Zhu, et al. DeepSeek-R1 incentivizes reasoning in LLMs through reinforcement learning. Nature , 645(8081):633–638, 2025. doi: 10.1038/s41586-025-09422-z. Mengkang Hu, Tianxing Chen, Qiguang Chen, Yao Mu, Wenqi Shao, and Ping Luo. HiAgent: Hierarchical working memory management for solving long-horizon agent tasks with large lan-guage models. In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 32779–32798, 2025. Jie Huang, Xinyun Chen, Swaroop Mishra, Huaixiu Steven Zheng, Adams Wei Yu, Xinying Song, and Denny Zhou. Large language models cannot self-correct reasoning yet. In The Twelfth International Conference on Learning Representations (ICLR) , 2024. URL https: //openreview.net/forum?id=IkmD3fKBPQ .Ziheng Huang, Sebastian Gutierrez, Hemanth Kamana, and Stephen MacNeil. Memory sandbox: Transparent and interactive memory management for conversational agents. In Adjunct Proceedings of the 36th Annual ACM Symposium on User Interface Software and Technology . ACM, 2023. doi: 10.1145/3586182.3615796. Carlos E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir Press, and Karthik R. Narasimhan. SWE-bench: Can language models resolve real-world GitHub issues? In The Twelfth International Conference on Learning Representations (ICLR) , 2024. URL https:// openreview.net/forum?id=VTF8yNQM66 .Chang Ma, Junlei Zhang, Zhihao Zhu, Cheng Yang, Yujiu Yang, Yaohui Jin, Zhenzhong Lan, Lingpeng Kong, and Junxian He. AgentBoard: An analytical evaluation board of multi-turn LLM agents. Advances in Neural Information Processing Systems , 37:74325–74362, 2024. Grégoire Mialon, Clémentine Fourrier, Thomas Wolf, Yann LeCun, and Thomas Scialom. GAIA: a benchmark for general AI assistants. In The Twelfth International Conference on Learning Representations (ICLR) , 2024. URL https://openreview.net/forum?id=fibxvahvs3 .Niloofar Mireshghallah, Hyunwoo Kim, Xuhui Zhou, Yulia Tsvetkov, Maarten Sap, Reza Shokri, and Yejin Choi. Can LLMs keep a secret? testing privacy implications of language models via contextual integrity theory. In International Conference on Learning Representations (ICLR) ,2024. Ali Modarressi, Ayyoob Imani, Mohsen Fayyaz, and Hinrich Schütze. RET-LLM: Towards a general read-write memory for large language models, 2023. URL https://arxiv.org/abs/2305. 14322 .Ali Modarressi, Abdullatif Köksal, Ayyoob Imani, Mohsen Fayyaz, and Hinrich Schütze. MemLLM: Finetuning LLMs to use explicit read-write memory. Transactions on Machine Learning Research ,2025. ISSN 2835-8856. URL https://openreview.net/forum?id=dghM7sOudh .Tsendsuren Munkhdalai, Manaal Faruqui, and Siddharth Gopal. Leave no context behind: Efficient infinite context transformers with infini-attention, 2024. URL https://arxiv.org/abs/2404. 07143 .Siru Ouyang, Jun Yan, I-Hung Hsu, Yanfei Chen, Ke Jiang, Zifeng Wang, Rujun Han, Long T. Le, Samira Daruki, Xiangru Tang, Vishy Tirumalashetty, George Lee, Mahsan Rofouei, Hangfei Lin, Jiawei Han, Chen-Yu Lee, and Tomas Pfister. ReasoningBank: Scaling agent self-evolving with reasoning memory. In The Fourteenth International Conference on Learning Representations (ICLR) , 2026. URL https://openreview.net/forum?id=jL7fwchScm .Charles Packer, Sarah Wooders, Kevin Lin, Vivian Fang, Shishir G. Patil, Ion Stoica, and Joseph E. Gonzalez. MemGPT: Towards LLMs as operating systems, 2023. URL https://arxiv.org/ abs/2310.08560 .Joon Sung Park, Joseph C. O’Brien, Carrie J. Cai, Meredith Ringel Morris, Percy Liang, and Michael S. Bernstein. Generative agents: Interactive simulacra of human behavior. In Proceedings of the 36th Annual ACM Symposium on User Interface Software and Technology (UIST) , 2023. 11 Freda Shi, Xinyun Chen, Kanishka Misra, Nathan Scales, David Dohan, Ed H. Chi, Nathanael Schärli, and Denny Zhou. Large language models can be easily distracted by irrelevant con-text. In Proceedings of the 40th International Conference on Machine Learning , volume 202 of Proceedings of Machine Learning Research , pages 31210–31227. PMLR, 2023. URL 
+
+https://proceedings.mlr.press/v202/shi23a.html .Noah Shinn, Federico Cassano, Ashwin Gopinath, Karthik Narasimhan, and Shunyu Yao. Reflexion: language agents with verbal reinforcement learning. In Advances in Neural Information Processing Systems , volume 36, pages 8634–8652. Curran Associates, Inc., 2023. doi: 10.52202/075280-0377. Mohit Shridhar, Xingdi Yuan, Marc-Alexandre Côté, Yonatan Bisk, Adam Trischler, and Matthew Hausknecht. ALFWorld: Aligning text and embodied environments for interactive learn-ing. In International Conference on Learning Representations (ICLR) , 2021. URL https: //openreview.net/forum?id=0IOX0YcCdTn .Kaya Stechly, Karthik Valmeekam, and Subbarao Kambhampati. On the self-verification limitations of large language models on reasoning and planning tasks. In The Thirteenth International Conference on Learning Representations (ICLR) . OpenReview.net, 2025. URL https://openreview.net/ forum?id=4O0v4s3IzY .Sainbayar Sukhbaatar, Arthur Szlam, Jason Weston, and Rob Fergus. End-to-end memory networks. In Advances in Neural Information Processing Systems , volume 28, pages 2440–2448. Curran Associates, Inc., 2015. Theodore Sumers, Shunyu Yao, Karthik R Narasimhan, and Thomas L Griffiths. Cognitive architec-tures for language agents. Transactions on Machine Learning Research , 2023. Xiangru Tang, Tianrui Qin, Tianhao Peng, Ziyang Zhou, Daniel Shao, Tingting Du, Xinming Wei, Peng Xia, Fang Wu, He Zhu, et al. Agent KB: Leveraging cross-domain experience for agentic problem solving. arXiv preprint arXiv:2507.06229 , 2025. Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, et al. Llama 2: Open foundation and fine-tuned chat models, 2023. URL https://arxiv.org/abs/ 2307.09288 .Endel Tulving. How many memory systems are there? American Psychologist , 40(4):385–398, 1985. doi: 10.1037/0003-066X.40.4.385. Guanzhi Wang, Yuqi Xie, Yunfan Jiang, Ajay Mandlekar, Chaowei Xiao, Yuke Zhu, Linxi Fan, and Anima Anandkumar. Voyager: An open-ended embodied agent with large lan-guage models. Transactions on Machine Learning Research , 2024. ISSN 2835-8856. URL 
+
+https://openreview.net/forum?id=ehfRiF0R3a .Yu Wang and Xi Chen. MIRIX: Multi-agent memory system for LLM-based agents, 2025. URL 
+
+https://arxiv.org/abs/2507.07957 .Zora Zhiruo Wang, Jiayuan Mao, Daniel Fried, and Graham Neubig. Agent workflow memory. In Proceedings of the 42nd International Conference on Machine Learning , volume 267 of 
+
+Proceedings of Machine Learning Research , pages 63897–63911. PMLR, 2025. Tianxin Wei, Noveen Sachdeva, Benjamin Coleman, Zhankui He, Yuanchen Bei, Xuying Ning, Mengting Ai, Yunzhe Li, Jingrui He, Ed H. Chi, Chi Wang, Shuo Chen, Fernando Pereira, Wang-Cheng Kang, and Derek Zhiyuan Cheng. Evo-Memory: Benchmarking LLM agent test-time learning with self-evolving memory, 2025. URL https://arxiv.org/abs/2511.20857 .Yaxiong Wu, Sheng Liang, Chen Zhang, Yichao Wang, Yongyue Zhang, Huifeng Guo, Ruiming Tang, and Yong Liu. From human memory to AI memory: A survey on memory mechanisms in the era of LLMs, 2025. URL https://arxiv.org/abs/2504.15965 .Jian Xie, Kai Zhang, Jiangjie Chen, Tinghui Zhu, Renze Lou, Yuandong Tian, Yanghua Xiao, and Yu Su. TravelPlanner: A benchmark for real-world planning with language agents. In Proceedings of the 41st International Conference on Machine Learning , volume 235 of Proceedings of Machine Learning Research , pages 54590–54613. PMLR, 2024. 12 Zidi Xiong, Yuping Lin, Wenya Xie, Pengfei He, Zirui Liu, Jiliang Tang, Himabindu Lakkaraju, and Zhen Xiang. How memory management impacts LLM agents: An empirical study of experience-following behavior. In Proceedings of the 64th Annual Meeting of the Association for Compu-tational Linguistics (Volume 1: Long Papers) , pages 623–645, San Diego, California, United States, 2026. Association for Computational Linguistics. doi: 10.18653/v1/2026.acl-long.27. URL 
+
+https://aclanthology.org/2026.acl-long.27/ .Lingling Xu, Haoran Xie, S. Joe Qin, Xiaohui Tao, and Fu Lee Wang. Parameter-efficient fine-tuning methods for pretrained language models: A critical review and assessment. IEEE Transactions on Pattern Analysis and Machine Intelligence , 48(6):6107–6126, 2026. doi: 10.1109/TPAMI.2026. 3657354. Ling Yang, Zhaochen Yu, Tianjun Zhang, Shiyi Cao, Minkai Xu, Wentao Zhang, Joseph E. Gonzalez, and Bin Cui. Buffer of thoughts: Thought-augmented reasoning with large language models. In 
+
+Advances in Neural Information Processing Systems , volume 37, pages 113519–113544. Curran Associates, Inc., 2024. doi: 10.52202/079017-3607. Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik R. Narasimhan, and Yuan Cao. ReAct: Synergizing reasoning and acting in language models. In The Eleventh Interna-tional Conference on Learning Representations, ICLR 2023, Kigali, Rwanda, May 1-5, 2023 .OpenReview.net, 2023. URL https://openreview.net/forum?id=WE_vluYUL-X .Hongli Yu, Tinghong Chen, Jiangtao Feng, Jiangjie Chen, Weinan Dai, Qiying Yu, Ya-Qin Zhang, Wei-Ying Ma, Jingjing Liu, Mingxuan Wang, and Hao Zhou. MemAgent: Reshaping long-context LLM with multi-conv RL-based memory agent. In The Fourteenth International Conference on Learning Representations , 2026. URL https://openreview.net/forum?id=k5nIOvYGCL .Qizheng Zhang, Changran Hu, Shubhangi Upasani, Boyuan Ma, Fenglu Hong, Vamsidhar Kamanuru, Jay Rainton, Chen Wu, Mengmeng Ji, Hanchen Li, Urmish Thakker, James Zou, and Kunle Olukotun. Agentic context engineering: Evolving contexts for self-improving language models. In The Fourteenth International Conference on Learning Representations , 2026. URL https: //openreview.net/forum?id=eC4ygDs02R .Zeyu Zhang, Quanyu Dai, Xiaohe Bo, Chen Ma, Rui Li, Xu Chen, et al. A survey on the memory mechanism of large language model-based agents. ACM Transactions on Information Systems , 43 (6):155:1–155:47, 2025. doi: 10.1145/3748302. Andrew Zhao, Daniel Huang, Quentin Xu, Matthieu Lin, Yong-Jin Liu, and Gao Huang. ExpeL: LLM agents are experiential learners. In Proceedings of the AAAI Conference on Artificial Intelligence ,volume 38, pages 19632–19642, 2024. Longtao Zheng, Rundong Wang, Xinrun Wang, and Bo An. Synapse: Trajectory-as-exemplar prompting with memory for computer control. In The Twelfth International Conference on Learning Representations (ICLR) , 2024. URL https://openreview.net/forum?id=Pc8AU1aF5e .Wanjun Zhong, Lianghong Guo, Qiqi Gao, He Ye, and Yanlin Wang. MemoryBank: Enhancing large language models with long-term memory. In Proceedings of the AAAI Conference on Artificial Intelligence , volume 38, pages 19724–19731, 2024. doi: 10.1609/aaai.v38i17.29946. Huichi Zhou, Yihang Chen, Siyuan Guo, Xue Yan, et al. Memento: Fine-tuning LLM agents without fine-tuning LLMs, 2025. URL https://arxiv.org/abs/2508.16153 .Shuyan Zhou, Frank F. Xu, Hao Zhu, Xuhui Zhou, Robert Lo, Abishek Sridhar, Xianyi Cheng, Tianyue Ou, Yonatan Bisk, Daniel Fried, Uri Alon, and Graham Neubig. WebArena: A realistic web environment for building autonomous agents. In The Twelfth International Conference on Learning Representations , 2024. URL https://openreview.net/forum?id=oKn9c6ytLx .Zijian Zhou, Ao Qu, Zhaoxuan Wu, Sunghwan Kim, Alok Prakash, Daniela Rus, Bryan Kian Hsiang Low, and Paul Pu Liang. MEM1: Learning to synergize memory and reasoning for efficient long-horizon agents. In The Fourteenth International Conference on Learning Representations ,2026. URL https://openreview.net/forum?id=XY8AaxDSLb .13 A The actor and critic loops 
+
+Algorithm 1 Actor loop Initial short-term memory s0. Round number t ← 0.
+
+while active do 
+
+t ← t + 1 . Receive observation ot from the user / environment. Send ot to the critic. Send the context ct = ( st−1, o t) to the memory store to write semantic and episodic entries. Query the store for procedural entries Mt = [ m(1)  
+
+> t
+
+, . . . , m (n) 
+
+> t
+
+] and for semantic and episodic entries M ′ 
+
+> t
+
+, given ct.Choose action at from (ct, M t, M ′ 
+
+> t
+
+) and commit to an expected outcome ˆot+1 for it. Update short-term memory, st ← p(st−1, o t, a t).Send the pending record k = ( ct, a t, ˆot+1 , M t) to the critic. 
+
+end while Algorithm 2 Critic loop (runs concurrently with Algorithm 1) Pending queue Q ← [] .
+
+while active do if a pending record k arrives from the actor then 
+
+put k into Q.
+
+end if if an observation o arrives from the actor then for every pending record k = ( ck, a k, ˆok, M k) in Q do if o is relevant to k then 
+
+Append o to k.
+
+if k has received all the observations needed to judge it then 
+
+Compare the realized outcome against the committed expectation ˆok;emit reward rk ∈ { 0, 1} and reflection fk.Write the procedural entry (ck, a k, ˆok, r k, f k) to the store, with v ← 1.Send (Mk, r k) to the store, crediting the entries that were retrieved for this action, to update their utilities (Section 2.4). Remove k from Q.
+
+end if end if end for end if end while What “relevant” means in Algorithm 2. An observation o is relevant to a pending record k exactly when o arrives inside the scope that k opened. For an act record that is the immediately following observation; for an add sub-goal record it is every observation between that push and the matching pop; for a plan for the task record it is every observation in the task. Relevance is therefore decided by the sub-goal stack rather than by a model call, and k becomes judgeable exactly when its scope closes, which is what bounds the pending queue. Note also that the semantic and episodic write in Algorithm 1 is issued before the retrieval query at the same step, so a summary of the current observation can be returned by that query; this is redundant rather than circular, since the actor has already seen the observation being summarized, and it does not affect procedural retrieval, which is fed only by the critic’s asynchronous write path. 
+
+# B Utility updates for the procedural entries 
+
+We write out the reward model and the update referred to in Section 2.4. Fix an actor step with context ct, retrieved procedural entries Mt = [ m(1)  
+
+> t
+
+, . . . , m (n) 
+
+> t
+
+], and observed reward rt ∈ { 0, 1}.The noisy-OR model is 
+
+rt | ct = l(1)  
+
+> t
+
+∨ · · · ∨ l(n) 
+
+> t
+
+∨ l(0)  
+
+> t
+
+, l(i) 
+
+> t
+
+∼ B 
+
+
+
+vm(i)
+
+> t
+
+ψ(ct)⊤ψ(c(i))
+
+
+
+, l(0)  
+
+> t
+
+∼ B (p0), (2) 14 where B(p) is Bernoulli with mean p, the latent l(i) 
+
+> t
+
+∈ { 0, 1} indicates that entry i helped, and l(0) 
+
+> t
+
+that the action would have succeeded with no memory at all. The single global parameter p0 for the memory-free success rate is estimated alongside the vm. Abbreviate the per-entry help probability under the current estimates as 
+
+qi = ˆ vm(i)
+
+> t
+
+σi, σi = ψ(ct)⊤ψ(c(i))
+
+> [0 ,1]
+
+, q0 = ˆp0,
+
+where [·][0 ,1] clips to the unit interval. Under the noisy-OR of Equation (2) the reward is 1 unless every cause fails, so 
+
+Pr[ rt = 1 | ct, M t] = 1 −
+
+> n
+
+Y
+
+> i=0
+
+(1 − qi). (3) 
+
+E-step. The latent variables are the indicators l(i) 
+
+> t
+
+. Their posteriors given the observed reward are 
+
+γi = Pr l(i) 
+
+> t
+
+= 1 | rt
+
+ =
+
+
+
+qi
+
+1 − Qnj=0 (1 − qj ) , rt = 1 ,
+
+0, rt = 0 .
+
+(4) The rt = 0 case is exact rather than an approximation: a noisy-OR outputs 0 only if every cause failed, so observing rt = 0 deterministically sets every l(i) 
+
+> t
+
+= 0 . This is the asymmetry that gives the estimator its behavior — a failed action drives all of its retrieved entries down together, while a successful one distributes credit in proportion to how likely each entry was to be the cause. An entry retrieved alongside a strong entry receives little credit for a success, and full blame for a failure. 
+
+M-step. Each retrieved entry’s utility is moved towards its responsibility discounted by the similarity that gated it, since γi estimates Pr[ l(i) = 1] = vmσi and we want vm:
+
+ˆvm(i)
+
+> t
+
+←
+
+h
+
+(1 − η) ˆ vm(i)
+
+> t
+
++ η γi
+
+σi
+
+i
+
+> [0 ,1]
+
+, ˆp0 ← (1 − η) ˆ p0 + η γ 0
+
+
+
+> [0 ,1]
+
+, (5) with step size η ∈ (0 , 1] . Entries not retrieved at step t are untouched, so the cost of an update is O(n)
+
+in the number of retrieved entries and independent of the size of the store. Newly written entries enter with ˆvm = 1 .
+
+Gradient form. Equation (5) and a stochastic-gradient step on the same objective are interchange-able in this system, and our implementation uses the latter: 
+
+ˆvm(i)
+
+> t
+
+←
+
+h
+
+ˆvm(i)
+
+> t
+
++ η ∂∂ˆvm(i)
+
+> t
+
+log Pr[ rt | ct, M t]
+
+i
+
+> [0 ,1]
+
+, (6) which for rt = 1 evaluates to ˆvi +η σ iP0/ (1 − qi)(1 − P0) with P0 = Q 
+
+> j
+
+(1 − qj ), and for rt = 0 
+
+to ˆvi −η σ i/(1 − qi). Both Equation (5) and Equation (6) ascend Equation (3) and inherit the same asymmetry; Equation (6) avoids the division by σi and is the more numerically forgiving of the two. To keep the noisy-OR factors away from the degenerate ends of the unit interval, qi is clipped to 
+
+[0 .05 , 0.95] before use. 
+
+The p0 term in practice. Our implementation fixes p0 = 0 rather than estimating it, so Equation (3) reduces to a product over the n retrieved entries. This is exact for the rt = 0 branch, whose update 
+
+−η σ i/(1 − qi) contains no p0, but over-credits on rt = 1 : with the unaided route removed, a success must be explained by the retrieved entries, so the credit they receive is an upper bound on what a model with p0 > 0 would assign. The two settings also agree at initialization, since a new entry enters at ˆvm = 1 , the upper clip bound. We keep p0 in the model because it is what makes the noisy-OR the right generative story for a reward that does not require memory to be present, and record the simplification here rather than leaving it implicit. 
+
+What the model can and cannot express. Six properties should be stated plainly. First, this is a 
+
+streaming update: one step per observed reward rather than iterating to convergence on a retained dataset, so the monotone-likelihood guarantee of batch EM does not transfer and we do not claim it. The estimator should be read as tracking a non-stationary quantity — an entry’s usefulness genuinely 15 changes as the rest of the store changes around it — rather than as maximizing a fixed likelihood. Second, retrieval only surfaces entries whose score exceeds the inclusion threshold, which bounds 
+
+σi away from zero for exactly the entries that get updated. Third, the similarity σi is supplied by a frozen embedding model and is never itself learned, so the model can only reallocate credit among retrieved entries and cannot discover that its notion of context similarity is wrong. Fourth, vm is bounded below at 0, so the model represents an entry that never helps but not one that actively hurts. This is deliberate rather than an oversight: harm leaves the store through the retrieval channel rather than through a negative score. An entry that keeps co-occurring with failures is driven towards 0, its Equation (1) value falls with it, it stops clearing the inclusion threshold, and the frequency-based eviction of Section 2.4 then deletes it — so a harmful entry and a merely useless one receive the same treatment, which is removal, and a signed utility would only be needed if the system had to rank harmful entries against one another, which it never does. It is also worth being precise about how a failure is charged: by Equation (6) the decrement is η σ i/(1 − qi), which is not 
+
+uniform over the retrieved set — an entry whose stored context closely matches the present one loses more than a marginally similar one, and an entry currently estimated to help loses more than one already near zero. Fifth, the update conditions on retrieval, not on use: an entry the actor ignored is credited or blamed as if it had been followed, a failure with an external cause, such as a broken tool, lowers every entry retrieved for that action, and the noisy-OR treats retrieved entries as independent causes, so overlapping or conflicting entries are not modelled as such. Finally, we read vm as the model’s estimate of the probability that an entry helps here, which is the quantity retrieval ranks by; the causal phrasing is licensed by the generative model rather than measured against an intervention, and we make no calibration claim. 
+
+# C Pairing and clustering robustness of the pooled tests 
+
+Two properties of the design are not captured by a Fisher exact test on a 2 × 2 table, and we bound the effect of both rather than assume them away. 
+
+Pairing. All three methods are run over the same 707 tasks, so the pooled comparison is paired and the appropriate test is McNemar’s on the discordant pairs. We do not log per-task outcomes for the baselines, so the pairing itself is unavailable; instead we take the worst case over every pairing consistent with the observed margins. Given the two margins — 441 solved for AdMem against 
+
+388 for ReAct — write b for the tasks AdMem solves and ReAct fails and c for the converse, so that b − c = 53 is fixed while b + c is not. The exact two-sided McNemar test, a binomial test on b out of b + c at rate 12 , is least significant when the discordant count b + c is largest, so we maximize it subject to b ≤ min(441 , 707 − 388) and c = b − 53 ≥ 0. The extreme admissible pairing is b = 319 , c = 266 , giving p = 0 .031 . The same construction for AWM against ReAct, with c − b = 76 , has extreme point b = 312 , c = 388 and gives p = 4 .6 × 10 −3; for PDDL, b = 40 ,
+
+c = 14 and p = 5 .4 × 10 −4. Every pairing consistent with the reported margins is therefore at least this significant, so neither pooled conclusion nor the PDDL result depends on the unobserved pairing being favorable. Applying the same construction to AlfWorld gives p = 0 .096 , which is one more reason we do not rest a claim on that domain. 
+
+Clustering within a stream. Tasks in a memory arm are not independent trials: they share one evolving store, so a single badly generalizing entry can correlate failures across the tasks that follow it. This inflates the true variance of a pooled rate by a design effect D, equivalently reducing the effective sample size to n/D , and it is precisely the mechanism Section 3 argues is operating. Rather than assume D = 1 , we report the breakdown point: dividing the observed two-proportion z by √D,the negative result for workflow-induction memory ( z = −4.04 ) crosses α = 0 .05 only at D = 4 .2,and the PDDL gain ( z = 4 .77 ) only at D = 5 .9. A design effect above 4 within a single stream of a few hundred tasks would require most of the outcome variance to be attributable to stream position, which the per-domain spread in Table 1 does not support. We note that this is a sensitivity analysis and not a substitute for replicated stream orders, which remains the right experiment. 16 D The memory store as an attack surface: full dataflow 
+
+This expands Section 4. The write path is: environment text → critic prompt (as the realized outcome of a pending action) → procedural entry → retrieval index → actor context at some later step, possibly in a later task, where the actor is instructed to reason over the retrieved entry before choosing an action. Three properties of that path matter. It is persistent : a payload that succeeds once is stored and re-retrieved, so the cost of a single successful injection is amortized over every later retrieval, in contrast to a single-context payload. It is self-authored : no external document has to be trusted, because the agent writes the entry itself from text the environment supplied. And it is reward-coupled :the utility vm that governs retrieval, consolidation, and eviction is produced by an LLM critic reading environment text, so an adversary who can shape observations can in principle shape the signal that decides what the store keeps. Initializing vm = 1 is the choice with the sharpest two-sidedness. It is the exploration policy that lets an untried entry acquire the statistics that will keep or evict it, and it is exactly the property an attacker who can cause one entry to be written would want, since maximum retrieval priority is granted before any evidence exists. A pessimistic initialization would blunt that at the cost of never surfacing genuinely useful new entries; we did not evaluate the trade-off and note it as the obvious knob. The defenses available without adding any new machinery are the life cycle itself. Utility-weighted ranking means an entry that does not help stops being retrieved, and the frequency-based eviction of Section 2.4 then removes it, so a payload that does not produce apparent success decays. Provenance makes every entry traceable to the action, context, and reflection that produced it. Tool-set scoping bounds which later contexts an entry can reach at all: an entry recorded under one action space is ineligible in another, which limits lateral movement across domains. And because the store is human-readable text, an operator can audit and delete, which is not true of a store held in parameters or opaque embeddings. On personal data specifically, the critic prompt (Appendix E) instructs the critic to replace identifying values with placeholders before writing, which limits what crosses a task boundary. This is an instruction-level measure and not a guarantee: it depends on the critic complying, it does not cover what a summarizer writes into semantic or episodic entries, and it does not address the contextual-integrity question of which information is appropriate to carry into which later context [Mireshghallah et al., 2024]. A deployment with real users would need a mechanism rather than an instruction here. We report no adversarial evaluation and make no robustness claim; the purpose of this section is to state the dataflow and the two design choices that bear on it, so that they are visible rather than found. 17 E LLM Prompts 
+
+Here we include the prompts used by the actor and by the critic. Bold segments are filled with the corresponding information at run time. 
+
+Actor: 
+
+You are a helpful agent that solves tasks in a given environment. You take turns to interact with the environment and learn about the environment from the observations, until you achieve the goal defined in the task. A log for your previous turns in the task is given below, where planner messages (if exists) marks the plan you made earlier for solving the task and agent_summary messages provide summarization of one or more turns in the process. In the next turn you MUST use one of the tools in the <tools>tag. Do not output plain text. Some tools are provided for you to plan for next steps in the task and some tools are provided to interact with the environment. You need to decide which tool to use, but to solve hard task efficiently, careful planning is important. Always make sure you generate valid JSON for using the tool. Before action, the system will also generate some messages by recalling the system memory. These messages include information from your past interactions with the environment, as well as reflections on your past actions under similar circumstances (for other tasks in the same environment). Please examine these messages and think about their implications for the possible outcomes or your action, before deciding your action. <tools> 
+
+[Memory Tool Descriptions] 
+
+</tools> Below is the description of the task and the environment. 
+
+[Task Instructions] 
+
+Below is the task execution log: 
+
+[Short Term Memory Output] 
+
+Below is some memory recall for past experience under similar circumstances: 
+
+[Long Term Memory Output] 
+
+18 Critic: 
+
+You are a helpful assistant that generates a procedural memory entry from an event. The event is an action (or a plan) taken by an agent when solving a task. The purpose of the procedural memory entry is to provide a description of the context of the action (plan), the action (plan) taken by the agent, the expected outcome of the action (plan), a summary of the actual outcome after the action (plan), and some evaluations and reflections aiming to optimize the action based on the result. The procedural memory should not be too long, but should be helpful in improving the agent’s behavior when provided to the agent in a similar situation in the future. Hide private information like user name, account number etc. to protect privacy, for example use [user name] in the place of actual user name. The context of the action (or plan): [context] 
+
+The action (or plan) taken by the agent: [action] 
+
+The expected outcome/purpose: [expectation] 
+
+The actual outcome: [observation] 
+
+Below is some domain information that helps you understand the task setting. 
+
+[Domain Information] 
+
+Now it’s your turn to generate the procedural memory entry. To generate, call the tool ’gener-ate_procedural_memory’ and fill in the arguments with corresponding information. <tool_description> 
+
+Name: generate_procedural_memory 
+
+Description: Generate procedural memory entry. 
+
+Args: context (str): the action context, a brief and high-level background description summarizing the context where the agent action occurs. 
+
+result (str): a summary of the result of the action or plan, including 1. the agent’s expected outcome / achievement; 2. the actual outcome; 3. whether they are consistent. 
+
+success (bool): True or False that the action was successful, considering 1. whether the outcome of the action meets the expectation, 2. whether the outcome offers progress towards the task solving and plan execution. 
+
+reflection (str): Think about what can be learned from the result of the action, specifically what to change in the agent’s expectation, and what should the agent do under the same circumstances to better carry out the plan and solve the task. Specifically, think about whether the agent should set up a subgoal first instead of directly interacting with the environment, to better organize the task solving process. </tool_description> 
+
+We also provide the descriptions for the memory tools we built. Notice that not all memory tools are activated simultaneously to the agent: at the start of a task, the agent can only use plan_for_the_task. Later it can use add_subgoal if the stack depth of sub-goals is within limit; it can use conclude_subgoal if there is an active sub-goal; it can use think if the previous turn is an action in the environment, and it can use take_action always after task planning. 19 Memory Tools: 
+
+Name: plan_for_the_task 
+
+Description: Plan for a solution. Set the goal and highlight the key points in solving the task, and plan for the task by writing a list of step-by-step instructions. Each instruction can either be high-level subgoal (e.g. learn something about the environment or achieve certain status), or some actions to interact with the environment (e.g. use certain tools in the environment or communicate with the environment). If the task is hard, decompose the task into multiple subgoals that are needed to be attained in line to solve the task. 
+
+Args: goal (str): The goal and key points of the current task. 
+
+plan (str): the step-by-step plan for solving the task. 
+
+Name: add_subgoal 
+
+Description: Add a sub-goal to the current task and make plans to achieve the sub-goal. The sub-goal should admit an observation-based success criterion and should be helpful to solving the final task. Use this method when the task is hard to complete or when you believe the current task plan is not effective to solve the task any more. 
+
+Args: subgoal (str): The current sub-goal to be set. 
+
+plan (str): A list of step-by-step instructions that can be followed to achieve the sub-goal. 
+
+Name: conclude_subgoal 
+
+Description: Conclude the current sub-goal and judge whether it is successfully achieved. You should call the method if the current sub-goal is already achieved or it cannot be achieved anymore. 
+
+Args: evaluation (str): A short natural language justification of whether the sub-goal is successful 
+
+success (bool): Whether the sub-goal is successfully achieved. 
+
+Name: take_action 
+
+Description: Take an action in the environment. In this method, you can take an action in the environment by passing the action information in the action argument. Write what you expect the action to achieve (or the purpose of the action) in the expectation argument. 
+
+Args: action (str): The action to be taken. 
+
+expectation (str): The expected outcome / purpose of the action. 
+
+Name: think 
+
+Description: Generate some thoughts. This method will not change the environment. 
+
+Args: thoughts (str): Some thoughts. 
+
+20
