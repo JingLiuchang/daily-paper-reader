@@ -1,0 +1,972 @@
+Title: SIMQ: A Single Graph-based Index for Multi-Vector Query
+
+URL Source: https://arxiv.org/pdf/2611.22079v1
+
+Published Time: Wed, 18 Nov 2026 01:45:43 GMT
+
+Number of Pages: 13
+
+Markdown Content:
+# SIMQ: A Single Graph-based Index for Multi-Vector Query 
+
+Yifan Lu 1, Jiabao Jin 1, Xiaoyao Zhong 1, Peng Cheng 1, Xiangyu Wang 2, Haotian Li 2, Hua Chen 2,Junqing Chen 2, Wei Xi 3, Heng Tao Shen 1
+
+> 1
+
+Tongji University, Shanghai, China; 2Ant Group, Shanghai, China; 3Xi’an Jiaotong University, Xi’an, China 
+
+2353549@tongji.edu.cn, jiabaojin0723@gmail.com, xiaoyao.zhong@hotmail.com, cspcheng@tongji.edu.cn, 
+
+{wxy407827, tianlan.lht, xuanji.ch, junqing.cjq }@antgroup.com, xiwei@xjtu.edu.cn, shenhengtao@hotmail.com 
+
+Abstract —Multi-vector retrieval models such as ColBERT achieve state-of-the-art effectiveness by representing documents as sets of token-level vectors and scoring via MaxSim, but their high computational cost limits scalability to large corpora. Existing approximate methods face fundamental bottlenecks: centroid interaction matrix approaches require computing a full matrix at every query and rely on GPU-accelerated clustering, while data-oblivious compression methods yield unstable recall that requires repeated compensation. Graph-based approaches may retain existing centroid-clustering and residual-compression pipelines, operate at the document-set level with complex con-struction procedures, or demand specialized GPU hardware. We propose SIMQ (Single Graph Index for Multi-vector Query), a framework that bridges single-vector graph indices and multi-vector retrieval through data-aware sampling-based clustering and per-token graph navigation, simultaneously bypassing all aforementioned bottlenecks. SIMQ organizes all token vectors into fine-grained clusters via data-aware sampling, builds a single graph index over cluster centroids independently of PLAID’s residual representation, and approximates the MaxSim score through per-token graph search without materializing any in-teraction matrix or relying on GPU acceleration. We provide theoretical analysis showing that, under a manifold assump-tion and successful cell retrieval, data-aware partitioning has a smaller expected approximation error than a data-oblivious partition. Building on this foundation, SIMQ+ further introduces count-based scoring and a dynamic candidate set to improve robustness across varying query conditions. Experiments on five benchmarks compare recall, throughput, and construction time against several baselines, primarily on CPU; large-scale PLAID 
+
+k-means centroids are built on a separate GPU machine. SIMQ has been integrated into VSAG, an Ant Group’s open-source vector search library. 
+
+Index Terms —multi-vector retrieval, approximate nearest neighbor search, data-aware partition 
+
+I. I NTRODUCTION 
+
+Multi-vector retrieval has emerged as a highly effective paradigm for dense passage retrieval, achieving state-of-the-art performance across a wide range of benchmarks [1], [2]. As illustrated in Fig. 1, unlike single-vector models that compress an entire document into one embedding, multi-vector models, such as ColBERT [1], produce contextualized token-level embeddings, capturing richer semantic structure. Then, to estimate the similarity between two multi-vectors, the MaxSim scoring mechanism is commonly used, however, whose exact evaluation computation complexity is prohibitive at scale. +                 
+
+> (b) Multi-vector retrieval (MaxSim)
+> d₁ d₂ d₃ d₄
+> q₁ 0.61 0.77 0.92 0.54
+> q₂ 0.50 0.86 0.66 0.71
+> MaxSim 0.92 + 0.86 + 0.81 = 2.59
+> q₃ 0.74 0.63 0.59 0.81
+> (a) Single-vector retrieval
+> dq0.92
+
+qd
+
+> 0.92
+
+q
+
+q₁ q₂ q₃ 
+
+d₁ d₂ d₃ d₄ 
+
+Fig. 1. Multi-vector retrieval represents each document as a set of token-level vectors and scores a query through late-interaction MaxSim. 
+
+Existing multi-vector retrieval methods each face fundamen-tal limitations rooted in their partitioning strategy. PLAID’s [3] centroid-based approach, although data-aware in its k-means clustering, is forced by the interaction-matrix bottleneck to keep the number of centroids K small; each centroid must then cover a large, semantically diverse region that may span multi-ple clusters, and running k-means over hundreds of millions of token vectors further requires GPU acceleration. IGP [4] adds graph navigation over PLAID’s existing clustering centroids, but retains the underlying clustering and residual-compressed token representation. MUVERA’s [5] LSH partitioning, by contrast, is data-oblivious: the random hyperplanes slice the space, which mixes semantically distinct tokens into the same cell. Repeating the pipeline many times compensates for the resulting recall variability. Designing an efficient multi-vector retrieval framework faces three key challenges: (C1) Data-aware partitioning without GPU. Producing fine-grained, semantically coherent clusters typically requires k-means clustering over hundreds of millions of token vectors, which is prohibitively slow on CPU and depends on GPU acceleration. A partitioning strategy must remain data-aware while avoiding iterative convergence. 
+
+(C2) Avoiding the interaction matrix bottleneck. Any approach that computes a full centroid-query interaction matrix at every query faces a fundamental trade-off: reducing the number of centroids hurts cluster granularity, while increasing it raises the per-query cost proportionally. The framework must bypass the interaction matrix entirely while retaining fine-grained cluster-ing. (C3) Robust approximate scoring. Under a fine-grained arXiv:2611.22079v1 [cs.IR] 17 Nov 2026 partition, centroid inner products are uniformly close to 1 for all retrieved centroids, making the approximate scores of different candidate documents similar in magnitude. A robust scoring mechanism must separate relevant documents from irrelevant ones under such near-uniform centroid similarity. In this paper, we propose SIMQ (single graph index for multi-vector query), a framework that bridges single-vector graph indices and multi-vector retrieval through a data-aware centroid graph. SIMQ organizes all token vectors into fine-grained clusters via sampling-based data-aware partitioning, builds a single graph index over the centroids, and com-putes the approximate score fM(d, Q ) through per-token graph search, where Q indicates a query and d denotes a document. SIMQ constructs its token-level partition through sampling, assignment, and local splitting, then indexes the updated cluster centroids. SIMQ addresses (C1) with sampling and graph-guided assignment, followed by local splits for over-sized clusters, rather than corpus-wide iterative k-means. It addresses (C2) by bypassing the interaction matrix. SIMQ+ addresses (C3) with count-based scoring and a dynamic candi-date set. We provide a theoretical analysis that under the stated manifold and successful-cell-retrieval assumptions, SIMQ’s data-aware partitioning has smaller expected approximation error than MUVERA’s data-oblivious LSH partitioning. To summarize, we make the following contributions:  
+
+> •
+
+We identify the dual bottleneck of centroid interaction matrix methods and the partition instability of data-oblivious compression methods for multi-vector retrieval, and formal-ize the problem in §II.  
+
+> •
+
+We propose SIMQ, a framework that applies data-aware sampling-based clustering and per-token graph navigation to approximate MaxSim without interaction matrices or GPU-accelerated clustering in §III. We provide a theoretical anal-ysis showing that, under explicit manifold and successful-cell-retrieval assumptions, SIMQ’s data-aware partitioning has lower expected intra-cell approximation error than MU-VERA’s data-oblivious LSH partitioning in §IV.  
+
+> •
+
+We propose SIMQ+ with count-based scoring and a dynamic candidate set to further improve robustness in §V.  
+
+> •
+
+We conduct extensive experiments on five standard bench-marks to validate the efficiency and effectiveness of SIMQ and SIMQ+ in §VI. II. P RELIMINARIES 
+
+A. Problem Definition 
+
+Let D be a corpus of N documents. A query Q contains 
+
+m token vectors, and V (d) is the set of token vectors of document d, with pd = |V (d)| and corpus average token size 
+
+p = N −1 P 
+
+> d∈D
+
+pd. Every token vector has dimension h. We use k for the number of documents returned to the user. We note δ(v, v ′) = ∥v − v′∥2 for the ℓ2 distance between vectors v and v′, and ⟨v, v ′⟩ denotes their inner product. For a query-token vector q and a document-token vector v, both 
+
+ℓ2-normalized as in ColBERT-style models, inner product and 
+
+ℓ2 distance satisfy:      
+
+> ⟨q, v ⟩= 1 −12δ2(q, v ).(1)
+
+Definition 1 (Multi-Vector Retrieval) . Given a query Q =
+
+{q1, . . . , q m} ⊂ Rh and a document corpus D =
+
+{d1, . . . , d N }, where each document d is represented by a set of vectors V (d) = {v1, . . . , v pd } ⊂ Rh, the MaxSim score between Q and d measures their semantic similarity. In inner product form , it is defined as:   
+
+> M(d, Q ) =
+> mX
+> i=1
+> max
+> v∈V(d)
+> ⟨qi, v ⟩.(2)
+
+Equivalently, by Eq. 1, MaxSim’s distance form is:       
+
+> M(d, Q ) = m−12
+> mX
+> i=1
+> min
+> v∈V(d)δ2(qi, v ).(3)
+
+The two forms (Eqs. 2 and 3) are mathematically equiva-lent. Throughout this paper, we use whichever form is more convenient for the context. The goal of multi-vector retrieval is to efficiently retrieve the top-k documents with the highest MaxSim scores from D.For a query with m token vectors and a corpus of N doc-uments averaging p token vectors per document, the MaxSim scoring mechanism incurs O(m·N ·p) computation complexity. 
+
+B. Existing Multi-Vector Retrieval Approaches 
+
+Existing methods partition token vectors, but differ in whether they preserve token-level interactions or compress each document into a single vector, and whether their par-titions adapt to the data or not. 
+
+PLAID. PLAID [3] applies data-aware k-means to cluster the 
+
+N p token vectors into K centroids. It preserves the multi-vector structure by computing a K × m centroid–query-token interaction matrix, then progressively refines the candidate documents and exactly reranks them. Residual quantization compresses token storage. The full interaction matrix is a query-time bottleneck, while clustering very large token sets typically requires GPU acceleration. 
+
+MUVERA. Let b be the number of binary hash bits per parti-tion, dproj the projected dimension per cell, and R the number of independent partition repetitions. MUVERA [5] uses data-oblivious LSH to partition tokens into 2b cells, then aggregates and projects each cell into a fixed-dimensional encoding (FDE) of size 2bdproj per document. These encodings can be indexed as single vectors. To reduce the instability of randomized partitions, MUVERA repeats this process R times and aver-ages the scores. The cells do not adapt to token distributions, and compressing low-dimensional token embeddings may lose useful information. Before optional product quantization, the FDE space is O(R2bdproj N ), growing exponentially with b
+
+and linearly with R.III. SIMQ F RAMEWORK 
+
+A. Overview 
+
+We propose SIMQ framework to efficiently solve the multi-vector retrieval problem. Figure 2 illustrates the overall framework pipeline, which has three phases: (1) data-aware partitioning : all token vectors in the corpus are organized into fine-grained clusters via a sampling-based strategy, where the Doc Token vector Centroid HNSW edge Local cell Query Token vector Search path Document Entry point 
+
+> Query Processing
+> · · ·
+> 𝐀 1
+> 𝐀 2
+> 𝐀 𝐀
+> 𝐀 𝐀
+> Build Graph
+> 𝐀 𝐀
+> Index Construction
+> 𝐀 1
+> 𝐀 2
+> 𝐀 6
+> 𝐀 8
+> 𝐀 15
+> 𝐀 23
+> 𝐀 1
+> 𝐀 2
+> 𝐀 6
+> 𝐀 8
+> 𝐀 23
+> 𝐀 1
+> 𝐀 2
+> 𝐀 6
+> 𝐀 8
+> 𝐀 15
+> Approximate Score
+
+𝐀 𝐀𝐀𝐀𝐀 (= 4)        
+
+> 𝐀 1
+> 𝐀 2
+> 𝐀 8
+> 𝐀 23
+> 𝐀 𝐀
+> 0.83 0.86 0.92 0.90 0.87 0.88 0.71 0.82
+> MaxSim
+> 1.69 1.82 1.75 1.53
+> 𝐀 𝐀
+> 𝐀 1
+> 𝐀 8
+> 𝐀 2
+> 𝐀 23
+> Rerank
+> 𝐀 15
+> 𝐀 23
+> 𝐀 𝐀 Approx.
+> 𝐀 1
+> 𝐀 2
+> 𝐀 8
+> 𝐀 6
+> 𝐀 𝐀
+> IP Rerank MaxSim Rerank Fig. 2. Overview of the SIMQ framework. Given a document corpus, SIMQ (1) samples initial centroids, assigns token vectors, splits oversized clusters, and updates their centroids, (2) builds a single query graph index over the updated centroids, and (3) at query time, performs per-token graph navigation to collect candidate documents and compute approximate MaxSim scores fM(d, Q ).
+
+sampled vectors initialize the clusters, whose centroids are subsequently updated after assignment and splitting; (2) graph construction : a single graph index is built over the centroids, enabling efficient per-token nearest-neighbor search at query time; (3) query processing : for each query token, graph search retrieves the nc nearest centroids, and the documents associated with these centroids form the candidate set. An approximate MaxSim score fM(d, Q ) (defined in Eq. 6) is then accumulated from centroid inner products, and the top candidates are re-ranked by exact MaxSim computation. 
+
+B. Data-Aware Sampling-Based Partitioning 
+
+SIMQ adopts a data-aware sampling-based partitioning strategy derived from the Point Aggregation Graph (PAG) [6]. PAG is a proximity graph structure over a sampled subset of vectors, called aggregation points , that supports efficient nearest-neighbor navigation for the remaining residual points .Aggregation points are obtained via uniform random sampling and used to construct a proximity graph; residual points are subsequently assigned to their nearest aggregation point. PAG builds a high-quality partition without iterative clustering, achieving significantly lower construction cost than k-means while remaining entirely data-aware. In SIMQ, we adapt PAG to the multi-vector retrieval set-ting: aggregation points serve as initial centroids. After token assignment and splitting of oversized clusters, each centroid is updated to its cluster’s normalized mean. A single query graph index is built over these updated centroids for efficient per-token navigation. Compared with PLAID’s k-means clustering, the PAG-based partition has two key advantages. First, it avoids the iterative Lloyd’s algorithm that must scan all N · p token vectors in each iteration until convergence, reducing the build time from O(N · p · I) full-data iteration work (i.e., I is the number of iterations) to graph-guided assignment, with approximately logarithmic search cost per token under fixed search settings; this comparison excludes local splitting and final graph construction and suppresses vector dimension and centroid-comparison costs. Second, the initial centroids are sampled directly from the data, thus follows the empirical data distribution; by contrast, k-means centroids are arithmetic means that may fall between clusters in low-density areas, par-ticularly when K is constrained to be small. After assignment and local splitting, SIMQ updates each centroid to its cluster’s normalized mean, then final centroids need not coincide with observed token vectors. 
+
+C. Motivation 
+
+The main bottleneck of PLAID [3] is that computing the full K × | Q| centroid–query interaction matrix at every query is mandatory. As illustrated in Figure 3, changing the cluster number K cannot resolve this, as decreasing K increases document candidate filter costs while increasing K inflates matrix computation costs. Additionally, producing PLAID’s centroids via k-means requires processing all token vectors and typically relies on GPU acceleration at scale. Rather than computing this full matrix, SIMQ leverages data-aware sampling and graph-based indexing to navigate each query token directly to its most relevant centroids, naturally bypassing irrelevant ones. This allows SIMQ to use far more centroids than PLAID without the associated computational penalty, yielding smaller and more precise clusters while keeping query-time cost low and avoiding GPU dependency entirely. (a) Effect of centroid count K in PLAID Small K Large K     
+
+> coarse clusters, more candidate documents fine-grained clusters, larger interaction matrix
+> token vector centroid cluster boundary
+> (b) Trade-off in PLAID
+> cost number of centroids K
+> Filter Cost
+> (Candidate Documents)
+> Matrix Cost
+> (Interaction Matrix )Fig. 3. The trade-off in PLAID’s number of clusters K.
+
+D. Index Construction 
+
+Given a corpus of multi-vector documents, each document 
+
+d is represented by a set of single vectors {v1, v 2, . . . , v pd } ⊂ 
+
+Rh, where pd denotes the number of token vectors in docu-ment d. We denote the average number of token vectors per document as p, then the total number of single vectors across the corpus is approximately N · p. We construct two auxiliary mappings: ϕ(v) = d maps each token v ∈ V (d) to its source document d, and Ψ( cj ) = {ϕ(v) : v ∈ Sj } maps a centroid cj
+
+to the source documents of the member-tokens in its cluster. 
+
+Centroid Initialization. Following the PAG strategy, we uni-formly sample a subset of single vectors as initial cluster centroids with sampling ratio α ∈ (0 , 1] . Since N · p ≫ 1 
+
+> α
+
+,the density of sampled centroids converges in probability to the overall distribution of vectors in the embedding space; in expectation, C = α · N · p centroids are selected initially. 
+
+Cluster Assignment and Splitting. We first build a tempo-rary graph-index Ginit over the sampled centroids. For each remaining token vector, graph search on Ginit approximately identifies its nearest centroid for assignment. The online scheme described below updates the graph during assignment. Because uniform sampling can under-represent locally dense regions, some sampled centroids may receive many vectors from the same region. We therefore enforce a maximum cluster size T . There are two ways to enforce this bound: 
+
+Online split-insertion. Clusters exceeding T trigger imme-diate splitting using a farthest member as the new centroid, followed by local reassignment and incremental graph inser-tion. This handles local density well but couples assignment with graph mutation, requiring synchronization and limiting it to single-threaded builds. Extra insertions can also degrade construction efficiency and search quality in less robust graph backends. 
+
+Deferred recursive k = 2 splitting. Vectors are assigned against a fixed centroid set before oversized clusters undergo recursive binary splitting until all sizes are ≤ T . Final cen-troids are inserted into the graph in a single phase. Decoupling assignment from graph mutation enables safe parallelization with minimal clustering overhead. 
+
+Centroid Update. For a cluster j, let cj be its centroid, 
+
+A[cj ] = Sj be its member-token set, and μj be its unnormal-ized mean. Each centroid is updated as cj = μj /∥μj ∥, where 
+
+μj = 1 
+
+> |Sj|
+
+P 
+
+> v∈Sj
+
+v. Normalization ensures all centroids lie on 
+
+Algorithm 1: SIMQ Index Construction 
+
+Input: Corpus D = {d1, . . . , d N }; sampling ratio α; split threshold T
+
+Output: Graph index G; membership map A; mappings ϕ,
+
+Ψ 
+
+> 1
+
+V ← flatten all token vectors from D; 
+
+> 2
+
+ϕ(v) ← doc (v) for all v ∈ V ; 
+
+> 3
+
+C ← UniformSample (V, α ); 
+
+> 4
+
+Build temporary graph Ginit over C for token assignment;  
+
+> 5
+
+A[c] ← { c} for every c ∈ C ; 
+
+> 6
+
+foreach v ∈ V \ C do  
+
+> 7
+
+c∗ ← nearest centroid found by graph search on Ginit 
+
+for v; 
+
+> 8
+
+A[c∗] ← A [c∗] ∪ { v}; 
+
+> 9
+
+S ← {A [c] : c ∈ C} ; 
+
+> 10
+
+while some Sj ∈ S has |Sj | > T do  
+
+> 11
+
+split Sj into nonempty children Sa, S b using local 
+
+k-means with k = 2 ; 
+
+> 12
+
+S ← (S \ { Sj }) ∪ { Sa, S b}; 
+
+> 13
+
+C ← ∅ ; A ← ∅ ; 
+
+> 14
+
+foreach cluster Sj ∈ S do  
+
+> 15
+
+cj ←  P  
+
+> v∈Sj
+
+v/ P 
+
+> v∈Sj
+
+v ; 
+
+> 16
+
+C ← C ∪ { cj }; A[cj ] ← Sj ; 
+
+> 17
+
+Build graph index G over C (e.g., using HNSW [7]);  
+
+> 18
+
+foreach centroid c ∈ C do  
+
+> 19
+
+Ψ( c) ← { ϕ(v) : v ∈ A [c]} 
+
+> 20
+
+return G, A, ϕ, Ψ;
+
+the unit hypersphere, consistent with the ℓ2-normalized token vectors produced by ColBERT-style models. 
+
+Graph Construction. SIMQ indexes the centroids through a replaceable graph-based ANNS backend. HNSW [7] is our default implementation; other graph indices (e.g., Vamana [8] or NSG [9]) can be substituted depending on the deploy-ment scenario. We empirically validate SIMQ’s compatibility with alternative graph structures in §VI, demonstrating that the framework maintains strong performance across different graph backends. Construction is commonly modeled as ap-proximately O(|C| log |C| ) for HNSW under fixed dimension, degree, and construction-search settings, where C denote the set of cluster centroids. Algorithm 1 details the deferred construction procedure used in our multi-threaded implementation. In Algorithm 1, 
+
+doc( v) returns the source document of v. Let V =S 
+
+> d∈D
+
+V (d) denote all corpus token vectors. The function 
+
+UniformSample( V, α ) samples an α fraction of the token-vector collection V. It first flattens the corpus token vectors, records their source documents, samples initial centroids, and builds the temporary assignment graph (Lines 1–5). The re-maining vectors are assigned to their nearest retrieved centroid, and the initial clusters are formed (Lines 6–9). Each oversized cluster is then recursively split into two using local k-means with k = 2 until every cluster has at most T members (Lines 10–12). Finally, the algorithm computes normalized cluster means, rebuilds the centroid and membership maps, constructs the final graph, and creates the centroid-to-document map Ψ(Lines 13–20). This is the deferred strategy used in the multi-threaded experiments; online split-insertion is an alternative described above. 
+
+Running Example. Consider a small corpus of three docu-ments d1, d 2, d 3 with token vectors in a 2-dimensional embed-ding space. The coordinates below illustrate vector directions; all vectors are ℓ2-normalized before assignment and scoring. Suppose d1 contains vectors near (0 .9, 0.1) (corresponding to the term “machine”), d2 contains vectors near (0 .1, 0.9) 
+
+(corresponding to “algorithm”), and d3 contains both. With sampling ratio α = 0.5, two centroids c1 ≈ (0 .9, 0.1) 
+
+and c2 ≈ (0 .1, 0.9) are selected. After cluster assignment, 
+
+S1 contains the “machine” vectors of d1 and d3, while S2
+
+contains the “algorithm” vectors of d2 and d3. The graph connects c1 and c2 (as the only two centroids), with mappings 
+
+Ψ( c1) = {d1, d 3} and Ψ( c2) = {d2, d 3}. At query time, a query token q near (0 .85 , 0.15) would be navigated to 
+
+c1 via graph search, yielding candidate documents {d1, d 3}
+
+through Ψ( c1), correctly identifying the documents containing “machine”-related vectors. 
+
+E. Query Processing 
+
+Given a query Q = {q1, . . . , q m}, SIMQ processes each query token independently to retrieve candidate documents and compute approximate scores. 
+
+Centroid Retrieval and Candidate Collection. For each query token qi, we retrieve the nc nearest centroids via graph search: Ci = Search (G, q i, n c), where Search returns up to 
+
+nc centroid vectors from graph G for query token qi. The graph search starts from an entry point, then greedily traverses the graph toward the query token qi and returns the nearest centroids found. Under fixed dimension and search settings, well-constructed graphs commonly exhibit approximately log-arithmic search scaling in |C| ; this is not a worst-case guar-antee and does not account for increasing nc. In this work, we use HNSW [7] as the underlying graph index. Candidate documents for qi first form the raw pool Ui = S 
+
+> c∈C i
+
+Ψ( c).Let C(d) be the centroids whose clusters contain tokens of document d. For d ∈ U i, define its per-token approximate score as   
+
+> si(d) = max
+> c∈C i∩C (d)⟨qi, c ⟩.(4)
+
+The per-token document budget nd limits how many docu-ments are retained. We note Di = TopDocs( Ui, s i, n d), where 
+
+TopDocs keeps the highest-scoring nd documents. The full candidate set is Dcand = Smi=1 Di. This design avoids iterating through individual cluster members during query processing. 
+
+Approximate Scoring. For each candidate document d ∈Dcand , only the per-token scores retained in Di are accumu-lated. The approximate MaxSim score is    
+
+> fM(d, Q ) = X
+> i:d∈D i
+> si(d),(5)
+
+For each query token qi and document d, multiple retrieved clusters may contain token vectors from d. SIMQ uses the centroid with the highest inner product with qi to represent these matches. This maximum is taken over the retrieved centroids, while exact MaxSim takes the maximum over the 
+
+Algorithm 2: SIMQ Query Processing                                                                       
+
+> Input: Query Q={q1, . . . , q m}; Graph index G; mapping
+> Ψ; access to document token vectors V(d)for reranking; nc; per-token document budget nd;reranking budget kr; final result count k
+> Output: Top-kdocuments ranked by exact MaxSim
+> M(d, Q )
+> 1foreach query token qi∈Qdo
+> 2Ci←Search (G, q i, n c);
+> 3Ui←S
+> c∈C iΨ( c);
+> 4compute si(d)for each d∈ U iusing Eq. 4;
+> 5Di←TopDocs( Ui, s i, n d);
+> 6Dcand ←Smi=1 Di;
+> 7foreach d∈ D cand do
+> 8fM(d, Q )←P
+> i:d∈D isi(d);
+> 9T ← top-krin Dcand by fM;
+> 10 foreach d∈ T do
+> 11 M(d, Q )←Pmi=1 max v∈V(d)⟨qi, v ⟩;
+> 12 return top-kin Tby M(d, Q );
+
+document’s original token vectors. The approximation quality is analyzed formally in §IV. 
+
+Re-ranking. Let T denote the top-kr candidates ranked by 
+
+fM, where kr is the reranking budget and k is the count of final results. For every d ∈ T , we then access its original token vectors V (d) and compute the exact MaxSim score M(d, Q ).The system returns the top-k documents under these exact scores. This final step corrects ranking errors that may arise when a cluster centroid is an imperfect proxy for one or more of its member tokens. Algorithm 2 describes the query steps. For each query token, SIMQ searches the centroid graph index, gathers the documents represented by the retrieved clusters, scores each document using its best-matching retrieved centroid, and keeps up to nd documents (Lines 1–5). It unions the retained per-token sets, sums their proxy scores, and selects the top-kr
+
+candidates (Lines 6–9). It then accesses the original token vectors of these candidates, computes exact MaxSim, and returns the top-k documents (Lines 10–12). IV. T HEORETICAL ANALYSIS OF SIMQ We analyze when SIMQ’s data-aware partitioning can achieve smaller MaxSim approximation error than MUVERA’s data-oblivious LSH partitioning. Throughout this section, we use ˜vSi (εS ) and ˜vMi (εM ) to denote the approximate vectors (approximation MaxSim errors) of SIMQ and MUVERA, respectively, and fM(d, Q ) for the approximate MaxSim score. We assume token vectors concentrate on a low-dimensional manifold and form multiple semantic clusters [10], [11]. We state the additional cluster-separation and partition-mixing assumptions needed by the comparison explicitly below; the result is therefore conditional rather than a claim that every random LSH partition must mix every pair of semantic clus-ters. A. Approximation Framework 
+
+Definition 2 (Approximate Vector) . For a query token qi and a document d, let v∗ 
+
+> i
+
+= arg max v∈V (d)⟨qi, v ⟩ be the true best-matching vector. We define ˜vi as the approximate vector of 
+
+v∗ 
+
+> i
+
+: the centroid vector of the cluster cell containing v∗ 
+
+> i
+
+.For example, if the query token qi’s true best-matching vector v∗ 
+
+> i
+
+is in cluster j, the approximate vector ˜vi = cj . As Alg. 2 shows, we find ˜vi only from the retrieved nc centroids through graph search of query token qi. Since usually nc
+
+is much smaller than the size of document tokens, the time complexity to find ˜vi is also much smaller than that to calculate the true best-matching vector v∗ 
+
+> i
+
+. According to Eq. 4, we can denote ˜vi = arg max c∈C i∩C (d)⟨qi, c ⟩, where Ci is the retrieved 
+
+nc centroids through graph search for query token qi, and C(d)
+
+is the set of centroids whose corresponding clusters contains tokens of document d.
+
+Definition 3 (Approximate MaxSim Score) . The approximate MaxSim score is:   
+
+> fM(d, Q ) =
+> mX
+> i=1
+> ⟨qi,˜vi⟩(6)
+
+where m is the size of query tokens. 
+
+Definition 4 (Approximation MaxSim Error) . The approxi-mation MaxSim error is:         
+
+> ε=M(d, Q )−fM(d, Q ) =
+> mX
+> i=1
+> ⟨qi, v ∗
+> i−˜vi⟩
+> |{z }
+> εi
+> (7)
+
+By Cauchy–Schwarz, each per-token error satisfies:         
+
+> εi=⟨qi, v ∗
+> i−˜vi⟩ ≤ ∥ qi∥ · δ(v∗
+> i,˜vi)(8)
+
+The quality of the approximation thus depends on δ(v∗ 
+
+> i
+
+, ˜vi):how close the aggregation vector is to the true best-matching vector. Under the manifold and successful-cell-retrieval as-sumptions stated below, we compare the expected per-token error of SIMQ’s data-aware partitioning with MUVERA’s data-oblivious partitioning. 
+
+B. Approximation Analysis 
+
+Lemma IV.1 (Reduction to Per-Token Comparison) . Suppose two methods each apply a fixed partition to all token vectors and, at query time, successfully identify the cell containing each true best-matching vector v∗ 
+
+> i
+
+. Then for the same query 
+
+Q, the total approximation error comparison reduces to per-token average error comparison:         
+
+> E[εS]<E[εM]⇐⇒ εS< ε M(9)
+
+where ε = 1
+
+> m
+
+Pmi=1 E[εi] is the per-token average error. Proof. Since both methods apply a fixed partition to all token vectors, each v∗ 
+
+> i
+
+is approximated by the aggregation vector of its cell under the same mechanism. By linearity of expectation:    
+
+> E[ε] =
+> mX
+> i=1
+> E[εi] = m·ε
+
+For the same query, m is identical for both methods. There-fore, E[εS ] < E[εM ] if and only if εS < ε M .
+
+Interpretation. Lemma IV.1 states that comparing the total approximation errors of two methods reduces to comparing their per-token average errors. This simplification is significant because it allows us to analyze a single query-token/document-vector pair (qi, v ∗ 
+
+> i
+
+) in isolation, rather than reasoning about the full query-document interaction. In the remainder of this section, we focus on bounding E[δ(v∗ 
+
+> i
+
+, ˜vi)] for a single token pair under each method. 
+
+Lemma IV.2 (SIMQ Has Smaller Per-Token Error under Clus-ter Separation) . Under the low-dimensional-manifold assump-tion, suppose that SIMQ cells are contained within semantic clusters with radius at most rS , and that a MUVERA cell crosses semantic-cluster boundaries with probability pmix >
+
+0. If the inter-cluster separation dominates the within-cell radius, then for any query token qi and its true best-matching vector v∗ 
+
+> i
+
+:         
+
+> E[δ(v∗
+> i,˜vSi)] <E[δ(v∗
+> i,˜vMi)] (10)
+
+Proof. We analyze the two sides separately. Let δmin denote the minimum inter-cluster distance on the data manifold. 
+
+SIMQ (data-aware partitioning). SIMQ samples centroids from the data itself and forms a Voronoi partition. By the characteristic of data-aware Voronoi partitioning [12], the cell radius adapts to local data density: within a semantic cluster (a high-density region), cells are small and semantically coherent. Let rS denote the cell radius of SIMQ within a semantic cluster. Since all vectors in the cell lie within a ball of radius 
+
+rS , the aggregation vector ˜vSi (the cell centroid) satisfies:       
+
+> δ(v∗
+> i,˜vSi)≤rS(11)
+
+MUVERA (data-oblivious partitioning). MUVERA uses b
+
+random Gaussian projections to partition the space into 2b
+
+cells via SimHash. Since the partitioning hyperplanes are independent of the data distribution, they cannot adapt to semantic cluster boundaries. By the collision probability of random hyperplane LSH [13], two vectors at angle θ are separated with probability θ/π > 0. Consequently, MUVERA cells can mix vectors from multiple semantic clusters with positive probability. Conditioned on such a mixed cell, let the cell containing v∗ 
+
+> i
+
+intersect s clusters with centers μ1, . . . , μ s
+
+satisfying δ(μj , μ l) ≥ δmin for j̸ = l. The aggregation vector 
+
+˜vMi is the mean of all vectors in the cell, which is pulled toward the centroid ¯μ = 1
+
+> s
+
+Psj=1 μj of the mixed cluster centers. For any v∗ 
+
+> i
+
+belonging to cluster k, by the triangle inequality:                 
+
+> δ(v∗
+> i,˜vMi)≥δ(μk,¯μ)−δ(v∗
+> i, μ k)−δ(˜ vMi,¯μ)(12)
+
+Since the clusters are well-separated and each has bounded internal radius, δ(μk, ¯μ) = Ω( δmin ) while the correction terms are o(δmin ). Therefore, after accounting for the mixing probability:     
+
+> E[δ(v∗
+> i,˜vMi)] = Ω( pmix δmin )(13)
+
+If pmix δmin ≫ rS , Eqs. 11 and 13 together yield:             
+
+> E[δ(v∗
+> i,˜vSi)] ≤rS≪pmix δmin =O
+> 
+> E[δ(v∗
+> i,˜vMi)]
+> 
+
+Interpretation. Lemma IV.2 highlights the geometric ad-vantage of data-aware partitioning: SIMQ’s centroids ( ˜vSi )faithfully represent semantic clusters, whereas MUVERA’s boundary crossings pull centroids ( ˜vMi ) toward multi-cluster 𝐀 1        
+
+> 𝐀 2
+> 𝐀 6
+> 𝐀 23
+> 𝐀 𝐀 Approx.
+> 𝐀 8
+> 𝐀 15
+> 𝐀 𝐀 Approx.
+> 222211SIMQ SIMQ+ √√√√√√√√√√XX
+> 𝐀 𝐀𝐀𝐀𝐀 (=4) 𝐀 2
+> 𝐀 1
+> 𝐀 6
+> 𝐀 8
+> 𝐀 𝐀
+> 0.83 0.86 0.92 0.90 0.84 0.86 0.87 0.88
+> MaxSim
+> 1.69 1.82 1.70 1.75
+> 𝐀 1
+> 𝐀 8
+> 𝐀 6
+> 𝐀 2
+> Rerank
+> 𝐀 𝐀 𝐀 𝐀
+> 𝐀 𝐀
+> Rerank Count Rerank Fig. 4. Overview of the SIMQ+ query processing.
+
+averages. The factor pmix δmin captures the frequency and severity of this distortion. 
+
+Proposition IV.1 (Expected Approximation Error under Data-Aware Partitioning) . Under the manifold, cluster-separation, and partition-mixing assumptions above, and as-suming that graph search identifies the cell containing each true best-matching vector, for the same query Q and document 
+
+d:
+
+E[εS ] < E[εM ] (14) 
+
+Proof. Immediate from Lemma IV.1 and Lemma IV.2: the total error comparison reduces to per-token comparison (Lemma IV.1), and SIMQ’s per-token error is strictly smaller (Lemma IV.2). 
+
+Interpretation. Proposition IV.1 establishes a lower ex-pected approximation error for SIMQ under standard assump-tions. This advantage stems from SIMQ’s data-aware partition-ing producing semantically coherent cells, unlike MUVERA’s data-oblivious LSH which mixes distinct regions. 
+
+Remark IV.1 (Limitation of MUVERA’s Repeated Partitions) .
+
+MUVERA repeats its LSH partitioning R times with inde-pendent hash functions and averages the resulting scores. Let 
+
+fM(r) denote the approximate score under the r-th partition, and fMM (R) = 1
+
+> R
+
+PRr=1 fM(r). Under independent repetitions, the law of large numbers gives: 
+
+fMM (R) = 1
+
+R
+
+> R
+
+X
+
+> r=1
+
+fM(r) −−−−→ 
+
+> R→∞
+
+E[ fM(r)] (15) 
+
+Thus, increasing R makes the result approach the average behavior of the data-oblivious partitions; it does not select or recover the best individual partition. Repetition reduces the variance caused by the random hyperplanes, but it does not remove a systematic bias caused by the mismatch between the LSH partition and the data distribution. 
+
+Interpretation. This remark addresses a natural question: can MUVERA compensate for a weak random partition by repeating the pipeline many times? Repetition does not search for the best partition; it averages independent partitions and converges toward their expected behavior. Although this re-duces variance, it cannot remove a systematic partitioning bias. This interpretation is consistent with the results in §VI, where 𝐀 𝐀 0.83 0.86                   
+
+> 𝐀 𝐀 0.92 0.90 ...
+> (a) True ranking by MaxSim query 𝐀 𝐀
+> 𝐀 2
+> 𝐀 1
+> document MaxSim 𝐀 𝐀
+> 0.83 0.92
+> True ranking:
+> 𝐀 𝐀 >𝐀 𝐀
+> ...
+> (b) Bad case of approximate scoring
+> 𝐀 𝐀
+> 𝐀 𝐀 query 𝐀 𝐀 𝐀 𝐀
+> 0.72 0.86
+> underestimate
+> 0.88 0.78
+> overestimate
+> 𝐀 2
+> 𝐀 1
+> document Result Approx.
+> 1.66 1.58 pruned selected
+> Approximate ranking: 𝐀 𝐀 >𝐀 𝐀
+> ranking reversal
+> 0.86 1.69 0.90 1.82
+> 𝐀 𝐀
+> 𝐀 𝐀
+> ... ...
+> Fig. 5. Ranking-reversal bad case motivating SIMQ+.
+
+MUVERA with R = 20 repetitions remains sensitive to the data-oblivious partitioning strategy. V. SIMQ+ F RAMEWORK 
+
+The theoretical analysis in §IV shows that SIMQ’s data-aware partitioning produces fine-grained, semantically coher-ent cells, where each cell contains vectors from a small, locally coherent region of a semantic cluster. Under such a partition, the centroid of each cell closely approximates its member vectors, and query tokens that are semantically similar to document tokens are more likely to effectively cover them through graph search. This causes relevant documents to accumulate hits across more query tokens, naturally separating them from irrelevant ones. SIMQ+ is designed around this observation, introducing count-based scoring and a dynamic candidate set to further improve retrieval quality. Figure 4 illustrates the SIMQ+ pipeline. Given a query 
+
+Q, the per-token centroid search and raw document-pool construction are shared with basic SIMQ. However, SIMQ+ counts all documents in each raw pool, without per-token approximate-document-score filtering or top-nd truncation. The key modifications are in the scoring and candidate se-lection stages: (1) instead of computing approximate MaxSim scores fM(d, Q ) from centroid inner products, SIMQ+ assigns each candidate document a hit count cnt (d) reflecting how many distinct query tokens retrieved it; (2) instead of selecting a fixed top-kr candidate set, SIMQ+ collects candidates in decreasing order of cnt (d) and stops at the first count level at which the accumulated candidate count reaches the minimum reranking candidate count Nmin , retaining all ties at that level. If fewer candidates are available, all are retained. The selected candidates are then re-ranked by exact MaxSim computation 
+
+M(d, Q ).Figure 5 illustrates the ranking-reversal bad case that moti-vates SIMQ+. A relevant document with a high exact MaxSim score can be represented by an approximate lower point, while an irrelevant document with a lower exact score can be represented by an approximate upper point. The approximate ranking may therefore reverse the order of the two documents before exact re-ranking. We call a document d underestimated 
+
+when its approximate score satisfies fM(d, Q ) < M(d, Q ),and overestimated when fM(d, Q ) > M(d, Q ). A relevant document with a high exact MaxSim score may therefore be pushed downward by an underestimated proxy, while an irrelevant document with a low exact score may be promoted by an overestimated proxy. The resulting inversion is espe-cially harmful when a fixed candidate cutoff separates the two documents. This is the failure mode that motivates the count-based scoring and dynamic candidate selection in SIMQ+. 
+
+A. From Inner Products to Count-Based Scoring 
+
+Under SIMQ’s fine-grained partition, each centroid cj
+
+lies close to its member vectors. Since all vectors are ℓ2-normalized, the inner product ⟨qi, c j ⟩ between a query token and a nearby centroid is close to 1 for all retrieved centroids. As a result, the approximate MaxSim scores across different candidate documents become similar in magnitude, and the 
+
+relative ordering of documents is driven more by how many 
+
+query tokens hit each document than by the precise inner product values. This motivates replacing inner-product scoring with count-based scoring. For each candidate document d ∈ Smi=1 Ui, let 
+
+1[A] be 1 when condition A holds and 0 otherwise. We define cnt (d) = Pmi=1 1[d ∈ U i], where Ui = S 
+
+> c∈C i
+
+Ψ( c) contains all documents represented in the clusters retrieved for qi. Set membership ensures that a document contributes at most one hit per query token, even if several retrieved clusters contain its tokens. Unlike basic SIMQ, SIMQ+ does not compute si(d) or apply TopDocs to this pool. Before exact reranking, centroid inner products guide graph search but do not filter or rank the document candidates. A document’s count reflects the number of distinct query tokens for which it was covered, providing a more robust signal than inner product values when centroids are close to their member vectors. Count-based scoring treats all hits equally, flattening the tail of the score distribution and reducing the advantage of spurious high-scoring irrelevant documents that arise from fa-vorable centroid alignment. When the number of query tokens 
+
+m is large, relevant documents accumulate hits across more tokens due to semantic relevance, and count-based scoring naturally produces a clear separation between relevant and irrelevant documents. From a probabilistic perspective, the expected hit count of a document d is E[cnt (d)] = Pmi=1 P (d ∈ U i), where the probability is taken over the randomness of the query. For a relevant document whose token vectors are semantically close to many query tokens, P (d ∈ U i) is high for a large fraction of tokens, yielding a large expected count. For an irrelevant document, P (d ∈ U i) is small for most tokens, yielding a small expected count. The difference in expected counts provides a robust signal for separating relevant from irrelevant documents, which is more reliable than the fine-grained inner product values when centroids are close to their member vectors. 
+
+B. Dynamic Candidate Set 
+
+SIMQ uses a fixed top-kr candidate set for re-ranking. SIMQ+ replaces this with a dynamic threshold strategy: candi-dates are collected in decreasing order of cnt (d), and collection stops at the first count level where at least Nmin documents have been collected. Equivalently, τ is the largest integer threshold that retains at least Nmin documents. In the sets below, d ranges only over Smi=1 Ui, the documents hit by at 
+
+Algorithm 3: SIMQ+ Query Processing                                                                             
+
+> Input: Query Q={q1, . . . , q m}; Graph index G; mapping
+> Ψ; access to document token vectors V(d)for reranking; centroids retrieved per token nc; final top-k; minimum candidate size Nmin
+> Output: Top-kdocuments ranked by exact MaxSim M
+> 1foreach query token qi∈Qdo
+> 2Ci←Search (G, q i, n c);
+> 3Ui←S
+> c∈C iΨ( c);
+> 4foreach document dsuch that ∃i:d∈ U ido
+> 5cnt (d)←Pmi=1 1[d∈ U i];
+> 6Dcand ←Smi=1 Ui;
+> 7if |D cand | ≥ Nmin then
+> 8select the largest feasible threshold τusing Eq. 16;
+> 9Dcand ← { d∈ D cand :cnt (d)≥τ};
+> 10 foreach document d∈ D cand do
+> 11 M(d, Q )←Pmi=1 max v∈V(d)⟨qi, v ⟩;
+> 12 return top-kdocuments in Dcand ranked by M(·, Q );
+
+least one query token before any document truncation. When this pool contains at least Nmin documents, we select           
+
+> Dcand ={d:cnt (d)≥τ},τ=max
+> t∈{ 1,...,m }|{ d:cnt (d)≥t}|≥ Nmin
+> t. (16)
+
+If the pool contains fewer than Nmin documents, we retain the entire pool; an empty pool yields no results. This ensures that all documents sharing the same boundary count value are included together, preventing arbitrary exclusion of relevant documents that happen to tie at the threshold. When enough candidates are available, the selected set has at least Nmin 
+
+documents and may be larger when many documents share the boundary count. The motivation for the dynamic candidate set is as fol-lows. Under basic SIMQ, the top-kr candidates are selected by the approximate score fM(d, Q ). When many documents share similar approximate scores, a fixed cutoff at kr may split documents with identical scores, including some while excluding others arbitrarily. By contrast, the dynamic strategy retains all documents tied at the boundary count. When at least 
+
+Nmin candidates are available, the selected set exceeds Nmin 
+
+only when including the entire boundary group takes its size beyond that minimum. Thus, the amount of expansion depends on the number of tied documents at the boundary, rather than on high hit counts alone. This avoids arbitrarily splitting a tied group while excluding documents with lower counts than the boundary. Algorithm 3 summarizes SIMQ+ query processing. It searches the centroid graph for each query token and forms the corresponding document pools (Lines 1–3). It counts how many distinct query-token pools contain each document and forms the full candidate set (Lines 4–6). If at least Nmin 
+
+candidates are available, it applies the dynamic threshold 
+
+τ , retaining all candidates tied at the boundary (Lines 7– 9). Finally, it computes exact MaxSim from the selected TABLE I DATASET STATISTICS .                           
+
+> Dataset Doc. tok. Avg. tok./doc. Queries Avg. q. tok.
+> h
+> NQ 264.4M 98.6 3.5K 11.9 64 LoTTE-pooled 389.5M 138.2 3.9K 11.3 64 Quora 8.5M 16.3 10K 13.7 64 SciDocs 4.2M 164.4 1K 15.1 64 HotpotQA 349.1M 66.7 7.4K 21.6 64
+
+documents’ original token vectors and returns the top-k results (Lines 10–12). VI. E XPERIMENTAL STUDY 
+
+In this section, we evaluate the performance of SIMQ and SIMQ+ through extensive experiments on five benchmark datasets. We evaluate index construction and query processing on CPU-based systems to demonstrate the practical efficiency of our approach. PLAID’s large-scale k-means centroids are the exception: because CPU construction was prohibitively slow, those final centroids were generated on a separate GPU machine. We aim to answer the following research questions:  
+
+> •
+
+RQ1: How does SIMQ compare with state-of-the-art multi-vector retrieval methods in terms of recall, query throughput, and index construction time?  
+
+> •
+
+RQ2: How does the PAG-based clustering strategy compare with alternative clustering methods (e.g., k-means and LSH) in terms of retrieval quality and query throughput?  
+
+> •
+
+RQ3: How does SIMQ+ improve upon SIMQ, and what benefit does its count-based scoring and dynamic candidate selection provide?  
+
+> •
+
+RQ4: Can SIMQ support different graph-based ANNS backends? 
+
+A. Experimental Setup 1) Datasets: We evaluate our methods on five widely-used information retrieval datasets from the BEIR benchmark [14] and the ColBERTv2 evaluation suite [2]:  
+
+> •
+
+Quora : A duplicate question retrieval dataset with 522,931 passages and 10K queries. Each query seeks semantically equivalent questions.  
+
+> •
+
+SciDocs : A scientific paper retrieval dataset with 25,657 passages and 1K queries, where queries are paper titles and relevant passages are abstracts.  
+
+> •
+
+NQ (Natural Questions) : A large-scale question answering dataset with 2,681,468 passages and 3.5K queries, derived from Google search queries and Wikipedia articles.  
+
+> •
+
+HotpotQA : A multi-hop question answering dataset with 5,233,329 passages and 7.4K queries, requiring reasoning across multiple documents.  
+
+> •
+
+LoTTE-pooled : A collection of five domain-specific forums (Writing, Lifestyle, Science, Technology, Recreation) with 2,819,103 passages and 3.9K queries, serving as an out-of-domain benchmark. The statistics of datasets are summarized in Table I. 
+
+2) Baselines: We compare SIMQ and SIMQ+ against the following state-of-the-art multi-vector retrieval methods:  
+
+> •
+
+PLAID [3]: A multi-stage retrieval engine built on Col-BERTv2, employing residual quantization and a centroid interaction matrix for candidate pruning.  
+
+> •
+
+MUVERA [5]: It reduces multi-vector retrieval to single-vector retrieval via Fixed Dimensional Encodings (FDEs) using LSH-based partitioning and random projections.  
+
+> •
+
+IGP [4]: A graph-based multi-vector retrieval method op-erating on the compressed centroid/residual representation. We use the PLAID-style compressed index and search the centroid graph before residual-decode reranking.  
+
+> •
+
+GEM [15]: A native graph-based index for multi-vector retrieval, which constructs proximity graphs over document vector sets using set-level clustering and bridges between local graphs. All methods use the same ColBERTv2 token embed-dings [2] with dimension h = 64 and the same evaluation qrels. Unless otherwise stated, we report Recall@100@100. 
+
+3) Metrics: We evaluate the following metrics:  
+
+> •
+
+Recall@ k@k: For each query, we divide the size of the intersection between the exact top-k documents under MaxSim and the retrieved top-k documents by k, then average this fraction over the evaluation queries. The main experiment reports k ∈ {20 , 50 , 100 }; unless otherwise stated, the remaining experiments use k = 100 . 
+
+> •
+
+Queries Per Second (QPS) : The number of queries the system can process per second, measuring throughput.  
+
+> •
+
+Index Construction Time : The time required to build in-dexes, including any clustering or graph construction steps. 
+
+4) Implementation and Hardware: SIMQ and SIMQ+ are implemented in C++ with HNSW graph construc-tion and search based on the hnswlib library. 1 Except for PLAID’s large-scale k-means centroid generation, the index-construction and query-processing experiments are conducted on a single-socket AMD EPYC 9T24 host with 96 physical cores, 192 logical threads, approximately 1.1 TiB memory, and local NVMe storage. SIMQ, SIMQ+, and IGP graph construc-tion use 16 threads where applicable. The default is α = 0 .1;the sensitivity sweep also evaluates {0.05 , 0.08 , 0.15 , 0.20 }.
+
+5) Parameter Settings:  
+
+> •
+
+PLAID : 4-bit residual quantization (threshold 0.3) with 
+
+K = 7 .5k (SciDocs), 15 k (Quora), and 262 .1k (others). Experiments sweep the number of centroid cells probed per query token ncells from 1 to 25 at the candidate-document filtering budget ndocs = 4 k, retaining 1,000 documents for exact MaxSim reranking.  
+
+> •
+
+MUVERA : The FDE uses R = 20 independent partition repetitions, b = 4 SimHash bits per partition, and projected dimension dproj = 16 per cell. The DiskANN index [8] uses maximum graph degree Rd = 32 , construction-search candidate-list size L = 100 , and edge-pruning factor αe =1.2. Both constructions use 16 threads. 
+
+> 1https://github.com/nmslib/hnswlib
+
+SIMQ GEM MUVERA PLAID IGP 0.8 0.9 1200 500 1000 QPS Recall                                                    
+
+> (a) Quora, 20@20 0.7 0.8 0.9 120 50 100 200 QPS
+> Recall
+> (b) SciDocs, 20@20 0.6 0.7 0.8 0.9 120 50 100 200 QPS
+> Recall
+> (c) LoTTE, 20@20 0.8 0.9 120 50 100 200 QPS
+> Recall
+> (d) NQ, 20@20 0.4 0.5 0.6 0.7 0.8 0.9 20 50 100 200 QPS
+> Recall
+> (e) HotpotQA, 20@20 0.7 0.8 0.9 1200 500 1000 QPS
+> Recall
+> (f) Quora, 50@50 0.7 0.8 0.9 120 50 100 200 QPS
+> Recall
+> (g) SciDocs, 50@50 0.5 0.6 0.7 0.8 0.9 20 50 100 200 QPS
+> Recall
+> (h) LoTTE, 50@50 0.7 0.8 0.9 120 50 100 200 QPS
+> Recall
+> (i) NQ, 50@50 0.4 0.5 0.6 0.7 0.8 0.9 20 50 100 200 QPS
+> Recall
+> (j) HotpotQA, 50@50 0.7 0.8 0.9 1200 500 1000 QPS
+> Recall
+> (k) Quora, 100@100 0.7 0.8 0.9 120 50 100 200 QPS
+> Recall
+> (l) SciDocs, 100@100 0.5 0.6 0.7 0.8 20 50 100 200 QPS
+> Recall
+> (m) LoTTE, 100@100 0.7 0.8 0.9 120 50 100 200 QPS
+> Recall
+> (n) NQ, 100@100 0.4 0.5 0.6 0.7 0.8 0.9 20 50 100 200 QPS
+> Recall
+> (o) HotpotQA, 100@100 Fig. 6. QPS versus Recall on five datasets. QPS is on a logarithmic vertical axis.
+> •
+
+SIMQ : Sampling ratio α = 0.1, maximum cluster size 
+
+T = 160 , and two children per recursive split ( K = 2 ,local to this splitting step). The multi-threaded construction uses deferred recursive splitting after token assignment. The HNSW graph uses degree parameter M = 32 and construction-search candidate-list size efConstruction =50 . The per-token candidate-document budget is nd = 1000 ;
+
+nc separately counts the centroids retrieved per query token. The exact-reranking budget is kr = 1000 . 
+
+> •
+
+SIMQ+ : We use the same index, graph-search, and ex-ecution settings as SIMQ, with minimum candidate size 
+
+Nmin = 1000 . 
+
+> •
+
+GEM : The number of clusters probed during search is 
+
+nprobe = 1 –2. Its dataset-specific K and 20-iteration k-means settings follow PLAID.  
+
+> •
+
+IGP : PLAID-style 4-bit residual-compressed index, centroid HNSW graph built with 16 threads, and residual-decode reranking. The parameter probe topk = 1400 controls the candidate-document search budget. The parameter nprobe 
+
+controls the number of clusters probed; the Quora sweep uses nprobe = 1 –20 .
+
+B. Experimental Results 1) RQ1: Comparison with Baselines: a) QPS-Recall Performance.: Figure 6 shows SIMQ and baseline QPS–Recall curves across five datasets for 20@20, 50@50, and 100@100 retrieval settings. SIMQ and PLAID have different query-time trade-offs. PLAID computes a full K × m centroid–query interaction matrix, where K is the total centroid count in its residual-compressed representation. Larger K yields finer clusters but increases matrix computation; smaller K reduces this cost but coarsens clusters and can increase candidate-processing work. At fixed K, probing fewer cells does not remove the full matrix cost, while probing more cells increases downstream document-scoring work. SIMQ instead navigates directly to relevant centroids through per-token graph search, supporting fine-grained partitions without a full centroid scan, thus can beat the baselines in query performance. MUVERA’s LSH cell quality depends on how its random hyperplanes align with non-uniform token structures; while 
+
+R = 20 repetitions reduce variance, the partition remains data-oblivious. In contrast, SIMQ’s PAG-based partitioning adapts directly to the token distribution. GEM [15] builds proximity graphs over document vector sets via a costly pipeline (set-level clustering, local graphs, and bridging). IGP adds a centroid graph to PLAID’s rep-resentation, reporting build overhead relative to PLAID. All methods are evaluated using Pareto frontiers rather than single operating points. 
+
+b) Sampling Ratio Sensitivity.: To assess the effect of the sampling ratio, we compare SIMQ with α values 0.05, 0.08, 0.1, 0.15, and 0.20 on NQ and Quora. The default setting is 
+
+α = 0 .1. For each setting, we vary the retrieval parameter and plot the measured QPS–Recall@100@100 operating points. Figure 7 shows that SIMQ maintains broadly comparable QPS–Recall trade-offs for sampling ratios α between 0.08 and 0.20 on both datasets, with the default α = 0 .1 in this stable range. The smallest setting, α = 0 .05 , is less robust; its throughput lags at the high-recall end on NQ and offers no TABLE II TOTAL INDEX CONSTRUCTION TIME (SECONDS ). T HE FASTEST REPORTED METHOD FOR EACH DATASET IS SHOWN IN BOLD .
+
+Dataset PLAID IGP MUVERA SIMQ 
+
+NQ / / 2,458 3,386 LoTTE-pooled / / 2,936 5,271 Quora 4,282 4,282.3 264 68 
+
+SciDocs 1,061 1,061.2 21 33 HotpotQA / / 4,058 4,020 0.70 0.75 0.80 0.85 0.90 100 200 300 QPS Recall100@100 0.80 0.85 0.90 0.95 400 500 600 700 QPS Recall100@100                   
+
+> α= 0 .05 α= 0 .08 α= 0 .1(default)
+> α= 0 .15 α= 0 .20 0.70 0.75 0.80 0.85 0.90 100 200 300 Recall100@100 QPS
+> (a) NQ across sampling ratios 0.80 0.85 0.90 0.95 400 500 600 700 Recall100@100 QPS (b) Quora across sampling ratios Fig. 7. QPS–Recall@100@100 curves for SIMQ.
+
+consistent advantage on Quora. This trend is consistent with the effect of sparse sampling: fewer sampled centroids lead to larger clusters, whose greater radii can make approximate scores less discriminative for identifying target documents. Overall, the results support α = 0 .1 as a practical default and suggest avoiding overly small sampling ratios. 
+
+c) Index Construction Time.: Table II reports the total index construction time for each dataset and method. PLAID uses 20 k-means iterations. SciDocs and Quora were small enough to complete this construction on the CPU host; for the larger datasets, the k-means construction was completed on a separate GPU machine and no CPU construction time is reported. GEM is omitted because its construction cost is not comparable under the present CPU setup. The slash indicates that no CPU construction time is re-ported; the corresponding PLAID indexes were completed using k-means on a separate GPU machine, so IGP total time is also unavailable. IGP times include the corresponding PLAID construction and centroid-graph construction overhead. MUVERA times include FDE encoding, DiskANN construc-tion, and index serialization. GEM is not included in this table because its construction is substantially more expensive under the CPU configuration. The fastest reported construction time in each row is bolded. 
+
+2) RQ2: PAG vs. Alternative Clustering Methods: To com-pare the partitioning strategies, we evaluate PAG, k-means, and LSH on all five datasets using the same downstream graph and query pipeline. k-means is a useful reference because, with sufficiently many centroids, it directly optimizes a data-aware clustering objective. We test whether PAG’s sampling- and graph-based construction can preserve retrieval behavior while reducing the CPU burden of repeated global k-means iterations. For PAG and k-means, we select measured operating points with nearly matched Recall@100@100; no interpolated values are used. LSH is reported at its available      
+
+> TABLE III PAG AND k-MEANS AT NEARLY MATCHED RECALL @100@100, WITH
+> LSH SHOWN AT ITS AVAILABLE OPERATING POINT . E ACH CELL REPORTS
+> QPS / R ECALL @100@100.
+
+Dataset PAG k-means LSH 
+
+SciDocs 121.6 / 0.787 105.0 / 0.794 106.4 / 0.480 Quora 532.7 / 0.834 516.2 / 0.840 504.0 / 0.421 LoTTE-pooled 163.4 / 0.710 160.6 / 0.684 148.1 / 0.314 NQ 187.6 / 0.779 183.8 / 0.771 169.2 / 0.371 HotpotQA 227.1 / 0.576 216.8 / 0.565 214.6 / 0.262 SIMQ SIMQ+ 10 100 1000 0.2 0.4 0.6 0.8 1.0            
+
+> nc
+> Recall@100
+> (a) LoTTE 10 100 1000 0.2 0.4 0.6 0.8 1.0
+> nc
+> Recall@100 (b) NQ 10 100 1000 0.2 0.4 0.6 0.8 1.0
+> nc
+> Recall@100
+> (c) HotpotQA 210 50 100 0.2 0.4 0.6 0.8 1.0
+> nc
+> Recall@100 (d) Quora Fig. 8. SIMQ vs. SIMQ+ Recall@100@100 as a function of nc.
+
+measured operating point because its recall range is lower and some datasets have only a single completed sweep point. Its occupied-cell count and cluster sizes are data-dependent, which can lead to uneven partition utilization. Across the five datasets, PAG achieves recall close to k-means and comparable or higher QPS at the selected operat-ing points. Its construction is more CPU-friendly by design: PAG samples aggregation points and assigns residual vectors through graph-guided search instead of repeatedly applying global Lloyd iterations to all token vectors; only oversized clusters undergo local recursive two-way splitting. Table III reports retrieval throughput and recall, not a direct measure-ment of clustering construction time. LSH is included only at its available measured point, where its recall is substantially lower, so it is not a recall-matched comparison. 
+
+3) RQ3: SIMQ vs. SIMQ+: We vary nc, the number of nearest centroids retrieved per query token, to compare SIMQ and SIMQ+ on LoTTE, NQ, HotpotQA, and Quora. SIMQ+ counts all documents in the retrieved clusters before document selection, rather than applying basic SIMQ’s per-token approximate-score truncation. It uses hit-count ranking and expands tied candidates at the dynamic boundary before exact reranking. SIMQ+’s gains stem from two design changes: a) Count-based scoring: replaces weak centroid inner-product scoring with distinct query-token hit counts across the retrieved pool, avoiding SIMQ’s per-token score truncation; b) Dynamic candidate selection: gathers candidates by descending hit count 0.6 0.7 0.8 0.9 100 200 QPS 0.4 0.5 0.6 0.7 0.8 0.3 Recall100@100 Recall100@100 QPS            
+
+> SIMQ(HNSW) SIMQ(NSG) SIMQ(DPG) 0.6 0.7 0.8 0.9 100 200 QPS
+> Recall100@100 (a) NQ 0.4 0.5 0.6 0.7 0.8 0.3 QPS 100 200
+> Recall100@100 (b) HotpotQA Fig. 9. QPS–Recall@100@100 comparison across graph backends.
+
+until reaching at least Nmin documents, retaining all tied candidates at the boundary to prevent arbitrary exclusion. 
+
+4) RQ4: Flexibility across Graph Backends: SIMQ treats the centroid graph as a replaceable ANNS backend: any graph-based backend that indexes the cluster centroids and supports nearest-centroid search can provide the navigation stage of the framework. HNSW is the default implementation used in the main experiments, rather than a requirement of SIMQ. To demonstrate this flexibility, we evaluate three representative backends: HNSW [7], NSG [9], and DPG [16], on NQ and HotpotQA. We retain the same PAG-based partitioning, candidate generation, and exact MaxSim reranking pipeline, replacing only the graph construction and search algorithms. All backends use deferred recursive K = 2 partition refine-ment after token assignment. We keep the shared retrieval parameters fixed across back-ends, so the comparison examines substituting the centroid-navigation backend within SIMQ. Figure 9 shows that all three backends support SIMQ’s retrieval pipeline, demonstrating that its centroid navigation is not tied to HNSW. Their curves exhibit different recall– throughput trade-offs, so backend substitution preserves the framework while allowing different performance characteris-tics. HNSW, NSG, and DPG provide representative empirical validations of this modular design; the reported performance comparisons concern the measured NQ and HotpotQA results. 
+
+C. Summary of Experimental Findings 
+
+The experimental results lead to the following conclusions: 1) SIMQ and SIMQ+ provide competitive retrieval quality and efficiency against PLAID, MUVERA, IGP, and GEM across five diverse datasets; exact operating-point claims are reported in the corresponding figures and tables. 2) At nearly matched Recall@100@100, PAG achieves re-trieval quality close to k-means with comparable or higher QPS. Its sampling and graph-guided assignment provide a more CPU-friendly construction path than repeated global k-means iterations; Table III reports re-trieval metrics, while LSH is shown only at its available lower-recall operating point. 3) SIMQ+’s count-based scoring and dynamic candidate set address ranking reversals caused by biased approximate scores under fine-grained partitioning. 4) SIMQ separates its multi-vector retrieval pipeline from the underlying centroid-navigation backend. Experiments with HNSW, NSG, and DPG on NQ and HotpotQA demonstrate that the backend can be replaced with-out changing partitioning, candidate generation, or exact reranking; the recall–throughput trade-off varies with the chosen backend. VII. R ELATED WORK 
+
+Multi-Vector Retrieval Models. ColBERT [1] and Col-BERTv2 [2] use token-level MaxSim scoring, which is com-putationally expensive. PLAID [3] accelerates this via k-means centroids and residual quantization (also adopted by XTR [17] and WARP [18]), though it faces bottlenecks in ma-trix granularity and GPU-dependent clustering. Alternatively, MUVERA [5] compresses documents into fixed-dimensional encodings (FDEs) via LSH and random projections; however, its data-oblivious partitioning requires R hash repetitions to stabilize recall. 
+
+Graph-based Multi-vector Retrieval. GEM [15] builds a dual proximity graph over document vector sets, decoupling Earth Mover’s Distance based construction from Chamfer scoring via semantic shortcuts, though its set-to-set compu-tations scale with token length. IGP [4] builds a proximity graph over PLAID centroids using incremental probing for candidate generation while retaining PLAID’s quantization. VecFlow-Chamfer [19] is a GPU-optimized multi-vector re-trieval method for high-throughput systems. 
+
+Data Partitioning for Retrieval. Partitioning approaches vary: PLAID uses data-aware yet GPU-heavy k-means clus-tering, while MUVERA relies on fast but data-oblivious LSH. DSANN [6] introduces the Point Aggregation Graph (PAG) via sampling for data-aware partitions without iterative clustering. SIMQ adapts PAG for multi-vector retrieval, delivering fine-grained, stable clusters without GPU dependency. 
+
+Graph-based ANNS Methods. Graph-based indices such as HNSW [7], Vamana [8], and NSG [9] are widely used graph-based methods for single-vector approximate nearest neighbor search. SIMQ builds upon these single-vector graph methods by constructing a graph index over cluster centroids and adapting per-token graph navigation to approximate multi-vector MaxSim scoring. VIII. C ONCLUSION 
+
+We presented SIMQ, a multi-vector retrieval framework that combines data-aware sampling-based clustering with per-token graph navigation. By indexing cluster centroids refined after sampling-based initialization, SIMQ avoids materializing a centroid interaction matrix and reduces reliance on GPU-based large-scale k-means. Under a manifold assumption and successful cell retrieval, our analysis shows that SIMQ has lower expected intra-cell approximation error than MUVERA’s data-oblivious LSH partitioning. SIMQ+ adds count-based scoring and a dynamic candidate set to improve ranking robustness. Experiments on five benchmarks measure retrieval quality, throughput, and construction-time trade-offs against PLAID, MUVERA, IGP, and GEM, and evaluate alternative graph backends on CPUs. ACKNOWLEDGMENT 
+
+During the preparation of this work, the authors used Ope-nAI Codex for coding assistance. The authors are responsible for reviewing and validating all AI-assisted material and take full responsibility for the final manuscript, implementation, and reported results. REFERENCES [1] O. Khattab and M. Zaharia, “Colbert: Efficient and effective passage search via contextualized late interaction over bert,” in Proceedings of the 43rd International ACM SIGIR Conference on Research and Development in Information Retrieval , pp. 39–48, 2020. [2] K. Santhanam, O. Khattab, J. Saad-Falcon, C. Potts, and M. Zaharia, “Colbertv2: Effective and efficient retrieval via lightweight late inter-action,” in Proceedings of the 2022 Conference of the North American Chapter of the Association for Computational Linguistics , pp. 3715– 3734, 2022. [3] K. Santhanam, O. Khattab, C. Potts, and M. Zaharia, “Plaid: An efficient engine for late interaction retrieval,” in Proceedings of the 31st ACM International Conference on Information and Knowledge Management ,pp. 1747–1756, 2022. [4] Z. Bian, M. L. Yiu, and B. Tang, “Igp: Efficient multi-vector retrieval via proximity graph index,” in Proceedings of the 48th International ACM SIGIR Conference on Research and Development in Information Retrieval , 2025. [5] L. Dhulipala, R. Jayaram, T. Pham, Y. Sun, and D. P. Woodruff, “Muvera: Multi-vector retrieval via fixed dimensional encodings,” in 
+
+Advances in Neural Information Processing Systems , 2024. [6] K. Yu, J. Jin, X. Zhong, P. Cheng, L. Chen, Z. Shen, J. Song, H. Shen, and X. Lin, “Approximate nearest neighbor search of large scale vectors on distributed storage,” arXiv preprint arXiv:2510.17326 , 2025. [7] Y. A. Malkov and D. A. Yashunin, “Efficient and robust approxi-mate nearest neighbor search using hierarchical navigable small world graphs,” IEEE Transactions on Pattern Analysis and Machine Intelli-gence , vol. 42, no. 4, pp. 824–836, 2020. [8] S. J. Subramanya, F. Devvrit, R. Kadekodi, R. Krishnaswamy, and H. V. Simhadri, “Diskann: Fast accurate billion-point nearest neighbor search on a single node,” in Advances in Neural Information Processing Systems , vol. 32, pp. 13197–13207, 2019. [9] C. Fu, C. Xiang, C. Wang, and D. Cai, “Fast approximate nearest neighbor search with the navigating spreading-out graph,” Proceedings of the VLDB Endowment , vol. 12, no. 5, pp. 461–474, 2019. [10] J. B. Tenenbaum, V. de Silva, and J. C. Langford, “A global geometric framework for nonlinear dimensionality reduction,” Science , vol. 290, no. 5500, pp. 2319–2323, 2000. [11] Y. Bengio, A. Courville, and P. Vincent, “Representation learning: A review and new perspectives,” IEEE Transactions on Pattern Analysis and Machine Intelligence , vol. 35, no. 8, pp. 1798–1828, 2013. [12] X. Qin, K. M. Ting, Y. Zhu, and V. C. Lee, “Nearest-neighbour-induced isolation similarity and its impact on density-based clustering,” in Proceedings of the AAAI Conference on Artificial Intelligence , vol. 33, pp. 4555–4562, 2019. [13] M. S. Charikar, “Similarity estimation techniques from rounding algo-rithms,” in Proceedings of the 34th Annual ACM Symposium on Theory of Computing , pp. 380–388, 2002. [14] N. Thakur, N. Reimers, A. R¨ uckl´ e, A. Srivastava, and I. Gurevych, “Beir: A heterogeneous benchmark for zero-shot evaluation of information retrieval models,” in Proceedings of the Neural Information Processing Systems Track on Datasets and Benchmarks , vol. 1, 2021. [15] Y. Tian, Z. Tian, X. Zhao, R. Zhang, and X. Zhou, “Gem: A native graph-based index for multi-vector retrieval,” Proceedings of the ACM on Management of Data , vol. 4, no. 3, pp. 1–27, 2026. [16] W. Li, Y. Zhang, Y. Sun, W. Wang, M. Li, W. Zhang, and X. Lin, “Approximate nearest neighbor search on high dimensional data— experiments, analyses, and improvement,” IEEE Transactions on Knowl-edge and Data Engineering , vol. 32, no. 8, pp. 1475–1488, 2020. [17] J. Lee, Z. Dai, S. M. K. Duddu, T. Lei, I. Naim, M.-W. Chang, and V. Y. Zhao, “Rethinking the role of token retrieval in multi-vector retrieval,” in Advances in Neural Information Processing Systems , 2023. [18] J. L. Scheerer, M. Zaharia, C. Potts, G. Alonso, and O. Khattab, “Warp: An efficient engine for multi-vector retrieval,” in Proceedings of the 48th International ACM SIGIR Conference on Research and Development in Information Retrieval , 2025. [19] C. Mo, B. Karsin, P. Adams, and M. Zhang, “Vecflow-chamfer: A gpu-based data management system for high-performance multi-vector search on superchips,” in Proceedings of the 2026 International Con-ference on Management of Data (SIGMOD) , 2026.

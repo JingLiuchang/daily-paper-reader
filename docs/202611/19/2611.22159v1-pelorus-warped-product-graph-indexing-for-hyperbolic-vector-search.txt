@@ -1,0 +1,2631 @@
+Title: Pelorus: Warped-Product Graph Indexing for Hyperbolic Vector Search
+
+URL Source: https://arxiv.org/pdf/2611.22159v1
+
+Published Time: Wed, 18 Nov 2026 01:54:05 GMT
+
+Number of Pages: 28
+
+Markdown Content:
+# Pelorus: Warped-Product Graph Indexing for Hyperbolic Vector Search 
+
+# Wenxuan Xiao 
+
+Astrmira Tech. China w.xiao@astrmira.com 
+
+# Xu Cao 
+
+Astrmira Tech. China x.cao@astrmira.com 
+
+## ABSTRACT 
+
+Hyperbolic embeddings in the Poincaré ball and Lorentz hyper-boloid represent hierarchical, taxonomic, and entailment relations with substantially lower distortion than flat Euclidean spaces, sup-porting retrieval-augmented generation, vision-language align-ment, and knowledge-base search. Serving million-scale approxi-mate nearest neighbor (ANN) queries over curved manifolds, how-ever, exposes a fundamental tension between geometric fidelity and memory efficiency: flat inner-product indices distort geodesic order across radial shells, whereas native hyperbolic graph indices either fetch full-precision coordinates at every traversal hop or quantize ambient coordinates without decoupling conformal scales. Transplanting flat proximity-graph pruning and vector compression to hyperbolic space also fails. Because negative curvature bends geodesics toward the origin and scales directional inner products by the singular conformal factor (1 − 𝑐 ∥𝑥 ∥22)−1, interior hubs geodesi-cally occlude entire spherical neighborhoods during Vamana prun-ing, shared-query quantization errors fail to cancel across radial shells, and tight boundary clusters suffer margin-to-noise ratio (MNR) collapse. We present Pelorus , a warped-product proximity-graph in-dex for hyperbolic vector search. Pelorus decouples exact single-precision radial and conformal scalars in a 32-byte vertex header from scale-invariant spherical directional codes—instantiated with training-free 2-bit Sign-Magnitude (SM) bitplanes—deferring full-vector double-precision geodesic evaluation to a compact reranking tail. Analyzing how hyperbolic conformal weights and geodesic curvature interact with polar directional quantization, we establish query boundary-depth invariance on isobathic shells, characterize cross-shell query-noise non-cancellation, derive a deterministic parameter-free orthogonal-projection estimator, and introduce a purity-gated local tangent-cone residual code with Conformal Ja-cobian gating (CJ-Gate) that attenuates intra-cone tangent error with zero per-vertex byte overhead and without global random rota-tions while keeping diffuse manifolds on the zero-overhead global 2-bit path. Guided by these geometric properties, we construct a warped-product fiber-bundle graph inside-out using QuadriPrune— partitioning each vertex’s out-degree across four geometric chan-nels (stem-excess geodesic fibers, radially shielded isobathic rings restoring same-shell error cancellation, and inward/outward ra-dial elevators)—paired with degree-preserving spanning-tree chord swaps that achieve full directed BFS reachability from entry hubs across all measured graphs. An execution engine co-locates polar headers, variance-stabilized 256-bit early beam sketches, and 2-bit bitplanes within single 4096 B OS pages to avoid cross-array sec-ondary DTLB walks per accessed record and evaluates bitplane inner products via a 3-to-2 carry-save AVX2 kernel. Across eight real and synthetic hyperbolic benchmarks on AMD EPYC 9654 (Zen 4), Pelorus builds indices 5 .44 × faster (35 .0 s vs. 190 .2 s on 32 threads on Cohere-1M) than full-precision polar graphs (1 .91 × faster than 8-bit Polar-SQ8 at 66 .9 s) and shrinks hot naviga-tion memory to 517 .0 MB page-co-located (2 .44 × below Polar-SQ8, or 485 .0 MB / 2 .60 × in split form). At 99% Recall@10 on Cohere-1M, Pelorus improves throughput over full-precision polar traversal by 4.30 × on 1 thread (1 ,930 vs. 448 QPS) and 6 .31 × on 24 threads (42 ,466 vs. 6 ,735 QPS); on this benchmark, HyperspaceDB (3 .23 GB) peaks at 96 .78% Recall@10 (290 vs. 4 ,939 QPS on 1 thread at 95% recall) and centered Faiss peaks at 98 .91% (127 vs. 2 ,907 QPS on 1 thread at 98% recall). On native hyperbolic MERU-1M, Pelorus delivers 53 ,483 QPS (99 .25% Recall@10, 3 .37 ×–3 .88 × over HyperspaceDB FP32) and reaches 65 ,405 QPS (99 .36%) on WordNet-Hazy on the global 2-bit path (0 cones across diffuse real sets), while activating 256 cones on clustered shells to raise Clustered-Narrow recall from 34 .22% to 99 .385% at 𝐿 = 256 (99 .80% at 𝐿 = 384; 1 .84 ×–4 .56 ×
+
+higher 99%-recall QPS than HyperspaceDB FP32) and delineating recall limits on isotropic narrow shells. 
+
+Code & Artifact Availability: 
+
+The source code, data, and/or other artifacts are available at https://github. com/Astrmira/Pelorus. 
+
+## 1 INTRODUCTION 
+
+Representation models that embed text, images, and structured enti-ties into negatively curved Riemannian manifolds—specifically the Poincaré ball B𝐷 𝑐 and the Lorentz hyperboloid L𝐷 𝑐 —provide a prin-cipled geometric inductive bias for hierarchical retrieval. Because geodesic ball volume in hyperbolic space grows exponentially with radius rather than polynomially, trees, ontologies, and asymmetric entailment cones embed with far lower metric distortion than in flat Euclidean space [24, 32, 47, 52]. Recent encoders scale curved representations across graph neural networks [10, 48], fully hyper-bolic Transformers and vision backbones [15, 21, 40], million-vector multimodal alignment (MERU [19]), and hyperbolic dense retrieval for retrieval-augmented generation (HypRAG [42, 43]). Serving low-latency, high-recall approximate nearest neighbor (ANN) queries over curved manifolds nevertheless remains a severe database systems bottleneck. In flat Euclidean and cosine spaces, proximity graphs such as HNSW [45], NSG [23], and Vamana (DiskANN) [5, 55] define the latency–recall frontier. Industrial and academic compressed graph engines—including locally-adaptive scalar quantization (LVQ) [1], binary lookup tables (BBQ) [59], ran-domized extended codes (SymphonyQG) [31], and training-free arXiv:2611.22159v1 [cs.DB] 17 Nov 2026 2-bit Sign-Magnitude (SM) indexing in QuIVer [66]—further accel-erate search by reading full FP32 vectors only during tail rerank-ing. In hyperbolic spaces, existing approaches force an unsatisfac-tory trade-off. Data-oblivious hyperbolic locality-sensitive hash-ing (LSH) [17] requires wide multi-table probing at 99% + recall, while flattening B𝐷 𝑐 or L𝐷 𝑐 into Euclidean or inner-product prox-ies inside production vector databases (Faiss [20, 39], Milvus [60], AnalyticDB-V [64], VBASE [69]) conflates radial hierarchy depth with angular proximity and inflates candidate pools across radial shells. Conversely, native hyperbolic graph indices [7, 29, 50] either evaluate geodesic distances over full-precision coordinates at every graph hop or quantize ambient coordinates without decoupling conformal scales under single-metric pruning, incurring compute, memory, or distortion stalls: under exact traversal near the manifold boundary ( ∥𝑥 ∥2 → 1/√𝑐 ), the conformal factor 𝑓 𝑥 = 2/( 1 − 𝑐 ∥𝑥 ∥22)
+
+diverges and requires IEEE-754 double-precision accumulation to prevent catastrophic cancellation, while random 3–6 KB vector fetches across millions of vertices amplify random memory traffic and data TLB (DTLB) pressure. 
+
+## 1.1 Why Flat Graph Indexing Breaks Under Negative Curvature 
+
+How should proximity-graph indexes be architected for negatively curved manifolds? Geometrically, B𝐷 𝑐 is not an isotropic vector space but a warped product R≥0 × 1√𝑐 sinh (√𝑐𝑅 ) S𝐷 −1 coupling a ra-dial depth half-line with an exponentially expanding sphere. Our theoretical and diagnostic study reveals that transplanting flat single-metric Vamana pruning [55] or flat compressed naviga-tion [1, 27, 66] onto this warped product fails due to three coupled geometric obstructions: (1) Cross-Shell Conformal Non-Cancellation and Lorentz-MIPS Blowup. In flat cosine search, ranking can-didates 𝑥 and 𝑦 against query 𝑞 evaluates ⟨𝑢 𝑞 , 𝑢 𝑥 ⟩ − ⟨ 𝑢 𝑞 , 𝑢 𝑦 ⟩;because both terms weight 𝑢 𝑞 equally, first-order quantiza-tion noise on 𝑢 𝑞 cancels identically as 𝑢 𝑥 → 𝑢 𝑦 [65]. In B𝐷 𝑐 ,the monotonic geodesic proxy weights each directional inner product ⟨𝑢 𝑞 , 𝑢 𝑣 ⟩ by a candidate-dependent conformal factor 𝑊 (𝑟 𝑞 , 𝑟 𝑣 ) = 2𝑟 𝑞 𝑟 𝑣 𝑓 𝑞 𝑓 𝑣 = 2 
+
+> 𝑐
+
+sinh 𝜌 𝑞 sinh 𝜌 𝑣 . When-ever 𝑟 𝑥 ≠ 𝑟 𝑦 , query quantization leaves an uncancelled residual scaled by 𝑊 (𝑟 𝑞 , 𝑟 𝑦 ) − 𝑊 (𝑟 𝑞 , 𝑟 𝑥 ) ≠ 0 that grows exponentially with boundary depth. Worse, quantizing 
+
+(𝐷 + 1)-dimensional Lorentz coordinates directly via Minkowski inner products multiplies coordinate quanti-zation noise by ∥ ˜𝑧 ∥2 = Θ(𝑒 𝜌 ) without separating radial norms. (2) Radial Occlusion Bounds and Angular Escape Condi-tions. Hyperbolic geodesics bend inward toward the origin 0 ∈ B𝐷 𝑐 . We prove that if an outer vertex 𝑢 at geodesic depth 
+
+𝑅 𝑢 admits an interior neighbor 𝑝 (𝑅 𝑝 < 𝑅 𝑢 ) during Vamana RobustPrune [55], then every candidate inside the ball 
+
+𝑅 𝑣 ≤ ( 𝑅 𝑢 − 𝛼𝑅 𝑝 )/( 𝛼 + 1) satisfies 𝛼 𝑑 B (𝑝, 𝑣 ) ≤ 𝑑 B (𝑢, 𝑣 ) si-multaneously across all spherical angles 𝜃 𝑝𝑣 ∈ [ 0, 𝜋 ]—even 180 ◦ opposite 𝑝 —while along any outer shell 𝜌 = √𝑐 𝑅 ,negative curvature shrinks the same-shell angular cone surviving origin pruning exponentially as sin (𝜃 𝑢𝑣 /2) <
+
+sinh ( 𝛼  
+
+> 2
+
+𝜌 )/ sinh (𝜌 ) ∼ 𝑒 − ( 2−𝛼 )𝜌 /2 (from 73 .7◦ in flat space to 23 .1◦ at 𝜌 = 4 for 𝛼 = 1.2). Interior hubs consequently shadow lateral boundary links and isolate 518–626 zero-in-degree boundary islands per million vectors on Cohere-1M; removing directional protection in our controlled three-seed Cohere-1M ablation drops 99%-recall throughput by 5.26 × (2 ,071 → 394 QPS) and prevents reaching 99 .5% re-call. (3) Boundary Cluster Margins and Fixed-Budget Pool Di-lution. For equal-depth candidates in a tight cone, the ranking margin scales as 𝛽 𝑞,𝑐 𝛽 𝑣 times the tangent-direction difference. Global-code comparison error depends on the co-variance between the candidate errors (Theorem 4). As the comparison margin-to-noise ratio (MNR) collapses toward zero, expanding beam width 𝐿 under a fixed rerank budget 
+
+𝐵 counterintuitively reduces recall by flooding the candi-date pool with indistinguishable intra-cluster distractors: on a 1M-vector clustered narrow-shell benchmark, beam traversal visits 93 .9% of true top-10 neighbors at 𝐿 = 256 yet retains only 49 .3% in the finalist beam and 33 .0% after pool gating (34 .2% across all 2 ,000 queries), and raising 𝐿 
+
+from 256 to 2 ,048 lowers recall monotonically from 34 .2% to 27 .8%. Local tangent encoding allocates the existing bit-planes to normalized within-cone variation, retaining na-tive coordinates outside the selected cones. 
+
+## 1.2 Warped-Product Polar Co-Design in Pelorus 
+
+We address these obstructions with Pelorus —named after the mar-itime bearing dial that decouples angular direction from radial course—an in-memory hyperbolic proximity-graph index grounded in warped-product polar decoupling . Every point 𝑥 ∈ B𝐷 𝑐 (and via exact stereographic isometry every point 𝑧 ∈ L𝐷 𝑐 ) is factored into unquantized FP32 radial scalars (𝑟 𝑥 , 𝐹 𝑥 , 𝜌 𝑥 ), with 𝐹 𝑥 = 𝑓 𝑥 /2, stored in a 32-byte header and a scale-invariant directional code on the unit sphere S𝐷 −1, instantiated via training-free 2-bit SM bitplanes. Storing radial scalars independently in FP32 keeps directional-code error out of the conformal denominator 1 − 𝑐𝑟 2 
+
+> 𝑥
+
+and decouples hy-perbolic distance into scalar radial lower bounds plus weighted spherical inner products. From this representation, Pelorus co-designs conformal polar estimation primitives, fiber-bundle topology, and page-aligned hard-ware execution: 
+
+• Conformal Polar Estimation and Tangent-Cone Recovery (§3): 
+
+We prove that polar decoupling makes same-shell direc-tional flip criteria invariant to query boundary proximity (𝑓 𝑞 → ∞ ), derive a deterministic zero-parameter orthogonal-projection asymmetric estimator (Stage-0.5) based on ex-act two-level SM Pythagorean reconstruction, establish 1-strong convexity of the hyperbolic-cosine objective and derive its closed-form radial minimizer along directional rays, and introduce a purity-gated local tangent-cone resid-ual code paired with an off-axis Conformal Jacobian plateau gate (CJ-Gate) that attenuates intra-cone tangent error with zero per-vertex byte overhead while keeping diffuse embeddings on the zero-overhead global path. 
+
+• Warped-Product Fiber-Bundle Topology (§4): Rather than pruning edges under a single isotropic predicate, Pelorus 
+
+> 2
+
+inserts vertices inside-out by geodesic depth and partitions each out-degree list across four geometric channels via 
+
+QuadriPrune : stem-excess geodesic fibers, radially shielded 
+
+isobathic (same-shell) rings where 𝑊 (𝑟 𝑞 , 𝑟 𝑥 ) ≈ 𝑊 (𝑟 𝑞 , 𝑟 𝑦 )
+
+restores shared-query cancellation, and step-aligned in-ward and outward radial elevators, followed by a degree-preserving spanning-tree chord-swap pass that achieves full directed BFS reachability from entry hubs across all measured graphs. 
+
+• Page-Aligned Polar Execution (§5): To avoid the dual-array DTLB walks of Structure-of-Arrays layouts, Pelorus co-locates each vertex’s 32 B polar header, binomial-variance-stabilized 256-bit early sketch, and complete 2-bit SM bit-planes inside a power-of-two record within a single 4096 B OS page (16 vertices/page at 𝐷 = 768), evaluates surviv-ing 5-popcount bitplane products via a 3-to-2 carry-save AVX2 kernel, refines the converged beam in L1 cache via fixed-point masked subset sums, and reranks the top tail in IEEE-754 FP64 SIMD. 
+
+Contributions. Our main contributions are summarized as fol-lows: 
+
+• Building on flat comparison-decision theory [65], we ana-lyze conformal polar quantization and hyperbolic Vamana pathologies on B𝐷 𝑐 and L𝐷 𝑐 , characterizing query boundary-depth invariance, cross-shell query-noise non-cancellation, Lorentz-MIPS quantization blowup, radial occlusion with exponential angular-cone contraction, fixed-budget pool dilution, deterministic orthogonal-projection de-biasing, and purity-gated zero-byte-per-node tangent-cone MNR recovery (§3). 
+
+• We design a warped-product graph construction and rout-ing pipeline combining inside-out geodesic seeding, stem-excess QuadriPrune degree partitioning, spanning-tree chord-swap island repair (1 ,000 ,000 /1,000 ,000 directed BFS reachability from entry hubs), and routing via the con-strained radial minimizer (§4). 
+
+• We engineer a stateless hardware-conscious execution engine integrating 4096 B single-page vertex co-location, variance-stabilized 256-bit beam filtering, 3-to-2 carry-save AVX2 popcounts, L1-bounded Stage-0.5/CJ-Gate refine-ment, and FP64 SIMD geodesic reranking (§5). 
+
+• Across eight real and synthetic hyperbolic benchmarks on AMD Zen 4, Pelorus accelerates 32-thread graph con-struction by 5 .44 × over Polar-FP32 (35 .0 s vs. 190 .2 s on Cohere-1M, and 1 .91 × vs. Polar-SQ8 at 66 .9 s), cuts hot navigation memory to 517 .0 MB page-co-located (2 .44 ×
+
+below 8-bit Polar-SQ8, or 485 .0 MB / 2 .60 × split), deliv-ers 4 .30 × (1T) to 6 .31 × (24T) higher 99%-recall QPS on Cohere-1M (reaching 99 .70% peak Recall@10 vs. 96 .78% for HyperspaceDB and 98 .91% / 98 .69% for centered Faiss / Milvus, with 17 .0×–28 .3× higher QPS than HyperspaceDB at 95% recall and 22 .9×–58 .2× over centered Faiss / Mil-vus at 98% recall), reaches 53 ,483 QPS on MERU-1M (Im-ageNet, 3 .37 ×–3 .88 × over HyperspaceDB FP32 at 99% re-call), 14 ,731 QPS on 1536D OpenAI-1536 (DBpedia), and 65 ,405 QPS on WordNet-Hazy on the global 2-bit path (0 cones), and activates 256 cones on Clustered-Narrow to raise recall from 34 .22% to 99 .385% at 𝐿 = 256 (99 .80% at 𝐿 = 384; 1 .84 ×–4 .56 × higher 99%-recall QPS than Hy-perspaceDB FP32) while characterizing recall limits on Uniform-Narrow (§6). 
+
+## 2 PRELIMINARIES AND PROBLEM FORMULATION 
+
+We formalize hyperbolic metric models as warped-product man-ifolds, establish the exact polar geodesic proxy, characterize the two-level spherical Sign-Magnitude (SM) geometry, and define the discrete comparison decisions governing quantized graph construc-tion and search. 
+
+## 2.1 Hyperbolic Models and Warped-Product Unification 
+
+Poincaré Ball and Lorentz Stereographic Isometry. For constant negative sectional curvature −𝑐 < 0, the 𝐷 -dimensional Poincaré ball is the open manifold 
+
+B𝐷 𝑐 = 𝑥 ∈ R𝐷 : 𝑐 ∥𝑥 ∥22 < 1 , 𝑔 B 
+
+> 𝑥
+
+= 𝑓 2 
+
+> 𝑥
+
+𝐼 𝐷 , (1) with conformal metric factor 𝑓 𝑥 = 21−𝑐 ∥𝑥 ∥22
+
+. The Riemannian geo-desic distance between 𝑞, 𝑣 ∈ B𝐷 𝑐 is 
+
+𝑑 B (𝑞, 𝑣 ) = 1
+
+√𝑐 arccosh 
+
+
+
+1 + 2𝑐 ∥𝑞 − 𝑣 ∥22
+
+(1 − 𝑐 ∥𝑞 ∥22)( 1 − 𝑐 ∥𝑣 ∥22)
+
+
+
+. (2) Many modern hyperbolic encoders, including fully hyperbolic net-works [15], MERU [19], and HypRAG [43], parameterize embed-dings on the upper sheet of the (𝐷 + 1)-dimensional Lorentz hyper-boloid L𝐷 𝑐 = {𝑧 = (𝑧 0, ˜𝑧 ) ∈ R × R𝐷 : −𝑧 20 + ∥ ˜𝑧 ∥22 = −1/𝑐, 𝑧 0 > 0}
+
+under 𝑑 L (𝑧, 𝑧 ′) = 1√𝑐 arccosh  𝑐 (𝑧 0𝑧 ′ 
+
+> 0
+
+− ⟨ ˜𝑧, ˜𝑧 ′⟩) . Stereographic pro-jection Π : L𝐷 𝑐 → B𝐷 𝑐 ,
+
+Π(𝑧 0, ˜𝑧 ) = ˜𝑧 
+
+1 + √𝑐 𝑧 0
+
+, (3) is a global Riemannian isometry satisfying 𝑑 B (Π(𝑧 ), Π(𝑧 ′)) =
+
+𝑑 L (𝑧, 𝑧 ′) for all 𝑧, 𝑧 ′ ∈ L𝐷 𝑐 [48] (proved algebraically in Appen-dix A). Projecting L𝐷 𝑐 embeddings via (3) at ingestion eliminates the redundant time-like coordinate 𝑧 0 without losing exact geodesic distances or rankings; as shown in Theorem 2(3), it also avoids ex-ponential quantization error blowup on unbounded spatial norms 
+
+∥ ˜𝑧 ∥2.
+
+Warped-Product Decomposition and Order-Isomorphic Polar Proxy. 
+
+Every 𝑥 ∈ B𝐷 𝑐 decomposes into Euclidean radius 𝑟 𝑥 = ∥𝑥 ∥2 ∈[0, 1/√𝑐 ) and unit spherical direction 𝑢 𝑥 ∈ S𝐷 −1 (𝑢 0 = 𝑒 1 at 𝑟 𝑥 =
+
+0). Let 𝑅 𝑥 = 𝑑 B (0, 𝑥 ) denote geodesic radius from the origin and 
+
+𝜌 𝑥 = √𝑐 𝑅 𝑥 = 2 atanh (√𝑐 𝑟 𝑥 ) denote dimensionless geodesic depth, which satisfy the exact identities sinh 𝜌 𝑥 = √𝑐 𝑟 𝑥 𝑓 𝑥 and cosh 𝜌 𝑥 =
+
+𝑐𝑟 2 
+
+> 𝑥
+
+𝑓 𝑥 + 1 = 𝑓 𝑥 − 1. In coordinates (𝑅, 𝑢 ) ∈ ( 0, ∞) × S𝐷 −1, B𝐷 𝑐 \ { 0}
+
+is isometric to the warped-product manifold 
+
+B𝐷 𝑐 \ { 0}  (0, ∞) × 1√𝑐 sinh (√𝑐𝑅 ) S𝐷 −1,
+
+d𝑠 2 = d𝑅 2 + 1
+
+𝑐 sinh 2 (√𝑐𝑅 ) dΩ2 
+
+> 𝐷 −1
+
+,
+
+(4) 
+
+> 3
+
+where spherical fiber distances expand exponentially as  
+
+> 1√𝑐
+
+sinh (√𝑐𝑅 ) = 12√𝑐 𝑒 𝜌 (1 −𝑒 −2𝜌 ). Expanding ∥𝑞 −𝑣 ∥22 = (𝑟 𝑞 −𝑟 𝑣 )2 +
+
+2𝑟 𝑞 𝑟 𝑣 (1 −𝛾 𝑞𝑣 ) for spherical cosine 𝛾 𝑞𝑣 = ⟨𝑢 𝑞 , 𝑢 𝑣 ⟩ = cos 𝜃 𝑞𝑣 ∈ [− 1, 1]
+
+yields the polar geodesic proxy :
+
+𝑃 B (𝑞, 𝑣 ) ≜ ∥𝑞 − 𝑣 ∥22 𝑓 𝑞 𝑓 𝑣 = 𝑅 (𝑟 𝑞 , 𝑟 𝑣 ) + 𝑊 (𝑟 𝑞 , 𝑟 𝑣 )  1 − 𝛾 𝑞𝑣 
+
+, (5) where the radial discrepancy term and conformal angular weight are 
+
+𝑅 (𝑟 𝑞 , 𝑟 𝑣 ) = (𝑟 𝑞 − 𝑟 𝑣 )2 𝑓 𝑞 𝑓 𝑣 ,𝑊 (𝑟 𝑞 , 𝑟 𝑣 ) = 2𝑟 𝑞 𝑟 𝑣 𝑓 𝑞 𝑓 𝑣 = 2
+
+𝑐 sinh 𝜌 𝑞 sinh 𝜌 𝑣 . (6) By the hyperbolic law of cosines, 𝑐  
+
+> 4
+
+𝑃 B (𝑞, 𝑣 ) = sinh 2  𝜌 𝑞 −𝜌 𝑣 
+
+> 2
+
+ +
+
+sinh 𝜌 𝑞 sinh 𝜌 𝑣 sin 2  𝜃 𝑞𝑣 
+
+> 2
+
+ = sinh 2  √𝑐  
+
+> 2
+
+𝑑 B (𝑞, 𝑣 ), so exact geodesic dis-tance relates to 𝑃 B (𝑞, 𝑣 ) through 
+
+𝑑 B (𝑞, 𝑣 ) = 1
+
+√𝑐 arccosh 
+
+
+
+1 + 𝑐 
+
+2 𝑃 B (𝑞, 𝑣 )
+
+
+
+= 2
+
+√𝑐 asinh 
+
+ 12√︁ 𝑐 𝑃 B (𝑞, 𝑣 )
+
+
+
+.
+
+(7) Because 𝑧 ↦ → 2√𝑐 asinh   12
+
+√𝑐𝑧  is strictly increasing on [0, ∞) ,
+
+𝑃 B (𝑞, 𝑣 ) is strictly order-isomorphic to 𝑑 B (𝑞, 𝑣 ), deferring tran-scendental evaluations to the final 𝑘 returned neighbors. The implementation stores 𝐹 𝑣 = 𝑓 𝑣 /2 = (1 − 𝑐𝑟 2 
+
+> 𝑣
+
+)−1 and evaluates 
+
+𝑃 impl = 𝑃 B/4, with 𝑑 = 2 asinh (√︁ 𝑐𝑃 impl )/ √𝑐 . All beam thresholds, radial gates, and Jacobian scales use this normalization consis-tently. Furthermore, in the flat-curvature limit 𝑐 → 0+, 𝑓 𝑥 → 2and 14 𝑃 B (𝑞, 𝑣 ) → ∥ 𝑞 − 𝑣 ∥22, recovering flat Euclidean and spherical geometry continuously. 
+
+## 2.2 Exact Two-Level Spherical SM Geometry and Decision Operators 
+
+Deterministic Conditional-Mean Two-Level SM Reconstruction. In polar coordinates, 𝑢 𝑣 ∈ S𝐷 −1 lies on the unit sphere independently of 𝑟 𝑣 . Following QuIVer’s training-free 2-bit SM bitplane encod-ing [66]—whose conditional-mean Pythagorean identity (Lemma 1) underpins our orthogonal-projection refinement (§5)—each coordi-nate 𝑢 𝑣,𝑖 (𝑖 ∈ { 1, . . . , 𝐷 }) is encoded into two packed bitplanes: a sign bit 𝑠 𝑣,𝑖 = I[𝑢 𝑣,𝑖 ≥ 0] and a strong-magnitude bit 𝑚 𝑣,𝑖 = I[| 𝑢 𝑣,𝑖 | > 𝜏 𝑣 ]
+
+relative to the L1 mean threshold 𝜏 𝑣 = 1
+
+> 𝐷
+
+Í𝐷 𝑗 =1 |𝑢 𝑣,𝑗 |, with strong-bit count 𝑠 𝑣 = Í𝐷 𝑖 =1 𝑚 𝑣,𝑖 . Partitioning {1, . . . , 𝐷 } into weak in-dices 𝐼 0,𝑣 = {𝑖 : 𝑚 𝑣,𝑖 = 0} (|𝐼 0,𝑣 | = 𝐷 − 𝑠 𝑣 ) and strong indices 
+
+𝐼 1,𝑣 = {𝑖 : 𝑚 𝑣,𝑖 = 1} (|𝐼 1,𝑣 | = 𝑠 𝑣 ) defines conditional magnitude means 𝑎 𝑣 = 1 
+
+> 𝐷 −𝑠 𝑣
+
+Í𝑖 ∈𝐼 0,𝑣 |𝑢 𝑣,𝑖 | (0 if 𝑠 𝑣 = 𝐷 ), 𝑏 𝑣 = 1
+
+> 𝑠 𝑣
+
+Í𝑖 ∈𝐼 1,𝑣 |𝑢 𝑣,𝑖 | (0 if 
+
+𝑠 𝑣 = 0), and step 𝛿 𝑣 = 𝑏 𝑣 − 𝑎 𝑣 . For 0 < 𝑠 𝑣 < 𝐷 , 𝛿 𝑣 ≥ 0. At 𝑠 𝑣 = 0, the implementation sets the unused strong mean to 𝑏 𝑣 = 0, so 𝛿 𝑣 = −𝑎 𝑣 
+
+and all reconstructed coordinates use 𝑎 𝑣 .Lemma 1 (Deterministic Two-Level SM Pythagorean Iden-tity). For any 𝑢 𝑣 ∈ S𝐷 −1, let ˆ𝑢 𝑣 ∈ R𝐷 be the conditional-mean two-level vector ˆ𝑢 𝑣,𝑖 = sgn (𝑢 𝑣,𝑖 )( 𝑎 𝑣 + 𝛿 𝑣 𝑚 𝑣,𝑖 ) (setting sgn (0) = +1). Then, with zero distributional assumptions on 𝑢 𝑣 , the reconstructed vector ˆ𝑢 𝑣 uniquely minimizes ∥𝑢 𝑣 − ˜𝑢 ∥22 over all two-level vectors sharing bitplanes (𝑠 𝑣 , 𝑚 𝑣 ). The populated-group means are unique, and the reconstruction satisfies 
+
+⟨𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ = (𝐷 − 𝑠 𝑣 )𝑎 2 
+
+> 𝑣
+
++ 𝑠 𝑣 𝑏 2
+
+> 𝑣
+
+= ∥ ˆ𝑢 𝑣 ∥22 ≜ 𝜎 2 
+
+> 𝑣
+
+∈ ( 0, 1],
+
+∥𝑢 𝑣 − ˆ𝑢 𝑣 ∥22 = 1 − 𝜎 2 
+
+> 𝑣
+
+.
+
+(8) 
+
+Moreover, for two two-level codes ˆ𝑢 𝑞 , ˆ𝑢 𝑣 , let 𝑝 ⊕ = popcnt ( ¯𝑥 ), 𝑝 10 =
+
+popcnt ( ¯𝑥 ∧𝑚 𝑞 ), 𝑝 01 = popcnt ( ¯𝑥 ∧𝑚 𝑣 ), 𝑝 11 = popcnt ( ¯𝑥 ∧𝑚 𝑞 ∧𝑚 𝑣 ),and 𝑛 11 = popcnt (𝑚 𝑞 ∧ 𝑚 𝑣 ) where ¯𝑥 = ¬( 𝑠 𝑞 ⊕ 𝑠 𝑣 ) marks sign agreement. Then ⟨ ˆ𝑢 𝑞 , ˆ𝑢 𝑣 ⟩ = 𝑎 𝑞 𝑎 𝑣 (2𝑝 ⊕ − 𝐷 ) + 𝑎 𝑞 𝛿 𝑣 (2𝑝 01 − 𝑠 𝑣 ) + 
+
+𝛿 𝑞 𝑎 𝑣 (2𝑝 10 − 𝑠 𝑞 ) + 𝛿 𝑞 𝛿 𝑣 (2𝑝 11 − 𝑛 11 ) exactly (proof in Appendix B). 
+
+Proof Sketch. Because sgn (𝑢 𝑣,𝑖 )𝑢 𝑣,𝑖 = |𝑢 𝑣,𝑖 |, splitting ⟨𝑢 𝑣 , ˆ𝑢 𝑣 ⟩
+
+over 𝐼 0,𝑣 and 𝐼 1,𝑣 gives 𝑎 𝑣 
+
+Í𝑖 ∈𝐼 0,𝑣 |𝑢 𝑣,𝑖 | + 𝑏 𝑣 
+
+Í𝑖 ∈𝐼 1,𝑣 |𝑢 𝑣,𝑖 | = (𝐷 −𝑠 𝑣 )𝑎 2 
+
+> 𝑣
+
++
+
+𝑠 𝑣 𝑏 2 
+
+> 𝑣
+
+= ∥ ˆ𝑢 𝑣 ∥22, whence ⟨𝑢 𝑣 − ˆ𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ = 0 and ∥𝑢 𝑣 − ˆ𝑢 𝑣 ∥22 = 1 − 𝜎 2 
+
+> 𝑣
+
+.Expanding sgn 𝑞 sgn 𝑣 = 2 ¯ 𝑥 𝑖 − 1 over {1, 𝑚 𝑞 , 𝑚 𝑣 , 𝑚 𝑞 𝑚 𝑣 } yields the five-popcount identity. □
+
+The main hop scorer uses the conditional-mean five-popcount product from Lemma 1. With 𝑡 = clip [− 1,1] (⟨ ˆ𝑢 𝑞 , ˆ𝑢 𝑣 ⟩/( 𝜎 𝑞 𝜎 𝑣 )) , it applies ˆ𝛾 sym = 𝑡 𝜅 + ( 1 − 𝜅 )𝑡 2 , 𝜅 = clip [0.5,1] (𝜎 𝑞 𝜎 𝑣 ). (9) The FP32 norms are precomputed at ingestion. For fixed 𝜅 ∈ [ 0.5, 1],
+
+𝑔 𝜅 (𝑡 ) = 𝑡 /( 𝜅 + ( 1 − 𝜅 )𝑡 2) is strictly increasing on [− 1, 1] (𝑔 ′ 
+
+> 𝜅
+
+(𝑡 ) =
+
+[𝜅 −( 1−𝜅 )𝑡 2]/[ 𝜅 +( 1−𝜅 )𝑡 2]2 > 0 on (− 1, 1)), preserving rank across equal-𝜎 𝑣 candidates while calibrating hop scores ( 𝜎 𝑣 -dependent 𝜅 )ahead of Stage-0.5’s exact orthogonal projection. The canonical code sgn (𝑢 𝑖 )( 1 + 𝑚 𝑖 ) ∈ {± 1, ±2}, with inverse norm (𝐷 + 3𝑠 )−1/2,supplies legacy scoring paths. Training-free encoding computes bitplanes and conditional means directly from each vector. Cone-axis fitting uses the deterministic sample procedure in §4.1. 
+
+Problem Statement and Discrete Comparison Operators. Given 𝑁 
+
+database points X ⊂ B𝐷 𝑐 and query 𝑞 ∈ B𝐷 𝑐 , exact top-𝑘 retrieval returns N𝑘 (𝑞 ) minimizing 𝑑 B (𝑞, 𝑣 ), and ANN accuracy is evaluated via Recall@ 𝑘 = | bN𝑘 (𝑞 ) ∩ N 𝑘 (𝑞 )|/ 𝑘 against throughput (QPS) and p99 latency. As established by comparison-decision stability theory for flat quantized search [65], proximity-graph construction and traversal depend not on point-wise metric reconstruction error |b𝑃 B−
+
+𝑃 B |, but on sign preservation of two binary comparison operators: (1) Shared-query ranking during beam search: for query 𝑞 and candidates 𝑥, 𝑦 ∈ X , deciding the sign of 
+
+Ψrank (𝑞 ; 𝑥, 𝑦 ) ≜ 𝑃 B (𝑞, 𝑥 ) − 𝑃 B (𝑞, 𝑦 ); (10) (2) Shared-target diversity pruning during Vamana edge selec-tion [55]: for vertex 𝑢 , selected neighbor 𝑤 , and candidate 
+
+𝑣 under geodesic slack 𝛼 > 1, deciding whether 
+
+Ψprune (𝑢, 𝑤, 𝑣 ; 𝛼 ) ≜ 𝛼 𝑑 B (𝑤, 𝑣 ) − 𝑑 B (𝑢, 𝑣 ) ≤ 0. (11) For any noisy estimator bΨ = Ψ + ΔbΨ, the probability of a decision flip is controlled by its margin-to-noise ratio [65]: MNR (bΨ) ≜ |E[bΨ]| √︃ 
+
+Var (ΔbΨ)
+
+. (12) Section 3 characterizes how negative curvature reshapes both Var (ΔbΨrank ) and the geometry of Ψprune .
+
+> 4
+
+## 3 CONFORMAL POLAR DISTORTION AND HYPERBOLIC GRAPH PATHOLOGIES 
+
+Why do flat proximity-graph pruning rules [55] and compact direc-tional codes [65, 66] break when transplanted to negatively curved manifolds? We analyze both the stochastic comparison error of the polar proxy b𝑃 B (𝑞, 𝑣 ) = 𝑅 (𝑟 𝑞 , 𝑟 𝑣 ) + 𝑊 (𝑟 𝑞 , 𝑟 𝑣 )( 1 − ˆ𝛾 (𝑢 𝑞 , 𝑢 𝑣 )) and the deterministic geodesic geometry of Vamana pruning on B𝐷 𝑐 .
+
+## 3.1 Conformal Flip Criterion, Query Depth Invariance, and Lorentz Blowup 
+
+Write the directional estimation error for any pair (𝑢 𝑞 , 𝑢 𝑣 ) as 
+
+𝜀 ∠ (𝑞, 𝑣 ) ≜ ˆ𝛾 (𝑢 𝑞 , 𝑢 𝑣 ) − 𝛾 𝑞𝑣 . For the normalized bilinear score 
+
+⟨ ˆ𝑢 𝑞 /𝜎 𝑞 , ˆ𝑢 𝑣 /𝜎 𝑣 ⟩, define directional residuals ˆ 𝑢 𝑧 /𝜎 𝑧 − 𝑢 𝑧 = 𝑒 𝑧 , the bilinear error decomposition [8, 65] is 
+
+𝜀 ∠ (𝑞, 𝑣 ) = ⟨𝑒 𝑞 , 𝑢 𝑣 ⟩
+
+| {z }  
+
+> 𝜂 𝑞 (𝑢 𝑣 )
+
++ ⟨ 𝑢 𝑞 , 𝑒 𝑣 ⟩
+
+| {z }  
+
+> 𝜂 𝑣 (𝑢 𝑞 )
+
++ ⟨ 𝑒 𝑞 , 𝑒 𝑣 ⟩
+
+| {z }
+
+> 𝜉 𝑞𝑣
+
+, (13) The calibrated hop score (9) applies its rational map after this bilinear product (while Stage-0.5 evaluates the uncalibrated lin-ear projection directly at 𝑒 𝑞 = 0). Here 𝜂 𝑞 (𝑢 𝑣 ) is the first-order query projection, 𝜂 𝑣 (𝑢 𝑞 ) is the first-order candidate projection, and 𝜉 𝑞𝑣 is the second-order cross residual. In flat cosine ranking (𝑊 ≡ 1), comparing angularly close candidates 𝑢 𝑥 , 𝑢 𝑦 subtracts 
+
+𝜂 𝑞 (𝑢 𝑥 )− 𝜂 𝑞 (𝑢 𝑦 ) = ⟨𝑒 𝑞 , 𝑢 𝑥 −𝑢 𝑦 ⟩, with variance (𝑢 𝑥 −𝑢 𝑦 )⊤ Σ𝑞 (𝑢 𝑥 −𝑢 𝑦 )
+
+for Σ𝑞 = Cov (𝑒 𝑞 ). The scaling ∥Σ𝑞 ∥2 = 𝑂 (1/𝐷 ) gives standard de-viation 𝑂 (∥ 𝑢 𝑥 − 𝑢 𝑦 ∥2/√𝐷 ) [65]. On B𝐷 𝑐 , conformal radial weights reshape this behavior in four distinct ways. Theorem 2 (Conformal Flip Criterion, Depth Invariance, and Lorentz-MIPS Blowup). Let 𝑞, 𝑥, 𝑦 ∈ B𝐷 𝑐 (𝑟 𝑞 > 0) satisfy 
+
+𝑃 B (𝑞, 𝑥 ) < 𝑃 B (𝑞, 𝑦 ) with true proxy margin Δ𝑃 (𝑞 ; 𝑥, 𝑦 ) ≜ 𝑃 B (𝑞, 𝑦 ) − 
+
+𝑃 B (𝑞, 𝑥 ) > 0, with real-valued radial scalars (𝑟 𝑧 , 𝑓 𝑧 ). Implementation rounding is quantified in Appendix E.2.Then 
+
+(1) Exact flip criterion and query boundary-depth invari-ance: An approximate proxy inversion b𝑃 B (𝑞, 𝑦 ) ≤ b𝑃 B (𝑞, 𝑥 )
+
+occurs if and only if 
+
+𝑟 𝑦 𝑓 𝑦 𝜀 ∠ (𝑞, 𝑦 ) − 𝑟 𝑥 𝑓 𝑥 𝜀 ∠ (𝑞, 𝑥 ) ≥ Δ𝑃 (𝑞 ; 𝑥, 𝑦 )
+
+2𝑟 𝑞 𝑓 𝑞 
+
+. (14) 
+
+When 𝑥, 𝑦 lie on an isobathic shell (𝑟 𝑥 = 𝑟 𝑦 = 𝑟 > 0), (14) 
+
+simplifies to 𝜀 ∠ (𝑞, 𝑦 ) − 𝜀 ∠ (𝑞, 𝑥 ) ≥ 𝛾 𝑞𝑥 − 𝛾 𝑞𝑦 : both 𝑓 𝑞 and 𝑓 𝑥 
+
+cancel identically, rendering same-shell flip probabilities com-pletely invariant to query and candidate boundary proximity (𝑓 𝑞 , 𝑓 𝑥 → ∞ ). 
+
+(2) Cross-shell query-noise non-cancellation: For the bilin-ear error (13) , the ranking perturbation ΔbΨrank (𝑞 ; 𝑥, 𝑦 ) =
+
+b𝑃 B (𝑞, 𝑥 ) − b𝑃 B (𝑞, 𝑦 ) − Ψrank (𝑞 ; 𝑥, 𝑦 ) contains an uncan-celled query term 𝑑 𝑞 (𝑟 𝑞 ; 𝑟 𝑥 , 𝑟 𝑦 ) 𝜂 𝑞 (𝑢 𝑥 ) with 𝑑 𝑞 (𝑟 𝑞 ; 𝑟 𝑥 , 𝑟 𝑦 ) =
+
+𝑊 (𝑟 𝑞 , 𝑟 𝑦 ) − 𝑊 (𝑟 𝑞 , 𝑟 𝑥 ). For arbitrary Σ𝑞 = Cov (𝑒 𝑞 ), this first-order query term at 𝑢 𝑥 = 𝑢 𝑦 has variance 𝑑 2
+
+> 𝑞
+
+𝑢 ⊤ 
+
+> 𝑥
+
+Σ𝑞 𝑢 𝑥 . Special-izing to Σ𝑞 = 𝜅 𝑞  
+
+> 𝐷
+
+(𝐼 𝐷 − 𝑢 𝑞 𝑢 ⊤ 
+
+> 𝑞
+
+) gives 
+
+Var 𝑒 𝑞 
+
+ 𝑑 𝑞 𝜂 𝑞 (𝑢 𝑥 ) | 𝑢 𝑥 = 𝑢 𝑦 
+
+
+
+= 4𝜅 𝑞 
+
+𝑐 2𝐷 sinh 2 𝜌 𝑞 
+
+ sinh 𝜌 𝑦 − sinh 𝜌 𝑥 
+
+2 (1 − 𝛾 2 
+
+> 𝑞𝑥
+
+), (15) 
+
+For fixed nonzero shell gap and 1 − 𝛾 2 
+
+> 𝑞𝑥
+
+> 0, this expres-sion grows as Θ(𝑒 2𝜌 𝑞 +2 max (𝜌 𝑥 ,𝜌 𝑦 ) /𝐷 ) at large depths. Inside a deep-shell band of width 𝛿 𝜌 , its weight mismatch is 𝑂 (𝛿 2
+
+> 𝜌
+
+𝑊 2).An unquantized query sets 𝑒 𝑞 = 0 in pool re-scoring. 
+
+(3) Spatial Lorentz-MIPS quantization scaling: Under a spatial-error model Cov (𝜖 𝑣 ) = Θ(∥ ˜𝑧 𝑣 ∥22/𝐷 )𝐼 𝐷 , directly quan-tizing spatial coordinates ˜𝑧 = 1√𝑐 sinh 𝜌 𝑧 𝑢 𝑧 ∈ R𝐷 on L𝐷 𝑐 to approximate the Lorentz inner product −𝑧 0𝑧 ′ 
+
+> 0
+
++ ⟨ ˜𝑧, ˜𝑧 ′⟩ without polar norm separation incurs coordinate error standard devia-tion Θ( 1 
+
+> 𝑐 √𝐷
+
+sinh 𝜌 𝑞 sinh 𝜌 𝑣 ) even at 𝜃 𝑞𝑣 = 0, giving nonzero spatial inner-product variance on aligned rays. Polar stor-age supplies the scalar radial lower bound independently of directional evaluation (complete proof in Appendix C). 
+
+Proof Sketch. Because 𝑅 (𝑟 𝑞 , 𝑟 𝑣 ) and 𝑊 (𝑟 𝑞 , 𝑟 𝑣 ) = 2𝑟 𝑞 𝑟 𝑣 𝑓 𝑞 𝑓 𝑣 are exact, b𝑃 B (𝑞, 𝑣 ) − 𝑃 B (𝑞, 𝑣 ) = −2𝑟 𝑞 𝑓 𝑞 𝑟 𝑣 𝑓 𝑣 𝜀 ∠ (𝑞, 𝑣 ). Substituting this into 
+
+b𝑃 B (𝑞, 𝑦 ) − b𝑃 B (𝑞, 𝑥 ) ≤ 0 and dividing by 2 𝑟 𝑞 𝑓 𝑞 > 0 gives (14); setting 
+
+𝑟 𝑥 = 𝑟 𝑦 cancels 𝑟 𝑥 𝑓 𝑥 against Δ𝑃 = 2𝑟 𝑞 𝑟 𝑥 𝑓 𝑞 𝑓 𝑥 (𝛾 𝑞𝑥 − 𝛾 𝑞𝑦 ). Adding and subtracting 𝑊 (𝑟 𝑞 , 𝑟 𝑦 )𝜂 𝑞 (𝑢 𝑥 ) in (13) isolates 𝑑 𝑞 𝜂 𝑞 (𝑢 𝑥 ) and yields (15). Under the stated spatial-error model on L𝐷 𝑐 , a quantizer applied to ˜ 𝑧 𝑣 scales quantization step size by ∥ ˜𝑧 𝑣 ∥2 = 𝑐 −1/2 sinh 𝜌 𝑣 ,injecting Θ(𝑒 𝜌 𝑞 +𝜌 𝑣 /√𝐷 ) noise even along radial lines where polar 
+
+𝑅 (𝑟 𝑞 , 𝑟 𝑣 ) is exact. □
+
+Theorem 2 establishes why Pelorus projects L𝐷 𝑐 → B𝐷 𝑐 at in-gestion, stores (𝑟 𝑣 , 𝑓 𝑣 ) as unquantized FP32 scalars, isolates lateral graph edges inside isobathic shells |𝜌 𝑣 − 𝜌 𝑢 | ≤ 𝛿 𝜌 , and applies an unquantized-query refinement pass (Stage-0.5) before cross-shell truncation. 
+
+## 3.2 Hyperbolic Vamana Pathologies: Occlusion, Wells, and Bias 
+
+Even with exact geodesic distances, standard single-metric Vamana construction [55] exhibits severe topological degeneration in B𝐷 𝑐 
+
+because negative curvature bends geodesics toward the origin. Theorem 3 (Radial Occlusion Bound, Angular Escape Con-dition, and Intercept Bias). Let B𝐷 𝑐 have curvature −𝑐 < 0 and Vamana pruning slack 𝛼 > 1.
+
+(1) Radial occlusion bound and exponential angular con-traction: Suppose outer vertex 𝑢 at geodesic radius 𝑅 𝑢 =
+
+𝑑 B (0, 𝑢 ) admits an interior neighbor 𝑝 with 𝑅 𝑝 < 𝑅 𝑢 /𝛼 . Then for every vertex 𝑣 ∈ B𝐷 𝑐 inside the closed geodesic ball 
+
+𝑅 𝑣 ≤ 𝑅 occ (𝑅 𝑢 , 𝑅 𝑝 ; 𝛼 ) ≜ 𝑅 𝑢 − 𝛼𝑅 𝑝 
+
+𝛼 + 1 , (16) 
+
+the pruning inequality 𝛼 𝑑 B (𝑝, 𝑣 ) ≤ 𝑑 B (𝑢, 𝑣 ) holds simul-taneously for all spherical angles 𝜃 𝑝𝑣 ∈ [ 0, 𝜋 ]—including candidates 180 ◦ opposite 𝑝 . Whereas (16) is a generic metric ball, negative curvature drives severe same-shell angular col-lapse: for any outer shell 𝑅 𝑢 = 𝑅 𝑣 = 𝑅 > 0 (𝜌 = √𝑐 𝑅 ) and origin neighbor 𝑝 = 0 under 𝛼 ∈ ( 1, 2), 𝛼 𝑑 B (0, 𝑣 ) ≤ 𝑑 B (𝑢, 𝑣 )
+
+holds whenever sin (𝜃 𝑢𝑣 /2) ≥ sinh ( 𝛼  
+
+> 2
+
+𝜌 )/ sinh (𝜌 ), shrinking the surviving unoccluded cone exponentially as 2𝑒 − ( 2−𝛼 )𝜌 /2
+
+(from 73 .7◦ in the flat limit 𝑐 → 0+ down to 23 .1◦ at 𝜌 = 4
+
+and 10 .4◦ at 𝜌 = 6 for 𝛼 = 1.2). 
+
+> 5
+
+(2) Angular escape condition: For any query 𝑞 at radius 𝑅 𝑞 >
+
+0, a candidate 𝑣 at radius 𝑅 𝑣 > 0 is geodesically closer to 𝑞 
+
+than the origin 0 (𝑑 B (𝑞, 𝑣 ) < 𝑅 𝑞 ) if and only if its spherical cosine alignment exceeds 
+
+𝛾 𝑞𝑣 > 𝛾 esc (𝑅 𝑞 , 𝑅 𝑣 ) ≜ tanh (√𝑐 𝑅 𝑣 /2)
+
+tanh (√𝑐 𝑅 𝑞 ) . (17) 
+
+Outside this cap, 𝑣 fails to improve on the origin. Angular sensitivity vanishes along inward rays as sinh (√𝑐𝑅 𝑣 ) → 0.
+
+(3) Offset-intercept and proxy non-homogeneity bias: Re-placing geodesic distance with an affine surrogate ˆ𝑑 = 𝑎𝑑 + 𝑏 ,
+
+𝑎 > 0, gives pruning margin 𝑎 [𝑑 (𝑢, 𝑣 ) − 𝛼𝑑 (𝑤, 𝑣 )] + ( 1 −𝛼 )𝑏 .Positive 𝑏 produces under-pruning and negative 𝑏 produces over-pruning. Direct linear proxy slack 𝛼𝑃 B (𝑤, 𝑣 ) ≤ 𝑃 B (𝑢, 𝑣 )
+
+over-prunes relative to geodesic slack, whose proxy threshold is 𝑃 𝛼 (𝑃 ) = 2 
+
+> 𝑐
+
+[cosh (𝛼 arccosh (1+𝑐𝑃 /2)) − 1] > 𝛼𝑃 for 𝑃 > 0
+
+(complete proofs in Appendix D). 
+
+Proof Sketch. By the triangle inequality through 0, 
+
+𝑑 B (𝑝, 𝑣 ) ≤ 𝑅 𝑝 + 𝑅 𝑣 and 𝑑 B (𝑢, 𝑣 ) ≥ 𝑅 𝑢 − 𝑅 𝑣 for all 
+
+𝜃 𝑝𝑣 , 𝜃 𝑢𝑣 ∈ [0, 𝜋 ]; requiring 𝛼 (𝑅 𝑝 + 𝑅 𝑣 ) ≤ 𝑅 𝑢 − 𝑅 𝑣 yields (16). Along any same-shell pair 𝑅 𝑢 = 𝑅 𝑣 = 𝑅 , substituting  
+
+> 𝑐
+> 4
+
+𝑃 B (𝑢, 𝑣 ) = sinh 2 ( 
+
+> √𝑐
+> 2
+
+𝑑 B (𝑢, 𝑣 )) = sinh 2 𝜌 sin 2 (𝜃 𝑢𝑣 /2) reduces 
+
+𝛼 𝑑 B (0, 𝑣 ) ≤ 𝑑 B (𝑢, 𝑣 ) directly to sin (𝜃 𝑢𝑣 /2) ≥ sinh ( 𝛼  
+
+> 2
+
+𝜌 )/ sinh 𝜌 .For Claim (2), cosh (√𝑐 𝑑 B (𝑞, 𝑣 )) < cosh (√𝑐𝑅 𝑞 ) expands via the hyperbolic law of cosines to cosh 𝜌 𝑞 (cosh 𝜌 𝑣 − 1) <
+
+sinh 𝜌 𝑞 sinh 𝜌 𝑣 𝛾 𝑞𝑣 ; dividing by sinh 𝜌 𝑞 sinh 𝜌 𝑣 > 0 and apply-ing (cosh 𝜌 𝑣 − 1)/ sinh 𝜌 𝑣 = tanh (𝜌 𝑣 /2) gives (17). For Claim (3), ˆ𝑑 (𝑢, 𝑣 ) − 𝛼 ˆ𝑑 (𝑤, 𝑣 ) = 𝑎 ( ˜𝑑 (𝑢, 𝑣 ) − 𝛼 ˜𝑑 (𝑤, 𝑣 )) + ( 1 − 𝛼 )𝑏 . □
+
+Theorem 3 directly motivates Pelorus’s Inside-Out insertion or-der, radially shielded isobathic ring, stem-excess geodesic domi-nance rule (§4.2), and multi-entry polar router (§4.4). 
+
+## 3.3 Boundary Margin Collapse, Tangent-Cone Recovery, and Pool Dilution 
+
+Even when 𝑒 𝑞 = 0, candidate-side quantization noise 
+
+𝑊 (𝑟 𝑞 , 𝑟 𝑣 )𝜂 𝑣 (𝑢 𝑞 ) persists. When semantic subtrees concentrate inside a narrow cone around unit axis 𝜇 𝑐 ∈ S𝐷 −1 near the boundary (𝜌 𝑣 ≫ 1), orthogonal decomposition writes 
+
+𝑢 𝑣 = 𝛼 𝑣 𝜇 𝑐 + 𝛽 𝑣 ˜𝑟 𝑣 , 𝛼 𝑣 = ⟨𝑢 𝑣 , 𝜇 𝑐 ⟩,𝛽 𝑣 =√︁ 1 − 𝛼 2 
+
+> 𝑣
+
+, ˜𝑟 𝑣 ∈ 𝑇 𝜇 𝑐 S𝐷 −1 ∩ S𝐷 −1, (18) with ⟨ ˜𝑟 𝑣 , 𝜇 𝑐 ⟩ = 0. Decomposing 𝑢 𝑞 = 𝛼 𝑞,𝑐 𝜇 𝑐 + 𝛽 𝑞,𝑐 ˜𝑟 𝑞,𝑐 splits 𝛾 𝑞𝑣 into macroscopic axial alignment and microscopic tangent variation: 
+
+𝛾 𝑞𝑣 = ⟨𝑢 𝑞 , 𝑢 𝑣 ⟩ = 𝛼 𝑞,𝑐 𝛼 𝑣 + 𝛽 𝑞,𝑐 𝛽 𝑣 ⟨ ˜𝑟 𝑞,𝑐 , ˜𝑟 𝑣 ⟩. (19) Theorem 4 (Tangent-Cone Error Propagation and Fixed-Budget Admission). Consider same-shell candidates 
+
+𝑥, 𝑦 with weight 𝑊 = 𝑊 (𝑟 𝑞 , 𝑟 ) > 0, common 𝛼 =√︁ 1 − 𝛽 2, and 
+
+𝛽, 𝛽 𝑞,𝑐 > 0. Set Δ ˜𝑟 = ⟨ ˜𝑟 𝑞,𝑐 , ˜𝑟 𝑦 − ˜𝑟 𝑥 ⟩ ≠ 0. Variances below use a conditional error model with fixed displayed geometric quantities and zero-mean estimation errors. 
+
+(1) Pairwise margin and covariance: The true margin is 
+
+𝑊 𝛽 𝑞,𝑐 𝛽 |Δ ˜𝑟 |. For global cosine errors 𝑔 𝑥 , 𝑔 𝑦 , define 𝑉 𝑔 =
+
+Var (𝑔 𝑦 ) + Var (𝑔 𝑥 ) − 2 Cov (𝑔 𝑦 , 𝑔 𝑥 ). For 𝑉 𝑔 > 0,
+
+MNR global = 𝛽 𝑞,𝑐 𝛽 |Δ ˜𝑟 |√︁ 
+
+𝑉 𝑔 
+
+. (20) 
+
+Thus margin collapse occurs when √︁ 𝑉 𝑔 /( 𝛽 𝑞,𝑐 𝛽 |Δ ˜𝑟 |) → ∞ .
+
+(2) Fixed-budget admission under exchangeable ranks: 
+
+Suppose the retained pool contains 𝑁 𝑐 (𝐿 ) ≥ 𝐵 cone mem-bers, including 𝑘 𝑐 (𝐿 ) true neighbors, and all 𝐵 rerank slots are selected from these members. If their score ranks form a uniform permutation conditional on this pool, expected true-neighbor admission is 𝑘 𝑐 (𝐿 )𝐵 /𝑁 𝑐 (𝐿 ). It decreases between two widths exactly when 𝑘 𝑐 (𝐿 )/ 𝑁 𝑐 (𝐿 ) decreases. 
+
+(3) Exact tangent-error attenuation: With real-valued axial scalars, use 
+
+ˆ𝛾 cone (𝑞, 𝑣 ) ≜ 𝛼 𝑞,𝑐 𝛼 𝑣 + 𝛽 𝑞,𝑐 𝛽 𝑣 ˆ𝛾 asym ( ˜𝑟 𝑞,𝑐 , ˜𝑟 𝑣 ) (21) 
+
+and let 𝑒 𝑣 = ˆ𝛾 asym ( ˜𝑟 𝑞,𝑐 , ˜𝑟 𝑣 ) − ⟨ ˜𝑟 𝑞,𝑐 , ˜𝑟 𝑣 ⟩. Then cosine error equals 𝛽 𝑞,𝑐 𝛽 𝑣 𝑒 𝑣 pointwise. Set 𝑉 𝑟 = Var (𝑒 𝑦 ) + Var (𝑒 𝑥 ) − 
+
+2 Cov (𝑒 𝑦 , 𝑒 𝑥 ). For 𝑉 𝑟 > 0,
+
+MNR cone = |Δ ˜𝑟 |√𝑉 𝑟 
+
+,
+
+MNR cone 
+
+MNR global 
+
+=√︁ 𝑉 𝑔 
+
+𝛽 𝑞,𝑐 𝛽 √𝑉 𝑟 
+
+.
+
+(22) 
+
+Under equal residual variances 𝜅 SM /𝐷 and pair correlation 
+
+𝜚 < 1, 𝑉 𝑟 = 2𝜅 SM (1 − 𝜚 )/ 𝐷 . (Proof in Appendix E.) 
+
+Proof Sketch. Subtracting (19) for 𝑥, 𝑦 cancels the axial term. Applying Var (𝑋 −𝑌 ) = Var (𝑋 ) + Var (𝑌 ) − 2 Cov (𝑋, 𝑌 ) gives 𝑊 2𝑉 𝑔 
+
+for global proxy-error variance and 𝑊 2𝛽 2 
+
+> 𝑞,𝑐
+
+𝛽 2𝑉 𝑟 for residual proxy-error variance. Uniform ranks give each cone member admission probability 𝐵 /𝑁 𝑐 (𝐿 ). Summing indicators over its 𝑘 𝑐 (𝐿 ) true neigh-bors proves Claim (2). □
+
+On synthetic Clustered-Narrow, increasing 𝐿 from 256 to 2 ,048 at 
+
+𝐵 = 128 reduces global-code recall from 34 .22% to 27 .80%. The four-stage audit in §6.6 measures beam retention and rerank admission directly. Tangent encoding raises recall to 99 .385% at 𝐿 = 256, 99 .80% at 𝐿 = 384, and 99 .945% peak. It maps residual normalization [38] into the existing 2-bit bitplanes. Equation (22) identifies the pairwise covariance and tangent scale governing this representation. 
+
+## 3.4 Strong Convexity and Closed-Form Radial Minimization 
+
+Next, we establish the exact radial lower bound and ray convexity properties governing shell filtering and entry-point selection. Proposition 5 (Radial Lower Bound, Strong Convexity, and Closed-Form Radial Minimizer). Let 𝑞 ∈ B𝐷 𝑐 have radius 𝑟 𝑞 ,conformal factor 𝑓 𝑞 , and depth 𝜌 𝑞 = 2 atanh (√𝑐 𝑟 𝑞 ).
+
+(1) Lossless radial lower bound: For every 𝑣 ∈ B𝐷 𝑐 ,
+
+𝑃 B (𝑞, 𝑣 ) ≥ 𝑃 rad (𝑟 𝑞 , 𝑟 𝑣 ) ≜ (𝑟 𝑞 −𝑟 𝑣 )2 𝑓 𝑞 𝑓 𝑣 = 2
+
+𝑐 
+
+ cosh |𝜌 𝑞 −𝜌 𝑣 |− 1, (23) 
+
+giving the radial lower bound used by the header gate. Ap-pendix E.2 gives its FP32 perturbation bound. 
+
+> 6
+
+(2) Strong convexity and closed-form radial minimizer: 
+
+Along any directional ray {𝑣 (𝜌 ) : 𝜌 ∈ R} with cosine align-ment 𝛾 = ⟨𝑢 𝑞 , 𝜇 𝑎 ⟩, the hyperbolic cosine objective 𝑔 𝛾 (𝜌 ) ≜
+
+cosh (√𝑐 𝑑 B (𝑞, 𝑣 (𝜌 ))) = cosh 𝜌 𝑞 cosh 𝜌 − 𝛾 sinh 𝜌 𝑞 sinh 𝜌 is strictly 1-strongly convex on R (𝑔 ′′  
+
+> 𝛾
+
+(𝜌 ) = 𝑔 𝛾 (𝜌 ) ≥ cosh (𝜌 𝑞 −|𝜌 |) ≥ 1) and attains its unique minimizer on [0, ∞) at 
+
+𝜌 ∗ (𝜌 𝑞 , 𝛾 ) = atanh  tanh 𝜌 𝑞 · max (𝛾, 0), (24) 
+
+and on any closed radial support [𝜌 min , 𝜌 max ] ⊂ [0, ∞) 
+
+at 𝜌 ∗ 
+
+> sup
+
+= min  max (𝜌 ∗ (𝜌 𝑞 , 𝛾 ), 𝜌 min ), 𝜌 max 
+
+, specializing the classical hyperbolic right-triangle orthogonal-projection iden-tity and geodesic convexity of cosh (√𝑐 𝑑 B) to bounded em-pirical support (derivation in Appendix A). 
+
+Proof Sketch. Claim (1) follows from 𝛾 𝑞𝑣 ≤ 1 in (5). Differentiating 𝑔 𝛾 (𝜌 ) twice yields 𝑔 ′′  
+
+> 𝛾
+
+(𝜌 ) = 𝑔 𝛾 (𝜌 ) ≥
+
+cosh 𝜌 𝑞 cosh |𝜌 | − sinh 𝜌 𝑞 sinh |𝜌 | = cosh (𝜌 𝑞 − | 𝜌 |) ≥ 1. Set-ting 𝑔 ′ 
+
+> 𝛾
+
+(𝜌 ) = cosh 𝜌 𝑞 sinh 𝜌 − 𝛾 sinh 𝜌 𝑞 cosh 𝜌 = 0 gives tanh 𝜌 = 𝛾 tanh 𝜌 𝑞 for 𝛾 > 0 and boundary minimum 𝜌 ∗ = 0for 𝛾 ≤ 0; clamping follows by strict convexity. □
+
+Unlike Euclidean space, for a coarse routing cone at 𝛾 = 0.7and a deep query at 𝜌 𝑞 = 4.0, the closest point along ray 𝜇 𝑎 bends inward to 𝜌 ∗ ≈ 0.87, while on hollow datasets such as Cohere-1M ( 𝜌 0.01 = 1.44), clamping to [𝜌 min , 𝜌 max ] avoids targeting empty interior shells. 
+
+## 3.5 Deterministic Asymmetric De-Biasing, CJ-Gate, and Sketch Variance 
+
+Finally, we derive an algebraic estimator and two uncertainty mod-els governing candidate-pool refinement, plateau expansion, and 256-bit sketch filtering. Proposition 6 (Deterministic Orthogonal-Projection Es-timator, Off-Axis CJ-Gate, and Sketch Variance). Let ˆ𝑢 𝑣 be the two-level SM vector of 𝑢 𝑣 ∈ S𝐷 −1 with Pythagorean norm 
+
+𝜎 2 
+
+> 𝑣
+
+= ∥ ˆ𝑢 𝑣 ∥22 = ⟨𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ ∈ ( 0, 1] from Lemma 1. 
+
+(1) Deterministic orthogonal-projection decomposition: For 
+
+every deterministic pair 𝑢 𝑞 , 𝑢 𝑣 ∈ S𝐷 −1, write 𝑢 𝑞 = 𝛾 𝑞𝑣 𝑢 𝑣 + 𝑤 
+
+with ⟨𝑤, 𝑢 𝑣 ⟩ = 0 (∥𝑤 ∥2 =√︃ 1 − 𝛾 2 
+
+> 𝑞𝑣
+
+). Then without any distributional or rotational-symmetry assumption, 
+
+⟨𝑢 𝑞 , ˆ𝑢 𝑣 ⟩
+
+𝜎 2
+
+> 𝑣
+
+= 𝛾 𝑞𝑣 + ⟨𝑤, ˆ𝑢 𝑣 − 𝜎 2
+
+> 𝑣
+
+𝑢 𝑣 ⟩
+
+𝜎 2
+
+> 𝑣
+
+. (25) 
+
+Dividing ⟨𝑢 𝑞 , ˆ𝑢 𝑣 ⟩ by 𝜎 2 
+
+> 𝑣
+
+(rather than 𝜎 𝑣 ) recovers 𝛾 𝑞𝑣 with zero multiplicative shrinkage along 𝑢 𝑣 , leaving only per-pendicular residual ⟨𝑤, ˆ𝑢 𝑣 ⟩/ 𝜎 2 
+
+> 𝑣
+
+. Algebraically analogous to RaBitQ’s ⟨¯𝑜, 𝑜 ⟩ inner-product divisor [27]—which achieves unbiasedness in expectation via global random rotations— conditional-mean SM turns ˆ𝑢 𝑣 into an orthogonal projection (⟨𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ = 𝜎 2 
+
+> 𝑣
+
+, Lemma 1) so (25) holds deterministically with-out rotations or distributional hypotheses. 
+
+(2) Off-axis Conformal Jacobian uncertainty (CJ-Gate): 
+
+Propagating directional standard deviation 𝜎 𝛾 (𝑞, 𝑣 ) =√︁ 
+
+𝜅 SM /𝐷 ˜𝛽 (𝑞, 𝑣 ) through (5) , where ˜𝛽 (𝑞, 𝑣 ) = 𝛽 𝑞,𝑐 𝛽 𝑣 under cone encoding (21) and ˜𝛽 (𝑞, 𝑣 ) = 1 globally, gives 
+
+𝜎 𝑃 (𝑞, 𝑣 ) = 𝜕𝑃 B (𝑞, 𝑣 )
+
+𝜕𝛾 𝑞𝑣 
+
+𝜎 𝛾 (𝑞, 𝑣 ) = 2𝑟 𝑞 𝑟 𝑣 𝑓 𝑞 𝑓 𝑣 √︂ 𝜅 SM 
+
+𝐷 ˜𝛽 (𝑞, 𝑣 ). (26) 
+
+Using 𝛽 2 
+
+> 𝑣
+
+in place of 𝛽 𝑞,𝑐 𝛽 𝑣 underestimates 𝜎 𝑃 (𝑞, 𝑣 ) by fac-tor 𝛽 𝑞,𝑐 /𝛽 𝑣 on off-axis queries (up to 5.49 × when 𝛼 𝑣 =
+
+0.995 , 𝛼 𝑞,𝑐 = 0.84 ). 
+
+(3) Binomial sketch variance ratio: For a 𝐵 𝑠 -bit sign sketch (𝐵 𝑠 = 256 ) at observed Hamming distance 𝐻 = 𝐵 𝑠 𝑝 with arcsine cosine estimate ˆ𝛾 𝐵 𝑠 (𝐻 ) = cos (𝜋𝑝 ), first-order delta propagation of 𝐻 ∼ Binomial (𝐵 𝑠 , 𝑝 ) yields standard devi-ation 𝜎 sk (𝑝 ) = 𝜋 √𝐵 𝑠 sin (𝜋𝑝 )√︁ 𝑝 (1 − 𝑝 ), whose ratio reaches 
+
+2.306 × at 𝐻 = 128 (ˆ𝛾 = 0) and 2.265 × at 𝐻 = 115 (ˆ𝛾 ≈ 0.16 )relative to high-similarity neighbors ( 𝐻 ref = 48 , ˆ𝛾 ≈ 0.83 )(derivations in Appendix E). 
+
+Proof Sketch. Substituting 𝑢 𝑞 = 𝛾 𝑞𝑣 𝑢 𝑣 + 𝑤 into ⟨𝑢 𝑞 , ˆ𝑢 𝑣 ⟩
+
+and applying ⟨𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ = 𝜎 2 
+
+> 𝑣
+
+and ⟨𝑤, 𝑢 𝑣 ⟩ = 0 gives ⟨𝑢 𝑞 , ˆ𝑢 𝑣 ⟩ =
+
+𝛾 𝑞𝑣 𝜎 2 
+
+> 𝑣
+
++ ⟨ 𝑤, ˆ𝑢 𝑣 − 𝜎 2
+
+> 𝑣
+
+𝑢 𝑣 ⟩, proving (25) deterministically. Claim (2) follows from |𝜕𝑃 B/𝜕𝛾 𝑞𝑣 | = 𝑊 (𝑟 𝑞 , 𝑟 𝑣 ) = 2𝑟 𝑞 𝑟 𝑣 𝑓 𝑞 𝑓 𝑣 and (21). For Claim (3), | dd𝑝 cos (𝜋𝑝 )| = 𝜋 sin (𝜋𝑝 ) multiplied by √︁ Var (𝐻 /𝐵 𝑠 ) =√︁ 
+
+𝑝 (1 − 𝑝 )/ 𝐵 𝑠 yields 𝜎 sk (𝑝 ). □
+
+## 4 WARPED-PRODUCT REPRESENTATION AND GRAPH TOPOLOGY 
+
+Figure 1 summarizes the geometry and representation. Guided by Theorems 2–4 and Proposition 5, Pelorus models the index as a 
+
+warped-product fiber-bundle graph over R≥0 ×sinh S𝐷 −1, decoupling exact radial curvature from 2-bit spherical directions in memory and separating spherical diversity edges from radial transitions during construction. 
+
+## 4.1 Zero-Overhead Polar Vertex Representation 
+
+32-Byte PolarNodeMeta Header. For each vertex 𝑣 ∈ { 0, . . . , 𝑁 −
+
+1}, Pelorus stores a fixed 32-byte polar header (half a 64-byte cache line) paired with packed 2-bit SM bitplanes occupying 2 ⌈𝐷 /64 ⌉ × 8bytes: 
+
+• Unquantized radial scalars (12 B): Euclidean radius 𝑟 𝑣 ∈[0, 1/√𝑐 ), boundary factor 𝐹 𝑣 = (1 − 𝑐𝑟 2 
+
+> 𝑣
+
+)−1 = 𝑓 𝑣 /2, and di-mensionless geodesic depth 𝜌 𝑣 = 2 atanh (√𝑐 𝑟 𝑣 ), computed in FP64 at ingestion and stored in FP32. 
+
+• Conditional-mean two-level SM scalars (12 B): weak-coordinate mean 𝑎 𝑣 , level step 𝛿 𝑣 = 𝑏 𝑣 − 𝑎 𝑣 , and recon-structed two-level norm 𝜎 𝑣 = ∥ ˆ𝑢 𝑣 ∥2 in FP32 (Lemma 1). 
+
+• Bitpacked count/cone tag and axial/norm scalar (8 B): a 32-bit word packing the 20-bit strong-magnitude count 𝑠 𝑣 with a 12-bit residual cone tag (cone_id, with 0x0FFF denoting global native SM), paired with an FP32 field storing ax-ial alignment 𝛼 𝑣 = ⟨𝑢 𝑣 , 𝜇 𝑐 ⟩ for residual-cone vertices or precomputed canonical inverse norm (𝐷 + 3𝑠 𝑣 )−1/2 for global vertices. The triple (𝑎 𝑣 , 𝛿 𝑣 , 𝜎 𝑣 ) supports the main conditional-mean hop scorer and Stage-0.5. The global inverse-norm slot supports legacy canonical paths, while residual scoring reads 𝛼 𝑣 and computes 𝛽 𝑣 .
+
+> 7
+
+Figure 1: Geometric design of Pelorus. (a) An origin hub exposes all-angle inner-ball occlusion and a shrinking same-shell angular cap ( 𝛼 = 1.2). (b) A 32-slot example allocates 12 geodesic, 16 ring, two inward, and two outward links, with a cumulative ring cap of 28. PolarRouter selects ray-support entries, and chord swaps attach islands while preserving the BFS tree. (c) Tangent encoding reuses the polar header and directional bitplanes, with cosine-error multiplier 𝛽 𝑞,𝑐 𝛽 𝑣 . On synthetic Clustered-Narrow, Recall@10 rises from 34 .22% to 99 .385% at 𝐿 = 256 , 𝐵 = 128 .Table 1: Per-vertex logical representation payload at 𝐷 =
+
+768 , 𝑀 0 = 32 (𝑁 = 1M). For the 2-bit and SQ8 paths, cold FP32 vectors are read during final reranking. Full allocation components appear in Table 2.                                              
+
+> Representation Header (/Sketch) Dir. Code Active Edges Logical Total
+> Full-Vector Nav (FP32) 32 B 3,072 B 128 B 3,232 B Polar-SQ8 (8-bit dir.) 32 B 768 B 128 B 928 B Pelorus-Split (no sketch) 32 B 192 B 128 B 352 B †
+> Pelorus ( HotSmPage )64 B 192 B 128 B 384 B †
+> †HotSmPage adds 32 BSymSketch256 to the 32 B polar header ( 64 BHotSmHeader ). Active edges count 𝑀 0=32 u32 IDs ( 128 B), while fixed-stride adjacency reserves 64
+> slots/vertex ( 256 MB; Table 2). Residual encoding reuses the same per-vertex slots (4𝐶𝐷 B global dictionary for 𝐶 ≤512 axes, or 0.50 MiB at 𝐶 =256 , 𝐷 =512 ).
+
+Table 1 gives the per-vertex logical payload at 𝐷 = 768, 𝑀 0 = 32 (384 B with SymSketch256 under HotSmPage , or 352 B without the sketch in split form), and Table 2 reconciles this payload with the benchmark’s navigation-byte counter. The measured allocation is 517 .0 MB with page co-location (2 .44 × below the measured Polar-SQ8 implementation at 1 ,261 .0 MB and 6 .90 × below Polar-FP32 at 3,565 .0 MB) or 485 .0 MB in split form (2 .60 × and 7 .35 × smaller). Appendix E.2 quantifies header rounding. 
+
+Purity-Gated ResidualConeDict . To realize Theorem 4(3) with-out disturbing unclustered manifolds, Pelorus executes a determin-istic cone-purity check at index build over a uniform sample of min (𝑁 , 8,192 ) vertices: (1) Conformal depth gate: If the 90th-percentile sample depth satisfies 𝑝 90 (𝜌 ) < 1.0, boundary conformal amplification is benign and residual encoding exits immediately with 0 cones. (2) Leader seeding and two-round purity refinement: Otherwise, a deterministic spherical leader pass collects candidate unit axes separated by cosine < 𝜏 lead = 0.91 (capped at 1 ,024 candidates), followed by two rounds of spherical mean re-finement assigning samples with ⟨𝑢 𝑠 , 𝜇 𝑐 ⟩ ≥ 𝛼 min = 0.94. A cone 𝜇 𝑐 is retained if and only if it meets minimum sam-ple support clamp (⌊ 𝑁 samp /1024 ⌋, 3, 12 ) and achieves high intra-cone mean alignment ¯ 𝛼 𝑐 ≥ 0.955. Every database vertex 𝑣 achieving 𝛼 𝑣 = ⟨𝑢 𝑣 , 𝜇 𝑐 ⟩ ≥ 0.94 against its nearest retained axis stores the 2-bit SM code of its normalized tangent residual ˜ 𝑟 𝑣 = (𝑢 𝑣 − 𝛼 𝑣 𝜇 𝑐 )/ √︁ 1 − 𝛼 2 
+
+> 𝑣
+
+in the existing 192-byte bitplane slot and records cone_id in the 12-bit header field (with 0x0FFF reserved for global SM, 0 B/vertex overhead), giving 
+
+𝛽 2 
+
+> 𝑣
+
+= 1 − 𝛼 2 
+
+> 𝑣
+
+≤ 0.1164. The cosine-error multiplier is 𝛽 𝑞,𝑐 𝛽 𝑣 in Theorem 4(3). Setting 𝛼 min = 0.94 and ¯ 𝛼 𝑐 ≥ 0.955 activates residual coding only when tight concentration ( 𝛽 2 
+
+> 𝑣
+
+≤ 0.1164) outweighs axis-projection cost: all four diffuse real datasets pass through on the zero-overhead global path (0 cones), whereas both clustered benchmarks retain all 256 axes (0 .50 MiB at 𝐷 = 512). 
+
+## 4.2 Inside-Out Seeding and Stem-Excess QuadriPrune 
+
+By Theorem 3(1), single-metric Vamana pruning allows interior vertices to occlude entire spherical neighborhoods of boundary vertices. Algorithm 1 replaces isotropic pruning with an inside-out fiber-bundle construction. 
+
+Inside-Out Geodesic Seeding. Sorting vertices by non-decreasing depth schedules interior vertices before boundary waves. Router seeds are computed from the full database before these 256-vertex waves connect their adjacency lists. 
+
+> 8
+
+Table 2: Byte reconciliation on Cohere-1M, 𝑁 = 10 6, 𝐷 = 768 , 𝑀 0 = 32 . Entries are decimal MB. Fixed-stride adjacency reserves 64 neighbor slots and one degree word per vertex. The logical payload in Table 1 includes 32 edge slots. 
+
+Component 2-bit split 2-bit page-co-located Polar-SQ8 Polar-FP32 32-byte polar headers 32.000000 256.000000 32.000000 32.000000 2-bit directional storage 192.000000 192.000000 192.000000 Sketch and record alignment 0 0 032 logical edge slots, 32-bit IDs 128.000000 128.000000 128.000000 128.000000 32 reserved neighbor slots 128.000000 128.000000 128.000000 128.000000 Degree word 4.000000 4.000000 4.000000 4.000000 Router arrays 0.974912 0.974912 0.974912 0.974912 FP64 directional inverse norms 0 0 8.000000 8.000000 SQ8 directional coordinates 0 0 768.000000 0FP32 coordinates used in traversal 0 0 0 3,072.000000 Navigation total 484.974912 516.974912 1,260.974912 3,564.974912 
+
+> The SQ8/FP32 controls retain their 2-bit store and add an 8-byte inverse norm per vertex. Router arrays comprise 393,216 B cone bitplanes, 32,768 B SM parameters, 8,192 B inverse norms, 524,288 B cell representatives, 16,384 B coarse shortlists, and 64 B origin hubs. Adjacency stores forward lists in one fixed-stride array. Reverse insertions update these lists in place. The counter sums navigation-array payloads. Process RSS includes the cold vector store, ID maps, and allocator state.
+
+Stem-Excess and Angle-Guarded Geodesic Dominance. To pre-vent interior vertices from occluding opposite subtrees via The-orem 3(1)—a curvature-induced hub pathology distinct from flat angular redundancy [22, 23] and cross-modal query shift [13]— Pelorus replaces raw 𝛼 -pruning with stem-excess angle-guarded dominance . Let ˜𝑑 (𝑥, 𝑦 ) = √𝑐 𝑑 B (𝑥, 𝑦 ) denote dimensionless geo-desic distance and ℓ∠ (𝑥, 𝑦 ) = 1 − ˆ𝛾 (𝑢 𝑥 , 𝑢 𝑦 ) denote angular loss. Define the radial stem excess and effective non-stem distance of candidate 𝑣 relative to base 𝑢 and existing neighbor 𝑤 :
+
+Δstem (𝑢, 𝑣 ; 𝑤 ) ≜ max  0, |𝜌 𝑢 − 𝜌 𝑣 | − | 𝜌 𝑤 − 𝜌 𝑣 |,
+
+˜𝑑 eff (𝑢, 𝑣 ; 𝑤 ) ≜ max  0, ˜𝑑 (𝑢, 𝑣 ) − Δstem (𝑢, 𝑣 ; 𝑤 ). (27) Neighbor 𝑤 geodesically dominates candidate 𝑣 (Dom geo (𝑤 | 𝑢, 𝑣 ))if and only if 
+
+ℓ∠ (𝑤, 𝑣 ) ≤ ℓ∠ (𝑢, 𝑣 ) ∧ 𝛼 ˜𝑑 (𝑤, 𝑣 ) ≤ ˜𝑑 eff (𝑢, 𝑣 ; 𝑤 ) . (28) Condition ℓ∠ (𝑤, 𝑣 ) ≤ ℓ∠ (𝑢, 𝑣 ) forbids 𝑤 from pruning candidates at wider spherical angles than 𝑢 itself (preventing 180 ◦ cross-origin occlusion), while subtracting Δstem ensures 𝑤 shadows 𝑣 through genuine angular proximity rather than radial depth advantage alone. Moreover, because ˜𝑑 (𝑤, 𝑣 ) ≥ | 𝜌 𝑤 − 𝜌 𝑣 | by the reverse triangle in-equality, checking 𝛼 |𝜌 𝑤 −𝜌 𝑣 | > ˜𝑑 eff (𝑢, 𝑣 ; 𝑤 ) rejects non-dominating pairs in 𝑂 (1) scalar arithmetic without evaluating arccosh. 
+
+Shielded Isobathic Rings, Elevators, and Channel Allocation. Se-lection uses cumulative caps within each 𝑀 0 = 32-slot list. (i) The geodesic channel fills up to max (1, ⌊3𝑀 0/8⌋) = 12 slots via (28). (ii) The ring channel extends the combined list to 28 entries. It orders candidates by ℓ∠ (𝑢, 𝑣 ) + 0.85 |𝜌 𝑢 − 𝜌 𝑣 |. A selected neighbor 
+
+𝑤 may dominate 𝑣 only if |𝜌 𝑤 − 𝜌 𝑣 | ≤ 0.60 and 𝛼ℓ ∠ (𝑤, 𝑣 ) ≤ ℓ∠ (𝑢, 𝑣 ).(iii)–(iv) With 𝑠 entries selected and ℎ = 𝑀 0 − 𝑠 slots remaining, the inward pass targets 𝑠 + ⌊ ℎ/2⌋ total entries and the outward pass fills toward 𝑀 0. Thus a full 28-entry prefix leaves two slots for each radial direction. Their objective is 
+
+𝐽 elev (𝑢, 𝑣 ) = ℓ∠ (𝑢, 𝑣 ) + 0.15 |𝜌 𝑣 − 𝜌 𝑢 | − 0.65 . (29) Candidates must satisfy 𝜌 𝑣 < 𝜌 𝑢 − 0.18 inward or 𝜌 𝑣 > 𝜌 𝑢 +
+
+0.18 outward. Direction-specific dominators satisfy 𝜌 𝑤 < 𝜌 𝑢 −
+
+0.10 or 𝜌 𝑤 > 𝜌 𝑢 + 0.10, respectively, and use the angular 𝛼 test. If these passes leave capacity, a diversity pass orders remaining candidates by ℓ∠ (𝑢, 𝑣 ) + 0.25 |𝜌 𝑢 −𝜌 𝑣 | and admits angular dominators within |𝜌 𝑤 − 𝜌 𝑣 | ≤ 1.0. A final ordered fill takes remaining distinct candidates up to 𝑀 0. At constant depth the elevator sets are empty and the ring ranks by angle, using the fixed dataset-independent channel quotas and tolerances in Table 3. Appendix D derives the channel-wise constant-depth and flat-curvature limits. 
+
+## 4.3 Spanning-Tree Chord-Swap Island Repair 
+
+Parallel batch insertion and hub saturation can still leave 0.05%–0 .06% of extreme boundary vertices with zero incom-ing edges (deg − (𝑢 ) = 0: 518–626 islands on Cohere-1M), capping asymptotic recall strictly below 100%. The chord-swap pass in Algorithm 1 grows directed BFS entry reachability while preserving maximum out-degree deg + (𝑝 ) ≤ 𝑀 0. A qualifying anchor has spare capacity or an eligible non-tree chord. Directed BFS initializes a spanning tree (R , parent ) from the router entry hub, each un-reachable vertex 𝑢 ∉ R selects a reachable anchor 𝑝 ∈ R (scanning 
+
+𝑁 + (𝑢 ), router hubs, and the interior core prefix) and either appends 
+
+𝑝 → 𝑢 (if deg + (𝑝 ) < 𝑀 0) or replaces a peripheral non-tree chord 
+
+𝑝 → 𝑤 ★ satisfying both parent [𝑤 ★] ≠ 𝑝 and deg − (𝑤 ★) ≥ 2, decrementing deg − (𝑤 ★) in place and expanding (R , parent )
+
+incrementally from 𝑢 (monotonic reachability invariant proved in Appendix D). Because no spanning-tree edge is ever overwritten, 
+
+R grows monotonically without cycle breakage; across all 21 million-scale Zen 4 graphs, the pass reduces zero-in-degree islands to 0 (1 ,000 ,000 /1,000 ,000 directed-BFS reachable from the entry hub) in under 0 .3 s. 
+
+## 4.4 Convex-Support Polar Router 
+
+Pelorus builds 𝐶 = min (𝑁 , clamp (⌊ 𝑁 /100 ⌋, 64 , 2048 )) directional landmarks in SM mode and crosses them with eight quantile-adaptive shells. At 1M scale this gives 2,048 fine cones and 16,384 cells, each storing up to eight 32-bit vertex IDs. For 𝐶 > 256, 64 coarse landmarks each retain a 128-cone query shortlist. The query scores coarse landmarks, expands the leading shortlists, and uses 
+
+> 9
+
+Algorithm 1 Warped-Product Construction & Chord-Swap Repair                                                                                                                                                                         
+
+> Require: Dataset X ⊂ B𝐷 𝑐 , max out-degree 𝑀 0=2𝑀 , build beam 𝐿 𝑐 , slack
+> 𝛼 >1
+> Ensure: Graph 𝐺 =(𝑉 , 𝐸 )with maximum degree 𝑀 0and measured entry-reachable set R
+> 1: Compute FP32 polar headers (𝑟 𝑣 , 𝑓 𝑣 , 𝜌 𝑣 ),fit purity-gated
+> ResidualConeDict , encode 2-bit SM payloads, and build PolarRouter
+> (§4.4)
+> 2: Sort vertices 𝜋 =(𝑣 1, . . . , 𝑣 𝑁 )in non-decreasing geodesic depth 𝜌 𝑣 1≤· · · ≤ 𝜌 𝑣 𝑁 and initialize empty adjacency lists
+> 3: for consecutive radial wave 𝐵 𝑡 of up to 256 vertices in 𝜋 do
+> 4: for each 𝑢 ∈𝐵 𝑡 in parallel do
+> 5: C𝑢 ←PolarBeamSearch (𝐺, 𝑢, 𝐿 𝑐 )via 2-bit polar proxy b𝑃 B
+> 6: Partition up to 𝑀 0outgoing edges from C𝑢 via QuadriPrune :
+> 7: (a) Geodesic fiber (cumulative cap max (1,⌊3𝑀 0/8⌋ ) ): stem-excess prune (28)
+> 8: (b) Shielded isobathic ring (cumulative cap ⌊7𝑀 0/8⌋): rank by angle plus depth gap, test dominators with |𝜌 𝑤 −𝜌 𝑣 | ≤ 0.60
+> 9: (c)–(d) Inward & outward elevators : split remaining capacity, select step-aligned transitions via (29), then apply fallback fill
+> 10: Insert reverse edges 𝑣 →𝑢 for 𝑣 ∈𝑁 +(𝑢 ), re-applying QuadriPrune when deg +(𝑣 )>𝑀 0
+> 11: end for
+> 12: end for
+> 13: Final-prune every adjacency list to 𝑀 0slots
+> 14: ( R ,parent ) ← DirectedBFSTree (𝐺, entry_hub )⊲§4.3
+> 15: for each 𝑢 ∈𝜋 with 𝑢 ∉Rdo
+> 16: Search 𝑁 +(𝑢 ), hubs, and the 256-vertex interior prefix for reachable
+> 𝑝 with a free slot or removable non-tree chord
+> 17: if no qualifying anchor exists then
+> 18: Continue to the next vertex
+> 19: end if
+> 20: if deg +(𝑝 )<𝑀 0then append 𝑝 →𝑢
+> 21: else replace peripheral chord 𝑝 →𝑤 ★s.t. parent [𝑤 ★]≠𝑝 ∧
+> deg −(𝑤 ★) ≥ 2 with 𝑝 →𝑢
+> 22: end if
+> 23: parent [𝑢 ] ← 𝑝 ; expand ( R ,parent )via incremental BFS from 𝑢
+> 24: end for
+> 25: return fixed-stride graph 𝐺 , reachable set R, and 4096 B HotSmPage
+> layout
+
+the constrained radial minimizer 𝜌 ∗ 
+
+> sup
+
+(𝜌 𝑞 , 𝛾 ) from Proposition 5(2) to select shell representatives. The radial support endpoints are the smallest positive sampled database depth and the maximum depth. The variance-stabilized configuration activates a sampled isotropy guard that scans fine cones directly when coarse alignment falls below its dimension-scaled threshold. Table 3 gives the fixed settings. 
+
+## 5 HARDWARE-CONSCIOUS POLAR EXECUTION ENGINE 
+
+Figure 2 follows a query from page translation to final reranking. On million-scale hyperbolic graphs, achieving 99% Recall@10 at beam width 𝐿 ∈ [ 128 , 256 ] expands 300–350 vertices and evalu-ates 4 ,500–5 ,800 candidate neighbors per query, while reading only 
+
+𝐵 ∈ [ 64 , 128 ] cold FP32 vectors during final reranking. End-to-end latency is therefore governed by random-access DTLB walks, cache-line traffic during neighbor expansion, and 2-bit bitplane population counts. Query-private scratch buffers are reset by gener-ation stamps and reused across requests. Candidate scoring depends on the current query and index state. 
+
+## 5.1 Single-Page Co-Location Avoiding Cross-Array DTLB Walks 
+
+In conventional Structure-of-Arrays (SoA) engines, polar headers (32 MB at 𝑁 = 10 6) and 2-bit bitplanes (192 MB at 𝐷 = 768) oc-cupy separate contiguous arrays hundreds of megabytes apart in virtual memory (whereas disk-block reorderers [61] and neighbor-embedded quantizers [31] either require graph-isomorphism renum-bering or duplicate codes across edges). Because x86-64 cores pro-vide only 64–96 L1 DTLB entries and 1 ,024–3 ,072 L2 DTLB entries for 4 KiB pages, 5 ,500 random neighbor hops across a 224 MB work-ing set miss the DTLB on nearly every hop—forcing two indepen-dent page-table walks per candidate under SoA (one for metadata, a second for bitplanes). Table 4 shows our page-co-located HotSmPage layout: each ver-tex occupies a power-of-two record of 𝑆 rec = next_pow2 (64 +
+
+16 ⌈𝐷 /64 ⌉) bytes (256 B at 𝐷 = 512 , 768 packing 𝐾 = 16 ver-tices/page; 512 B at 𝐷 = 1536 packing 𝐾 = 8 vertices/page; 128 B at 𝐷 = 20 packing 𝐾 = 32 vertices/page, supporting up to 𝐷 = 16 ,128 within one 4 KiB page). Because 𝑆 rec divides 4096 evenly (page_id = vid /𝐾 , slot = vid mod 𝐾 ), every vertex’s 64-byte 
+
+HotSmHeader (PolarNodeMeta + SymSketch256 in cache line 0) and its complete 2-bit SM bitplanes reside contiguously inside a single 4096-byte OS page. Once hardware resolves the virtual-to-physical translation for HotSmHeader at base +𝑆 rec · slot (supported up to 𝐷 ≤ 16 ,128), any subsequent bitplane reads ( 0x40..0xFF at 
+
+𝐷 = 768) share the exact same 4 KiB virtual-page translation , avoid-ing cross-array secondary page-table walks per accessed vertex record. 
+
+## 5.2 Variance-Stabilized Two-Level Beam Filtering ( SymSketch256 )
+
+Even within one 4 KiB page, fetching full 2-bit SM bitplanes (192 B = 3 cache lines at 𝐷 = 768; 384 B = 6 cache lines at 𝐷 = 1536) for every unvisited neighbor incurs unnecessary memory traffic once the beam tightens around 𝑞 . Pelorus first prefetches only the single 64-byte HotSmHeader cache line (consuming just one hardware Line Fill Buffer entry per neighbor) and executes a two-stage gate against the current 𝐿 -th beam bound 𝜃 beam :(1) Stage-1a (Exact Radial Lower-Bound Gate, 0 ex-tra cache lines): Using (𝑟 𝑣 , 𝑓 𝑣 ) from HotSmHeader 
+
+(0x00..0x1F ), if 𝑃 rad (𝑟 𝑞 , 𝑟 𝑣 ) = (𝑟 𝑞 − 𝑟 𝑣 )2 𝑓 𝑞 𝑓 𝑣 > 𝜃 beam 
+
+(Proposition 5(1)), 𝑣 is discarded by the lossless radial bound. FP32 header perturbations follow Appendix E.2. (2) Stage-1b (Binomial-Stabilized SymSketch256 Gate, same 64 B header line): The upper half of HotSmHeader 
+
+(0x20..0x3F ) stores a 256-bit (32 B) strided sign sketch. Computing the 256-bit Hamming distance 𝐻 ∈ { 0, . . . , 256 }
+
+against 𝑞 ’s sketch via four u64 XOR +POPCNT instructions indexes two compile-time lookup tables (2 KB total in L1): the exact arcsine table ˆ 𝛾 256 = COS_PI_256 [𝐻 ] =
+
+cos (𝜋𝐻 /256 ) and the binomial-model standard-deviation ratio table 𝜌 std (𝐻 ) = SKETCH256_STD_RATIO [𝐻 ] =
+
+> 10
+
+Table 3: Fixed construction and execution settings. Search operating points are scanned separately in §6.1. 
+
+Mechanism Fixed values and rules Construction 𝑀 = 16, 𝑀 0 = 32, 𝐿 𝑐 = 128, 𝛼 = 1.2, radial wave size 256, repair fallback prefix 256 Geodesic/ring caps 12 geodesic slots, then 28 cumulative slots at 𝑀 0 = 32 Ring depth-gap weight 0.85, dominator–candidate tolerance 0.60, 𝛼 iso = 1.2Elevators step 0.65, step penalty 0.15, candidate depth offset 0.18, dominator depth offset 0.10 Diversity fill depth-gap weight 0.25, dominator–candidate tolerance 1.0 Router up to 2,048 fine landmarks, 64 coarse landmarks, 128-entry query shortlists, 8 shells, 8 IDs/cell, 16 origin hubs Shell boundaries if 𝑝 01 (𝜌 ) > 0.35, depth quantiles [0.005 , 0.02 , 0.05 , 0.12 , 0.25 , 0.45 , 0.72 ]
+
+otherwise [0.25 , 0.48 , 0.75 , 1.15 , 1.75 , 2.60 , 3.80 ]
+
+Isotropy guard coarse threshold clip [0.11 ,0.19 ] (3.8/√︁ max (𝐷, 64 ) ) 
+
+sampled median maximum fine alignment below clip [0.19 ,0.30 ] (5.6/√︁ max (𝐷, 64 ) ) 
+
+Cone selection sample min (𝑁 , 8192 ), depth 𝑝 90 ≥ 1.0, leader threshold 0.91, assignment 0.94, mean purity 0.955 support clamp ( ⌊ 𝑁 samp /1024 ⌋, 3, 12 ), 1,024 leader candidates, two refinement rounds, at most 512 retained axes Query cone cache materialization |𝛼 𝑞,𝑐 | ≥ 0.20, 𝛽 𝑞,𝑐 > 10 −6, at most 16 slots CJ-Gate 𝜅 SM = 0.221, relative gap 0.22, 𝑧 = 2, expansion offset 0.8, cap 768 Sketch / prefetch 256 bits, variance reference 𝐻 = 48, header prefetch window 8 
+
+Figure 2: Header-first query execution at 𝐷 = 768 . (a) One 4 KiB page contains 16 records, each with a 64 B header and 192 B bitplanes. (b) Radial and sketch gates precede full bitplane reads, with residual vertices bypassing the sketch gate. The skip rate and kernel annotations use the Cohere-1M measurements. (c) Asymmetric projection precedes adaptive rerank admission and cold-vector FP64 evaluation. The score curve is schematic. Stage-0.5 improves 99 .5% -recall Cohere QPS by 58 .2% in the controlled ablation. The measured +63 .7% (Cohere, 99 .5% recall) and +76 .5% (MERU, 99% recall) gains combine CJ-Gate with stabilized sketching. Table 4: Hardware-page-aligned 4096 B HotSmPage layout with power-of-two per-vertex record stride 𝑆 rec = next _pow2 (64 +
+
+16 ⌈𝐷 /64 ⌉) B (shown at 𝐷 = 768 : 𝑆 rec = 256 B, 𝐾 = 16 ver-tices/page). Resolving the 64 B HotSmHeader translates the en-tire vertex record on the identical 4 KiB OS page. 
+
+Record Offset Per-Vertex Slot in 4096 B HotSmPage (𝐷 = 768 ) Size 
+
+0x00..0x1F PolarNodeMeta (radial, SM, & cone scalars) 32 B 
+
+0x20..0x3F SymSketch256 (4 × u64 strided sign sketch) 32 B 
+
+0x40..0x9F Positive-sign SM bitplane ( pos , 12 × u64 ) 96 B 
+
+0xA0..0xFF Strong-magnitude SM bitplane ( strong ,12 × u64 )96 B 
+
+max (1, 𝜎 sk (𝐻 /256 )/ 𝜎 sk (48 /256 )) derived in Proposi-tion 6(3). Forming the variance-stabilized optimistic cosine bound ˆ 𝛾 upper = min (1, ˆ𝛾 256 + Δ0 · 𝜌 std (𝐻 )) yields optimistic proxy b𝑃 opt  
+
+> B
+
+(𝑞, 𝑣 ) = 𝑅 (𝑟 𝑞 , 𝑟 𝑣 ) + 𝑊 (𝑟 𝑞 , 𝑟 𝑣 )( 1 − ˆ𝛾 upper ); when-ever b𝑃 opt  
+
+> B
+
+(𝑞, 𝑣 ) > 𝜃 beam (for non-residual vertices once the beam fills), 𝑣 is pruned without prefetching or reading its trailing bitplane cache lines. Scaling the sketch margin by 𝜌 std (𝐻 ) keeps tight filtering (1 .0×) for high-similarity neighbors ( 𝐻 ≤ 48) while automatically widening to 2.265 × at 𝐻 = 115 and a maximum of 2 .306 × at 𝐻 = 128 to prevent premature pruning on moderate-angle manifolds. In our controlled three-seed ablation on Cohere-1M, Stage-1a and SymSketch256 
+
+skip 57 .6% of full bitplane loads, raising single-thread 99%-recall 
+
+> 11
+
+Algorithm 2 Residual-aware candidate cosine scoring 
+
+Require: Header ℎ𝑣 , candidate bitplanes, query cache, phase  
+
+> 1:
+
+if ℎ𝑣 has a global cone tag then  
+
+> 2:
+
+return 𝐾 (𝑢 𝑞 , 𝑢 𝑣 ) for hops, 𝐴 (𝑢 𝑞 , 𝑢 𝑣 ) for pool refinement  
+
+> 3:
+
+end if  
+
+> 4:
+
+Read cached (𝛼 𝑞,𝑐 , 𝛽 𝑞,𝑐 ), computing one axis dot product on a miss  
+
+> 5:
+
+𝛼 𝑣 ← ℎ𝑣 .𝛼 , 𝛽 𝑣 ←√︁ max (0, 1 − 𝛼 2 
+
+> 𝑣
+
+) 
+
+> 6:
+
+if candidate residual is degenerate then  
+
+> 7:
+
+return 𝛼 𝑞,𝑐 𝛼 𝑣  
+
+> 8:
+
+end if  
+
+> 9:
+
+if a residual slot is cached, or |𝛼 𝑞,𝑐 | ≥ 0.20, 𝛽 𝑞,𝑐 > 10 −6 and a free slot exists then  
+
+> 10:
+
+Reuse or materialize unit ˜ 𝑟 𝑞,𝑐 , its bitplanes, and SM param-eters  
+
+> 11:
+
+𝑡 res ← 𝐾 ( ˜𝑟 𝑞,𝑐 , ˜𝑟 𝑣 ) for hops, 𝐴 ( ˜𝑟 𝑞,𝑐 , ˜𝑟 𝑣 ) for refinement  
+
+> 12:
+
+return clip [− 1,1] (𝛼 𝑞,𝑐 𝛼 𝑣 + 𝛽 𝑞,𝑐 𝛽 𝑣 𝑡 res ) 
+
+> 13:
+
+else  
+
+> 14:
+
+𝑡 uq ← 𝐾 (𝑢 𝑞 , ˜𝑟 𝑣 ) for hops, 𝐴 (𝑢 𝑞 , ˜𝑟 𝑣 ) for refinement ⊲
+
+˜𝑟 𝑣 ⊥ 𝜇 𝑐 ⇒ ⟨ 𝑢 𝑞 , ˜𝑟 𝑣 ⟩ = 𝛽 𝑞,𝑐 ⟨ ˜𝑟 𝑞,𝑐 , ˜𝑟 𝑣 ⟩ 
+
+> 15:
+
+return clip [− 1,1] (𝛼 𝑞,𝑐 𝛼 𝑣 + 𝛽 𝑣 𝑡 uq ) 
+
+> 16:
+
+end if 
+
+QPS from 1 ,752 (SoA) to 1 ,909 ( HotSmPage ) and 2 ,071 ( HotSmPage 
+
++ SymSketch256 , +18 .2% total). 
+
+## 5.3 3-to-2 Carry-Save AVX2 Bitplane Kernel 
+
+During hop traversal, the engine evaluates the conditional-mean product in Lemma 1, followed by (9). For disagreement mask 𝑥 =
+
+𝑠 𝑞 ⊕ 𝑠 𝑣 , the five counts are popcnt (𝑥 ), popcnt (𝑥 ∧ 𝑚 𝑞 ), popcnt (𝑥 ∧
+
+𝑚 𝑣 ), popcnt (𝑚 𝑞 ∧ 𝑚 𝑣 ), and popcnt (𝑥 ∧ 𝑚 𝑞 ∧ 𝑚 𝑣 ). Together with the two headers’ (𝑎, 𝛿, 𝜎, 𝑠 ), these counts reconstruct the bilinear product without square roots in the main scorer. 
+
+Residual-Aware Hop Dispatch. Let 𝐾 (𝑎, 𝑏 ) denote this calibrated symmetric scorer and 𝐴 (𝑞, 𝑏 ) the asymmetric scorer of §5.4. A global vertex uses 𝐾 (𝑢 𝑞 , 𝑢 𝑣 ). A residual vertex uses its cone tag to read axis 𝜇 𝑐 and cache 𝛼 𝑞,𝑐 = ⟨𝑢 𝑞 , 𝜇 𝑐 ⟩, 𝛽 𝑞,𝑐 =√︃ 1 − 𝛼 2 
+
+> 𝑞,𝑐
+
+. Its header stores 
+
+𝛼 𝑣 in the shared axial/norm slot and the conditional means of ˜ 𝑟 𝑣 .Each query caches projections for at most 512 dictionary axes and materializes at most 16 residual queries. A first cone visit reads one 
+
+𝐷 -coordinate axis and performs 𝑂 (𝐷 ) work. Materialization adds 
+
+𝑂 (𝐷 ) re-orthogonalization and encoding, with 𝑂 (16 𝐷 +512 ) thread-local storage. A query visiting every dictionary axis performs at most 512 axis projections and 16 residual encodings. Repeated visits reuse these transforms. Upper-layer scoring without a query cache uses the global-query/residual-candidate branch. The radial gate applies to both tags, and residual vertices proceed directly to the full bitplane scorer after that gate. Invoking AVX2 vpshufb nibble-lookup popcounts [46] inde-pendently on every bitplane would execute 15 vpshufb shuffle instructions per 768D candidate. Adapting bitwise carry-save re-duction [46] to SM bitplanes, Pelorus compresses triplets (𝐴, 𝐵, 𝐶 )
+
+across 256-bit YMM registers via a 3-to-2 Carry-Save Adder (CSA): Sum = 𝐴 ⊕ 𝐵 ⊕ 𝐶, Carry = (𝐴 ∧ 𝐵 ) ∨  (𝐴 ⊕ 𝐵 ) ∧ 𝐶 , (30) which satisfies popcnt (𝐴 ) + popcnt (𝐵 ) + popcnt (𝐶 ) =
+
+popcnt (Sum ) + 2 popcnt (Carry ) identically (verified bit-by-bit in Appendix B), cutting vpshufb shuffle instructions by 33% (15 → 10 per 768D candidate) and evaluating each surviving candidate in < 35 ns alongside distance-2 software prefetching. 
+
+## 5.4 L1-Bounded Stage-0.5 Asymmetric Projection, CJ-Gate, and FP64 Reranking 
+
+Once beam search converges to a pool P of size 𝐿 , fetching all 𝐿 
+
+cold FP32 vectors ( 𝐿 × 3 KB) would dominate latency at large 𝐿 .Pelorus executes a three-step tail pipeline: (1) L1-Bounded Stage-0.5 Asymmetric Re-Scoring: 
+
+By Theorem 2(2) and Proposition 6(1), evaluating ˆ𝛾 asym (𝑢 𝑞 , 𝑢 𝑣 ) = clip [− 1,1] (⟨ 𝑢 𝑞 , ˆ𝑢 𝑣 ⟩/ 𝜎 2 
+
+> 𝑣
+
+) with unquantized 𝑢 𝑞 
+
+and (𝑎 𝑣 , 𝛿 𝑣 , 𝜎 𝑣 ) already resident in PolarNodeMeta elimi-nates both cross-shell query-noise non-cancellation ( 𝑒 𝑞 = 0) and norm-inflation bias. Let 𝑆 tot = Í𝐷 𝑖 =1 𝑢 𝑞,𝑖 and define three masked signed-query subset sums over candidate bitplanes 
+
+(𝑠 𝑣 , 𝑚 𝑣 ): positive-sign sum 𝑆 + = Í𝑖 :𝑠 𝑣,𝑖 =1 𝑢 𝑞,𝑖 , strong-candidate sum 𝑆 ℎ = Í𝑖 :𝑚 𝑣,𝑖 =1 𝑢 𝑞,𝑖 , and joint positive-strong sum 𝑆 +ℎ = Í𝑖 :𝑠 𝑣,𝑖 =1∧𝑚 𝑣,𝑖 =1 𝑢 𝑞,𝑖 (equivalently expressed via unsigned |𝑢 𝑞,𝑖 | and sign-agreement masks I[𝑠 𝑞,𝑖 = 𝑠 𝑣,𝑖 ]). Then ⟨𝑢 𝑞 , ˆ𝑢 𝑣 ⟩ reduces algebraically to 
+
+⟨𝑢 𝑞 , ˆ𝑢 𝑣 ⟩ = 𝑎 𝑣 
+
+ 2𝑆 + − 𝑆 tot 
+
+ + 𝛿 𝑣 
+
+ 2𝑆 +ℎ − 𝑆 ℎ
+
+. (31) Unlike 4-bit nibble SIMD lookup tables [2, 3, 59], 
+
+AsymQuerySm encodes 𝑢 𝑞 once per query into a 1 .5 KiB L1-resident i16 fixed-point array ( 𝑞 i16 ,𝑖 = round (8100 𝑢 𝑞,𝑖 )
+
+at 𝐷 = 768; Cauchy–Schwarz guarantees 16-lane sums remain ≤ 32 ,408 < 215 − 1 without overflow) and accu-mulates (𝑆 +, 𝑆 ℎ, 𝑆 +ℎ ) via register-resident AVX2 16-lane bit-mask selection and vpmaddwd (or an optional 2 KiB byte-mask LUT) exclusively over the 𝐿 pool members. For residual-cone pool members, Stage-0.5 reuses the cone cache from Algorithm 2 and lazily builds a fixed-point query array for each materialized residual. It applies 𝐴 in the same materialized or global-query branch. (2) CJ-Gate Observable-Margin Plateau Expansion: Sort 
+
+P by asymmetric proxy and let 𝐵 0 = min (𝐵, 𝐿 ), 𝑗 ref =
+
+min (𝑘, 𝐵 0), 𝑝 ref = b𝑃 ( 𝑗 ref ) . Compute one reference uncer-tainty 𝑠 ref from (26), using empirical 𝜅 SM = 0.221 to tar-get near-tie plateaus in the ≥ 99 .5% high-recall regime. A materialized cone uses attenuation 𝛽 𝑞,𝑐 𝛽 𝑣 , a global-query/residual branch uses 𝛽 𝑣 , and a global code uses 1. If 𝐵 0 < 𝐿 and b𝑃 (𝐵 0 ) − 𝑝 ref ≤ 𝑧𝑠 ref , extend the rerank prefix while 
+
+b𝑃 ( 𝑗 ) ≤ 𝑝 ref + ( 𝑧 + 0.8)𝑠 ref , 𝑗 ≤ min (𝐿, max (𝐵 0, 𝐵 max )) . (32) The measured full configuration fixes the relative-gap pa-rameter at 0 .22, giving 𝑧 = clip [0.5,4.5] (0.22 · 2/0.22 ) = 2 and 
+
+𝐵 max = 768. With no router metadata, the reference scale is max (𝑝 ref , 10 −9) · 0.22. (3) FP64 SIMD Geodesic Reranking: Near ∥𝑣 ∥2 → 1/√𝑐 ,single-precision evaluation of 1 − 𝑐 ∥𝑣 ∥22 loses mantissa pre-cision. Pelorus prefetches cold vector 𝑣 ( 𝑗 +2) while widen-ing 𝑞 and 𝑣 ( 𝑗 ) via vcvtps2pd into 8-wide AVX-512F (or 
+
+> 12
+
+4-wide AVX2+FMA) FP64 accumulators, computing exact 
+
+𝑃 B (𝑞, 𝑣 ( 𝑗 ) ) in double precision and invoking asinh (7) only on the final 𝑘 = 10 results. 
+
+## 6 EXPERIMENTAL EVALUATION 
+
+Our evaluation examines how warped-product graph indexing in Pelorus performs across real and synthetic curved manifolds. We first measure construction speed, hot navigation memory, and matched-recall throughput relative to full-precision and 8-bit polar graphs (§6.2), compare against exact hyperbolic graph indices and flat-proxy vector databases (§6.3), and test multi-threaded scaling from 1 to 24 hardware threads (§6.4). We then isolate each topolog-ical and execution mechanism via controlled ablations (§6.5) and evaluate external baselines on four synthetic distributions, using a four-stage recall-loss audit to characterize the measured traversal, beam-retention, and rerank-admission losses (§6.6). 
+
+## 6.1 Experimental Setup 
+
+Hardware and Protocol. Experiments execute in two isolated Linux containers on AMD EPYC 9654 (Zen 4) hosts, each restricted via cgroups to 32 logical CPUs and 60 GiB RAM. The CPU sets are 
+
+64-95 and 128-159 . Swap is disabled and transparent huge pages (THP) are set to never , using standard 4 KiB pages for DTLB trans-lation. Each instance runs one timed benchmark at a time, and mea-surement manifests record instance placement and source/binary fingerprints. All Rust binaries are compiled in release mode target-ing native AVX-512F and AVX2+FMA. Unless otherwise stated, graph indices use base degree 𝑀 = 16 (maximum out-degree 
+
+𝑀 0 = 32), construction beam 𝐿 𝑐 = 128, geodesic slack 𝛼 = 1.2, and 32 build threads. Following community ANN evaluation proto-cols [4, 53], controlled Cohere-1M representation comparisons and Pelorus-Core component ablations (alongside multi-seed Pelorus-Core stability checks on MERU-1M and OpenAI-1536) are built across three independent random seeds (12345 , 12446 , 12547 )and report three-graph means. Across all 210 three-graph oper-ating points, Recall@10 differs by at most 0 .22 percentage points across seeds, and 99%-recall Pelorus-Core QPS varies within ±2.64% on Cohere-1M ( ±0.20% on MERU-1M). Relying on this cross-seed stability to keep full multi-system parameter sweeps tractable, end-to-end Pelorus, Global-SM, synthetic stress tests, and external base-lines evaluate one build per (𝑀, 𝐿 𝑐 ) configuration (seed 12345 for configurable build randomness; HDB retains its upstream graph-builder randomization). All use the same Zen 4 resource quotas and IEEE-754 FP64 geodesic ground truth across 1 , 2, 4, 8, 16 , 24 query threads. 
+
+Fixed Parameters and Operating-Point Selection. Table 3 gives the shared construction, cone-purity, and uncertainty settings. The full-method sweep uses 
+
+𝐿 ∈ { 32 , 64 , 96 , 128 , 192 , 200 , 208 ,
+
+256 , 384 , 512 , 768 , 1024 , 1536 , 2048 },
+
+rerank budgets 𝐵 ∈ { 32 , 64 , 128 } subject to 𝐵 ≤ 𝐿 , and sketch mar-gins Δ0 ∈ { 0.08 , 0.12 , 0.20 }. Controlled engine sweeps additionally include full-pool reranking and sketch-disabled paths. Each query-thread count uses its measured qualifying operating points. Curves and recall-threshold columns report per-configuration empirical 
+
+Table 5: Hyperbolic benchmarks in B𝐷  
+
+> 1
+
+(𝑐 = 1).                                                           
+
+> Dataset 𝑁 𝐷 |𝑄 |Manifold Geometry
+> Cohere-1M 1,000K 768 1,000 Mapped Wikipedia (exp 10,
+> 𝜌 0.01 =1.44) MERU-1M [19] 1,000K 512 10,000 Native Lorentz →B𝐷
+> 1
+> multimodal OpenAI-1536 990K 1,536 8,000 Mapped DBpedia (exp 10,med 𝜌 =2.0) WordNet-Hazy 83.9K 20 2,000 Native Lorentz →B20 1
+> taxonomy Uniform-Narrow 1,000K 512 2,000 Isotropic S511 ,𝜌 ∈ [ 3.9,4.1]
+> Uniform-Wide 1,000K 512 2,000 Isotropic S511 ,𝜌 ∈ [ 0.4,6.0]
+> Clustered-Narrow 1,000K 512 2,000 256 tight cones, 𝜌 ∈ [ 3.9,4.1]
+> Clustered-Wide 1,000K 512 2,000 256 tight cones, 𝜌 ∈ [ 0.4,6.0]
+
+frontiers, with each recall column independently selecting its fastest qualifying measured build/search point per thread count. MERU-1M, OpenAI-1536, WordNet-Hazy, and the four synthetic datasets tune on disjoint 2 ,000-query splits and report archived test-curve frontiers, whereas Cohere-1M evaluates directly on its public 1 ,000-query set. Cone-purity thresholds and CJ-Gate constants stay fixed across datasets. 
+
+Benchmarks. Table 5 summarizes the eight hyperbolic bench-marks in B𝐷  
+
+> 1
+
+(𝑐 = 1). For Euclidean embeddings mapped into B𝐷  
+
+> 1
+
+,both Cohere-1M and OpenAI-1536 use the origin exponential map from centered coordinates: given database mean ¯ 𝑥 and global radial scale 𝑠 = 2/median 𝑖 (∥ 𝑥 𝑖 − ¯𝑥 ∥2), each vector is mapped as 
+
+Φ(𝑥 ) = tanh 
+
+ 𝑠 
+
+2 ∥𝑥 − ¯𝑥 ∥2
+
+ 𝑥 − ¯𝑥 
+
+∥𝑥 − ¯𝑥 ∥2
+
+,
+
+clamped at Euclidean radius 1 − 10 −6 so that the database me-dian geodesic depth is fixed at 𝜌 0.50 = 2.0. On Cohere-1M (1M 768D Wikipedia embeddings, 1 ,000 test queries, 𝑠 = 0.2644, zero clipped vectors), norm concentration after mean-centering nar-rows base depths to [0.98 , 3.39 ] (𝜌 0.01 = 1.45, 𝜌 0.99 = 2.69) and query depths to [1.25 , 2.98 ] (𝜌 0.01 = 1.44, 𝜌 0.99 = 2.67), form-ing a hollow boundary-concentrated shell with no vectors be-low 𝜌 = 0.98. OpenAI-1536 applies unit ℓ2-normalization be-fore mean-centering and Φ(𝑥 ) (𝑠 = 2.093) across 990K 1536D 
+
+text-embedding-3-large DBpedia embeddings with 8 ,000 held-out test queries and 2 ,000 tuning queries. In contrast, MERU-1M 
+
+contains 1M 512D native Lorentz hyperboloid MERU–ImageNet vision-language embeddings [19] mapped isometrically via (3) and evaluated on 10 ,000 held-out test queries alongside 2 ,000 tuning queries, and WordNet-Hazy adapts the public 20D native Lorentz WordNet weights ( wordnet_full.emb , 83 ,943 base nodes and 2 ,000 disjoint test queries) isometrically into B20 1 (≤ 2.53 × 10 −15 max nu-merical error). Four 1M-vector 512D synthetic benchmarks cross di-rectional geometry (isotropic S511 versus 256 tight spherical cones) with radial depth support (narrow boundary shell 𝜌 ∈ [ 3.9, 4.1]
+
+versus wide hierarchy 𝜌 ∈ [ 0.4, 6.0]). 
+
+Baselines. Within our engine family, we evaluate two orthogonal groups of controlled variants: (1) Representation and frozen-graph controls: Polar-FP32 and Polar-SQ8 share Pelorus’s QuadriPrune 
+
+> 13
+
+topology and router while substituting unquantized FP32 or 8-bit scalar-quantized unit directions during both construction and search, whereas SameGraph-FP32 and SameGraph-SQ8 freeze the 2-bit-constructed graph and replace only the search-time di-rectional representation to decouple graph quality from traver-sal speed (plotted as FP32 (same graph) and SQ8 (same graph) 
+
+alongside 2-bit SM in Figure 6b). (2) Cumulative 2-bit engine progres-sion: Pelorus-Split (split-array 2-bit QuadriPrune without chord-swap island repair, HotSmPage co-location, or SymSketch256 ) →
+
+Pelorus-Core (adding chord-swap repair, 4096 B single-page co-location, and SymSketch256 under global 2-bit SM) → full Pelorus 
+
+(further enabling purity-gated ResidualConeDict and adaptive CJ-Gate plateau expansion; in §6.6, Global-SM denotes the unres-cued global-code baseline without ResidualConeDict , CJ-Gate, or variance-stabilized sketch margins). Under the same hardware and FP64 ground-truth protocol, we compare against four exter-nal systems using the exact variant names reported in Figures 4– 5 and Tables 7 and 10: Exact-RobustPrune [50, 55] ( 𝑀 /𝐿 𝑐 =
+
+16 /128 , 𝐿 ≤ 2,048) using exact geodesic Vamana pruning without po-lar decoupling; HyperspaceDB (HDB , YARlabs/hyperspace-db 
+
+commit 89d0406 , native AVX-512F Poincaré HNSW) [29] across FP32 and FP64 hyperbolic modes and dynamic/flat storage lay-outs ( HDB FP32 dynamic , HDB FP32 flat , HDB FP64 dy-namic , HDB FP64 flat ); and flat inner-product HNSW indices in Faiss (faiss-cpu 1.16.0 IndexHNSWFlat ) [20]—tested with mean-centered Lorentz inner product ( Faiss centered IP ), unit-direction search with exact FP64 reranking ( Faiss direction ), and uncentered Lorentz inner product ( Faiss raw Lorentz-IP )—and 
+
+Milvus (Milvus Standalone 3.0.5 HNSW) [60] ( Milvus centered IP ), building HDB/Faiss/Milvus at both (𝑀 = 16 , 𝐿 𝑐 = 128 ) and 
+
+(𝑀 = 32 , 𝐿 𝑐 = 256 ) and scanning 18 𝑒 𝑓 values up to 4 ,096, all paired with exact FP64 geodesic reranking. 
+
+## 6.2 Index Construction and Polar Representation Comparison 
+
+Table 6 evaluates controlled polar directional representations on Cohere-1M and summarizes end-to-end Pelorus performance across all four real hyperbolic workloads. 
+
+Construction Speed and Memory Footprint. On Cohere-1M, Pelorus builds a 100% BFS-reachable 1M-vertex hyperbolic index in 35 .0 s on 32 threads—5 .44 × faster than Polar-FP32 (190 .2 s) and 1.91 × faster than Polar-SQ8 (66 .9 s)—while using 517 .0 MB hot navigation memory under 4096 B HotSmPage co-location (2 .44 ×
+
+smaller than Polar-SQ8 and 6 .90 × smaller than full-vector traversal; 485 .0 MB, or 2 .60 × and 7 .35 × smaller, in split form without the sketch). On native hyperbolic MERU-1M (512D), OpenAI-1536 (1536D), and WordNet-Hazy (20D), 32-thread construction com-pletes in 25 .7 s, 43 .6 s, and 1 .5 s, respectively, with zero unreachable islands and 0 retained residual cones across every real graph. 
+
+Matched-Recall Throughput and Graph-Quality Crossover. At 
+
+≥ 99% Recall@10 on Cohere-1M, Pelorus reaches 1 ,930 QPS (0 .62 ms p99) on 1 thread and 42 ,466 QPS (1 .20 ms p99) on 24 threads, im-proving over Polar-FP32 by 4 .30 × (1T) and 6 .31 × (24T) , and over Polar-SQ8 by 2 .20 × (1T) and 2 .52 × (24T) . Comparing Pelorus-Core and full Pelorus highlights the exact precision–throughput trade-off 94% 96% 98% 100% 
+
+Recall@10 
+
+> 200 500 1k 2k
+> QPS
+> Pelorus
+
+Figure 3: Measured Pelorus Recall@10–QPS frontier on OpenAI-1536 ( 990 K vectors, 1536 D, Zen 4, one query thread). 
+
+of adaptive plateau gating: on diffuse Cohere-1M (0 active residual cones), Pelorus-Core attains slightly higher throughput at moderate 98%–99% targets (3 ,841 / 2 ,071 QPS 1T vs. 2 ,907 / 1 ,930 QPS) because CJ-Gate conservatively promotes near-tie boundary plateau can-didates into FP64 reranking, whereas at ≥ 99 .5% Recall@10 that adaptive expansion pushes full Pelorus ahead to 738 QPS (1T) and 17 ,137 QPS (24T)—outperforming Pelorus-Core (688 / 16 ,059 QPS) as well as Polar-FP32 by 2 .86 × (1T) and 4 .35 × (24T) while safe-guarding concentrated boundary clusters (§6.6). The frozen-graph crossover variants isolate why 2-bit construction works: running unquantized FP32 directional navigation over the 2-bit-constructed graph (SameGraph-FP32) achieves 454 QPS at 99% recall versus 448 QPS on the FP32-constructed graph, confirming that polar 2-bit SM comparisons preserve Vamana topology quality at > 5× lower build cost. Meanwhile, replacing search-time FP32 reads with the 2-bit page-co-located engine accelerates traversal on that identical graph by 4 .25 × under Pelorus (4 .56 × under Pelorus-Core) at 99% re-call and 6 .53 × at 99 .5% recall (738 vs. 113 QPS). On native hyperbolic MERU-1M, Pelorus achieves 2 ,547 QPS (1T) and 53 ,483 QPS (24T) at 99 .25% Recall@10 (1 ,669 and 36 ,092 QPS at 99 .76% Recall@10); on 1536D OpenAI-1536 (Figure 3), it sustains 792 QPS (1T) and 14 ,731 QPS (24T) at 99 .24% Recall@10; and on 20D WordNet-Hazy, it reaches 3 ,089 QPS (1T) and 65 ,405 QPS (24T) at 99 .36% Recall@10 (2 ,341 and 52 ,371 QPS at 99 .79%). 
+
+## 6.3 Comparison with Hyperbolic and Flat-Proxy Engines 
+
+Table 7 and Figure 4 place Pelorus alongside Exact-RobustPrune [50], HDB (HyperspaceDB [29]), and flat inner-product HNSW proxies in Faiss [20] (Faiss centered IP, Faiss direction, Faiss raw Lorentz-IP) and Milvus [60] (Milvus centered 
+
+> 14
+
+Table 6: Controlled polar representation comparisons on Cohere-1M and measured Pelorus coverage across four real workloads (Zen 4, 32 build threads). Cohere-1M representation and progression controls report three-graph means; end-to-end full Pelorus rows follow the single-build protocol of §6.1. Internal representation controls were measured on Cohere-1M only. 
+
+Build Hot Nav Zero-In Recall@10 ≥ 98% Recall@10 ≥ 99% Recall@10 ≥ 99 .5% 
+
+Dataset Method 32T (s) (MB) Islands 1T QPS p99 24T QPS 1T QPS p99 24T QPS 1T QPS p99 24T QPS 
+
+Cohere-1M Polar-FP32 190.2 3,565.0 ‡ 0 1,027 1.19 14,925 448 2.69 6,735 258 4.67 3,937 Polar-SQ8 66.9 1,261.0 0 1,887 0.68 34,639 878 1.44 16,844 372 3.39 7,016 SameGraph-FP32 32.5 3,565.0 ‡ 0 1,031 1.27 — 454 2.60 — 113 10.54 —SameGraph-SQ8 32.5 1,261.0 0 1,979 0.62 — 894 1.52 — 222 5.57 —Pelorus-Split 32.3 485.0 626 2,760 0.45 56,365 1,749 0.67 38,203 618 1.88 14,439 Pelorus-Core 32.5 485.0 0 3,841 0.31 79,047 2,071 0.56 45,833 688 1.63 16,059 
+
+Pelorus 35.0 517.0 ∗ 0 2,907 0.41 58,162 1,930 0.62 42,466 738 1.65 17,137 
+
+MERU-1M Pelorus 25.7 516.8 ∗ 0 2,547 § 0.50 53,483 § 2,547 0.50 53,483 1,669 0.81 36,092 
+
+OpenAI-1536 Pelorus 43.6 765.6 ∗ 0 1,378 1.03 25,725 792 1.81 14,731 481 3.05 9,094 
+
+WordNet-Hazy Pelorus 1.5 32.8 ∗ 0 4,130 0.29 89,847 3,089 0.38 65,405 2,341 0.49 52,371                                              
+
+> Note: Latency p99 is in milliseconds (1T). ∗Full 4096 BHotSmPage allocation including 32 B/vertex SymSketch256 and page alignment; split allocations without the sketch are 485 .0,
+> 420 .8,670 .6, and 26 .1MB (Table 2). Pelorus-Core in row 6 also uses the 517 .0MB HotSmPage layout at runtime ( 485 .0MB base split counter). ‡Includes 3,072 MB FP32 vectors accessed during traversal; the remaining 493 .0MB comprises 256 MB 64-slot adjacency + 4MB degree words, 32 MB polar headers, 192 MB retained 2-bit storage, 8MB inverse norms, and 0.975 MB router arrays (Table 2). §Attains 99 .25% Recall@10 at the same operating point ( 4,521 QPS 1T and 94 ,846 QPS 24T at ≥95% Recall@10).
+
+IP). On the mapped Cohere-1M benchmark (Figure 4a), Pelorus builds in 35 .0 s, reaches 99 .70% peak Recall@10, and sustains 1,930 QPS (1T) and 42 ,466 QPS (24T) at ≥ 99% recall. Because external baselines miss 99% even at 𝑒 𝑓 = 4,096, Table 7 reports their higher-recall 32 /256 builds on Cohere-1M: Exact-RobustPrune (16 /128) reaches 93 .94% peak Recall@10 (75 .5 s build), HDB FP32 dynamic and HDB FP32 flat (32 /256) reach 96 .78% and 96 .67% (414 .8 s and 416 .3 s build), and HDB FP64 dynamic and HDB FP64 flat (32 /256) reach 94 .43% and 94 .33% (866 .5 s and 869 .3 s); at matched 95% recall, Pelorus delivers 4 ,939 QPS (1T) and 96 ,584 QPS (24T) compared with 290 QPS (1T, 17 .0×) and 3 ,416 QPS (24T, 28 .3×)for HDB FP32 dynamic. Among flat HNSW proxies with exact FP64 reranking on Cohere-1M, Faiss centered IP and Milvus centered IP (32 /256) peak at 98 .91% and 98 .69% Recall@10 (167 .3 s and 361 .7 s build; at 98% recall, Pelorus attains 2 ,907 QPS on 1T and 58 ,162 QPS on 24T vs. 127 / 1 ,660 QPS for Faiss centered IP and 76 / 999 QPS for Milvus centered IP), while Faiss direction and Faiss raw Lorentz-IP reach 65 .17% and 0 .12%. Under matched 𝑀 /𝐿 𝑐 = 16 /128 (𝑒 𝑓 ≤ 4,096), external Cohere-1M peak recalls drop further to 93 .84%/93 .64% for HDB FP32 dynamic/flat (106 .1 s/107 .5 s build; 558/530 QPS 1T at ≥ 90%, missing 95%), 89 .94%/89 .74% for HDB FP64, and 97 .93%/97 .99% for Faiss/Milvus centered IP (517/176 QPS 1T at ≥ 95%, missing 98%). On native hyperbolic MERU-1M (Figure 4b), where radial depth variance is wider and interior connectivity is denser, all exter-nal systems except Faiss raw Lorentz-IP (93 .86% peak) reach 99% recall. At ≥ 99% Recall@10, Pelorus builds in 25 .7 s and achieves 2 ,547 QPS (1T, 0 .50 ms p99), outperforming HDB FP32 flat (1 ,296 QPS, 1 .97 ×), HDB FP32 dynamic (1 ,188 QPS, 2 .14 ×), Faiss direction (1 ,078 QPS, 2 .36 ×), Faiss centered IP (1 ,059 QPS, 2 .41 ×), Milvus centered IP (260 QPS, 9 .80 ×), and HDB FP64 dynamic/flat (196/93 QPS, 13 .0×/27 .4×). On 24 threads, Pelorus’s compact work-ing set widens its advantage to 53 ,483 QPS versus 15 ,890 QPS for HDB FP32 flat (3 .37 ×), 14 ,967 QPS for Faiss direction (3 .57 ×), 13 ,780 QPS for HDB FP32 dynamic (3 .88 ×), 13 ,005 QPS for Faiss cen-tered IP (4 .11 ×), 4 ,098 QPS for HDB FP64 dynamic (13 .1×), 1 ,933 QPS for HDB FP64 flat (27 .7×), and 1 ,130 QPS for Milvus centered IP (47 .3×). The full-range plots in Figure 4 also retain low-recall operat-ing points, while the high-recall detail views expose the 90%–100% trade-offs directly. 
+
+## 6.4 Multi-Threaded Scaling Efficiency 
+
+Figure 5 reports throughput scaling from 1 to 24 threads at ≥ 99% Recall@10. With stateless, read-only traversal over a compact hot working set (485 .0 MB logical and 517 .0 MB page-co-located on Cohere-1M, reading 64–256 B per visited neighbor at 𝐷 = 768 with header, sketch, and complete bitplanes co-located on a single 4 KiB page), Pelorus scales by 22 .0× at 24 threads on Cohere-1M (1 ,930 → 42 ,466 QPS, 91 .7% parallel efficiency; Figure 5a), 21 .0× on MERU-1M (2 ,547 → 53 ,483 QPS), 18 .6× on OpenAI-1536 (792 →
+
+14 ,731 QPS), and 21 .2× on WordNet-Hazy (3 ,089 → 65 ,405 QPS). By contrast, Polar-FP32 reads 3 ,072 B (48 cache lines) per visited neighbor across a 3 .56 GB footprint and scales by 15 .0× at 24 threads on Cohere-1M (448 → 6,735 QPS), widening Pelorus’s speedup from 4.30 × (1T) to 6 .31 × (24T) ; similarly, on MERU-1M (Figure 5b), in-process FP32 systems scale by 11 .6×–12 .3× (HDB FP32 dynamic/flat: 1,188 → 13 ,780 QPS and 1 ,296 → 15 ,890 QPS; Faiss centered IP: 1,059 → 13 ,005 QPS) and Milvus centered IP scales by 4 .3× (260 →
+
+1,130 QPS), further widening Pelorus’s multi-threaded lead. 
+
+## 6.5 Geometry and Execution Ablation Study 
+
+Table 8 and Figure 6 (Figures 6a–6b) quantify each topological and execution component on Cohere-1M: 
+
+• QuadriPrune (5.26 × throughput gain): Replacing QuadriPrune’s four-channel quotas and stem-excess dominance with global hyperbolic 𝛼 -pruning produces the radial occlusion characterized by Theorem 3(1), dropping 
+
+> 15
+
+Table 7: Measured comparison of Pelorus and baselines on Cohere-1M and MERU-1M (Zen 4, 32 build threads) at Recall@10 targets of 90% , 95% , 98% , 99% , and 99 .5% . Panels (a) and (b) report 1-thread and 24-thread QPS, respectively. 
+
+(a) Single-thread QPS Dataset Method 𝑀 /𝐿 𝑐 
+
+Build 32T (s) Peak Rec@10 ≥ 90% ≥ 95% ≥ 98% ≥ 99% ≥ 99 .5% 
+
+p99 (ms) at 99% 
+
+Cohere-1M Pelorus 16/128 35.0 99.700% 4,939 4,939 2,907 1,930 738 0.62 Faiss centered IP 32/256 167.3 98.910% 1,652 830 127 — — —Faiss direction 16/128 77.6 65.170% — — — — — —Faiss raw Lorentz-IP 16/128 7.4 0.120% — — — — — —Milvus centered IP 32/256 361.7 98.690% 252 238 76 — — —HDB FP32 dynamic 32/256 414.8 96.780% 839 290 — — — —HDB FP32 flat 32/256 416.3 96.670% 946 279 — — — —HDB FP64 dynamic 32/256 866.5 94.430% 67 — — — — —HDB FP64 flat 32/256 869.3 94.330% 74 — — — — —Exact-RobustPrune 16/128 75.5 93.940% 629 — — — — —Polar-SQ8 16/128 66.9 99.780% 2,428 2,428 1,887 878 372 1.44 Polar-FP32 16/128 190.2 99.783% 1,355 1,355 1,027 448 258 2.69 MERU-1M Pelorus 16/128 25.7 99.983% 5,846 4,521 2,547 2,547 1,669 0.50 Faiss centered IP 32/256 99.2 99.988% 4,312 2,800 1,903 1,059 872 1.43 Faiss direction 16/128 48.8 100.000% 3,460 1,814 1,480 1,078 1,078 1.30 Faiss raw Lorentz-IP 16/128 36.3 93.858% 841 — — — — —Milvus centered IP 32/256 271.6 99.991% 297 297 297 260 233 5.30 HDB FP32 dynamic 16/128 86.5 99.947% 3,136 2,103 1,493 1,188 875 1.27 HDB FP32 flat 16/128 87.6 99.947% 3,187 2,184 1,579 1,296 966 1.15 HDB FP64 dynamic 32/256 631.4 99.955% 615 428 281 196 165 8.83 HDB FP64 flat 32/256 633.9 99.707% 480 320 186 93 46 21.68 
+
+(b) 24-thread QPS (queries/s) Dataset Method ≥ 90% ≥ 95% ≥ 98% ≥ 99% ≥ 99 .5% 
+
+Cohere-1M Pelorus 96,584 96,584 58,162 42,466 17,137 Faiss centered IP 10,717 10,717 1,660 — —Faiss direction — — — — —Faiss raw Lorentz-IP — — — — —Milvus centered IP 1,115 1,115 999 — —HDB FP32 dynamic 3,416 3,416 — — —HDB FP32 flat 3,656 3,656 — — —HDB FP64 dynamic — — — — —HDB FP64 flat — — — — —Exact-RobustPrune — — — — —Polar-SQ8 46,034 46,034 34,639 16,844 7,016 Polar-FP32 19,932 19,932 14,925 6,735 3,937 MERU-1M Pelorus 94,846 94,846 53,483 53,483 36,092 Faiss centered IP 33,189 33,189 22,488 13,005 9,349 Faiss direction 43,798 43,798 19,883 14,967 9,866 Faiss raw Lorentz-IP — — — — —Milvus centered IP 1,208 1,208 1,208 1,130 1,088 HDB FP32 dynamic 30,015 30,015 18,413 13,780 11,038 HDB FP32 flat 26,235 26,235 19,434 15,890 11,699 HDB FP64 dynamic 9,588 9,588 6,121 4,098 3,414 HDB FP64 flat 6,362 6,362 4,039 1,933 925 
+
+Note: HDB denotes HyperspaceDB. A dash denotes the absence of a qualifying measured point at that thread count. Polar-SQ8 and Polar-FP32 report three-graph means; Pelorus and external systems use the single-build protocol of §6.1. Build time and 𝑀 /𝐿 𝑐 correspond to the fastest qualifying 1T configuration at 99% recall, or the peak-recall configuration when 99% is unreached. Each QPS column independently selects its fastest measured qualifying configuration. The 90% and 95% columns are selected from the existing measured configurations. Peak recall is the largest measured 1T recall; p99 is in milliseconds at the selected 99% 1T point. 
+
+99%-recall QPS from 2 ,071 to 394 (2 .92 ms p99) and failing to reach 99 .5% recall even at 𝐿 = 2,048. 
+
+• Stage-0.5 Asymmetric Refinement (w/o Stage-0.5 Asym Gate in Table 8, +58 .2% at 99 .5% recall): Removing lazy orthogonal-projection re-scoring leaves cross-shell query error 𝑑 𝑞 𝜂 𝑞 (𝑢 𝑥 ) uncancelled during pool truncation (The-orem 2(2)), reducing 99 .5%-recall throughput from 688 to 435 QPS (1 ,659 QPS at 99% recall). 
+
+• Spanning-Tree Chord-Swap Repair: Omitting chord swaps leaves 518 zero-in-degree boundary islands per million ver-tices and lowers SoA 99%-recall QPS from 1 ,752 to 1 ,723. 
+
+• HotSmPage and SymSketch256 (+18 .2% at 99% , +28 .1% 
+
+at 99 .5% recall): Single-page 4096 B co-location lifts 99%-recall QPS from 1 ,752 to 1 ,909 ( +9.0%) by avoiding cross-array secondary DTLB walks; adding binomial-stabilized SymSketch256 (57 .6% header-line bitplane skip rate) reaches 2 ,071 QPS (688 QPS vs. 537 QPS at 99 .5% recall).     
+
+> 16 0% 25% 50% 75% 100% 510 20 50 100 200 500 1k 2k 5k 10k 20k 50k
+> QPS
+
+Full measured range   
+
+> 90% 95% 100%
+
+Recall@10 
+
+> 510 20 50 100 200 500 1k 2k 5k
+> QPS
+
+High-recall detail 
+
+> Pelorus Faiss centered IP Faiss direction Faiss raw Lorentz-IP Milvus centered IP HDB FP32 dynamic HDB FP32 flat HDB FP64 dynamic HDB FP64 flat Exact-RobustPrune Polar-SQ8 Polar-FP32
+
+(a) Cohere-1M ( 768 D, 1 thread) 0% 25% 50% 75% 100% 10 20 50 100 200 500 1k 2k 5k 10k 
+
+> QPS
+
+Full measured range   
+
+> 90% 95% 100%
+
+Recall@10 
+
+> 10 20 50 100 200 500 1k 2k 5k
+> QPS
+
+High-recall detail  
+
+> Pelorus Faiss centered IP Faiss direction Faiss raw Lorentz-IP Milvus centered IP HDB FP32 dynamic HDB FP32 flat HDB FP64 dynamic HDB FP64 flat
+
+(b) MERU-1M ( 512 D, 1 thread) 
+
+Figure 4: Matched-dataset Recall@10–QPS frontiers of Pelorus and all measured external baselines on Zen 4. Each panel shows the full measured recall range and a high-recall detail view. HDB denotes HyperspaceDB. Polar-FP32 and Polar-SQ8 report three-graph means with min–max error bars, while Pelorus and external baselines follow the single-build protocol of §6.1. Each method’s frontier includes its measured build and search configurations; lines connect nondominated measurements. Table 8: Controlled component ablations around Pelorus-Core on Cohere-1M (Zen 4, 1 thread, three-graph means). 
+
+Zero-In Build 1T QPS (p99 ms) Variant Islands 32T (s) ≥ 99% ≥ 99 .5% 
+
+Pelorus-Core 0 32.5 2,071 (0.56) 688 (1.63) w/o SymSketch256 0 32.5 1,909 (0.60) 593 (1.90) w/o HotSmPage (SoA) 0 32.5 1,752 (0.65) 537 (2.11) w/o Stage-0.5 Asym Gate 0 32.5 1,659 (0.70) 435 (2.66) w/o Chord-Swap Repair 518 32.4 1,723 (0.66) 540 (2.08) w/o QuadriPrune 0 29.2 394 (2.92) Unreached 
+
+## 6.6 Synthetic Stress Tests, Recall-Loss Audit, and Applicability Boundaries 
+
+External Comparisons Across Distributions. Table 10 reports all 12 external-baseline builds alongside Pelorus on the four synthetic distributions. On Clustered-Narrow, at Recall@10 ≥ 99%, Pelorus reaches 1 ,840 QPS (1T) and 38 ,876 QPS (24T), compared with HDB FP32 flat at 998 and 13 ,311 QPS (1 .84 × and 2 .92 ×). Their selected points attain 99 .385% and 99 .5% recall, respectively. On Clustered-Wide, the corresponding rates are 2 ,704/57 ,144 for Pelorus and 735/12 ,519 for HDB (3 .68 ×/4 .56 ×), at 99 .61% and 99 .495% recall. These are common-threshold throughput comparisons across the re-ported construction budgets. Centered Faiss and Milvus attain peak recalls of 21 .245%/19 .525% on Clustered-Narrow and 4 .015%/9 .33% on Clustered-Wide. On Uniform-Wide, peak recalls are 98 .88% for Pelorus, 97 .86% for HDB, 48 .64% for Faiss, and 54 .04% for Milvus. The Uniform-Narrow results expose a separate recall weakness of the current Pelorus configuration, analyzed below.     
+
+> 17 14816 24
+
+Query threads 
+
+> 010k 20k 30k 40k
+> QPS
+> Pelorus Polar-SQ8 Polar-FP32
+
+(a) Cohere-1M ( ≥ 99% Recall) 1 4 8 16 24 
+
+Query threads  
+
+> 010k 20k 30k 40k 50k
+> QPS
+> Pelorus Faiss centered IP Faiss direction Milvus centered IP HDB FP32 dynamic HDB FP32 flat HDB FP64 dynamic HDB FP64 flat
+
+(b) MERU-1M ( ≥ 99% Recall) 
+
+Figure 5: Multi-threaded query scaling from 1 to 24 threads on Zen 4 at Recall@10 ≥ 99% . On Cohere-1M, Pelorus is compared against Polar-SQ8 and Polar-FP32 (three-graph means with min–max error bars; external baseline peak recalls are reported in Table 7). On MERU-1M, Pelorus is compared against all external systems reaching 99% recall; each method selects its fastest qualifying configuration per thread count. 94% 96% 98% 100% 
+
+Recall@10 
+
+> 500 1k 2k 5k
+> QPS
+> Pelorus-Core w/o SymSketch256 w/o HotSmPage (SoA) w/o Stage-0.5 gate w/o Chord-Swap w/o QuadriPrune
+
+(a) Topology & decision ablations 97% 98% 99% 100% 
+
+Recall@10  
+
+> 100 200 500 1k 2k 5k
+> QPS
+> 2-bit SM (same graph) SQ8 (same graph) FP32 (same graph) Polar-SQ8 Polar-FP32
+
+(b) Representation crossover 
+
+Figure 6: Single-thread ablation Pareto curves around Pelorus-Core on Cohere-1M (Zen 4, three-graph means; error bars show graph min–max). In the geometry panel, “w/o Stage-0.5 gate” and “w/o Chord-Swap” correspond to w/o Stage-0.5 Asym Gate and w/o Chord-Swap Repair in Table 8; in the representation crossover (matched SoA search policy), “2-bit SM (same graph)” denotes w/o HotSmPage (SoA), while “SQ8 (same graph)” and “FP32 (same graph)” denote SameGraph-SQ8 and SameGraph-FP32 in Table 6. 
+
+Four-Stage Telescoping Recall-Loss Audit. To pinpoint where can-didates are lost on pathological manifolds, let 𝐺 𝑘 (𝑞 ) be the exact top-𝑘 set, 𝑉 (𝑞 ) the vertices visited during traversal, 𝐶 𝐿 (𝑞 ) ⊆ 𝑉 (𝑞 )
+
+the retained beam pool of size 𝐿 , 𝐹 𝐵 (𝑞 ) ⊆ 𝐶 𝐿 (𝑞 ) the candidates admitted to exact reranking, and 𝑅 𝑘 (𝑞 ) ⊆ 𝐹 𝐵 (𝑞 ) the returned top-𝑘 .Because 𝑅 𝑘 (𝑞 ) ⊆ 𝐹 𝐵 (𝑞 ) ⊆ 𝐶 𝐿 (𝑞 ) ⊆ 𝑉 (𝑞 ), recall miss decomposes 
+
+> 18
+
+Table 9: Synthetic extreme manifolds and real-manifold trade-offs on Zen 4 (complete Pelorus with tangent-cone res-cue and adaptive CJ-Gate vs. Global-SM without cone rescue or CJ-Gate, 0 B/vertex overhead).                                                                                    
+
+> Max Rec@10 ≥99% QPS (Zen 4) Dataset Global SM Pelorus Cones Global SM 1T Pelorus 1T Pelorus 24T
+> Clustered-Narrow 34.22% 99.95% 256 Unr. 1,840 38,876
+> Clustered-Wide 73.87% 100.00% 256 Unr. 2,704 57,144
+> Uniform-Wide 97.93% 98.88% 0Unr. †98%:300 †6,739
+> Uniform-Narrow 62.41% 64.74% ‡0Unr. Unr. Unr.
+> Cohere-1M ( 99% )99.70% 99.70% 01,932 1,930 42,466 Cohere-1M ( 99 .5% )99.70% 99.70% 0451 738 17,137
+> MERU-1M ( 99% )99.95% 99.98% 01,443 2,547 53,483
+> MERU-1M ( 99 .5% )99.95% 99.98% 01,443 1,669 36,092
+> OpenAI-1536 ( 99% )99.81% 99.81% 0820 792 14,731 OpenAI-1536 ( 99 .5% )99.81% 99.81% 0487 481 9,094
+> †At ≥98% Recall@10 ( 98 .51% at 𝐿 =1,536 , 𝐵 =128 ; Global-SM caps at 97 .93% ). ‡On the 32-query diagnostic probe, FP64 geodesic traversal over FP32 coordinates over the same degree-32 graph visits and returns 62 .2%
+> (Lreach =37 .8% ,Lbeam =Lgate =0% ), characterizing traversal loss on this constructed graph.
+
+telescopically with zero overlap (Appendix F): 1 − Recall@ 𝑘 (𝑞 )
+
+= 1 − |𝐺 𝑘 ∩ 𝑉 |
+
+𝑘 
+
+| {z } 
+
+> Lreach (𝑞 )
+
++ |𝐺 𝑘 ∩ ( 𝑉 \ 𝐶 𝐿 )| 
+
+𝑘 
+
+| {z } 
+
+> Lbeam (𝑞 )
+
++ |𝐺 𝑘 ∩ ( 𝐶 𝐿 \ 𝐹 𝐵 )| 
+
+𝑘 
+
+| {z } 
+
+> Lgate (𝑞 )
+
++ |𝐺 𝑘 ∩ ( 𝐹 𝐵 \ 𝑅 𝑘 )| 
+
+𝑘 
+
+| {z } 
+
+> Lrerank (𝑞 )≡ 0
+
+.
+
+(33) On Clustered-Narrow ( 𝑁 = 1M, 256 tight cones at 𝜌 ∈ [ 3.9, 4.1]) at 
+
+𝐿 = 256 , 𝐵 = 128, auditing Global-SM without tangent-cone rescue or CJ-Gate on the diagnostic subset reveals |𝐺 10 ∩ 𝑉 |/ 10 = 93 .9% (Lreach = 6.1%), yet pool retention drops to 49 .3% ( Lbeam = 44 .6%) and rerank admission drops to 33 .0% ( Lgate = 16 .3% , Lrerank = 0%; 34 .22% across all 2 ,000 queries). Increasing 𝐿 from 256 to 2 ,048 at fixed 𝐵 = 128 monotonically lowers Global-SM recall from 34 .22% (2 ,071 QPS) through 31 .78% ( 𝐿 = 512) and 29 .43% ( 𝐿 = 1,024) down to 27 .80% ( 𝐿 = 2,048) via intra-cluster pool dilution. 
+
+Synthetic Tangent-Cone Rescue and Real-Data Gate Gains. Ta-ble 9 demonstrates that Pelorus’s purity-gated ResidualConeDict 
+
+automatically detects all 256 tight cones (0 B/vertex) on both syn-thetic clustered benchmarks, lifting Clustered-Narrow at fixed 
+
+𝐿 = 256 , 𝐵 = 128 from 34 .22% to 99 .39% Recall@10 (1 ,840 QPS 1T and 38 ,876 QPS 24T; climbing to 99 .80% at 𝐿 = 384 , 𝐵 = 128 and 99 .95% peak) and lifting Clustered-Wide from 73 .87% to 99 .61% at 𝐿 = 192 , 𝐵 = 64 (2 ,704 QPS 1T and 57 ,144 QPS 24T; 99 .995% peak). On the unclustered real benchmarks (Cohere-1M, MERU-1M, OpenAI-1536, and WordNet-Hazy), the strict purity gate retains 0 
+
+cones , avoiding unnecessary residual dictionary construction while adaptive CJ-Gate and variance-stabilized sketching raise Cohere-1M 99 .5%-recall QPS by +63 .7% (451 → 738 QPS 1T, 17 ,137 QPS 24T) and MERU-1M 99%-recall QPS by +76 .5% (1 ,443 → 2,547 QPS 1T, 53 ,483 QPS 24T) at < 3.5% overhead on 1536D OpenAI-1536 (792 vs. 820 QPS). 
+
+Degree-and-Budget Limits on Isotropic Narrow Shells. On Uniform-Narrow (1M points with uniform directions on S511 , 𝜌 ∈ [ 3.9, 4.1],and local intrinsic dimensionality LID ≈ 511 [36]), Pelorus (16 /128 , 𝐿 ≤ 2,048) reaches 64 .735% recall (62 .41% under Global-SM), whereas HDB FP32 flat (32 /256) reaches 85 .08% at 𝑒 𝑓 = 2,048 and 92 .17% at 𝑒 𝑓 = 4,096 (18 QPS 1T and 288 QPS 24T at ≥ 90%) on the full 2 ,000-query test set, and Faiss/Milvus peak at 29 .86%/46 .445%. On a separate 32-query probe over that same degree-32 Pelorus graph, exact FP64 geodesic search over FP32 coordinates achieves 62 .2% Recall@10 ( Lreach = 37 .8% , Lbeam = Lgate = 0%), iso-lating graph reachability rather than 2-bit quantization on the 16 /128 build; separating single-layer QuadriPrune structure from HDB’s larger 𝑀 /𝐿 𝑐 = 32 /256 , 𝑒 𝑓 ≤ 4,096 budget requires matched-degree builds. Widening radial depth to 𝜌 ∈ [ 0.4, 6.0] (Uniform-Wide) enables exact polar radial lower-bound pruning (Proposi-tion 5(1)) across shells and restores Recall@10 above 98% (98 .88% peak, 300 QPS 1T and 6 ,739 QPS 24T at 98 .51%). 
+
+## 7 RELATED WORK 
+
+We position Pelorus relative to academic and industrial work across four areas: hyperbolic representation learning and non-Euclidean indexing, proximity-graph topology design, low-bit vector quanti-zation, and production vector database systems. 
+
+## 7.1 Hyperbolic Representations and Non-Euclidean Indexing 
+
+Curved Representation Models. Negatively curved manifolds em-bed trees and asymmetric hierarchies with exponentially lower distortion than flat Euclidean spaces [47, 52]. Foundational mod-els formulate optimization directly on the Poincaré ball for tax-onomies, neural layers, and lexical semantics [25, 58], or param-eterize partial orders via Poincaré entailment cones [24]. Parallel lines adopt the Lorentz hyperboloid and mixed-curvature product manifolds to stabilize Riemannian gradients across graph neural networks [10, 32, 48], low-dimensional knowledge graphs [9], and fully hyperbolic Transformer backbones [15]. In visual and mul-timodal retrieval, hyperbolic metric learning captures semantic uncertainty and part-whole hierarchies in image encoders [21, 40], scaling to million-item contrastive vision-language alignment in Meta’s MERU [19] and hierarchical passage retrieval for generation in HypRAG [42, 43]. Pelorus unifies both Poincaré and Lorentz workloads at ingestion via exact stereographic projection (3), avoid-ing unbounded spatial-norm quantization blowup on L𝐷 𝑐 (Theo-rem 2(3)). 
+
+Metric, Hashing, and Graph Search in Curved Spaces. Classical metric indexes such as vantage-point trees (vp-tree) [68] and nav-igating nets in doubling or negatively curved spaces [41] prune subtrees via exact triangle inequalities, but shell concentration in 
+
+𝐷 ≥ 512 dimensions causes metric ball bounds to overlap nearly the entire dataset. On the hashing and Euclidean-adapter side, Deng et al. [17] recently constructed native locality-sensitive hashing (LSH) families in hyperbolic space, though data-oblivious hashing requires many hash tables or wide candidate probes to sustain 99% +
+
+> 19
+
+Table 10: Measured comparison on all four synthetic distributions (1M vectors, 512D, Zen 4). Each QPS column selects the fastest measured configuration reaching its Recall@10 threshold. Panels (a) and (b) report one and 24 query threads.   
+
+> (a) Single-thread QPS Dataset Method
+
+𝑀 /𝐿 𝑐  
+
+> Build 32T (s) Peak Rec@10
+
+≥ 90% ≥ 95% ≥ 98% ≥ 99% ≥ 99 .5%  
+
+> p99 (ms) at
+
+99%                                                                                                                                                  
+
+> Uniform-Narrow Pelorus 16/128 46.8 64.735% ——————HDB FP32 flat 32/256 478.2 92.170% 18 —————Faiss centered IP 32/256 311.3 29.860% ——————Milvus centered IP 32/256 573.6 46.445% ——————Uniform-Wide Pelorus 16/128 31.9 98.880% 639 397 300 ———HDB FP32 flat 32/256 299.6 97.860% 241 103 ————Faiss centered IP 32/256 140.1 48.640% ——————Milvus centered IP 32/256 255.1 54.040% ——————Clustered-Narrow Pelorus 16/128 25.3 99.945% 3,371 2,875 2,092 1,840 1,551 0.67 HDB FP32 flat 32/256 106.4 99.950% 1,568 1,315 1,133 998 998 1.33 Faiss centered IP 32/256 35.2 21.245% ——————Milvus centered IP 32/256 146.8 19.525% ——————Clustered-Wide Pelorus 16/128 19.4 99.995% 4,113 3,572 3,141 2,704 2,704 0.44 HDB FP32 flat 32/256 73.7 99.500% 1,037 908 735 735 645 2.14 Faiss centered IP 32/256 38.3 4.015% ——————Milvus centered IP 32/256 273.7 9.330% ——————
+> (b) 24-thread QPS (queries/s) Dataset Method
+
+≥ 90% ≥ 95% ≥ 98% ≥ 99% ≥ 99 .5%                                                                                       
+
+> Uniform-Narrow Pelorus —————HDB FP32 flat 288 ————Faiss centered IP —————Milvus centered IP —————Uniform-Wide Pelorus 9,363 9,363 6,739 ——HDB FP32 flat 1,727 1,072 ———Faiss centered IP —————Milvus centered IP —————Clustered-Narrow Pelorus 55,231 55,231 44,175 38,876 33,132 HDB FP32 flat 17,024 17,024 14,483 13,311 13,311 Faiss centered IP —————Milvus centered IP —————Clustered-Wide Pelorus 72,780 72,780 70,801 57,144 57,144 HDB FP32 flat 15,090 15,090 12,519 12,519 12,011 Faiss centered IP —————Milvus centered IP —————
+> Note: Each row uses one graph and 32 build threads. Pelorus uses
+
+𝑀 /𝐿 𝑐 = 16 /128 and search widths through 2,048 ; the three external baselines use 32 /256 and widths through 
+
+4,096 . Every timed test condition processes 2,000 queries over five rounds. Peak recall is the largest measured 1T value. The p99 column uses the selected 99% -qualifying 1T point. A dash denotes the absence of a qualifying measured point for that thread count. Existing measured configurations supply the 90% and 95% selections. 
+
+recall in high dimensions, while HyEm [18] stores radius-bounded origin log-maps inside Euclidean HNSW before query-adaptive hyperbolic reranking rather than traversing a native curved graph. Empirical non-Euclidean graph libraries led by NMSLIB [7] (de-ployed in early OpenSearch engines), the theoretical hyperbolic graph analysis of Prokhorenkova et al. [50], recent low-dimensional navigable-graph bounds proving Ω(𝑛 ) worst-case out-degree with-out Steiner points [16], and the dedicated hyperbolic engine Hy-perspaceDB [29] demonstrate that greedy proximity-graph rout-ing adapts to intrinsic manifold structure. Nevertheless, existing hyperbolic graph indices either evaluate geodesic distances over full-precision coordinates at every hop—fetching 2–6 KB per vis-ited vertex and requiring FP64 arithmetic near ∥𝑥 ∥2 → 1/√𝑐 —or quantize ambient Cartesian/Lorentz coordinates without isolating conformal weights while pruning edges under a single isotropic predicate. Pelorus instead factors the warped-product metric into ex-act 32-byte radial scalars plus 2-bit spherical bitplanes and replaces isotropic pruning with stem-excess QuadriPrune four-channel di-versity. 
+
+## 7.2 Proximity-Graph Topology and Skewed Routing 
+
+Flat Proximity Graphs and Benchmarks. Navigable small-world graphs (NSW [44] and hierarchical HNSW [45]), approximate relative-neighborhood and satellite-system graphs (NSG [23] and NSSG [22]), and Microsoft’s 𝛼 -slack Vamana index (DiskANN) [55] define the standard in-memory and SSD-resident ANN paradigms, as established across standardized community benchmarks [4, 5, 53, 62]. Production extensions of DiskANN support streaming up-dates in FreshDiskANN [54], centroid-partitioned disk posting lists in SPANN [14], and structured predicate filtering in Filtered-DiskANN [30]. Transplanting these pruning rules from their as-sumed flat ambient metrics to B𝐷 𝑐 permits radial occlusion of entire spherical neighborhoods by interior vertices. The angular escape 
+
+> 20
+
+condition characterizes when a candidate improves on the origin (Theorem 3). 
+
+Skewed Distributions, Hub Occlusion, and Block Locality. Recent database indices examine routing pathologies and block layout from complementary angles. RoarGraph [13] shows that cross-modal out-of-distribution (OOD) queries suffer hub occlusion and long detours on flat inner-product graphs, mitigating shift by building a bipartite graph over historical query projections. In negatively curved spaces, hub occlusion arises even for in-distribution queries as an intrinsic geometric consequence of sinh (√𝑐𝑅 ) fiber expansion rather than query-modality shift. Pelorus controls radial occlusion through Inside-Out depth seeding, stem-excess angle-guarded dom-inance, shielded isobathic rings, spanning-tree chord-swap island repair, and routing via the closed-form radial minimizer, with an-gular ring pruning on constant-depth data. For storage locality, Starling [61] reorders disk-resident graph neighborhoods into 4 KiB SSD segments to reduce physical block reads per hop. Addressing the in-memory DTLB translation bottleneck rather than SSD block I/O, Pelorus’s HotSmPage co-locates polar headers, 256-bit sketches, and complete 2-bit bitplanes of 𝐾 consecutive vertex IDs inside one 4096 B OS page ( 𝐾 = 16 at 𝐷 = 768, Table 4), avoiding cross-array secondary page-table walks without graph-isomorphism reorder-ing. 
+
+## 7.3 Low-Bit Vector Quantization in Academia and Industry 
+
+Subspace and Anisotropic Codebooks. Product quantization (PQ [38] and OPQ [28]) partitions flat vectors into learned sub-spaces, while PQ Fast Scan [2] and Quick ADC [3] pack 4-bit lookup tables into SIMD registers via vpshufb shuffles. In indus-trial maximum inner-product search (MIPS), Google’s ScaNN [34] observes that quantization error parallel to a candidate vector perturbs rankings more severely than orthogonal error, motivating anisotropic codebook losses and spilled orthogonal-residual assign-ment in SOAR [56]. Subspace codebooks, however, require offline iterative clustering and assume fixed flat inner-product weights; similarly, HiHPQ [51] learns end-to-end trainable hyperbolic product quantization codebooks during representation training rather than serving a training-free post-hoc graph index. On 
+
+B𝐷 𝑐 , the directional weight 𝑊 (𝑟 𝑞 , 𝑟 𝑣 ) = 2 
+
+> 𝑐
+
+sinh 𝜌 𝑞 sinh 𝜌 𝑣 varies exponentially across candidate pairs and diverges near 𝑟 𝑣 → 1/√𝑐 ,which Pelorus isolates analytically in unquantized polar headers before touching directional codes. 
+
+Industrial Locally-Adaptive Scalar and Binary Quantization. To avoid codebook training during graph traversal, Intel’s Scalable Vector Search (SVS) introduces Locally-Adaptive Vector Quantiza-tion (LVQ) [1], centering and scaling each vector individually into 4-bit or 8-bit integers, and LeanVec [57], which pairs learned linear dimensionality reduction with LVQ to shrink memory bandwidth. In enterprise search engines, Apache Lucene and Elasticsearch de-ploy Better Binary Quantization (BBQ) [59], combining centered 1-bit database codes with asymmetric 4-bit query lookup tables. Two technical boundaries separate these flat production quantizers from Pelorus. On coordinate adaptation, LVQ’s per-vector scalar centering and scaling operate on ambient coordinates and cannot factor out the nonlinear Poincaré denominator (1 − 𝑐 ∥𝑥 ∥22) or pre-vent tight semantic cones ( 𝛼 𝑣 = ⟨𝑢 𝑣 , 𝜇 𝑐 ⟩ → 1) from expending dynamic range on the shared cluster axis 𝜇 𝑐 . Pelorus’s purity-gated 
+
+ResidualConeDict explicitly subtracts 𝛼 𝑣 𝜇 𝑐 in the spherical tan-gent space 𝑇 𝜇 𝑐 S𝐷 −1 at 0 B/vertex overhead, attenuating residual cosine error by 𝛽 𝑞,𝑐 𝛽 𝑣 and preserving the pairwise covariance in its MNR expression (Theorem 4). On bit-width fidelity, compared with 1-bit BBQ [59], two-level 2-bit SM retains strong-magnitude coor-dinates and pairs an L1-resident fixed-point masked subset-sum kernel (Stage-0.5, contrasting with 4-bit nibble SIMD shuffle ta-bles [2, 3]) with a deterministic Pythagorean orthogonal-projection divisor 𝜎 2 
+
+> 𝑣
+
+(Proposition 6(1)) that removes multiplicative shrinkage deterministically. 
+
+Randomized Bit Quantization, Quantized Graphs, and Decision Theory. Locality-sensitive hashing and random hyperplane round-ing (SimHash) [11, 37] initiated 1-bit angular estimation. Extending 1-bit hyperplane rounding, PolarQuant [35] applies random pre-conditioning and recursive 2D polar coordinate transforms in flat Euclidean space to eliminate block-scale metadata in KV-cache quantization (orthogonal to our warped-product separation of sin-gular hyperbolic conformal factors on B𝐷 𝑐 ). Recent database work achieves strong theoretical guarantees in flat Euclidean space via RaBitQ [27], asymptotically optimal extended RaBitQ [26], and SymphonyQG [31], which tightly co-layouts randomized quantized codes inside graph neighbor blocks. Both RaBitQ and SymphonyQG rely on a global random orthogonal rotation to equalize coordinate variances. On contrastive neural embeddings—whose representa-tions exhibit structured coordinate anisotropy and local Gaussian concentration [6, 63]—prior flat two-bit graph indexing [66] and flat comparison-decision stability theory [65] establish how shared-endpoint residual covariance governs ranking and pruning flips and why global random rotations can weaken native cancellation. Taking that flat decision framework as its foundation, Pelorus ad-dresses negatively curved warped-product manifolds by decoupling singular conformal factors into unquantized polar headers, isolat-ing cross-shell weight mismatch, rescuing concentrated boundary cones at zero byte overhead, and gating off-axis conformal uncer-tainty via CJ-Gate. 
+
+## 7.4 Production Vector Database Systems 
+
+Modern vector data management spans specialized vector engines and relational-hybrid databases [49]. Meta’s Faiss provides CPU and GPU kernels for flat, IVF-PQ, and HNSW search [20, 39], while Zilliz’s Milvus [60] and cloud-native Manu [33] disaggregate stor-age, streaming ingestion, and multi-replica index execution. On the hybrid analytical and transactional front, Alibaba’s PASE [67] and AnalyticDB-V [64] integrate quantized and graph vector in-dexes into PostgreSQL and cloud analytical optimizers. Microsoft’s VBASE [69] unifies online vector traversal and relational predi-cates by exploiting relaxed distance monotonicity along proximity-graph iterators, and SingleStore-V [12] embeds segmented HNSW and subspace compression inside a distributed SQL engine. All of these industrial engines assume flat 𝐿 2, cosine, or inner-product distance kernels. Hosting hyperbolic embeddings (MERU, HypRAG) on flat inner-product indices requires fetching wide candidate pools across mismatched radial shells before exact geodesic reranking. 
+
+> 21
+
+Because Pelorus’s polar proxy 𝑃 B (𝑞, 𝑣 ) is strictly order-isomorphic to 𝑑 B (𝑞, 𝑣 ) (satisfying VBASE-style relaxed monotonicity [69]) and encapsulates its state in stateless 4096 B pages plus fixed-stride adjacency arrays, our polar 2-bit operator can serve directly as a native curved-manifold index engine inside modular vector DBMS architectures. 
+
+## 8 CONCLUSION 
+
+We presented Pelorus , a warped-product proximity-graph index for hyperbolic vector search in the Poincaré ball and Lorentz hyper-boloid. By factoring the warped-product manifold into unquantized FP32 radial and conformal scalars paired with scale-invariant 2-bit Sign-Magnitude spherical codes, Pelorus prevents quantization noise from entering singular boundary denominators while com-pressing per-vertex logical hot navigation state to 384 B (517 .0 MB page-co-located at 𝑁 = 10 6, 𝐷 = 768, 2 .44 × below 8-bit Polar-SQ8; 352 B / 485 .0 MB / 2 .60 × in split form). Our conformal po-lar distortion and hyperbolic graph-pathology analysis charac-terized query boundary-depth invariance, cross-shell query-noise non-cancellation, radial occlusion and angular-cone collapse, and boundary cluster MNR collapse, directly motivating stem-excess QuadriPrune construction, spanning-tree chord-swap BFS island repair, routing via the constrained radial minimizer, deterministic orthogonal-projection de-biasing, purity-gated zero-byte-per-node tangent-cone residuals, and 4096 B single-page co-location. Across eight real and synthetic hyperbolic benchmarks on AMD Zen 4, Pelorus accelerates 32-thread index construction by 5 .44 × over Polar-FP32 (1 .91 × vs. Polar-SQ8), improves 99%-recall through-put by 4 .30 × (1T) to 6 .31 × (24T) over full-precision polar search on Cohere-1M, and reaches 99 .70% peak Recall@10 on Cohere-1M (vs. 96 .78% for HyperspaceDB and 98 .91% for centered Faiss) alongside 53 ,483 QPS at 99% recall on native hyperbolic MERU-1M (3 .37 ×–3 .88 × over HyperspaceDB FP32) on the global 2-bit path (0 cones across diffuse real sets), while activating 256 cones on clustered shells to raise Clustered-Narrow recall from 34 .22% to 99 .385% at 𝐿 = 256 (99 .80% at 𝐿 = 384). The synthetic stress tests further delineate how manifold geometry shapes these gains: at 
+
+≥ 99% recall, Pelorus exceeds HyperspaceDB FP32 flat throughput by 1 .84 × / 2 .92 × (1T / 24T) on Clustered-Narrow and 3 .68 × / 4 .56 ×
+
+on Clustered-Wide, whereas on isotropic Uniform-Narrow Pelorus (𝑀 /𝐿 𝑐 = 16 /128 , 𝐿 ≤ 2,048) peaks at 64 .735% Recall@10 compared with 92 .17% for HyperspaceDB (32 /256 , 𝑒 𝑓 ≤ 4,096), delineating degree-and-budget limits on unclustered narrow shells. 
+
+## REFERENCES 
+
+[1] Cecilia Aguerrebere, Ishwar Singh Bhati, Mark Hildebrand, Mariano Tepper, and Theodore Willke. 2023. Similarity Search in the Blink of an Eye with Compressed Indices. Proceedings of the VLDB Endowment 16, 11 (2023), 3433–3446. [2] Fabien André, Anne-Marie Kermarrec, and Nicolas Le Scouarnec. 2015. Cache Locality Is Not Enough: High-Performance Nearest Neighbor Search with Prod-uct Quantization Fast Scan. Proceedings of the VLDB Endowment 9, 4 (2015), 288–299. [3] Fabien André, Anne-Marie Kermarrec, and Nicolas Le Scouarnec. 2017. Acceler-ated Nearest Neighbor Search with Quick ADC. In Proceedings of the 2017 ACM on International Conference on Multimedia Retrieval (ICMR) . 159–166. [4] Martin Aumüller, Erik Bernhardsson, and Alexander Faithfull. 2020. ANN-Benchmarks: A Benchmarking Tool for Approximate Nearest Neighbor Algo-rithms. Information Systems 87 (2020), 101374. [5] Ilias Azizi, Karima Echihabi, and Themis Palpanas. 2025. Graph-Based Vector Search: An Experimental Evaluation of the State-of-the-Art. Proceedings of the ACM on Management of Data 3, 1 (2025), 1–31. [6] Roy Betser, Eyal Gofer, Meir Yossef Levi, and Guy Gilboa. 2026. InfoNCE Induces Gaussian Distribution. In International Conference on Learning Representations (ICLR) .[7] Leonid Boytsov and Bilegsaikhan Naidan. 2013. Engineering Efficient and Ef-fective Non-Metric Space Library. In Similarity Search and Applications (SISAP) .280–293. [8] Julian J. Bussgang. 1952. Crosscorrelation Functions of Amplitude-Distorted Gauss-ian Signals . Technical Report 216. Research Laboratory of Electronics, MIT. [9] Ines Chami, Adva Wolf, Da-Cheng Juan, Frederic Sala, Sujith Ravi, and Christo-pher Ré. 2020. Low-Dimensional Hyperbolic Knowledge Graph Embeddings. In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics (ACL) . 6901–6914. [10] Ines Chami, Zhitao Ying, Christopher Ré, and Jure Leskovec. 2019. Hyperbolic Graph Convolutional Neural Networks. In Advances in Neural Information Pro-cessing Systems (NeurIPS) , Vol. 32. 4868–4879. [11] Moses S. Charikar. 2002. Similarity Estimation Techniques from Rounding Algorithms. In Proceedings of the 34th Annual ACM Symposium on Theory of Computing (STOC) . 380–388. [12] Cheng Chen, Chenzhe Jin, Yunan Zhang, Sasha Podolsky, Chun Wu, Szu-Po Wang, Eric Hanson, Zhou Sun, Robert Walzer, and Jianguo Wang. 2024. SingleStore-V: An Integrated Vector Database System in SingleStore. Proceedings of the VLDB Endowment 17, 12 (2024), 3772–3785. [13] Meng Chen, Kai Zhang, Zhenying He, Yinan Jing, and X. Sean Wang. 2024. RoarGraph: A Projected Bipartite Graph for Efficient Cross-Modal Approximate Nearest Neighbor Search. Proceedings of the VLDB Endowment 17, 11 (2024), 2735–2749. [14] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li, Mao Yang, and Jingdong Wang. 2021. SPANN: Highly-Efficient Billion-Scale Ap-proximate Nearest Neighbor Search. In Advances in Neural Information Processing Systems (NeurIPS) , Vol. 34. 5199–5212. [15] Weize Chen, Xu Han, Yankai Lin, Hexu Zhao, Zhiyuan Liu, Peng Li, Maosong Sun, and Jie Zhou. 2022. Fully Hyperbolic Neural Networks. In Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (ACL) .5672–5686. [16] Chengyuan Deng, Jie Gao, Kuijun Liu, Kevin Lu, Feng Luo, Puheng Weng, and Cheng Xin. 2026. Navigable Graphs for Low-Dimensional Hyperbolic Spaces. arXiv:2610.24874. [17] Chengyuan Deng, Jie Gao, Kevin Lu, Feng Luo, and Cheng Xin. 2026. Locality Sensitive Hashing in Hyperbolic Space. In Proceedings of the 42nd International Symposium on Computational Geometry (SoCG) (LIPIcs) , Vol. 367. 39:1–39:19. [18] Ou Deng, Shoji Nishimura, Atsushi Ogihara, and Qun Jin. 2026. HyEm: Query-Adaptive Hyperbolic Retrieval for Biomedical Ontologies via Euclidean Vector Indexing. arXiv:2604.09550. [19] Karan Desai, Maximilian Nickel, Tanmay Rajpurohit, Justin Johnson, and Shan-mukha Ramakrishna Vedantam. 2023. Hyperbolic Image-Text Representations. In Proceedings of the 40th International Conference on Machine Learning (ICML) .7694–7731. [20] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. 2024. The Faiss Library. arXiv preprint arXiv:2401.08281 (2024). [21] Aleksandr Ermolov, Leyla Mirvakhabova, Valentin Khrulkov, Nicu Sebe, and Ivan Oseledets. 2022. Hyperbolic Vision Transformers: Combining Improvements in Metric Learning. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) . 7409–7419. [22] Cong Fu, Changxu Wang, and Deng Cai. 2022. High Dimensional Similarity Search With Satellite System Graph: Efficiency, Scalability, and Unindexed Query Compatibility. IEEE Transactions on Pattern Analysis and Machine Intelligence 44, 8 (2022), 4139–4150. [23] Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. 2019. Fast Approximate Nearest Neighbor Search with the Navigating Spreading-Out Graph. Proceedings of the VLDB Endowment 12, 5 (2019), 461–474. [24] Octavian-Eugen Ganea, Gary Bécigneul, and Thomas Hofmann. 2018. Hyperbolic Entailment Cones for Learning Hierarchical Embeddings. In Proceedings of the 35th International Conference on Machine Learning (ICML) . 1646–1655. [25] Octavian-Eugen Ganea, Gary Bécigneul, and Thomas Hofmann. 2018. Hyperbolic Neural Networks. In Advances in Neural Information Processing Systems (NeurIPS) ,Vol. 31. 5345–5355. [26] Jianyang Gao, Yutong Gou, Yuexuan Xu, Yongyi Yang, Cheng Long, and Raymond Chi-Wing Wong. 2025. Practical and Asymptotically Optimal Quantization of High-Dimensional Vectors in Euclidean Space for Approximate Nearest Neighbor Search. Proceedings of the ACM on Management of Data 3, 3 (2025), 202:1–202:26. [27] Jianyang Gao and Cheng Long. 2024. RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search. Proceedings of the ACM on Management of Data 2, 3 (2024), 1–27. [28] Tiezheng Ge, Kaiming He, Qifa Ke, and Jian Sun. 2014. Optimized Product Quantization. IEEE Transactions on Pattern Analysis and Machine Intelligence 36, 4 (2014), 744–755. 
+
+> 22
+
+[29] Sergey Glukhota. 2026. HyperspaceDB: High-Performance Hyperbolic Vector Database. https://github.com/YARlabs/hyperspace-db. [30] Siddharth Gollapudi, Neel Karia, Varun Sivashankar, Ravishankar Krishnaswamy, Nikit Begwani, Swapnil Raz, Yiyong Lin, Yin Zhang, Neelam Mahapatro, Premku-mar Srinivasan, Amit Singh, and Harsha Vardhan Simhadri. 2023. Filtered-DiskANN: Graph Algorithms for Approximate Nearest Neighbor Search with Filters. In Proceedings of the ACM Web Conference (WWW) . 3406–3416. [31] Yutong Gou, Jianyang Gao, Yuexuan Xu, and Cheng Long. 2025. SymphonyQG: Towards Symphonious Integration of Quantization and Graph for Approximate Nearest Neighbor Search. Proceedings of the ACM on Management of Data 3, 1 (2025), 80:1–80:26. [32] Albert Gu, Frederic Sala, Beliz Gunel, and Christopher Ré. 2019. Learning Mixed-Curvature Representations in Product Spaces. In International Conference on Learning Representations (ICLR) .[33] Rentong Guo, Xiaofan Luan, Long Xiang, Xiao Yan, Xiaomeng Yi, Jigao Luo, Qianya Cheng, Weizhi Xu, Jiarui Luo, Frank Liu, Zhenshan Cao, Yanliang Qiao, Ting Wang, Bo Tang, and Charles Xie. 2022. Manu: A Cloud Native Vector Database Management System. Proceedings of the VLDB Endowment 15, 12 (2022), 3548–3561. [34] Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern, and Sanjiv Kumar. 2020. Accelerating Large-Scale Inference with Anisotropic Vector Quantization. In Proceedings of the 37th International Conference on Machine Learning (ICML) . 3887–3896. [35] Insu Han, Praneeth Kacham, Amin Karbasi, Vahab Mirrokni, and Amir Zandieh. 2026. PolarQuant: Vector Quantization with Polar Transformation. In Proceed-ings of the 29th International Conference on Artificial Intelligence and Statistics (AISTATS) (Proceedings of Machine Learning Research) , Vol. 300. 5113–5121. [36] Michael E. Houle. 2017. Local Intrinsic Dimensionality I: An Extreme-Value-Theoretic Foundation for Similarity Applications. In Similarity Search and Appli-cations (SISAP) . 64–79. [37] Piotr Indyk and Rajeev Motwani. 1998. Approximate Nearest Neighbors: Towards Removing the Curse of Dimensionality. In Proceedings of the 30th Annual ACM Symposium on Theory of Computing (STOC) . 604–613. [38] Hervé Jégou, Matthijs Douze, and Cordelia Schmid. 2011. Product Quantization for Nearest Neighbor Search. IEEE Transactions on Pattern Analysis and Machine Intelligence 33, 1 (2011), 117–128. [39] Jeff Johnson, Matthijs Douze, and Hervé Jégou. 2021. Billion-Scale Similarity Search with GPUs. IEEE Transactions on Big Data 7, 3 (2021), 535–547. [40] Valentin Khrulkov, Leyla Mirvakhabova, Evgeniya Ustinova, Ivan Oseledets, and Victor Lempitsky. 2020. Hyperbolic Image Embeddings. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) .6417–6427. [41] Robert Krauthgamer and James R. Lee. 2006. Algorithms on Negatively Curved Spaces. In Proceedings of the 47th Annual IEEE Symposium on Foundations of Computer Science (FOCS) . 119–132. [42] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen tau Yih, Tim Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. In Advances in Neural Informa-tion Processing Systems (NeurIPS) , Vol. 33. 9459–9474. [43] Hiren Madhu, Ngoc Bui, Ali Maatouk, Leandros Tassiulas, Smita Krishnaswamy, Menglin Yang, Sukanta Ganguly, Kiran Srinivasan, and Rex Ying. 2026. HypRAG: Hyperbolic Dense Retrieval for Retrieval Augmented Generation. In Pro-ceedings of the 43rd International Conference on Machine Learning (ICML) .arXiv:2602.07739. [44] Yury Malkov, Alexander Ponomarenko, Andrey Logvinov, and Vladimir Krylov. 2014. Approximate Nearest Neighbor Algorithm Based on Navigable Small World Graphs. Information Systems 45 (2014), 61–68. [45] Yu A. Malkov and D. A. Yashunin. 2020. Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs. 
+
+IEEE Transactions on Pattern Analysis and Machine Intelligence 42, 4 (2020), 824– 836. [46] Wojciech Muła, Nathan Kurz, and Daniel Lemire. 2018. Faster Population Counts Using AVX2 Instructions. Comput. J. 61, 1 (2018), 111–120. [47] Maximilian Nickel and Douwe Kiela. 2017. Poincaré Embeddings for Learn-ing Hierarchical Representations. In Advances in Neural Information Processing Systems (NeurIPS) , Vol. 30. 6338–6347. [48] Maximilian Nickel and Douwe Kiela. 2018. Learning Continuous Hierarchies in the Lorentz Model of Hyperbolic Geometry. In Proceedings of the 35th Interna-tional Conference on Machine Learning (ICML) . 3779–3788. [49] James Jie Pan, Jianguo Wang, and Guoliang Li. 2024. Survey of Vector Database Management Systems. The VLDB Journal 33, 5 (2024), 1591–1615. [50] Liudmila Prokhorenkova, Dmitry Baranchuk, Nikolay Bogachev, Yury Demi-dovich, and Alexander Kolpakov. 2022. Graph-Based Nearest Neighbor Search in Hyperbolic Spaces. In International Conference on Learning Representations (ICLR) .[51] Zexuan Qiu, Jiahong Liu, Yankai Chen, and Irwin King. 2024. HiHPQ: Hier-archical Hyperbolic Product Quantization for Unsupervised Image Retrieval. In Proceedings of the AAAI Conference on Artificial Intelligence (AAAI) , Vol. 38. 4614–4622. [52] Frederic Sala, Chris De Sa, Albert Gu, and Christopher Ré. 2018. Representation Tradeoffs for Hyperbolic Embeddings. In Proceedings of the 35th International Conference on Machine Learning (ICML) . 4460–4469. [53] Harsha Vardhan Simhadri, George Williams, Martin Aumüller, Matthijs Douze, Artem Babenko, Dmitry Baranchuk, Qi Chen, Lucas Hosseini, Ravishankar Kr-ishnaswamy, Gopal Srinivasa, Suhas Jayaram Subramanya, and Jingdong Wang. 2022. Results of the NeurIPS’21 Challenge on Billion-Scale Approximate Nearest Neighbor Search. In Proceedings of Machine Learning Research (PMLR) , Vol. 176. 177–189. [54] Aditi Singh, Suhas Jayaram Subramanya, Ravishankar Krishnaswamy, and Har-sha Vardhan Simhadri. 2021. FreshDiskANN: A Fast and Accurate Graph-Based ANN Index for Streaming Similarity Search. arXiv preprint arXiv:2105.09613 
+
+(2021). [55] Suhas Jayaram Subramanya, Fnu Devvrit, Harsha Vardhan Simhadri, Ravishankar Krishnaswamy, and Rohan Kadekodi. 2019. DiskANN: Fast Accurate Billion-Point Nearest Neighbor Search on a Single Node. In Advances in Neural Information Processing Systems (NeurIPS) , Vol. 32. 13748–13758. [56] Philip Sun, David Simcha, Dave Dopson, Ruiqi Guo, and Sanjiv Kumar. 2023. SOAR: Improved Indexing for Approximate Nearest Neighbor Search. In Ad-vances in Neural Information Processing Systems (NeurIPS) , Vol. 36. 3189–3204. [57] Mariano Tepper, Ishwar Singh Bhati, Cecilia Aguerrebere, Mark Hildebrand, and Theodore L. Willke. 2024. LeanVec: Searching Vectors Faster by Making Them Fit. Transactions on Machine Learning Research (TMLR) (2024). [58] Alexandru Tifrea, Gary Bécigneul, and Octavian-Eugen Ganea. 2019. Poincaré GloVe: Hyperbolic Word Embeddings. In International Conference on Learning Representations (ICLR) .[59] Benjamin Trent. 2024. Better Binary Quantization (BBQ) in Lucene and Elas-ticsearch. Elastic Search Labs. https://www.elastic.co/search-labs/blog/better-binary-quantization-lucene-elasticsearch [60] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li, Xi-angyu Wang, Xiangzhou Guo, Chengming Li, Xiaohai Xu, Kun Yu, Yuxing Yuan, Yinghao Zou, Jiquan Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang, Yihua Mo, Jun Gu, Ruiyi Jiang, Yi Wei, and Charles Xie. 2021. Milvus: A Purpose-Built Vec-tor Data Management System. In Proceedings of the 2021 International Conference on Management of Data (SIGMOD) . 2614–2627. [61] Mengzhao Wang, Weizhi Xu, Xiaomeng Yi, Songlin Wu, Zhangyang Peng, Xi-angyu Ke, Yunjun Gao, Xiaoliang Xu, Rentong Guo, and Charles Xie. 2024. Starling: An I/O-Efficient Disk-Resident Graph Index Framework for High-Dimensional Vector Similarity Search on Data Segment. Proceedings of the ACM on Management of Data 2, 1 (2024), 1–27. [62] Mengzhao Wang, Xiaoliang Xu, Qiang Yue, and Yuxiang Wang. 2021. A Com-prehensive Survey and Experimental Comparison of Graph-Based Approximate Nearest Neighbor Search. Proceedings of the VLDB Endowment 14, 11 (2021), 1964–1978. [63] Tongzhou Wang and Phillip Isola. 2020. Understanding Contrastive Represen-tation Learning Through Alignment and Uniformity on the Hypersphere. In 
+
+Proceedings of the 37th International Conference on Machine Learning (ICML) .9929–9939. [64] Chuangxian Wei, Bin Wu, Sheng Wang, Renjie Lou, Chaoqun Zhan, Feifei Li, and Yuanzhe Cai. 2020. AnalyticDB-V: A Hybrid Analytical Engine Towards Query Fusion for Structured and Unstructured Data. Proceedings of the VLDB Endowment 13, 12 (2020), 3152–3165. [65] Wenxuan Xiao and Xu Cao. 2026. When Does Low-Bit Quantization Preserve the Decisions of Vector Search? arXiv:2609.09854. [66] Wenxuan Xiao, Peidong Zhu, Chengcheng Li, and Xu Cao. 2026. QuIVer: Efficient Graph Indexing with Two-Bit Construction and Navigation. arXiv:2605.02171. [67] Wen Yang, Tao Li, Gai Fang, and Hong Wei. 2020. PASE: PostgreSQL Ultra-High-Dimensional Approximate Nearest Neighbor Search Extension. In Proceedings of the 2020 ACM SIGMOD International Conference on Management of Data (SIG-MOD) . 2241–2253. [68] Peter N. Yianilos. 1993. Data Structures and Algorithms for Nearest Neighbor Search in General Metric Spaces. In Proceedings of the 4th Annual ACM-SIAM Symposium on Discrete Algorithms (SODA) . 311–321. [69] Qianxi Zhang, Shuotao Xu, Qi Chen, Guoxin Sui, Jiadong Xie, Zhizhen Cai, Yaoqi Chen, Yinxuan He, Yuqing Yang, Fan Yang, Mao Yang, and Lidong Zhou. 2023. VBASE: Unifying Online Vector Similarity Search and Relational Queries via Relaxed Monotonicity. In 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI) . 377–395. 
+
+> 23
+
+## A RIEMANNIAN GEOMETRY, STEREOGRAPHIC ISOMETRY, AND WARPED-PRODUCT PROOFS A.1 Algebraic Proof of the Lorentz-to-Poincaré Stereographic Isometry 
+
+Let 𝑧 = (𝑧 0, ˜𝑧 ), 𝑧 ′ = (𝑧 ′
+
+> 0
+
+, ˜𝑧 ′) ∈ L𝐷 𝑐 satisfy the upper-sheet hyper-boloid constraint −𝑧 20 + ∥ ˜𝑧 ∥22 = −1/𝑐 with 𝑧 0 > 0, so 𝑐 ∥ ˜𝑧 ∥22 = 𝑐𝑧 20 − 1. For 𝑥 = Π(𝑧 ) = ˜𝑧  
+
+> 1+√𝑐 𝑧 0
+
+, we first verify 𝑥 ∈ B𝐷 𝑐 :1 − 𝑐 ∥𝑥 ∥22 = 1 − 𝑐 ∥ ˜𝑧 ∥22
+
+(1 + √𝑐 𝑧 0)2
+
+= 1 − 𝑐𝑧 20 − 1
+
+(1 + √𝑐 𝑧 0)2
+
+= 2(1 + √𝑐 𝑧 0)(1 + √𝑐 𝑧 0)2
+
+= 21 + √𝑐 𝑧 0
+
+> 0,
+
+(34) which simultaneously yields the exact conformal factor identity 
+
+𝑓 Π (𝑧 ) = 21−𝑐 ∥Π (𝑧 ) ∥ 22
+
+= 1+√𝑐 𝑧 0. Next, denote the scaled Lorentz inner product by 𝐿 (𝑧, 𝑧 ′) ≜ 𝑐 (𝑧 0𝑧 ′ 
+
+> 0
+
+− ⟨ ˜𝑧, ˜𝑧 ′⟩) ≥ 1. Expanding ∥𝑥 − 𝑥 ′ ∥22 for 
+
+𝑥 = ˜𝑧 𝑓 𝑥 and 𝑥 ′ = ˜𝑧 ′  
+
+> 𝑓 𝑥 ′
+
+where 𝑓 𝑥 = 1 + √𝑐 𝑧 0 and 𝑓 𝑥 ′ = 1 + √𝑐 𝑧 ′
+
+> 0
+
+:
+
+𝑐 𝑓 𝑥 𝑓 𝑥 ′ ∥𝑥 − 𝑥 ′ ∥22
+
+= 𝑐 ∥ ˜𝑧 ∥22 𝑓 𝑥 ′
+
+𝑓 𝑥 
+
++ 𝑐 ∥ ˜𝑧 ′ ∥22 𝑓 𝑥 
+
+𝑓 𝑥 ′
+
+− 2𝑐 ⟨ ˜𝑧, ˜𝑧 ′⟩
+
+= (√𝑐 𝑧 0 − 1)( 1 + √𝑐 𝑧 ′
+
+> 0
+
+)+ ( √𝑐 𝑧 ′ 
+
+> 0
+
+− 1)( 1 + √𝑐 𝑧 0) − 2𝑐 ⟨ ˜𝑧, ˜𝑧 ′⟩
+
+= 2 𝑐𝑧 0𝑧 ′ 
+
+> 0
+
+− 1 − 𝑐 ⟨ ˜𝑧, ˜𝑧 ′⟩
+
+= 2 𝐿 (𝑧, 𝑧 ′) − 1.
+
+(35) Substituting 𝑓 𝑥 𝑓 𝑥 ′ = 4       
+
+> (1−𝑐 ∥𝑥 ∥22) ( 1−𝑐 ∥𝑥 ′∥22)
+
+gives 1+ 2𝑐 ∥𝑥 − 𝑥 ′ ∥22
+
+(1 − 𝑐 ∥𝑥 ∥22)( 1 − 𝑐 ∥𝑥 ′ ∥22) = 1+ 𝑐 
+
+2 𝑓 𝑥 𝑓 𝑥 ′ ∥𝑥 −𝑥 ′ ∥22 = 𝐿 (𝑧, 𝑧 ′). (36) Applying 1√𝑐 arccosh (·) to both sides proves 𝑑 B (Π(𝑧 ), Π(𝑧 ′)) =
+
+𝑑 L (𝑧, 𝑧 ′) identically for all 𝑧, 𝑧 ′ ∈ L𝐷 𝑐 . □
+
+## A.2 Warped-Product Metric Tensor, Hyperbolic Law of Cosines, and Flat Limit 
+
+Write 𝑥 = 𝑟𝑢 ∈ B𝐷 𝑐 \ { 0} with 𝑟 ∈ ( 0, 1/√𝑐 ) and 𝑢 ∈ S𝐷 −1. In Euclidean polar coordinates, d 𝑥 ⊤d𝑥 = d𝑟 2 + 𝑟 2dΩ2 
+
+> 𝐷 −1
+
+. From 𝜌 =
+
+√𝑐 𝑅 = 2 atanh (√𝑐 𝑟 ), we have √𝑐 𝑟 = tanh ( 
+
+> √𝑐
+> 2
+
+𝑅 ), whence d𝑟 = 12 sech 2
+
+ √𝑐 
+
+2 𝑅 
+
+
+
+d𝑅, 
+
+1 − 𝑐𝑟 2 = sech 2
+
+ √𝑐 
+
+2 𝑅 
+
+
+
+,𝑓 𝑥 = 21 − 𝑐𝑟 2 = 2 cosh 2
+
+ √𝑐 
+
+2 𝑅 
+
+
+
+.
+
+(37) Multiplying d 𝑥 ⊤d𝑥 by 𝑓 2 
+
+> 𝑥
+
+gives the Riemannian line element: d𝑠 2 = 𝑓 2
+
+> 𝑥
+
+ d𝑟 2 + 𝑟 2dΩ2 
+
+> 𝐷 −1
+
+
+
+= d𝑅 2 + 4
+
+𝑐 cosh 4
+
+ √𝑐 
+
+2 𝑅 
+
+
+
+× tanh 2
+
+ √𝑐 
+
+2 𝑅 
+
+
+
+dΩ2 
+
+> 𝐷 −1
+
+= d𝑅 2 + 1
+
+𝑐 sinh 2 (√𝑐 𝑅 ) dΩ2 
+
+> 𝐷 −1
+
+,
+
+(38) establishing (4). Furthermore, using sinh 𝜌 𝑧 = √𝑐 𝑟 𝑧 𝑓 𝑧 and cosh 𝜌 𝑧 =
+
+𝑓 𝑧 − 1 = 𝑐𝑟 2 
+
+> 𝑧
+
+𝑓 𝑧 + 1, direct expansion of 𝑐  
+
+> 4
+
+𝑃 B (𝑞, 𝑣 ) gives 
+
+𝑐 
+
+4 𝑃 B (𝑞, 𝑣 )
+
+= 𝑐 
+
+4 (𝑟 𝑞 − 𝑟 𝑣 )2 𝑓 𝑞 𝑓 𝑣 + 𝑐 
+
+2𝑟 𝑞 𝑟 𝑣 𝑓 𝑞 𝑓 𝑣 (1 − cos 𝜃 𝑞𝑣 )
+
+= 12
+
+ cosh 𝜌 𝑞 cosh 𝜌 𝑣 − sinh 𝜌 𝑞 sinh 𝜌 𝑣 − 1
+
++ sinh 𝜌 𝑞 sinh 𝜌 𝑣 sin 2
+
+ 𝜃 𝑞𝑣 
+
+2
+
+
+
+= sinh 2  𝜌 𝑞 − 𝜌 𝑣 
+
+2
+
+
+
++ sinh 𝜌 𝑞 sinh 𝜌 𝑣 sin 2
+
+ 𝜃 𝑞𝑣 
+
+2
+
+
+
+= sinh 2
+
+ √𝑐 
+
+2 𝑑 B (𝑞, 𝑣 )
+
+
+
+,
+
+(39) where the final equality uses sinh 2 (𝑡 /2) = 12 (cosh 𝑡 − 1). Taking 
+
+𝑐 → 0+ with fixed 𝑞, 𝑣 ∈ R𝐷 , lim 𝑐 →0+ 𝑓 𝑧 = 2, so lim 𝑐 →0+ 14 𝑃 B (𝑞, 𝑣 ) =
+
+∥𝑞 − 𝑣 ∥22 and lim 𝑐 →0+ 𝑑 B (𝑞, 𝑣 ) = 2∥𝑞 − 𝑣 ∥2. □
+
+## A.3 Complete Proof of Proposition 5 (Strong Convexity and Constrained Radial Minimization) 
+
+Proof. For Claim (1), since 𝑢 𝑞 , 𝑢 𝑣 ∈ S𝐷 −1, Cauchy–Schwarz gives 𝛾 𝑞𝑣 = ⟨𝑢 𝑞 , 𝑢 𝑣 ⟩ ≤ 1. Since 𝑊 (𝑟 𝑞 , 𝑟 𝑣 ) = 2𝑟 𝑞 𝑟 𝑣 𝑓 𝑞 𝑓 𝑣 ≥ 0, 𝑃 B (𝑞, 𝑣 ) =
+
+𝑅 (𝑟 𝑞 , 𝑟 𝑣 ) + 𝑊 (𝑟 𝑞 , 𝑟 𝑣 )( 1−𝛾 𝑞𝑣 ) ≥ 𝑅 (𝑟 𝑞 , 𝑟 𝑣 ) = 𝑃 rad (𝑟 𝑞 , 𝑟 𝑣 ), with equality at 𝑢 𝑣 = 𝑢 𝑞 , where 𝑑 B (𝑞, 𝑣 ) = |𝜌 𝑞 − 𝜌 𝑣 |/ √𝑐 yields 𝑃 rad (𝑟 𝑞 , 𝑟 𝑣 ) = 
+
+> 2
+> 𝑐
+
+(cosh |𝜌 𝑞 − 𝜌 𝑣 | − 1).For Claim (2), consider 𝑔 𝛾 (𝜌 ) = cosh 𝜌 𝑞 cosh 𝜌 − 𝛾 sinh 𝜌 𝑞 sinh 𝜌 
+
+for 𝜌 ∈ R and 𝛾 ∈ [− 1, 1]. Differentiating twice with respect to 𝜌 :
+
+𝑔 ′ 
+
+> 𝛾
+
+(𝜌 ) = cosh 𝜌 𝑞 sinh 𝜌 − 𝛾 sinh 𝜌 𝑞 cosh 𝜌, (40) 
+
+𝑔 ′′  
+
+> 𝛾
+
+(𝜌 ) = cosh 𝜌 𝑞 cosh 𝜌 − 𝛾 sinh 𝜌 𝑞 sinh 𝜌 = 𝑔 𝛾 (𝜌 ). (41) Since |𝛾 | ≤ 1 and sinh 𝜌 𝑞 ≥ 0, |𝛾 sinh 𝜌 𝑞 sinh 𝜌 | ≤ sinh 𝜌 𝑞 | sinh 𝜌 |,hence for all 𝜌 ∈ R:
+
+𝑔 ′′  
+
+> 𝛾
+
+(𝜌 ) = 𝑔 𝛾 (𝜌 )≥ cosh 𝜌 𝑞 cosh |𝜌 | − sinh 𝜌 𝑞 sinh |𝜌 |
+
+= cosh (𝜌 𝑞 − | 𝜌 |) ≥ 1 > 0.
+
+(42) Thus 𝑔 𝛾 (𝜌 ) is globally 1-strongly convex on R. Evaluating the first-order optimality condition 𝑔 ′ 
+
+> 𝛾
+
+(𝜌 ) = 0 divides by cosh 𝜌 𝑞 cosh 𝜌 ≥ 1to obtain tanh 𝜌 = 𝛾 tanh 𝜌 𝑞 ∈ (− 1, 1), so the unique unconstrained minimizer on R is 𝜌 ∗ 
+
+> R
+
+= atanh (𝛾 tanh 𝜌 𝑞 ). Restricting 𝜌 to [0, ∞) : if 
+
+𝛾 ≤ 0, 𝜌 ∗ 
+
+> R
+
+≤ 0 and 𝑔 ′ 
+
+> 𝛾
+
+(𝜌 ) > 0 for all 𝜌 > 0, so the unique minimizer on [0, ∞) is 0 = atanh (max (𝛾, 0) tanh 𝜌 𝑞 ); if 𝛾 > 0, 𝜌 ∗ 
+
+> R
+
+> 0 lies in the interior. Similarly, for any closed interval [𝜌 min , 𝜌 max ] ⊂ [ 0, ∞) , a 1-strongly convex univariate function decreases strictly on (−∞ , 𝜌 ∗
+
+> R
+
+)
+
+> 24
+
+and increases strictly on (𝜌 ∗
+
+> R
+
+, ∞) , so its unique minimizer on 
+
+[𝜌 min , 𝜌 max ] is min (max (𝜌 ∗
+
+> R
+
+, 𝜌 min ), 𝜌 max ) = 𝜌 ∗
+
+> sup
+
+, which also min-imizes 𝑑 B (𝑞, 𝑣 (𝜌 )) = 1√𝑐 arccosh (𝑔 𝛾 (𝜌 )) by strict monotonicity of arccosh on [1, ∞) . □
+
+## B TWO-LEVEL SPHERICAL SM ALGEBRA, BITPLANE KERNELS, AND DETERMINISTIC DE-BIASING B.1 Complete Proof of Lemma 1 (Conditional-Mean Pythagorean Identity) 
+
+Proof. Let 𝑢 𝑣 ∈ S𝐷 −1 have bitplanes 𝑠 𝑣,𝑖 = I[𝑢 𝑣,𝑖 ≥ 0] and 
+
+𝑚 𝑣,𝑖 = I[| 𝑢 𝑣,𝑖 | > 𝜏 𝑣 ], partitioning {1, . . . , 𝐷 } into 𝐼 0,𝑣 (|𝐼 0,𝑣 | = 𝐷 −
+
+𝑠 𝑣 ) and 𝐼 1,𝑣 (|𝐼 1,𝑣 | = 𝑠 𝑣 ). For any candidate two-level vector ˜ 𝑢 𝑖 =
+
+sgn (𝑢 𝑣,𝑖 )( 𝑎 + ( 𝑏 − 𝑎 )𝑚 𝑣,𝑖 ) parameterized by (𝑎, 𝑏 ) ∈ R2, because sgn (𝑢 𝑣,𝑖 )𝑢 𝑣,𝑖 = |𝑢 𝑣,𝑖 | for every 𝑖 (including 𝑢 𝑣,𝑖 = 0 where |0| = 0), the squared Euclidean reconstruction error splits additively across 
+
+𝐼 0,𝑣 and 𝐼 1,𝑣 :
+
+∥𝑢 𝑣 − ˜𝑢 ∥22 =∑︁  
+
+> 𝑖 ∈𝐼 0,𝑣
+
+ |𝑢 𝑣,𝑖 | − 𝑎 2 +∑︁  
+
+> 𝑖 ∈𝐼 1,𝑣
+
+ |𝑢 𝑣,𝑖 | − 𝑏 2. (43) When 0 < 𝑠 𝑣 < 𝐷 , both sums are strictly convex quadratics minimized uniquely at the empirical conditional means 𝑎 𝑣 = 
+
+> 1
+> 𝐷 −𝑠 𝑣
+
+Í𝑖 ∈𝐼 0,𝑣 |𝑢 𝑣,𝑖 | and 𝑏 𝑣 = 1
+
+> 𝑠 𝑣
+
+Í𝑖 ∈𝐼 1,𝑣 |𝑢 𝑣,𝑖 | For 𝑠 𝑣 = 0, the weak mean is uniquely 𝑎 𝑣 = 𝜏 𝑣 > 0 and the strong mean is unused. The implementation chooses 𝑏 𝑣 = 0, giving 𝛿 𝑣 = −𝑎 𝑣 . Every recon-structed coordinate uses 𝑎 𝑣 , so the reconstructed vector remains unique. The strict mean threshold implies 𝑠 𝑣 < 𝐷 in real arithmetic. At (𝑎 𝑣 , 𝑏 𝑣 ), setting ˆ 𝑢 𝑣,𝑖 = sgn (𝑢 𝑣,𝑖 )( 𝑎 𝑣 + 𝛿 𝑣 𝑚 𝑣,𝑖 ) with 𝛿 𝑣 = 𝑏 𝑣 − 𝑎 𝑣 
+
+gives: 
+
+⟨𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ =∑︁  
+
+> 𝑖 ∈𝐼 0,𝑣
+
+|𝑢 𝑣,𝑖 |𝑎 𝑣 +∑︁  
+
+> 𝑖 ∈𝐼 1,𝑣
+
+|𝑢 𝑣,𝑖 |𝑏 𝑣 = (𝐷 − 𝑠 𝑣 )𝑎 2 
+
+> 𝑣
+
++ 𝑠 𝑣 𝑏 2
+
+> 𝑣
+
+, (44) 
+
+∥ ˆ𝑢 𝑣 ∥22 =∑︁  
+
+> 𝑖 ∈𝐼 0,𝑣
+
+𝑎 2 
+
+> 𝑣
+
++∑︁  
+
+> 𝑖 ∈𝐼 1,𝑣
+
+𝑏 2 
+
+> 𝑣
+
+= (𝐷 − 𝑠 𝑣 )𝑎 2 
+
+> 𝑣
+
++ 𝑠 𝑣 𝑏 2 
+
+> 𝑣
+
+≜ 𝜎 2 
+
+> 𝑣
+
+. (45) Hence ⟨𝑢 𝑣 − ˆ𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ = ⟨𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ − ∥ ˆ𝑢 𝑣 ∥22 = 0, and the Pythagorean identity yields 
+
+∥𝑢 𝑣 − ˆ𝑢 𝑣 ∥22 = ∥𝑢 𝑣 ∥22 − 2⟨𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ + ∥ ˆ𝑢 𝑣 ∥22 = 1 − 𝜎 2 
+
+> 𝑣
+
+≥ 0, (46) which implies 𝜎 2 
+
+> 𝑣
+
+≤ 1; meanwhile 𝜎 2 
+
+> 𝑣
+
+≥ 1 
+
+> 𝐷
+
+(Í𝐷 𝑖 =1 |𝑢 𝑣,𝑖 |) 2 ≥ 1 
+
+> 𝐷
+
+∥𝑢 𝑣 ∥22 = 
+
+> 1
+> 𝐷
+
+> 0. For the five-popcount bilinear formula, let 𝜎 𝑞,𝑖 = sgn (𝑢 𝑞,𝑖 ) ∈ {± 1}, 𝜎 𝑣,𝑖 = sgn (𝑢 𝑣,𝑖 ) ∈ {± 1}, and ¯ 𝑥 𝑖 = I[𝑠 𝑞,𝑖 = 𝑠 𝑣,𝑖 ] ∈ { 0, 1},so 𝜎 𝑞,𝑖 𝜎 𝑣,𝑖 = 2 ¯ 𝑥 𝑖 − 1. Expanding ⟨ ˆ𝑢 𝑞 , ˆ𝑢 𝑣 ⟩ = Í𝐷 𝑖 =1 (2 ¯ 𝑥 𝑖 − 1)( 𝑎 𝑞 +
+
+𝛿 𝑞 𝑚 𝑞,𝑖 )( 𝑎 𝑣 + 𝛿 𝑣 𝑚 𝑣,𝑖 ) term by term: 
+
+> 𝐷
+
+∑︁ 
+
+> 𝑖 =1
+
+(2 ¯ 𝑥 𝑖 − 1) = 2𝑝 ⊕ − 𝐷, 
+
+> 𝐷
+
+∑︁ 
+
+> 𝑖 =1
+
+(2 ¯ 𝑥 𝑖 − 1)𝑚 𝑣,𝑖 = 2𝑝 01 − 𝑠 𝑣 ,
+
+> 𝐷
+
+∑︁ 
+
+> 𝑖 =1
+
+(2 ¯ 𝑥 𝑖 − 1)𝑚 𝑞,𝑖 = 2𝑝 10 − 𝑠 𝑞 ,
+
+> 𝐷
+
+∑︁ 
+
+> 𝑖 =1
+
+(2 ¯ 𝑥 𝑖 − 1)𝑚 𝑞,𝑖 𝑚 𝑣,𝑖 = 2𝑝 11 − 𝑛 11 ,
+
+(47) proving Lemma 1. □
+
+## B.2 Bit-by-Bit Proof of the 3-to-2 Carry-Save Adder (CSA) Identity 
+
+For any single bit position 𝑖 across three binary words 𝐴, 𝐵, 𝐶 ∈{0, 1}𝑊 , integer addition of bits 𝐴 𝑖 + 𝐵 𝑖 + 𝐶 𝑖 ∈ { 0, 1, 2, 3} equals the two-bit binary representation Sum 𝑖 + 2 Carry 𝑖 , where the full-adder truth table gives Sum 𝑖 = 𝐴 𝑖 ⊕𝐵 𝑖 ⊕𝐶 𝑖 , Carry 𝑖 = (𝐴 𝑖 ∧𝐵 𝑖 ) ∨  (𝐴 𝑖 ⊕𝐵 𝑖 ) ∧ 𝐶 𝑖 
+
+. (48) Checking all 8 combinations (𝐴 𝑖 , 𝐵 𝑖 , 𝐶 𝑖 ) ∈ { 0, 1}3: for weight 0, 
+
+(0, 0) ↦ → 0; for weight 1, (Sum 𝑖 , Carry 𝑖 ) = (1, 0) ↦ → 1; for weight 2, (0, 1) ↦ → 2; and for weight 3, (1, 1) ↦ → 1 + 2 = 3. Summing over 𝑖 = 1, . . . ,𝑊 yields popcnt (𝐴 ) + popcnt (𝐵 ) + popcnt (𝐶 ) =
+
+popcnt (Sum ) + 2 popcnt (Carry ) identically. □
+
+## B.3 Three-Subset-Sum Identity, Fixed-Point Overflow Bound, and Proof of Proposition 6(1) 
+
+Derivation of (31) and Overflow-Free i16 Accumulation. Write each candidate sign as 𝜎 𝑣,𝑖 = 2𝑠 𝑣,𝑖 − 1 ∈ {± 1} with 𝑠 𝑣,𝑖 ∈ { 0, 1}.Expanding ˆ 𝑢 𝑣,𝑖 = (2𝑠 𝑣,𝑖 − 1)( 𝑎 𝑣 + 𝛿 𝑣 𝑚 𝑣,𝑖 ) directly against signed query coordinates 𝑢 𝑞,𝑖 gives 
+
+⟨𝑢 𝑞 , ˆ𝑢 𝑣 ⟩ =
+
+> 𝐷
+
+∑︁ 
+
+> 𝑖 =1
+
+𝑢 𝑞,𝑖 (2𝑠 𝑣,𝑖 − 1)  𝑎 𝑣 + 𝛿 𝑣 𝑚 𝑣,𝑖 
+
+
+
+= 𝑎 𝑣 2
+
+> 𝐷
+
+∑︁ 
+
+> 𝑖 =1
+
+𝑢 𝑞,𝑖 𝑠 𝑣,𝑖 −
+
+> 𝐷
+
+∑︁ 
+
+> 𝑖 =1
+
+𝑢 𝑞,𝑖 
+
+!
+
++ 𝛿 𝑣 2
+
+> 𝐷
+
+∑︁ 
+
+> 𝑖 =1
+
+𝑢 𝑞,𝑖 𝑠 𝑣,𝑖 𝑚 𝑣,𝑖 −
+
+> 𝐷
+
+∑︁ 
+
+> 𝑖 =1
+
+𝑢 𝑞,𝑖 𝑚 𝑣,𝑖 
+
+!
+
+= 𝑎 𝑣 
+
+ 2𝑆 + − 𝑆 tot 
+
+ + 𝛿 𝑣 
+
+ 2𝑆 +ℎ − 𝑆 ℎ
+
+, (49) and substituting 𝑢 𝑞,𝑖 = (2𝑠 𝑞,𝑖 −1)| 𝑢 𝑞,𝑖 | yields the equivalent unsigned sign-agreement form with ¯ 𝑥 𝑖 = I[𝑠 𝑞,𝑖 = 𝑠 𝑣,𝑖 ]. When AsymQuerySm 
+
+encodes 𝑢 𝑞 ∈ S𝐷 −1 as 𝑞 i16 ,𝑖 = round (8100 𝑢 𝑞,𝑖 ) and accumulates up to four 64-coordinate chunks (16 SIMD steps per i16 lane) before widening via vpmaddwd to i32 , Cauchy–Schwarz bounds every 16-term lane sum by 
+
+> 16
+
+∑︁  
+
+> 𝑡 =1
+
+|𝑞 i16 ,𝑖 𝑡 | ≤ 8100 
+
+> 16
+
+∑︁  
+
+> 𝑡 =1
+
+|𝑢 𝑞,𝑖 𝑡 | + 8
+
+≤ 8100 √16 ∥𝑢 𝑞 ∥2 + 8
+
+= 32 ,408 < 32 ,767 = 215 − 1,
+
+guaranteeing strictly overflow-free i16 SIMD accumulation for all unit directions 𝑢 𝑞 ∈ S𝐷 −1.
+
+Complete Proof of Proposition 6(1). 
+
+Proof. Let 𝑢 𝑞 , 𝑢 𝑣 ∈ S𝐷 −1 be arbitrary deterministic unit vectors with 𝛾 𝑞𝑣 = ⟨𝑢 𝑞 , 𝑢 𝑣 ⟩. Define 𝑤 ≜ 𝑢 𝑞 −𝛾 𝑞𝑣 𝑢 𝑣 ; then ⟨𝑤, 𝑢 𝑣 ⟩ = ⟨𝑢 𝑞 , 𝑢 𝑣 ⟩ − 
+
+𝛾 𝑞𝑣 ∥𝑢 𝑣 ∥22 = 0 and ∥𝑤 ∥22 = 1 − 𝛾 2 
+
+> 𝑞𝑣
+
+. Taking the inner product of 
+
+𝑢 𝑞 = 𝛾 𝑞𝑣 𝑢 𝑣 + 𝑤 with ˆ 𝑢 𝑣 and applying ⟨𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ = 𝜎 2 
+
+> 𝑣
+
+> 0 from Lemma 1: 
+
+⟨𝑢 𝑞 , ˆ𝑢 𝑣 ⟩ = 𝛾 𝑞𝑣 ⟨𝑢 𝑣 , ˆ𝑢 𝑣 ⟩ + ⟨ 𝑤, ˆ𝑢 𝑣 ⟩ = 𝛾 𝑞𝑣 𝜎 2 
+
+> 𝑣
+
++ ⟨ 𝑤, ˆ𝑢 𝑣 − 𝜎 2
+
+> 𝑣
+
+𝑢 𝑣 ⟩, (50) 
+
+> 25
+
+where the last step uses ⟨𝑤, 𝑢 𝑣 ⟩ = 0. Dividing both sides by 𝜎 2
+
+> 𝑣
+
+yields (25) deterministically for every pair (𝑢 𝑞 , 𝑢 𝑣 ) without invoking any distributional or rotational-symmetry hypothesis. In particular, along 𝑢 𝑞 = ±𝑢 𝑣 (𝑤 = 0), ⟨± 𝑢 𝑣 , ˆ𝑢 𝑣 ⟩/ 𝜎 2 
+
+> 𝑣
+
+= ±1 is exact, whereas stan-dard cosine normalization ⟨± 𝑢 𝑣 , ˆ𝑢 𝑣 ⟩/ 𝜎 𝑣 = ±𝜎 𝑣 suffers deterministic multiplicative shrinkage 1 − 𝜎 𝑣 > 0. □
+
+## C CONFORMAL COMPARISON FLIP THEORY AND SUBOPTIMALITY OF DIRECT LORENTZ-MIPS QUANTIZATION 
+
+Complete Proof of Theorem 2. Part (1): Exact flip crite-rion and depth invariance. For any 𝑣 ∈ B𝐷 𝑐 , since (𝑟 𝑞 , 𝑓 𝑞 , 𝑟 𝑣 , 𝑓 𝑣 )
+
+are stored without quantization error, 𝑅 (𝑟 𝑞 , 𝑟 𝑣 ) and 𝑊 (𝑟 𝑞 , 𝑟 𝑣 ) =
+
+2𝑟 𝑞 𝑟 𝑣 𝑓 𝑞 𝑓 𝑣 are exact, so 
+
+b𝑃 B (𝑞, 𝑣 ) − 𝑃 B (𝑞, 𝑣 )
+
+= 𝑊 (𝑟 𝑞 , 𝑟 𝑣 )  𝛾 𝑞𝑣 − ˆ𝛾 (𝑢 𝑞 , 𝑢 𝑣 )
+
+= −2𝑟 𝑞 𝑓 𝑞 𝑟 𝑣 𝑓 𝑣 𝜀 ∠ (𝑞, 𝑣 ).
+
+(51) Given 𝑃 B (𝑞, 𝑥 ) < 𝑃 B (𝑞, 𝑦 ) with Δ𝑃 (𝑞 ; 𝑥, 𝑦 ) = 𝑃 B (𝑞, 𝑦 )− 𝑃 B (𝑞, 𝑥 ) > 0, a ranking flip b𝑃 B (𝑞, 𝑦 ) ≤ b𝑃 B (𝑞, 𝑥 ) holds if and only if 
+
+Δ𝑃 (𝑞 ; 𝑥, 𝑦 ) +  b𝑃 B (𝑞, 𝑦 ) − 𝑃 B (𝑞, 𝑦 )
+
+−  b𝑃 B (𝑞, 𝑥 ) − 𝑃 B (𝑞, 𝑥 ) ≤ 0
+
+⇐⇒ 2𝑟 𝑞 𝑓 𝑞 
+
+ 𝑟 𝑦 𝑓 𝑦 𝜀 ∠ (𝑞, 𝑦 ) − 𝑟 𝑥 𝑓 𝑥 𝜀 ∠ (𝑞, 𝑥 )
+
+≥ Δ𝑃 (𝑞 ; 𝑥, 𝑦 ).
+
+(52) Since 𝑟 𝑞 > 0 implies 2 𝑟 𝑞 𝑓 𝑞 > 0, dividing by 2 𝑟 𝑞 𝑓 𝑞 yields (14). Notice that Δ𝑃 (𝑞 ;𝑥,𝑦 )  
+
+> 2𝑟 𝑞 𝑓 𝑞
+
+= (𝑟 𝑞 −𝑟 𝑦 )2 𝑓 𝑦 − ( 𝑟 𝑞 −𝑟 𝑥 )2 𝑓 𝑥  
+
+> 2𝑟 𝑞
+
++𝑟 𝑦 𝑓 𝑦 (1−𝛾 𝑞𝑦 ) − 𝑟 𝑥 𝑓 𝑥 (1−𝛾 𝑞𝑥 )
+
+remains completely bounded as 𝑟 𝑞 → 1/√𝑐 (𝑓 𝑞 → ∞ cancels out of both numerator and denominator). Furthermore, on an isobathic shell 𝑟 𝑥 = 𝑟 𝑦 = 𝑟 > 0 ( 𝑓 𝑥 = 𝑓 𝑦 = 𝑓 ), 𝑅 (𝑟 𝑞 , 𝑟 𝑦 ) = 𝑅 (𝑟 𝑞 , 𝑟 𝑥 ) cancels in Δ𝑃 , leaving Δ𝑃 (𝑞 ; 𝑥, 𝑦 ) = 2𝑟 𝑞 𝑓 𝑞 𝑟 𝑓 (𝛾 𝑞𝑥 − 𝛾 𝑞𝑦 ); dividing (14) by 
+
+𝑟 𝑓 > 0 yields 𝜀 ∠ (𝑞, 𝑦 ) − 𝜀 ∠ (𝑞, 𝑥 ) ≥ 𝛾 𝑞𝑥 − 𝛾 𝑞𝑦 , which is independent of both 𝑓 𝑞 and 𝑓 .
+
+Part (2): Cross-shell query-noise non-cancellation. Sub-stituting 𝜀 ∠ (𝑞, 𝑣 ) = 𝜂 𝑞 (𝑢 𝑣 ) + 𝜂 𝑣 (𝑢 𝑞 ) + 𝜉 𝑞𝑣 into ΔbΨrank (𝑞 ; 𝑥, 𝑦 ) =
+
+(b𝑃 B (𝑞, 𝑥 ) − 𝑃 B (𝑞, 𝑥 )) − ( b𝑃 B (𝑞, 𝑦 ) − 𝑃 B (𝑞, 𝑦 )) and writing 𝑊 𝑣 =
+
+𝑊 (𝑟 𝑞 , 𝑟 𝑣 ):
+
+ΔbΨrank (𝑞 ; 𝑥, 𝑦 )
+
+= 𝑊 𝑦 𝜂 𝑞 (𝑢 𝑦 ) − 𝑊 𝑥 𝜂 𝑞 (𝑢 𝑥 )+  𝑊 𝑦 𝜂 𝑦 (𝑢 𝑞 ) − 𝑊 𝑥 𝜂 𝑥 (𝑢 𝑞 )
+
++  𝑊 𝑦 𝜉 𝑞𝑦 − 𝑊 𝑥 𝜉 𝑞𝑥 
+
+
+
+= (𝑊 𝑦 − 𝑊 𝑥 )𝜂 𝑞 (𝑢 𝑥 ) + 𝑊 𝑦 ⟨𝑒 𝑞 , 𝑢 𝑦 − 𝑢 𝑥 ⟩+  𝑊 𝑦 𝜂 𝑦 (𝑢 𝑞 ) − 𝑊 𝑥 𝜂 𝑥 (𝑢 𝑞 )
+
++  𝑊 𝑦 𝜉 𝑞𝑦 − 𝑊 𝑥 𝜉 𝑞𝑥 
+
+.
+
+(53) At 𝑢 𝑥 = 𝑢 𝑦 , ⟨𝑒 𝑞 , 𝑢 𝑦 −𝑢 𝑥 ⟩ = 0. The first-order query term has variance 
+
+(𝑊 𝑦 − 𝑊 𝑥 )2𝑢 ⊤ 
+
+> 𝑥
+
+Σ𝑞 𝑢 𝑥 for Σ𝑞 = Cov (𝑒 𝑞 ). Under Σ𝑞 = 𝜅 𝑞  
+
+> 𝐷
+
+(𝐼 𝐷 − 𝑢 𝑞 𝑢 ⊤ 
+
+> 𝑞
+
+),Var 𝑒 𝑞 (𝜂 𝑞 (𝑢 𝑥 )) = 𝑢 ⊤ 
+
+> 𝑥
+
+Cov (𝑒 𝑞 )𝑢 𝑥 = 𝜅 𝑞  
+
+> 𝐷
+
+(1 − 𝛾 2 
+
+> 𝑞𝑥
+
+); substituting 𝑊 𝑦 −
+
+𝑊 𝑥 = 2 
+
+> 𝑐
+
+sinh 𝜌 𝑞 (sinh 𝜌 𝑦 −sinh 𝜌 𝑥 ) proves (15). When |𝜌 𝑦 −𝜌 𝑥 | ≤ 𝛿 𝜌 ,
+
+| sinh 𝜌 𝑦 − sinh 𝜌 𝑥 | = 2 sinh |𝜌 𝑦 −𝜌 𝑥 | 
+
+> 2
+
+cosh 𝜌 𝑦 +𝜌 𝑥  
+
+> 2
+
+= 𝑂 (𝛿 𝜌 cosh 𝜌 𝑥 ),bounding (𝑊 𝑦 − 𝑊 𝑥 )2 = 𝑂 (𝛿 2
+
+> 𝜌
+
+𝑊 2 
+
+> 𝑥
+
+). When 𝑒 𝑞 = 0, 𝜂 𝑞 ≡ 0 and 
+
+𝜉 𝑞𝑣 ≡ 0 for all (𝑟 𝑥 , 𝑟 𝑦 ).
+
+Part (3): Direct (𝐷 + 1)-D Lorentz-MIPS suboptimality. 
+
+On L𝐷 𝑐 , 𝑧 = ( 1√𝑐 cosh 𝜌 𝑧 , 1√𝑐 sinh 𝜌 𝑧 𝑢 𝑧 ). If ˜ 𝑧 𝑣 = 1√𝑐 sinh 𝜌 𝑣 𝑢 𝑣 ∈
+
+R𝐷 is quantized directly by a coordinate quantizer ˆ˜𝑧 𝑣 = ˜𝑧 𝑣 +
+
+𝜖 𝑣 without factoring out ∥ ˜𝑧 𝑣 ∥2 = 1√𝑐 sinh 𝜌 𝑣 , the stated model Cov (𝜖 𝑣 ) = Θ(∥ ˜𝑧 𝑣 ∥22/𝐷 )𝐼 𝐷 gives Var (⟨ ˜𝑧 𝑞 , 𝜖 𝑣 ⟩) = Θ( 1 
+
+> 𝐷
+
+∥ ˜𝑧 𝑞 ∥22 ∥ ˜𝑧 𝑣 ∥22) =
+
+Θ( 1 
+
+> 𝑐 2𝐷
+
+sinh 2 𝜌 𝑞 sinh 2 𝜌 𝑣 ). In particular, when 𝑢 𝑥 = 𝑢 𝑦 = 𝑢 𝑞 (𝜃 𝑞𝑥 =
+
+𝜃 𝑞𝑦 = 0) with 𝜌 𝑥 ≠ 𝜌 𝑦 , polar decoupling has ⟨𝑢 𝑞 , ˆ𝑢 𝑥 ⟩/ 𝜎 2 
+
+> 𝑥
+
+= 1 (or ex-act radial comparison 𝑅 (𝑟 𝑞 , 𝑟 𝑣 )), whereas direct Lorentz coordinate quantization suffers Θ(𝑒 𝜌 𝑞 +max (𝜌 𝑥 ,𝜌 𝑦 ) /√𝐷 ) noise along the radial direction itself and provides no 𝑂 (1) radial lower bound 𝑃 rad prior to scanning 𝐷 coordinates. □
+
+## D HYPERBOLIC VAMANA PATHOLOGIES, STEM-EXCESS DOMINANCE, AND CHORD-SWAP INVARIANTS D.1 Complete Proof of Theorem 3 
+
+Proof. Claim (1): Radial occlusion bound. Let 𝑢, 𝑝, 𝑣 ∈ B𝐷 𝑐 
+
+have geodesic radii 𝑅 𝑢 , 𝑅 𝑝 , 𝑅 𝑣 from the origin 0, with 𝛼𝑅 𝑝 < 𝑅 𝑢 .Applying the metric triangle inequality on (B𝐷 𝑐 , 𝑑 B) through 0 gives two angle-independent bounds valid for all spherical directions 
+
+𝑢 𝑢 , 𝑢 𝑝 , 𝑢 𝑣 ∈ S𝐷 −1:
+
+𝑑 B (𝑝, 𝑣 ) ≤ 𝑑 B (𝑝, 0) + 𝑑 B (0, 𝑣 )
+
+= 𝑅 𝑝 + 𝑅 𝑣 ,𝑑 B (𝑢, 𝑣 ) ≥ 𝑑 B (𝑢, 0) − 𝑑 B (0, 𝑣 )
+
+≥ 𝑅 𝑢 − 𝑅 𝑣 .
+
+(54) Whenever 𝑅 𝑣 ≤ 𝑅 𝑢 −𝛼𝑅 𝑝  
+
+> 𝛼 +1
+
+, rearranging (𝛼 + 1)𝑅 𝑣 ≤ 𝑅 𝑢 − 𝛼𝑅 𝑝 yields 
+
+𝛼 (𝑅 𝑝 + 𝑅 𝑣 ) ≤ 𝑅 𝑢 − 𝑅 𝑣 , whence 
+
+𝛼 𝑑 B (𝑝, 𝑣 ) ≤ 𝛼 (𝑅 𝑝 + 𝑅 𝑣 ) ≤ 𝑅 𝑢 − 𝑅 𝑣 ≤ 𝑑 B (𝑢, 𝑣 ) (55) for every 𝜃 𝑝𝑣 ∈ [ 0, 𝜋 ] (attaining worst-case equality on 𝑑 B (𝑝, 𝑣 ) =
+
+𝑅 𝑝 + 𝑅 𝑣 when 𝑢 𝑣 = −𝑢 𝑝 , i.e., 180 ◦ opposite 𝑝 ). To isolate the curvature-specific angular contraction from this generic metric ball, consider any same-shell pair 𝑢, 𝑣 ∈ B𝐷 𝑐 at geodesic radius 𝑅 𝑢 = 𝑅 𝑣 = 𝑅 > 0 ( 𝜌 = √𝑐 𝑅 ) and angle 
+
+𝜃 𝑢𝑣 ∈ [0, 𝜋 ] relative to the origin neighbor 𝑝 = 0 ( 𝑅 𝑝 = 0 <
+
+𝑅 /𝛼 ). Substituting 𝜌 𝑢 = 𝜌 𝑣 = 𝜌 into the warped-product iden-tity 𝑐  
+
+> 4
+
+𝑃 B (𝑢, 𝑣 ) = sinh 2 ( 
+
+> √𝑐
+> 2
+
+𝑑 B (𝑢, 𝑣 )) = sinh 2 𝜌 sin 2 (𝜃 𝑢𝑣 /2) yields sinh ( 
+
+> √𝑐
+> 2
+
+𝑑 B (𝑢, 𝑣 )) = sinh 𝜌 sin (𝜃 𝑢𝑣 /2). Because 𝑑 B (0, 𝑣 ) = 𝑅 , the pruning test 𝛼 𝑑 B (0, 𝑣 ) ≤ 𝑑 B (𝑢, 𝑣 ) holds if and only if sin 
+
+ 𝜃 𝑢𝑣 
+
+2
+
+
+
+≥ sinh   𝛼  
+
+> 2
+
+𝜌 
+
+sinh 𝜌 . (56) In the flat limit 𝑐 → 0+, sinh ( 𝛼  
+
+> 2
+
+𝜌 )/ sinh 𝜌 → 𝛼 /2, keeping the sur-viving unoccluded cone constant at 𝜃 surv = 2 arcsin (𝛼 /2) ≈ 73 .7◦
+
+for 𝛼 = 1.2. Under negative curvature −𝑐 < 0 and 𝛼 ∈ ( 1, 2),sinh ( 𝛼  
+
+> 2
+
+𝜌 )/ sinh 𝜌 ∼ 𝑒 − 2−𝛼   
+
+> 2𝜌
+
+decays exponentially with depth 𝜌 ,shrinking the surviving cone to 23 .1◦ at 𝜌 = 4 and 10 .4◦ at 𝜌 = 6. 
+
+Claim (2): Angular escape condition. Since arccosh is strictly increasing on [1, ∞) and 𝑑 B (𝑞, 0) = 𝑅 𝑞 = 𝜌 𝑞 /√𝑐 , we have 𝑑 B (𝑞, 𝑣 ) <
+
+> 26
+
+𝑑 B (𝑞, 0) if and only if cosh 𝜌 𝑞 cosh 𝜌 𝑣 − sinh 𝜌 𝑞 sinh 𝜌 𝑣 𝛾 𝑞𝑣 < cosh 𝜌 𝑞 
+
+⇐⇒ cosh 𝜌 𝑞 (cosh 𝜌 𝑣 − 1) < sinh 𝜌 𝑞 sinh 𝜌 𝑣 𝛾 𝑞𝑣 . (57) For 𝑅 𝑞 , 𝑅 𝑣 > 0, sinh 𝜌 𝑞 sinh 𝜌 𝑣 > 0; dividing through and using the half-angle identity cosh 𝜌 𝑣 −1sinh 𝜌 𝑣 = 2 sinh 2 (𝜌 𝑣 /2)    
+
+> 2 sinh (𝜌 𝑣 /2)cosh (𝜌 𝑣 /2)
+
+= tanh (𝜌 𝑣 /2)
+
+gives 𝛾 𝑞𝑣 > tanh (𝜌 𝑣 /2)  
+
+> tanh 𝜌 𝑞
+
+= tanh (√𝑐𝑅 𝑣 /2)  
+
+> tanh (√𝑐𝑅 𝑞 )
+
+.
+
+Claim (3): Offset-intercept and proxy non-homogeneity distortion. If ˆ𝑑 (𝑥, 𝑦 ) = 𝑎 ˜𝑑 (𝑥, 𝑦 ) + 𝑏 with 𝑎 > 0, 𝑏 ≠ 0, then ˆ𝑑 (𝑢, 𝑣 ) − 𝛼 ˆ𝑑 (𝑤, 𝑣 ) = 𝑎   ˜𝑑 (𝑢, 𝑣 ) − 𝛼 ˜𝑑 (𝑤, 𝑣 ) + ( 1 − 𝛼 )𝑏. (58) Since 𝛼 > 1, (1−𝛼 )𝑏 < 0 for 𝑏 > 0, making the nonnegative pruning-margin test harder and producing under-pruning. For 𝑏 < 0, the test becomes easier and produces over-pruning. For direct proxy slack 𝛼𝑃 B (𝑤, 𝑣 ) ≤ 𝑃 B (𝑢, 𝑣 ), note from (11) that exact geodesic slack requires 𝑃 𝛼 (𝑃 ) = 2 
+
+> 𝑐
+
+(cosh (𝛼 arccosh (1 + 𝑐  
+
+> 2
+
+𝑃 )) − 1): as 𝑃 → 0+,
+
+𝑃 𝛼 (𝑃 ) ∼ 𝛼 2𝑃 , whereas as 𝑃 → ∞ , 𝑃 𝛼 (𝑃 ) ∼ 1 
+
+> 𝑐
+
+(𝑐𝑃 )𝛼 = 𝑐 𝛼 −1𝑃 𝛼 ≫
+
+𝛼𝑃 since 𝛼 > 1. The exact pruning test is 𝑃 𝛼 (𝑃 (𝑤, 𝑣 )) ≤ 𝑃 (𝑢, 𝑣 ).Since 𝑃 (𝑑 ) = 2 
+
+> 𝑐
+
+(cosh (√𝑐 𝑑 ) − 1) is strictly convex with 𝑃 (0) = 0, 
+
+𝑃 (𝛼𝑑 ) > 𝛼𝑃 (𝑑 ) for 𝑑 > 0, 𝛼 > 1. Replacing 𝑃 𝛼 (𝑃 ) by 𝛼𝑃 expands the set of accepted dominance pairs and produces over-pruning. □
+
+## D.2 Reverse-Triangle Shortcut and Channel-Wise Flat Limits 
+
+Lossless 𝑂 (1) Reverse-Triangle Shortcut. By the reverse triangle inequality on (B𝐷 𝑐 , 𝑑 B), ˜𝑑 (𝑤, 𝑣 ) = √𝑐 𝑑 B (𝑤, 𝑣 ) ≥ | √𝑐 𝑑 B (0, 𝑤 ) − √𝑐 𝑑 B (0, 𝑣 )| = |𝜌 𝑤 − 𝜌 𝑣 |. Therefore, if 𝛼 |𝜌 𝑤 − 𝜌 𝑣 | > ˜𝑑 eff (𝑢, 𝑣 ; 𝑤 ), we immediately have 𝛼 ˜𝑑 (𝑤, 𝑣 ) ≥ 𝛼 |𝜌 𝑤 − 𝜌 𝑣 | > ˜𝑑 eff (𝑢, 𝑣 ; 𝑤 ), proving 
+
+¬ Dom geo (𝑤 | 𝑢, 𝑣 ) with zero false rejections and without comput-ing arccosh. 
+
+Constant-Depth and Flat-Curvature Limits. For constant depth 
+
+𝜌 𝑣 = 𝜌 0, both elevator candidate sets are empty and Δstem = 0. Ring ordering uses angular loss alone, and every selected neighbor satisfies the radial shield. The geodesic channel retains 𝛼𝑑 (𝑤, 𝑣 ) ≤ 
+
+𝑑 (𝑢, 𝑣 ), whereas the ring uses 𝛼ℓ ∠ (𝑤, 𝑣 ) ≤ ℓ∠ (𝑢, 𝑣 ). In the limit 𝑐 →
+
+0+ at fixed Euclidean coordinates, 𝑓 𝑧 → 2 and 𝑑 B (𝑥, 𝑦 ) → 2∥𝑥 −
+
+𝑦 ∥2. At constant Euclidean radius, the geodesic-channel condition consequently becomes 𝛼 2ℓ∠ (𝑤, 𝑣 ) ≤ ℓ∠ (𝑢, 𝑣 ), while the ring keeps its angular 𝛼 test. Both channels select spherical diversity at their respective slack values. □
+
+## D.3 Degree-𝑀 0 and Reachability Invariant of Chord-Swap Island Repair 
+
+Proposition 7 (Spanning-Tree Chord-Swap Invariant). Sup-pose the entry set E ⊂ 𝑉 is non-empty, (R , parent ) is initialized by directed BFS from E, and Algorithm 1’s single repair pass up-dates edge slots, deg − (·) , and parent [·] sequentially. Whenever an unreachable vertex 𝑢 ∉ R selects a reachable anchor 𝑝 ∈ R that either satisfies deg + (𝑝 ) < 𝑀 0 or owns a non-tree chord 𝑝 → 𝑤 ★
+
+with parent [𝑤 ★] ≠ 𝑝 and deg − (𝑤 ★) ≥ 2: (i) all vertices preserve 
+
+deg + (𝑣 ) ≤ 𝑀 0, (ii) every vertex previously having deg − (𝑤 ) ≥ 1 (in-cluding 𝑤 ★ and 𝑢 ) maintains deg − (𝑤 ) ≥ 1, (iii) zero BFS spanning-tree edges in {( parent [𝑣 ], 𝑣 ) : 𝑣 ∈ R \ E} are overwritten, so every vertex in R remains permanently reachable from E, and (iv) attach-ing 𝑝 → 𝑢 plus incremental directed BFS from 𝑢 strictly increases 
+
+|R| by at least 1. Hence, whenever every remaining island locates a qualifying anchor 𝑝 , the single pass terminates with 100% directed reachability ( |R| = 𝑁 ). 
+
+Proof. Let 𝑇 = {( parent [𝑣 ], 𝑣 ) : 𝑣 ∈ R \ E} denote the current directed BFS spanning tree rooted at E. By induction on the BFS depth stored in parent [·] , every 𝑣 ∈ R retains a directed path from E inside 𝑇 . If deg + (𝑝 ) < 𝑀 0, appending 𝑝 → 𝑢 preserves deg + (𝑝 ) ≤ 𝑀 0, deletes no edges of 𝐺 , and sets deg − (𝑢 ) ≥ 1. If deg + (𝑝 ) = 𝑀 0, replacing 𝑝 → 𝑤 ★ with 𝑝 → 𝑢 leaves deg + (𝑝 ) = 𝑀 0
+
+unchanged, increments deg − (𝑢 ) by one, and decrements deg − (𝑤 ★)
+
+to deg − (𝑤 ★) − 1 ≥ 1. Because the explicit guard parent [𝑤 ★] ≠ 𝑝 
+
+ensures (𝑝, 𝑤 ★) ∉ 𝑇 , 𝑇 remains an intact subgraph of 𝐺 and no previously reachable vertex in R can become disconnected through cycle breakage. Since 𝑝 ∈ R stays reachable and 𝑝 → 𝑢 is present, setting parent [𝑢 ] = 𝑝 validly extends 𝑇 to 𝑢 and, via incremental directed BFS from 𝑢 , to every unvisited vertex reachable from 𝑢 ,strictly enlarging |R| . When every island 𝑢 ∉ R encountered by the pass obtains a qualifying anchor, no unreachable vertices can remain upon completion. □
+
+## E TANGENT-CONE RECOVERY, POOL-DILUTION INVERSION, OFF-AXIS CJ-GATE, AND SKETCH VARIANCE E.1 Complete Proof of Theorem 4 
+
+Proof. Part (1). For equal radial and axial coordinates, subtract-ing (19) gives 𝛾 𝑞𝑦 − 𝛾 𝑞𝑥 = 𝛽 𝑞,𝑐 𝛽 Δ ˜𝑟 . Global proxy error is −𝑊 𝑔 𝑣 , so the comparison-error variance is 𝑊 2 Var (𝑔 𝑦 −𝑔 𝑥 ) = 𝑊 2𝑉 𝑔 . Division by its standard deviation proves (20). The covariance term captures the shared query, common bitplanes, and threshold crossings of nearby candidates. 
+
+Part (2). Condition on the retained cone pool and its true-neighbor membership. Under uniform score ranks, every member has probability 𝐵 /𝑁 𝑐 (𝐿 ) of occupying a rerank slot. Let 𝐼 𝑣 indicate admission of true neighbor 𝑣 . Linearity of expectation gives 
+
+E
+
+∑︁ 𝑣 ∈𝐺 𝑘 ∩𝐶 𝐿 ∩𝑐 
+
+𝐼 𝑣 
+
+
+
+=∑︁    
+
+> 𝑣 ∈𝐺 𝑘 ∩𝐶 𝐿 ∩𝑐
+
+𝐵 𝑁 𝑐 (𝐿 ) = 𝐵𝑘 𝑐 (𝐿 )
+
+𝑁 𝑐 (𝐿 ) . (59) Taking the ratio at two widths proves the stated decrease condi-tion. For arbitrary ranks the same identity is E[| 𝐺 𝑘 ∩ 𝐹 𝐵 | | 𝐶 𝐿 ] =
+
+Í𝑣 ∈𝐺 𝑘 ∩𝐶 𝐿 Pr (𝑣 ∈ 𝐹 𝐵 | 𝐶 𝐿 ). The implementation orders score ties deterministically, and the four-stage audit measures these actual admission counts. 
+
+Part (3). Subtract (19) from (21). The axial product cancels and yields ˆ 𝛾 cone − 𝛾 = 𝛽 𝑞,𝑐 𝛽 𝑣 𝑒 𝑣 for every pair. For equal 𝛽 𝑥 = 𝛽 𝑦 =
+
+𝛽 , comparison-error variance is 𝑊 2𝛽 2 
+
+> 𝑞,𝑐
+
+𝛽 2𝑉 𝑟 . Cancelling 𝑊 𝛽 𝑞,𝑐 𝛽 
+
+proves (22). Equal marginal variances 𝜅 SM /𝐷 with correlation 𝜚 
+
+give 𝑉 𝑟 = 2𝜅 SM (1 − 𝜚 )/ 𝐷 by direct substitution. □
+
+## E.2 FP32 Polar and Axial Scalar Perturbations 
+
+Polar headers store scalars computed in FP64 and rounded inde-pendently to FP32. The implementation stores 𝐹 = 𝑓 /2, so the following bounds for 𝑓 apply to twice the stored boundary factor. 
+
+> 27
+
+For a normal finite scalar, round-to-nearest gives |𝛿𝑟 | ≤ 𝑢 32 |𝑟 | and 
+
+|𝛿 𝑓 | ≤ 𝑢 32 |𝑓 |, where 𝑢 32 = 2−24 . In particular, the stored conformal factor retains relative error at most 𝑢 32 from this final conversion. For an FP64 query, define 𝐴 = 𝑟 2 
+
+> 𝑞
+
++𝑟 2 −2𝑟 𝑞 𝑟𝛾 and 𝑇 = 2|𝑟 −𝑟 𝑞 𝛾 |𝜖 𝑟 +𝜖 2 
+
+> 𝑟
+
+,with 𝜖 𝑟 = 𝑢 32 |𝑟 | and 𝜖 𝑓 = 𝑢 32 |𝑓 |. Header conversion changes the real-valued proxy by at most 
+
+|e𝑃 − 𝑃 | ≤ 𝑓 𝑞 
+
+𝑓 𝑇 + 𝜖 𝑓 (𝐴 + 𝑇 ) . (60) Indeed, replacing 𝑟 by 𝑟 + 𝛿𝑟 changes 𝐴 by 2 (𝑟 − 𝑟 𝑞 𝛾 )𝛿𝑟 + 𝛿𝑟 2, and multiplying by 𝑓 + 𝛿 𝑓 gives the bound. Setting 𝛾 = 1 gives the radial-gate perturbation. With the mapped-data evaluation clamp 
+
+𝑟 ≤ 1 − 10 −6 at 𝑐 = 1, 𝑓 ≤ 1,000 ,000 .501 and 𝜖 𝑓 ≤ 0.059605. For an axial scalar ˜ 𝛼 = 𝛼 + 𝛿𝛼 clipped to [− 1, 1], define ˜𝛽 = √1 − ˜𝛼 2. Then 
+
+| ˜𝛽 − 𝛽 | = |2𝛼𝛿𝛼 + ( 𝛿𝛼 )2 |
+
+˜𝛽 + 𝛽 (61) whenever the denominator is positive. The cone scorer clips the square-root argument at zero and uses the axial product for a de-generate residual. Final reranking evaluates the original FP32 coor-dinates with FP64 accumulation. 
+
+## E.3 Off-Axis CJ-Gate Jacobian and 5.49 ×
+
+## Underestimation Counterexample 
+
+From 𝑃 B (𝑞, 𝑣 ) = 𝑅 (𝑟 𝑞 , 𝑟 𝑣 ) + 2𝑟 𝑞 𝑟 𝑣 𝑓 𝑞 𝑓 𝑣 (1 − 𝛾 𝑞𝑣 ) and (21), only ˆ𝛾 asym ( ˜𝑟 𝑞,𝑐 , ˜𝑟 𝑣 ) carries quantization uncertainty 𝜎 0 =√︁ 𝜅 SM /𝐷 , mul-tiplied by 𝜕 ˆ𝛾 cone   
+
+> 𝜕 ˆ𝛾 asym
+
+= 𝛽 𝑞,𝑐 𝛽 𝑣 and 𝜕𝑃 B 
+
+> 𝜕𝛾 𝑞𝑣
+
+= 2𝑟 𝑞 𝑟 𝑣 𝑓 𝑞 𝑓 𝑣 , proving (26). If an implementation approximates 𝑞 as lying at the cluster cen-ter ( 𝛽 𝑞,𝑐 ≈ 𝛽 𝑣 ), replacing 𝛽 𝑞,𝑐 𝛽 𝑣 by 𝛽 2 
+
+> 𝑣
+
+mis-scales 𝜎 𝑃 (𝑞, 𝑣 ) by 𝛽 𝑞,𝑐  
+
+> 𝛽 𝑣
+
+:for a boundary-cone query at 𝛼 𝑞,𝑐 = 0.84 ( 𝛽 𝑞,𝑐 = √1 − 0.84 2 ≈
+
+0.5426) evaluating a near-axis candidate at 𝛼 𝑣 = 0.9951 ( 𝛽 𝑣 =
+
+√1 − 0.9951 2 ≈ 0.0989), 𝛽 𝑞,𝑐  
+
+> 𝛽 𝑣
+
+= 0.5426 0.0989 ≈ 5.49, underestimating true plateau uncertainty by 5 .49 ×. Using exact ˜𝛽 (𝑞, 𝑣 ) = 𝛽 𝑞,𝑐 𝛽 𝑣 
+
+eliminates this underestimation across all query angles. 
+
+## E.4 Binomial Variance Propagation for 
+
+## SymSketch256 
+
+Let 𝐻 ∈ { 0, . . . , 𝐵 𝑠 } (𝐵 𝑠 = 256) be the Hamming distance over 𝐵 𝑠 
+
+sampled coordinates with disagreement probability 𝑝 ∈ ( 0, 1), so 
+
+E[𝐻 /𝐵 𝑠 ] = 𝑝 and Var (𝐻 /𝐵 𝑠 ) = 𝑝 (1−𝑝 ) 
+
+> 𝐵 𝑠
+
+. Applying the first-order delta method to 𝑔 (𝑝 ) = cos (𝜋𝑝 ) (|𝑔 ′ (𝑝 )| = 𝜋 sin (𝜋𝑝 )) gives 
+
+𝜎 sk (𝑝 ) = 𝑔 ′ (𝑝 )√︁ Var (𝐻 /𝐵 𝑠 ) = 𝜋 
+
+√𝐵 𝑠 
+
+sin (𝜋𝑝 )√︁ 𝑝 (1 − 𝑝 ). (62) Define 𝑢 (𝑝 ) = sin (𝜋𝑝 )√︁ 𝑝 (1 − 𝑝 ). At high-similarity reference 
+
+𝑝 ref = 48 /256 = 0.1875 (cos (𝜋𝑝 ref ) ≈ 0.8315), 𝑢 (𝑝 ref ) =
+
+sin (0.1875 𝜋 )√0.1875 × 0.8125 ≈ 0.5556 × 0.3903 ≈ 0.2168. Near orthogonality 𝑝 = 115 /256 ≈ 0.4492 (cos (𝜋𝑝 ) ≈ 0.159), 𝑢 (𝑝 ) =
+
+sin (0.4492 𝜋 )√0.4492 × 0.5508 ≈ 0.9873 × 0.4974 ≈ 0.4911, giv-ing 𝑢 (115 /256 )  
+
+> 𝑢 (48 /256 )
+
+≈ 0.4911 0.2168 ≈ 2.265 (peaking at 0 .5/0.2168 ≈ 2.306 at 
+
+𝑝 = 0.5). □
+
+## F FOUR-STAGE TELESCOPING RECALL-LOSS IDENTITY AND SUPPLEMENTARY BREAKDOWNS F.1 Proof of the Four-Stage Telescoping Recall-Loss Identity (33) 
+
+Proof. Because every stage filters the output of the preceding stage ( 𝑅 𝑘 (𝑞 ) ⊆ 𝐹 𝐵 (𝑞 ) ⊆ 𝐶 𝐿 (𝑞 ) ⊆ 𝑉 (𝑞 )), intersecting with 𝐺 𝑘 (𝑞 )
+
+preserves inclusion: 
+
+𝐺 𝑘 (𝑞 ) ∩ 𝑅 𝑘 (𝑞 ) ⊆ 𝐺 𝑘 (𝑞 ) ∩ 𝐹 𝐵 (𝑞 )⊆ 𝐺 𝑘 (𝑞 ) ∩ 𝐶 𝐿 (𝑞 )⊆ 𝐺 𝑘 (𝑞 ) ∩ 𝑉 (𝑞 ) ⊆ 𝐺 𝑘 (𝑞 ).
+
+(63) For any finite nested chain 𝐴 4 ⊆ 𝐴 3 ⊆ 𝐴 2 ⊆ 𝐴 1 ⊆ 𝐴 0 with |𝐴 0 | = 𝑘 ,
+
+|𝐴 0 | − | 𝐴 4 | = |𝐴 0 \𝐴 1 | + | 𝐴 1 \𝐴 2 | + | 𝐴 2 \𝐴 3 | + | 𝐴 3 \𝐴 4 |; dividing by 𝑘 
+
+yields (33). Moreover, suppose exact IEEE-754 FP64 reranking sorts 
+
+𝐹 𝐵 (𝑞 ) strictly by true geodesic distance 𝑑 B (𝑞, ·) (with consistent tie-breaking matching 𝐺 𝑘 (𝑞 )) and returns the top 𝑘 elements 𝑅 𝑘 (𝑞 )
+
+(|𝐹 𝐵 (𝑞 )| ≥ 𝑘 ). For any 𝑣 ★ ∈ 𝐺 𝑘 (𝑞 ) ∩ 𝐹 𝐵 (𝑞 ), at most 𝑘 −1 points in the entire dataset X—and a fortiori at most 𝑘 − 1 points in 𝐹 𝐵 (𝑞 ) ⊆ X —precede 𝑣 ★ in exact geodesic order, so 𝑣 ★ must lie in the top 𝑘 of 
+
+𝐹 𝐵 (𝑞 ), i.e., 𝑣 ★ ∈ 𝑅 𝑘 (𝑞 ). Hence 𝐺 𝑘 (𝑞 ) ∩ ( 𝐹 𝐵 (𝑞 ) \ 𝑅 𝑘 (𝑞 )) = ∅ and 
+
+Lrerank (𝑞 ) ≡ 0. □
+
+## F.2 Supplementary Stage-Wise Audit and Component Ablation Matrix 
+
+Table 11: Controlled component ablation on Clustered-Narrow ( 𝑁 = 1M, 𝐷 = 512 , 𝜌 ∈ [ 3.9, 4.1], fixed 𝐿 = 256 , 𝐵 = 128 ,AMD Zen 4 32T build / 1T search).                           
+
+> Configuration Cones Build (32T) Recall@10 1T QPS
+> Global-SM (No Rescue) 021.9 s 34.22% 2,071
+> + CJ-Gate Only 021.9 s 50.59% 1,884 + Var.-Stab. SymSketch256 021.5 s 34.22% 1,960 +ResidualConeDict +CJ-Gate 256 25.7 s 99.37% 1,958
+> Pelorus 256 25.3 s 99.39% 1,840
+
+Table 11 reports the controlled fixed-budget ablation ( 𝐿 =
+
+256 , 𝐵 = 128, independent Zen 4 graph builds per configuration) on Clustered-Narrow: on the diagnostic subset, Global-SM traversal without tangent-cone rescue or adaptive gating visits 93 .9% of true neighbors ( Lreach = 6.1%) yet loses 44 .6% inside the bounded 𝐿 -beam ( Lbeam ) and 16 .3% at pool gating ( Lgate , 33 .0% subset / 34 .22% full Recall@10). The full-query measurements raise recall from 34 .22% to 50 .59% with CJ-Gate alone (1 ,884 QPS). Residual encoding with CJ-Gate reaches 99 .365% (1 ,958 QPS), and full Pelorus reaches 99 .385% (1 ,840 QPS 1T and 38 ,876 QPS 24T). At 𝐿 = 384 , 𝐵 = 128, full-method recall is 99 .80%. Residual encoding reuses the existing per-vertex bitplanes and header slots.

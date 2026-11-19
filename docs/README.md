@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-18</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-19</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
     <strong class="dpr-home-dashboard-count">共 14 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>10</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>5</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>9</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-18 01:41:56 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-19 01:11:24 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日完成 14 篇论文筛选，精读 4 篇、速读 10 篇，重点集中在检索索引与向量查询优化。最值得看的是 UniGraph（9.0/10）提出的动态稠密-稀疏统一图索引，以及 CapCover Filter（8.0/10）的语义近似成员查询思路。普通读者可先读这两篇精读，再用速读中的智能体评测类论文补充应用视角。</p>
+<p>今天筛完14篇（精读5篇、速读9篇），重点落在向量检索索引与智能体记忆两条主线。最值得看的是两篇9.0分索引工作：SIMQ用单一图索引统一多向量查询，Pelorus把双曲向量搜索做成warped-product图索引。普通读者可先读这两篇的引言与方法图，再按兴趣翻速读里的多粒度记忆检索、智能体技能评测和终身具身导航。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +78,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">4 篇</strong>
+    <strong class="dpr-home-dashboard-count">5 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="UniGraph: A Unified Graph-based Index for Dynamic Hybrid Dense-Sparse Vector Retrieval">UniGraph: A Unified Graph-based Index for Dynamic Hybrid Dense-Sparse Vector Retrieval</span></li><li><span class="dpr-home-dashboard-paper-title" title="CapCover Filter: Semantic Approximate Membership Queries over Embeddings">CapCover Filter: Semantic Approximate Membership Queries over Embeddings</span></li><li><span class="dpr-home-dashboard-paper-title" title="HEAMS: Holistic Evaluation of Agent Memory Systems">HEAMS: Holistic Evaluation of Agent Memory Systems</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="SIMQ: A Single Graph-based Index for Multi-Vector Query">SIMQ: A Single Graph-based Index for Multi-Vector Query</span></li><li><span class="dpr-home-dashboard-paper-title" title="Pelorus: Warped-Product Graph Indexing for Hyperbolic Vector Search">Pelorus: Warped-Product Graph Indexing for Hyperbolic Vector Search</span></li><li><span class="dpr-home-dashboard-paper-title" title="RAG in a Trenchcoat: When Minimal Memory Is Enough for Agentic Systems, and When It Isn&#x27;t">RAG in a Trenchcoat: When Minimal Memory Is Enough for Agentic Systems, and When It Isn&#x27;t</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>2</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>2</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>2</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +91,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">10 篇</strong>
+    <strong class="dpr-home-dashboard-count">9 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Orbit AI: Evaluating Tool-Augmented Agents For Enterprise Question Answering">Orbit AI: Evaluating Tool-Augmented Agents For Enterprise Question Answering</span></li><li><span class="dpr-home-dashboard-paper-title" title="Behavioral Assurance for Socially Deployed AI Agents">Behavioral Assurance for Socially Deployed AI Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Bioformer-RetroMAE: retrieval-oriented pretraining of a compact biomedical language model for literature search">Bioformer-RetroMAE: retrieval-oriented pretraining of a compact biomedical language model for literature search</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="SkillBuffBench: Measuring What Agent Skills Contribute across Harnesses, Models, Skill Access Modes and Memory">SkillBuffBench: Measuring What Agent Skills Contribute across Harnesses, Models, Skill Access Modes and Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="Beyond Episodic Recall: Experience-to-Knowledge Evolution for Lifelong Embodied Navigation">Beyond Episodic Recall: Experience-to-Knowledge Evolution for Lifelong Embodied Navigation</span></li><li><span class="dpr-home-dashboard-paper-title" title="LMMR: Learned Multigranular Memory Retrieval for Small Language Model Agents">LMMR: Learned Multigranular Memory Retrieval for Small Language Model Agents</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>6</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>4</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>4</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 </div>
 
