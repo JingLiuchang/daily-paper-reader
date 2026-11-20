@@ -1,0 +1,565 @@
+Title: KV-LTM: Persistent Per-Session KV Caches as Long-Term Memory for Personal Assistants
+
+URL Source: https://arxiv.org/pdf/2611.21998v1
+
+Published Time: Wed, 18 Nov 2026 01:35:19 GMT
+
+Number of Pages: 45
+
+Markdown Content:
+# KV-LTM: Persistent Per-Session KV Caches as Long-Term Memory for Personal Assistants 
+
+## Ziv Kfir 
+
+## zivkfir@gmail.com 
+
+## Ido Kfir 
+
+## to.ido.kfir@gmail.com 
+
+Abstract 
+
+Personal assistants accumulate months of conversations, but today’s long-term memory stacks put derivation or selection between a question and its evidence. In a system-level comparison on LongMemEval, two commercial assistants scored well below the same model reading the history offline [1] — consistent with, but not isolating, content loss between write and read. We propose KV-LTM: a memory tier storing each session’s raw text plus its KV cache under a fixed reader model, answering by restoring cached sessions and appending the question — comple-mentary to, not a replacement for, retrieval and indexing. Text is the memory of record; the cache is a recompute-free prefill accelerator, degrading gracefully to text. We specify the design — storage record, budget-derived retention, append-only read path, bounded aggregation. We size it analytically: across pinned BF16 full-attention (GQA) and latent-cached MLA configurations, per-token state spans ≈31K–328K bytes (the pinned KDA+MLA hybrid differs: ≈8.1K bytes/token plus a fixed per-session recurrent term), giving ≈0.34–3.6 TB per user-year at a declared 30K-token/day scenario, against ≈49 MB of raw text; per-query cost is modelled as regime-conditional transfer, attention, decode, aggregation, and compute. We define an evaluation protocol needing no persistent-cache implementation for log-ical QA evaluation: per-session prefill emulates valid cache reuse under the same model/input-state contract and ideal arithmetic, with named arms, controlled base-lines, and a preregistered reader-model gate; a separate minimal real-cache replay tests numerical equivalence and measures the cost axis, outcomes not assumed. KV-LTM trades storage for avoided re-prefill compute and write-time fidelity, within a declared retention budget. 
+
+# 1 Introduction & Positioning 
+
+## 1.1 The personal-assistant memory problem 
+
+A personal assistant (PA) agent accumulates months of interactions: preferences stated once, decisions made in passing, constraints given casually. When the user later asks “what did we decide about X?”, the answer depends on evidence the system can still reach. Today’s long-term memory (LTM) stacks differ in what they retain, derive, and select. Extracted-fact memory (e.g., Mem0 [2]) stores LLM-distilled facts; temporal graphs (e.g., Zep/Graphiti [3]) store entities and edges; rolling summaries compress history into running text — these transform content at write time. RAG-style indexing and verbatim archives (e.g., MemPalace [4]) keep the raw text but select a subset 1arXiv:2611.21998v1 [cs.AI] 16 Nov 2026 at read time through a retrieval index; answering without one means re-reading ev-erything. Both paths cost the PA, at write time or at read time. KV-LTM targets this trade-off directly (§1.2). Public QA measurements show the pattern. On LongMemEval, GPT-4o reading the history offline scored 0.918 vs 0.577 for ChatGPT(GPT-4o) and 0.330 for Coze(GPT-4o) online with their memory pipelines, on a 97-question comparison [1, Fig. 4a]. On LoCoMo, long-context and RAG systems remain far behind human accuracy [5]. On the same benchmark, the full-context reader scores J≈72.9 vs 66.9 for Mem0 and ≈61 for the best RAG variant, as reported in Mem0’s own (vendor-authored, ECAI 2025) evaluation under its own protocol [2]. These are system-level comparisons — consistent with, but not isolating, content loss between write and read (§3 develops the quantitative evidence). For orientation, we distinguish four memory modes, not an accuracy ranking or an established taxonomy: L1, live context only , with no memory retained outside it; 
+
+L2, retrieval or derived memory , including indexed verbatim archives, extracted facts, graphs and summaries; L3, full-history text reading , which reads the entire retained history jointly for each question; and L4, the proposed KV-LTM tier , which restores per-session native state to avoid repeated session-text prefill. Systems may combine these modes. Under the §2.2 contract, a restored session read is equivalent to prefilling that same session with the same suffix, not to L3’s joint attention across the whole history (§4.7). In the LongMemEval and Mem0-reported LoCoMo comparisons above, offline or full-context reading scored higher than the selected memory-system baselines [1, Fig. 4a][2]. This is not a universal ordering: Zep’s separate comparison favours its re-trieval system (§3.2, §8.1). KV-LTM targets repeated session-prefill work while retain-ing original text; its storage, transfer and read costs are modelled in §5–§7, and its answer quality remains to be evaluated (§8). 
+
+## 1.2 Thesis: a persistent per-session KV-cache tier 
+
+We propose KV-LTM : a per-session long-term memory tier that stores, for every ses-sion, (i) the raw session text and (ii) the session’s KV cache under a fixed reader model. At query time the system restores cached sessions and appends the question — reading the session’s native activation state without re-prefilling its text. Two properties define the design: • Text is the memory of record. The raw session text is always preserved, in every variant of the design. What is preserved at write time is the full session content as source text; the native cache state differs by architecture class (full-attention/MLA models keep per-token state; hybrid models mix a fixed-size re-current state with per-token MLA state). • KV is a recompute-free prefill accelerator. The cache removes repeated pre-fill of the session text; §7 shows when that saving dominates and when byte trans-fer does instead. The cache is never the only copy: if it is evicted, expired, or invalidated by a model change, the system degrades gracefully to reading the original text. 2GPT-4o offline read (L3) ChatGPT (GPT-4o) (L2) Coze (GPT-4o) (L2)     
+
+> 00.510.918 0.577 0.330
+> Accuracy
+> (a) LongMemEval — 97-question subset, 3–6-session histories Full-context (L3) Mem0 (L2) Best RAG (L2)
+> 020 40 60 80 100
+> 72.9 66.9 ≈61
+> J score
+> (b) LoCoMo — vendor-authored Mem0 evaluation KV-LTM (L4): not yet measured — §8 (no bar shown; no value implied). L1 (no memory): not plotted — no published number.
+
+Figure 1: Published system-level comparisons under two different benchmarks and source evaluation protocols: (a) LongMemEval’s 97-question subset with 3–6-session histories [1, Fig. 4a]; (b) LoCoMo J scores from Mem0’s vendor-authored evaluation [2]. Full-history reading scores highest among the selected systems shown in each panel, not across all evidence. Zep’s separate vendor-reported LongMemEval-S com-parison favours its retrieval system over a full-context baseline averaging about 115K tokens and is not plotted here (§3.2, §8.1). These comparisons do not isolate a mem-ory mechanism, and scores depend on evaluation labels and judges (§9.1). L1–L4 are our descriptive memory modes; KV-LTM has no measured accuracy bar (§8). Costs are modelled separately (§7). 31.3 Complementary, not a replacement 
+
+KV-LTM does not replace indexing, retrieval, or compressed memory. It complements them in two concrete ways, both developed in §4: • (a) Bounded recent evidence-preserving tier. For the recent retention win-dow, KV-LTM answers by reading retained sessions directly — no retrieval index is involved on this reference path. • (b) Verifier/reranker over retrieval candidates. Behind an existing retrieval system, KV-LTM reads the cached KV of the candidate sessions the retriever re-turns — verifying and reranking them against full session content instead of re-prefilling their text. In both roles, the KV tier changes how evidence is accessed, not its fidelity relative to an identical full prefill. Reading the full session avoids dependence on selected or derived views (chunks, facts, summaries); whether that improves answers is mea-sured in §8. The reference path requires no index; the optional hybrid variant adds a pre-load prefilter over text/metadata (§4). The reference tier defers question-directed interpretation of retained session con-tent to read time rather than replacing it with a write-time summary or extracted facts. It does not eliminate compute: canonical prefill occurs at ingestion, and restore, suf-fix processing, decoding and aggregation remain query costs (§7). Its fidelity claim is relative to the same reader prefilling the same session and suffix under §2.2; reten-tion, reader errors, bounded evidence outputs and aggregation still limit end-to-end answers (§8). On this reference path, the reader searches each retained session through atten-tion over its native state rather than through a retrieval index. This is a per-session read, not joint attention over the archive. Selection still occurs through retention (§4.8), bounded evidence aggregation (§4.6), the joint tier (§4.7), and the optional prefilter (§4.5). We propose per-session reading from persistent KV caches as another search tool for personal assistants, complementary to indexes, RAG, grep and generated search code; its practical value is to be evaluated under §8. 
+
+## 1.4 Scope 
+
+• In scope: text available to the reader model, including textual documents the assistant processes. • Out of scope: any claim that visual, table, or audio meaning survives preprocess-ing into text; such transformations are excluded or separately evaluated. Session identification — how raw interaction is segmented into sessions — is a separate problem and is out of scope; we acknowledge it as a dependency (§9). 
+
+## 1.5 Contributions 
+
+1. Design (§4): the KV-LTM storage record, budget-derived retention policy, read protocol with append-only query path, and a bounded aggregation contract. 42. Feasibility cost model (§5–§7): per-token KV size across pinned model configu-rations, per-user annual storage envelopes under declared volume assumptions, and a regime-conditional per-query compute model. 3. Evaluation protocol (§8): a plan to measure the KV-LTM logical read path on public LTM benchmarks without implementing persistent caching , using per-session prefill as an exact logical stand-in under ideal arithmetic, with preregis-tered reader-selection gates and controlled baselines. The remainder: §2 fixes the technical background and positions prior work; §3 documents where today’s methods lose content; §4 gives the design; §5–§7 size it; §8 defines the evaluation; §9 states failure modes, limitations, and next steps. 
+
+# 2 Background & Related Work 
+
+## 2.1 KV-cache semantics: what “reuse” means 
+
+In a causal transformer (in standard full-attention designs), each layer caches key/value tensors per token — the KV cache. Computing a session’s cache once and reusing it later avoids re-running prefill over the session’s tokens. Two reuse regimes matter: • Prefix-exact reuse. The cached tokens form an unmodified prefix of the new computation. The new tokens are appended , continuing the cached position in-dices. This is the only regime KV-LTM uses on its reference path. • Non-prefix reuse. Cached segments are fused, reordered, or repositioned: CacheBlend fuses independently computed chunk caches and reports restoring quality by se-lectively recomputing a fraction of the KV rather than reusing everything, with TTFT gains in its tested setup [6]; EPIC reuses caches position-independently [7]; TurboRAG relies on altered masks/positions plus fine-tuning [8]; Prompt Cache reuses modular attention states at schema-reserved positions [9]. These meth-ods change masks, positions, or both, so their reuse is not guaranteed identical to a fresh prefill under the original sequence’s positions and masks; they approx-imate or change the computation. They are related work, not our mechanism. 
+
+## 2.2 The exactness lemma (scoped) 
+
+Statement. Take a session cached by a fixed model, and a question. Restoring the cached session and appending the question is mathematically identical, under ideal arithmetic , to a full prefill of (session ‖ question) — provided: the same complete token prefix (including fixed instructions), the same model weights, continued position indices (cache holds 0..N−1, query takes N..N+Q−1), pinned RoPE base/scaling/max-position, the same attention masks, and the same native cache state. 
+
+Boundaries. (i) Post-hoc quantization or pruning of the cache is a distinct variant; a matching dtype label is necessary but not sufficient for equivalent state evolution. (ii) Real engines use non-deterministic or batch-variant kernels, so practical equality is verified with tolerances by a small real-cache replay (§8), not assumed. (iii) The lemma is per-architecture: exactness under valid reuse gives no inter-architecture quality guarantee (the RoPE condition is itself per-architecture — a hybrid model’s MLA layers may be position-free). We derive the lemma from causal computation and the implementation contract; no external citation is needed. 52.3 Compression: three classes and a hybrid row 
+
+“KV compression” names unlike mechanisms; we separate them because the distinc-tion decides what KV-LTM may claim. Class Mechanism Keeps every token? Status for KV-LTM (i) Architectural footprint GQA, MLA — smaller state per token by design [10][11] Yes (for that model) On-thesis; exact for that model (ii) Quantization FP8/INT4 KV (KIVI, KVQuant) [12] Yes Numerically lossy ; must be validated per config (iii) Token eviction SnapKV, StreamingLLM — drops tokens; degrades in multi-turn reuse [13][14] No Off-thesis as a memory mechanism Hybrid native row KDA recurrent layers (fixed-size state) + MLA layers (per-token state), e.g., Kimi Linear (Kimi-Linear-48B-A3B, config pinned in §5) [15] Partially (recurrent state is fixed-size) Separate accounting: sessions × S_recurrent + tokens × b_MLA (§5) Class (iii) is the compression that contradicts evidence preservation; class (i) low-ers bytes per token (§5) — the retention budget bounds the total (§4, §6); class (ii) is a validated-or-not engineering choice. The hybrid row’s recurrent component does not keep per-token state; its quality is evaluated per checkpoint by the §8 gate, and no universal MLA-versus-GQA quality ordering is claimed. 
+
+## 2.4 Memory systems for agents (public primaries) 
+
+A compact inventory of today’s agent memory systems — what exists and what each optimizes. What each paradigm loses , with cited quantitative evidence, is developed in §3. System Paradigm What it optimizes Source Mem0 Extracted facts Compact, fast personalization [2] (vendor-authored paper, ECAI 2025) 6System Paradigm What it optimizes Source Zep / Graphiti Temporal knowledge graph Changing relationships, current state [3] (vendor preprint) Letta / MemGPT OS-style tiered memory Self-managed paging between context and storage tiers [16] MemoryBank Fact memory + forgetting curve Human-like retention and decay [17] MemoryOS Hierarchical OS-style store Short/mid/long-term integration [18] MemPalace Verbatim archive + spatial index Full verbatim retention [4, project + independent analysis] OpenViking Hierarchical evidence store Progressive L0/L1/L2 loading, traceable retrieval [19] (vendor docs) LangMem Memory SDK Framework-integrated seman-tic/episodic/procedural memory [20] (vendor docs) Cognee Graph + vector hybrid Entity/relationship traversal [21] (vendor docs) 
+
+## 2.5 KV-reuse prior art 
+
+Persisting and reusing KV state is established engineering. Cache-Augmented Genera-tion (CAG) [22] precomputes knowledge-prefix KV and appends queries — the nearest prefix-exact prior art. Serving systems built the infrastructure: PagedAttention/vLLM [23], RadixAttention/SGLang [24], CacheBlend [6], CacheGen [25], LMCache [26], Mooncake [27], MemServe [28], EPIC [7], TurboRAG [8], modular Prompt Cache [9], and SSD-backed Tutti [29]. Memorizing Transformers used a kNN memory over in-ternal K/V pairs — a related but distinct mechanism [30]. A recent survey maps the field [31]. 
+
+Novelty. How is KV-LTM different from CAG or a persistent prompt cache? The 
+
+mechanism — a persistent prefix cache — exists. The mechanistic delta: CAG keeps one static corpus prefix that must fit one context; KV-LTM keeps many growing per-session caches, reads them independently, aggregates the answers, and manages them with a retention policy and a text fallback. The contribution is what wraps the mechanism: a per-session retention/eviction policy derived from a PA storage and latency budget, a read/aggregation protocol (append-only per-session reads, bounded source-aware aggregation, text fallback), a PA-scale cost model (bytes/token, TB/year, per-query regimes), and an evaluation protocol that measures the logical read path on LTM benchmarks without an implementation. KV-LTM is positioned as 7policy + protocol + cost model + evaluation — not a new memory primitive. 
+
+# 3 Where Today’s LTM Loses Content 
+
+Chapter 2 inventoried today’s agent memory systems (§2.4). This chapter documents what their paradigms give up, in two separate evidence classes: a paradigm-level landscape (§3.1) and cited quantitative loss evidence (§3.2). Throughout, we distin-guish three places where evidence can become unavailable to the reader: write-time derivation (the system stores something other than the original), source retention 
+
+(whether originals are kept at all), and query-time selection (the reader sees only a chosen subset). 
+
+## 3.1 Landscape: what each paradigm optimizes and what it gives up 
+
+Method (author analysis): we characterize each paradigm along the three axes above, from each system’s public paper or documentation [5][2][3][16][17][18][4][19][20][21]. A derivation or selection step marks where evidence can become unavailable to the reader; its presence is not by itself a measured loss — measured numbers are §3.2’s job. Paradigm Exemplars (public primary) What it optimizes Originals retained? Where content can be given up RAG / vector indexing RAG baselines evaluated in LoCoMo [5] Read-time selectivity Yes (configurations that keep raw chunks) 
+
+Query-time selection —evidence outside the retrieved subset never reaches the reader Extracted facts Mem0 [2] (vendor-authored paper, ECAI 2025) Compact, fast personaliza-tion No — facts replace the dialogue 
+
+Write-time derivation —wording, rationale, and uncaptured context do not survive into the store 8Paradigm Exemplars (public primary) What it optimizes Originals retained? Where content can be given up Temporal graphs Zep / Graphiti [3] (vendor preprint) Changing relationships; current state Yes — raw messages retained as episodes Derivation + selection — the semantic entity/edge view is derived; superseded facts are 
+
+marked invalid by timestamp, not deleted ;retrieval over the derived view mediates what reaches the reader Hierarchical evidence stores OpenViking [19] (vendor docs) Progressive L0/L1/L2 loading; traceable retrieval Yes (L2 originals) 
+
+Derived L0/L1 abstracts mediate access — selection among them decides what gets read in full Verbatim archives MemPalace [4, project + independent analysis] Full verbatim retention Yes Query-time selection via vector retrieval — headline recall claims are independently questioned in the cited analysis 9Paradigm Exemplars (public primary) What it optimizes Originals retained? Where content can be given up OS-style tiered memory Letta / MemGPT [16]; MemoryOS [18] Self-managed paging across memory tiers May persist in a deep tier (documented for MemGPT: recall storage reached via agent-issued search) 
+
+Write-time derivation on evic-tion/consolidation — MemGPT: recursive summaries of evicted messages [16]; MemoryOS: segmented-page organization with LLM-summarized segments [18] Fact memory + decay MemoryBank [17] Human-like retention and forgetting Yes — conversation records kept alongside daily/global summaries Summaries derived at write time; decay-driven forgetting of unprompted content Memory SDKs LangMem [20] (vendor docs) Framework-integrated seman-tic/episodic/procedural memory Not stated in the cited docs 
+
+Write-time derivation —extraction-based writes into the store Graph + vector hybrids Cognee [21] (vendor docs) Entity/relationship traversal Documents/chunks tracked in a relational store 
+
+Write-time derivation —LLM extraction builds the graph at ingestion The pattern: every paradigm in this table either derives at write time or selects at read time (or both). KV-LTM’s design (§4) targets exactly these two points: within the retained session set, its reference path adds no further write-time textual summa-rization or extraction and applies no pre-load retrieval filtering — it keeps the original session text and reads the session’s native cache state (§2.3). Hybrid variants carry a derived, finite-size recurrent state, and reader/aggregation quality is evaluated, not guaranteed (§8, §9). 10 3.2 Quantitative loss evidence 
+
+Numbers below are cited, not anecdotal. System-level QA comparisons are labelled as such: they do not isolate a causal mechanism, and QA accuracy is not a retrieval-recall measurement. 
+
+Anchor. LongMemEval’s own analysis documents the mechanism directly: com-pressing sessions into summaries or per-round extracted facts degrades overall QA through information loss [1, §5.2]. The effect is conditional, and we report it as such: the same study finds that fact-level values help multi-session reasoning questions [1, Fig. 5] — the effect is granularity- and question-type-dependent, which is exactly why §8 fixes value granularity and reports per-ability results. The paper’s own error analysis is consistent: ChatGPT’s memory records evidence early but often modifies it when compressing the history, and most Coze errors come from failing to record information from some sessions [1]. This is the write-time derivation path that the extracted-fact and rolling-summary paradigms in §3.1 share. 
+
+Co-anchor: a controlled within-pipeline comparison. A controlled experiment isolates write-time derivation loss [32, v4 pinned]: within one fixed retrieve–rerank– reason pipeline, only the stored representation is swapped — LLM-extracted artifacts vs verbatim conversation chunks — with model, retriever, reranker, and judge held constant. Verbatim chunks win by 15.9 points on LoCoMo categories 1–3 (43.9% vs 28.0%; 699 questions over 10 conversations) and by 22.0 points on LongMemEval-S (67.4% vs 45.4%; 500 questions); six confound controls reproduce the effect, and accu-racy tracks how much source text survives in the store. The paper’s own limits are re-ported: chunks abstain worse. Chunks also lead the real-benchmark multi-hop/multi-session slices; artifacts win only the paper’s synthetic, ontology-aligned multi-hop probe — a different setup from LongMemEval’s own Fig. 5 finding above (fact gran-ularity helping multi-session reasoning there), so the two experiments do not share a direction. Label: single-author preprint, under review; self-comparisons within the paper; a scoped pipeline finding, not a verdict on all extraction methods. 
+
+Further mechanism evidence. Two further results document loss under their stated setups: (i) the same preprint’s constraint probe, illustrated by its “use type hints everywhere” example (the paper’s illustrative example, not an independently traced released item): over 50 conversations × 50 turns with four planted facts per conversation, rolling compression every 40 turns, and a gpt-4o-mini answerer, a rolling summary keeps “use type hints” but drops the quantifier — summarization scores 
+
+14.0% exact match (19.0% recall) , the neighbouring RAG store 89.5% exact , and the paper’s quote-grounded artifact pipeline 93.0% exact (97.5% recall) [32, v4, Ta-ble 4] — same-batch comparators, a self-comparison within a single-author preprint; (ii) the Knowledge Objects audit — one 36.7× compaction pass over 2,000 structured facts makes 60% of stored facts irrecoverable on fact-dense content, and cascad-ing compaction over three rounds (5-seed mean) loses 54% of project constraints 
+
+[33]. Both are preprints and are labelled as such. 
+
+Supporting system-level comparison. On the 97-question subset evaluated across commercial systems, LongMemEval reports ChatGPT and Coze (both GPT-4o) dropping 37% and 64% respectively relative to offline reading of the same history (0.918 → 0.577 / 0.330) [1, Fig. 4a] — a system-level comparison across products, not a causal compression estimate. 
+
+T5 — loss-evidence table. 
+
+11 Loss mode Mechanism Example Number Label System-level QA gap (recursive summarization vs full conversation) not isolated — system-level comparison; QA accuracy is not a retrieval-recall measurement Zep paper’s DMR benchmark recursive summarization 35.3% (MemGPT-reported) vs full conversation 94.4% (Zep-run); different GPT-4-Turbo snapshots vendor preprint [3] System-level QA gap (full context vs memory system vs RAG) not isolated — system-level comparison; QA is not a candidate-recall metric; reported subset not independently verified (§8 pins its own) Mem0 paper on LoCoMo full-context J≈72.9 vs Mem0 66.9 vs best RAG ≈61 vendor-authored paper (ECAI 2025) [2] Write-time derivation (extraction) controlled ablation — only the stored representation varies (model, retriever, reranker, judge fixed) Fidelity-Before-Structure ablation verbatim chunks vs extracted artifacts: LoCoMo cat 1–3, 43.9% vs 28.0% (699 Qs / 10 convs); LongMemEval-S 67.4% vs 45.4% (500 Qs) preprint (single author, under review); self-comparison [32, v4] 12 Loss mode Mechanism Example Number Label Summarization constraint quantifier dropped (directly supported by the source) [32] constraint probe (illustrative example: “use type hints everywhere”) summarization 14.0% exact (19.0% recall); RAG 89.5% exact; quote-grounded artifacts 93.0% exact (97.5% recall) — 50 convs × 50 turns, 4 planted facts/conv, compression every 40 turns preprint (single author, under review); self-comparison [32, v4] Compaction fact loss per pass; constraint loss on cascade (directly supported by the source) Knowledge Objects audit 36.7× pass over 2,000 structured facts → 60% of stored facts irrecoverable; three cascading rounds → 54% of project constraints preprint [33] System-level QA gap (full context vs memory system, small scale) not isolated — system-level comparison; setup-specific ConvoMem full context 70–82% vs Mem0 30–45% below 150 conversations vendor-authored preprint (Salesforce) [34] 
+
+How to read T5. The mechanism-level rows (the [32] ablation and probe, Knowl-edge Objects) isolate a mechanism; the three system-level rows do not. Together they support the article’s narrower claim — today’s pipelines put derivation or selection between question and evidence, and the gap is measurable — without claiming that any single mechanism explains any single system’s score. The ordering is not universal. In Zep’s vendor-reported LongMemEval-S compari-son, its system scored 71.2% versus 60.2% for full-context GPT-4o [3, Table 2]. The full-context baseline used histories averaging about 115K tokens; these are whole-history inputs, not the per-session reads proposed here. This result neither establishes nor rules out a benefit from per-session cache reuse; it remains a framing caution in §8.1 and is not plotted in Figure 1. 13 4 KV-LTM Design 
+
+This chapter specifies the KV-LTM design: what is stored, under which conditions a stored state is valid, how writes and reads work, how answers are aggregated, and how the store is retained, invalidated, and gracefully degraded. Figures 2 and 3 show the write and read flows; §5–§7 then size it. 
+
+## 4.1 Storage record 
+
+Each session is stored as one record: Field Content 
+
+state The session’s native cache state under the reader model: per-token K/V (or MLA latent) for attention layers, plus the fixed-size recurrent state for hybrid layers (§2.3, §5), plus any runtime auxiliary state required for replay — in a versioned state format 
+
+text The raw session text — the memory of record 
+
+meta Timestamps, session ID, model/config hash 
+
+serialization Versioned schema: roles, timestamps, prompt template, tokenizer version, metadata schema version 
+
+text_digest / state_digest Separate integrity hashes over the serialized text and the native state. Bad or missing state is rebuilt only from verified-intact source text; if source 
+
+verification fails, the session is recovered from a known-good copy or marked unavailable/out-of-coverage — damaged text is never silently trusted (§4.4, §4.8) Serialization is versioned so that a record remains decodable across software up-grades. We distinguish faithful replay (the entire §4.2 contract holds and the saved state is intact → the state is reusable as-is) from migration (a tokenizer change inval-idates the old state but not the recoverability of the retained source text, which can always be re-prefilled — §4.8). 
+
+## 4.2 Cache-validity contract 
+
+A stored state is reusable for a read when the read preserves the §2.2 conditions — the contract treats them as the operational checklist (the lemma states sufficiency, not necessity; practical equality is verified with tolerances by replay, §8): the same com-plete token prefix (including fixed instructions), the same model weights, continued 14 position indices (cache holds 0..N−1, the appended query takes N..N+Q−1), pinned RoPE base/scaling/max-position for the layers that are position-parameterized (a hy-brid model’s MLA layers may be position-free, §2.2), the same attention masks, the same numerical configuration, and the same native cache state — restored exactly as the writing model computed it, in its native form, with no format conversion, post-hoc quantization, or pruning between save and restore (§2.2 boundary i). A matching dtype label is necessary but not sufficient for equivalent state evolution. The model that writes the state is the model that reads it; the PA/answering/aggregator model may differ. (Engineering note, uncited mechanism remark: some engines show first-token/attention-sink artefacts when the leading prefix is dropped — the fixed-prefix contract prevents this.) 
+
+## 4.3 Write path 
+
+At session end, the system persists the session record. The defining invariant is: 
+
+state = prefill_reader(fixed_prefix ‖ serialize(text)) — the state is a canonical prefill of the serialized record under the reader model. A live serving cache is reused only when the reader is the serving model and the serialized context is identical; otherwise the tier prefills the session text (assistant turns included as text tokens) under the reader model at session end. This one-time ingestion compute is the amortized term in §7 — writes add no summarization or extraction step, but they do add this prefill. Checkpoints are taken per session : the stored state is the canonical reader prefill of the complete serialized session at its boundary (assistant turns included as text tokens). Under ideal arithmetic this equals the live cache only in the reuse case above. The fixed instruction prefix is shared across sessions ; its bytes are counted once in §5 only if physically deduplicated, immutable, compatible prefix blocks are shared — a hybrid’s recurrent boundary state remains per session. A session the user resumes later can be extended by prefix-exact appending under the same contract. 
+
+## 4.4 Read path — reference (exhaustive) 
+
+The reference read path needs no retrieval index . It is the fidelity reference; §7 mod-els its cost and shows when byte transfer rather than prefill dominates. Per-session outputs are structured and request-local — nothing is written back into the persisted checkpoint: 1. For each retained session: check validity (contract + intact state). On a valid hit, restore a request-local working copy of the cached prefix. 2. Append the question (a short suffix, typically a sentence or two — including the query-time instructions: answer only from this session, abstain if unsupported, quote evidence with its date). 3. Decode a short per-session answer. Answering and evidence are separate fields: a session can abstain from answering while still supplying relevant evidence (a bounded, source-linked partial) — only sessions with no relevant evidence reduce to a count. 15 write — once per session  
+
+> session ends
+> canonical prefill store
+> retention policy: byte + latency budgets; may evict or invalidate state (text is al-ways kept) (§4.8)
+> stored
+> session text
+> memory of record
+> metadata + digests
+> text_digest / state_digest
+> native KV state
+> per session, fixed reader
+
+Figure 2: KV-LTM write flow (once per session): canonical per-session prefill creates the stored state at session end; session text, metadata with integrity digests, and native reader state are retained under the §4.8 storage and latency policy, which may evict or invalidate state — the text is always kept. Boxes denote logical steps or stored objects, not software components. 4. On failed source verification: recover a known-good copy and re-verify the re-covered source ; on success, fall through to the state-validity check against the recovered text/serialization (load compatible state or rebuild from the verified text, then decode); on failure, append an explicit unavailable mark and continue — never rebuild from unverified text (§4.1, §4.8). 5. Aggregate the structured outputs (§4.6). Every answer reports its coverage: “state-read n sessions, text-fallback m, abstained a, unavailable u” — no silent truncation (§8). The reference pseudocode below permits rebuilding from verified text. A deploy-ment may disable this rebuild path; Figure 3 then counts the session outside the cache-read coverage and delegates it to the text fallback in §4.8, reported as text-fallback 
+
+m rather than state-read n. This cache-coverage count is not evidence and does not mark the verified text unavailable; any fallback evidence and costs are accounted for separately. 16 # prepare: verified source -> request-local state, or None function prepare(s): if not intact(s.text_digest): s = recover_known_good(s) if s is None or not intact(s.text_digest): return None if valid(s.meta) and intact(s.state_digest): return load_working_copy(s) return rebuild_from_text(s) function read_sessions(q, sessions): outs = [] for s in sessions: w = prepare(s) if w is None: outs.append(unavailable(s)) continue outs.append(decode(w, q)) return aggregate(q, structured(outs)) function answer_reference(q, store): return read_sessions(q, store.retained_sessions()) function answer_verifier(q, candidates): return read_sessions(q, candidates) 
+
+Here prepare verifies the memory of record before state use; recovered text is re-verified and retains the original session identity. State validity includes the full §4.2 contract against that verified text and serialization. Rebuilds are canonical prefills of verified text (§4.3); valid state is loaded into a request-local working copy. decode 
+
+appends the question and instructions, prefills that suffix and produces a short out-put. The reference reads the deduplicated retained set R(N ) ∪ L(M ) (§4.8); verifier candidates come from an external retriever (§4.5) and receive the same preparation checks. structured keeps session IDs, dates, evidence quotes and answer/abstain fields; unavailable marks are out-of-coverage records, not evidence, and never enter the aggregator’s evidence pool. Answer abstention does not discard relevant partial evidence (§4.6); coverage counts are retained separately. 
+
+Optional query-suffix hints. The appended question and query-time instructions may also carry bounded retrieval-derived hints without changing the stored session prefix. For example, ranked entity candidates with dated status may help interpret an ambiguous reference. Hints are clearly delimited, unverified interpretation aids, not session-local evidence: their rank is not proof, and the reader must support its output from the session or abstain while retaining relevant partial evidence. Repeating a hint across session outputs does not create independent confirmation. These provenance distinctions also apply at aggregation (§4.6). A hint producer is outside the unaugmented reference path; any evaluated hint-augmented variant freezes its source, generation and ranking rules, suffix format and token cap before testing (§8). Comparisons must declare and control hint access, report producer and repeated suffix-processing costs (§7), and preserve the context-fit rule (§4.7, §8.3). This permits query-side composition with retrieval methods, not a guarantee of equal or better answer accuracy. A question supported within one session can be handled by the per-session reader 17 and bounded aggregator without a joint read. Cross-session partials may also suffice for aggregation; otherwise the declared §4.7 trigger may invoke a bounded joint-text read or follow-up. This dispatch is a protocol choice, not a claim that every single-fact question succeeds or that every comparison requires joint attention. 
+
+## 4.5 Read path — optional hybrid variant and the verifier/reranker role 
+
+Hybrid variant. A pre-load prefilter over text/metadata (metadata filters, lexical match, or a dense embedding variant) selects candidate sessions before any state is loaded. Only the prefilter avoids cold-cache I/O: a query-conditioned 1-token probe still loads and reads each candidate cache — it saves decode, not cold reads. The prefilter method and any embedder are frozen protocol parameters, fixed before evaluation runs ; a dense variant’s index is not assumed small; selection effects are measured and reported (§8). The exhaustive path remains the reference; the hybrid is an optional, separately reported variant. 
+
+Verifier/reranker role. KV-LTM can also sit behind an existing retrieval system: the retriever ranks candidate sessions, and KV-LTM reads their cached state — ver-ifying and reranking candidates against full session content instead of re-prefilling their text. The role applies to candidates with valid state; other candidates fall back to text prefill. This is complementarity mechanism (b) of §1.3; mechanism (a) is the index-free reference tier above. 
+
+## 4.6 Aggregation contract 
+
+The aggregator is part of the method, specified enough to be evaluated: • Inputs: the question; dated, source-linked per-session evidence; abstain flags (abstention triggers are protocol parameters, §8). Answer abstention is not evi-dence absence: sessions that abstain from answering keep their bounded partial evidence and session IDs in the pool; only no-relevant-evidence records reduce to counts. • Bound (explicit and declared): at most S source evidences, each capped at 
+
+e tokens, output ≤ o tokens; abstain flags are not truncated. Overflow follows a declared rule — staged/tree aggregation or a documented ordering — frozen across arms A, A_k, O and reported. S, e, o are protocol parameters fixed before runs (§8); their storage/latency consequences are computed in §7. • Policy: a bounded, source- and recency-aware synthesis over dated evidence. 
+
+Majority voting is not truth resolution : repeated stale facts cannot override a supported newer fact by frequency alone. • Outputs: a supported answer with source links | abstain | follow-up (including original-text fallback). • Protocol: the aggregator’s model, prompt, and budget are fixed across arms A, A_k, O (§8). 
+
+## 4.7 Cross-session questions 
+
+Per-session reads cannot jointly attend across sessions. For joint-evidence questions, a second tier selects the top-k_joint relevant sessions — drawn from the sessions 18 whose per-session outputs carried relevant evidence, including partial evidence from sessions that abstained from answering — and re-prefills them from text for a joint read. (A bounded reselection over source text under a frozen rule is allowed when per-session evidence is insufficient.) The tier is invoked on the aggregator’s follow-up output or by question type; the joint read must fit the reader’s context in-cluding instructions, query, and output reserve — otherwise the system abstains or follows up (§8 reports joint-fallback limits separately; arm C, full-concat, is a different system used for contrast, not this tier). Concatenating independently cached sessions into one cache is non-exact — it misses cross-session attention [6, qualitative]; naive concatenation also breaks position indices (our own technical observation) — so the joint path works from text, not from fused caches. (Optimization note: an already-stored first session’s cache may prefix the joint input only when that complete saved prefix matches the actual joint serialization under the entire §4.2 contract —joint template, leading instructions, positions, masks; otherwise the whole joint input is prefilled.) 
+
+## 4.8 Retention, invalidation, fallback 
+
+• Retention. The store holds the recent set R(N months) ∪ the older set L(M). The capacity invariant applies to the deduplicated union , including native-state and metadata overhead: bytes(R ∪ L) plus per-query modelled latency must fit the budget derived in §6/§7. Under exhaustive reference reads, recency-of-load is vacuous (every retained session is read every query), so “use” is defined as evidence use : a session is used when it contributed supported evidence the aggregator cited — including cited partial evidence from answer-abstaining ses-sions — or scored a verifier/reranker hit; L(M) is ordered by last-used under this definition, which is a frozen protocol parameter. When either the byte or the latency budget is exceeded, the older-set allowance shrinks first and the recent window follows — “N months” becomes achievable-N ; overflow sessions drop to text-only. KV eviction is not text deletion: evicted sessions remain readable from their text. • Invalidation. A model, tokenizer, config, fixed-prefix/prompt-template, or serialization-version change invalidates the stored state; affected sessions are re-prefilled from text in the background (migration cost quantified in §7). • Fallback. Evicted or invalid state still leaves the original text: full-prefill reading, or RAG over it when full reading is infeasible. Degradation preserves availabil-ity ; the fidelity property holds only on paths that read the full session — the RAG branch inherits §3.1’s query-time selection exposure. 
+
+## 4.9 D1 — logical flow and stored objects 
+
+Figure 3 shows the read path’s logical steps and their data relationships. 
+
+# 5 KV-Cache Size Estimation 
+
+This chapter sizes the per-session state that §4 stores. All quantities are bytes per token ; a sequence-length factor is applied only when totals are computed (Appendix 19 read — per question (drawing on the stored objects) 
+
+query 
+
+q + instructions 
+
+verify text digest     
+
+> recover →re-verify; else unavailable u:out of coverage; counted, not evidence
+
+stored state valid? load 
+
+working copy 
+
+rebuild allowed by policy? not cached 
+
+text fallback (§4.4) 
+
+rebuild 
+
+from verified text 
+
+append q (+ instructions), short decode bounded aggregator 
+
+> (S,e,o; source-/recency-aware)
+
+result 
+
+answer + source links | abstain 
+
+| follow-up | unavailable u
+
+> verified ok valid invalid / evicted yes no out-of-coverage count (not evidence)
+
+Optional lanes: hybrid prefilter, verifier/reranker, joint re-read (§4.5, §4.7). 
+
+Figure 3: KV-LTM read flow (per question): each retained session’s text is verified against its stored digest first — a known-good copy is recovered and re-verified on failure, and an unrecoverable session counts as unavailable (out of coverage), never as evidence. Valid state is read from a request-local working copy; when policy al-lows, invalid or evicted state is rebuilt from the verified text (§4.3), otherwise the session is counted as not cached and delegated to the §4.8 text fallback, outside the depicted cache-read path. Per-session outputs supply bounded evidence to the aggre-gator (§4.6); optional hybrid, verifier/reranker and joint-evidence lanes (§4.5, §4.7) complement the reference read. Boxes denote logical steps or stored objects, not software components. 20 A shows every derivation). GB/TB are decimal (10⁹/10¹² B) throughout. 
+
+## 5.1 Formulas 
+
+• MHA / GQA: bytes/token = 2 · L · H_kv · d_head · b (2 = K+V; L = lay-ers; H_kv = KV heads; d_head = head dim; b = bytes per element). • MLA: bytes/token = L · (d_c + d_R) · b (d_c = KV LoRA rank; d_R = rope head dim). MLA figures assume a runtime that persists the compressed latent 
+
+(d_c + d_R); a runtime that caches decompressed per-head K/V stores ≈ H·(d_qk + d_v)/(d_c + d_R)× more (≈8.9× for DeepSeek-V2-Lite; derivation in A.1). • Hybrid (KDA + MLA): total = sessions × S_recurrent + tokens × b_MLA 
+
+— the recurrent state is fixed-size per session (symbolic S_recurrent pending runtime/dtype/auxiliary validation); the MLA layers keep per-token state. 
+
+## 5.2 T1 — pinned-config table 
+
+Model (pinned config) Class Bytes/token (bf16) TB per 1M tokens Annual @30K tok/day* MiniCPM3-4B (62 layers; d_c 256 + d_R 32) MLA 35,712 0.036 ≈0.39 TB DeepSeek-V2-Lite (27 layers; d_c 512 + d_R 64; MoE 16B/2.4B active) MLA 31,104 0.031 ≈0.34 TB Qwen2.5-7B (28 layers × 4 kv-heads × 128) GQA 57,344 0.057 ≈0.63 TB Llama-3.1-8B (32 layers × 8 × 128) GQA 131,072 0.131 ≈1.44 TB Llama-3.3-70B (80 layers × 8 × 128) GQA 327,680 0.328 ≈3.59 TB DeepSeek-V3-class (61 layers × 576) — published-config class assumption, not a pinned checkpoint 
+
+MLA 70,272 0.070 ≈0.77 TB bf16 / ≈0.39 TB ideal FP8** 21 Model (pinned config) Class Bytes/token (bf16) TB per 1M tokens Annual @30K tok/day* Kimi-Linear-48B-A3B (27 layers = 20 KDA + 7 MLA × 576) hybrid (KDA + MLA) b_MLA = 8,064 0.008 + (500 × S_recurrent)/10¹² ≈0.088 TB (MLA part) + 5,475 × S_recurrent B * The 30K tokens/day scenario is a declared assumption (§6). ** Ideal FP8 halves the quantized payload only (before scales/metadata; recurrent/non-quantized state unaffected) and is numerically lossy (class ii, §2.3) — validate per config before rely-ing on it [12]. Config values from public HF config.json, retrieved 2026-09-26 [11]: MiniCPM3-4B, DeepSeek-V2-Lite, Qwen2.5-7B, Llama-3.1-8B, Llama-3.3-70B; Kimi-Linear decomposition per [15] plus its public config. The DeepSeek-V3-class row uses the published architecture’s parameters as a representative class assumption —labelled, not a pinned checkpoint. Context caps: 32,768 max positions for MiniCPM3-4B (config value); ~32K for DeepSeek-V2-Lite (model-card guidance; its config allows more under scaling — config ≠ effective context, §9). Sessions longer than the cap need segmentation, noted in §9. The shared fixed instruction prefix (§4.3) is stored once as a physically deduplicated, immutable prefix block; its contribution is negli-gible at the declared volumes (a 500-token prefix ≈ 65.5 MB once ≈ 0.005% of the 8B-GQA annual state) — scenario token volumes count session tokens only. 
+
+## 5.3 The storage contrast 
+
+KV state is large relative to text: for the 8B-GQA config, 131,072 B/token vs ≈4.5 B/token of raw text (6 B/word ÷ 1.33 tokens/word, declared planning ratios) — a ratio of ≈2.9×10⁴ (derived per config in Appendix A; no universal multiplier is claimed). KV-LTM increases storage; what it buys is avoided re-prefill compute and the absence of write-time derivation loss (§3). The decision variable is therefore not “is the cache small” but “does the retention budget (§6) keep the working set affordable per query (§7)”. 
+
+## 5.4 C1 — bytes/token across the pinned configs 
+
+Figure 4 shows the per-token spread. 
+
+# 6 Storage Estimation for the PA Use Case 
+
+This chapter sizes the store of §4 for one user’s personal assistant, per year. Every volume is a declared, labelled assumption — not a behavioral fact; public literature gives order-of-magnitude context only [35]. Appendix A shows the arithmetic, and Appendix A.2 states the declared assumptions behind each volume. 22 Kimi-Linear-48B-A3B DeepSeek-V2-Lite MiniCPM3-4B Qwen2.5-7B DeepSeek-V3-class †
+
+> Llama-3.1-8B Llama-3.3-70B
+
+10 3
+
+10 4
+
+10 5
+
+10 68, 064 31 , 104 35 , 712 57 , 344 70 , 272 131 , 072 327 , 680    
+
+> bytes/token (bf16, log axis)  per-token state (bf16) hybrid: bMLA part only ( +Srecurrent /session, symbolic)
+
+Figure 4: BF16 state bytes per token, logarithmic scale, for six pinned configura-tions and one representative DeepSeek-V3-class assumption (marked †, not a pinned checkpoint). MLA values assume compressed-latent storage. Kimi-Linear shows only its MLA-layer component (b MLA = 8,064 B/token); its per-session recurrent state is symbolic and not drawn. The plotted per-token spread is ∼40× (the hybrid’s b MLA 
+
+part at the low end); among the non-hybrid configs the spread is ≈10.5× (31,104 → 327,680). 
+
+## 6.1 Volume scenarios 
+
+One coverage parameter drives everything: the fraction of a user’s daily language activity that flows through the PA. Scenario Coverage (declared assumption) Tokens/day Tokens/year Low 12% ≈10,000 3.65M Mid (anchor) 35% ≈30,000 10.95M High 100% ≈85,500 31.2M Context anchors for plausibility: measured speech production is ≈16K spoken words/day per adult [35] — order-of-magnitude context only; the calibration below uses a ≈13K-word speech component from its own recorded sources. The full-stream calibration behind the high row (speech + hearing + reading + writing ≈ 64K words/day), the ≈1.33 tokens/word and ≈4.5 B/token (6 B/word) ratios, and the coverage fractions (35% is a mid-point planning anchor, not a measurement) are declared assumptions (Appendix A.2). Tokens/word remains a parameter to measure on the chosen tokenizer [36]. 23 6.2 T2 — annual storage per scenario 
+
+Bytes from the pinned §5 table; totals in Appendix A. The text-only column keeps the storage contrast: KV-LTM stores more than text; the benefit is avoided re-prefill compute and no write-time derivation loss (§3, §5.3). Model (class) Low (3.65M tok) Mid (10.95M tok) High (31.2M tok) Sensitivity Llama-3.1-8B (GQA) 0.48 TB 1.44 TB 4.09 TB linear in coverage; achievable-N at a fixed budget scales 
+
+inversely with coverage Llama-3.3-70B (GQA) 1.20 TB 3.59 TB 10.2 TB same linearity Qwen2.5-7B (GQA) 0.21 TB 0.63 TB 1.79 TB DeepSeek-V3-class (MLA bf16) 0.26 TB 0.77 TB 2.19 TB ideal-FP8 halves the quantized payload only (before scales/metadata; lossy — validate) DeepSeek-V2-Lite (MLA) 0.11 TB 0.34 TB 0.97 TB MiniCPM3-4B (MLA) 0.13 TB 0.39 TB 1.11 TB Kimi-Linear-48B-A3B (hybrid) 0.03 TB + 1,825×S_rec B 0.088 TB + 5,475×S_rec B 0.25 TB + 15,600×S_rec BS_recurrent (bytes/session) symbolic until validated; session counts from the declared 2,000-token sessions 24 Model (class) Low (3.65M tok) Mid (10.95M tok) High (31.2M tok) Sensitivity 
+
+Text-only contrast ≈16 MB raw (≈5.5 MB at 3:1) ≈49 MB raw (≈16 MB at 3:1) ≈141 MB raw (≈47 MB at 3:1) 
+
+3:1 is an illustrative workload-dependent planning assumption, inside the 2.9–3.6× range documented for selected settings on the mixed-data Silesia corpus [37] — not validated PA compression 
+
+## 6.3 Retention set size from a byte budget 
+
+§4’s retention — R(N months) ∪ L(M), capacity from a budget — becomes concrete once a store budget is declared. Example with a declared B_store = 512 GB (a single consumer-NVMe allocation; assumption, not a measurement), mid scenario, uniform session sizes (2,000 tokens, declared), allocating the whole budget to the recent set (L = 0) , token payload only — the table divides by state bytes; the §4.8 invariant over the full record (incl. overhead) is checked in the §8 replay. This is a byte-only upper estimate :Model TB/yr (mid) Achievable-N within 512 GB (upper estimate) Llama-3.1-8B 1.44 ≈4.3 months DeepSeek-V3-class (bf16) 0.77 ≈8.0 months MiniCPM3-4B 0.39 ≈16 months DeepSeek-V2-Lite 0.34 ≈18 months Kimi-Linear (hybrid) 0.088 + sessions×S_rec formula below; 5.8 years is the optimistic 
+
+MLA-only byte ceiling 
+
+(S_rec → 0), not attainable full-hybrid retention For the hybrid, N ≤ B_store / (tokens/yr × b_MLA + sessions/yr × S_recurrent + overhead/yr) (all terms in bytes). Illustrative sensitivity: at S_recurrent ≈ 21 MB/session and ≈5,475 sessions/yr (mid), the recurrent share ≈115 GB/yr exceeds 25 the 88 GB/yr MLA part, giving N ≈ 512e9 / (88.3e9 + 115e9) ≈ 2.5 years (derivation and its limits in A.5). Reading: among the fully specified configs the model choice moves achievable-N by ≈4× (4.3 → 18 months) — and more if the hybrid’s recurrent state proves small. The budget, not a calendar, decides the retention window; when it is exceeded, the oldest sessions drop to text-only (achievable-N, §4.8) — the store degrades instead of failing. We report TB, not $/TB: storage prices are dated and deployment-specific; a dated price source can be added at deployment time without changing the model. 
+
+## 6.4 What this chapter does not claim 
+
+The volumes are planning scenarios with declared coverage parameters, not mea-sured PA usage. The byte figures follow from pinned model configs (Appendix A). No storage-saving claim is made for KV-LTM — it strictly increases storage over text-only memory; the trade it offers is compute and write-time fidelity (§3, §7). 
+
+# 7 Compute Estimation & Enabling Techniques 
+
+This chapter models the per-query cost of the §4 read paths. No single cost dominates universally — the regime decides. All latency figures are analytic estimates over declared parameters until the §8 minimal real-cache replay measures them; nothing here is a measured result. 26 7.1 Per-query cost model 
+
+For a query over the retained set C = R(N ) ∪ L(M ) (§4.8): 
+
+T(q) ≈ B_cold(q) / β_eff (a) + T_attn(q) (b) + Σ_s g_s / γ (c) + T_agg(S, e, o) (d) + Σ_{s∈rebuild} T_prefill(n_s) (e) + T_joint(k_joint) (f) + T_prefilter (g) + T_model (h) − overlap (i) 
+
+(a) Cold transfer. Bytes moved over effective bandwidth; βeff is symbolic or based on a named, dated source, distinguishing theoretical datasheet bandwidth from achieved transfer. (b) Query-prefill attention. Attention over the cached lengths when processing the ap-pended suffix. (c) Decode work. gs is each session’s output-token count ( C × g in total when equal). De-clare one convention for γ per run: serial aggregate (one active stream) or ideal parallel aggregate (sum over streams). Assumed rates are not achieved latencies. Throughput depends on bandwidth, residency and compute; dense attention re-reads cached state per generated token. Thus γ is not an independent scaling knob; do not double-count attention or model work already included in measured γ.(d) Bounded aggregation. Uses S, e, o (§4.6); staged or tree aggregation counts every call. (e) Conditional rebuild. Query-time prefill of invalid or missing state (§4.4), distinct from background migration; zero when all state is valid. (f) Conditional joint tier. Joint-tier text re-prefill (§4.7); zero when that tier is not invoked. (g) Hybrid prefilter. The Ak prefilter (§4.5); zero on the reference path. (h) Residual model compute. Model work not covered above. (i) Overlap correction. Subtract only overlap justified by a measured schedule from the otherwise non-overlapped sum. 
+
+plus the amortized ingestion prefill from §4.3 (one-time per session) and the re-prefill on model change (§4.8) — linear in archive token volume for fixed/bounded session-length processing (full-attention FLOP scaling is a separate term we do not expand here). Note the coupling : the decode term is what forces each session’s state to be read — bytes and decode are not independent alternatives. 
+
+## 7.2 Worked examples (declared assumptions) 
+
+Assume: 2,000-token sessions, g = 64 output tokens/session, every selected state cold (no residency) — all declared assumptions, not measurements. • Recent window, 8B-GQA (131,072 B/token): 300 sessions ≈ 600K tokens ≈ 79 GB of state — about 20 days at the §6 mid scenario. Per exhaustive query: cold transfer ≈ 79 GB/β_eff; decode ≈ 300 × 64 ≈ 19K generated tokens. • The coupling, made concrete: at a declared β_eff = 5 GB/s the 79 GB cold transfer takes ≈15.7 s. Decode of 19,200 tokens: under a declared serial aggre-gate γ = 30 tokens/s, ≈640 s of serial decode; under an ideal 300-way parallel 27 setup sustaining 30 tokens/s on every stream (aggregate γ = 9,000 — requir-ing additional resources), ≈2.1 s elapsed. Both γ figures are assumptions, not achieved latencies — and γ is not independent of transfer: dense attention re-reads the cached state each generated token (≈ g × B_state ≈ 5 TB of logical KV reads for this example), so actual device traffic and overlap are runtime-dependent. Which term dominates is regime-dependent; §8 reports both terms per arm, measured. • Year-scale, same model: 10.95M tokens ≈ 1.44 TB of state per exhaustive query; the cold-transfer component is 1.44 TB / β_eff (at the same declared 5 GB/s, ≈287 s) — note this is the transfer component of the query, not the full-query duration. This is the practical motivation for the §4.5 prefilter: the hybrid variant evaluates how much of that scan is avoidable, with its selection effects measured (§8). • Same volumes under MLA/hybrid configs shrink by the §5 ratios for the val-idated per-token parts (e.g., DeepSeek-V2-Lite: 0.34 TB/yr, ≈4× smaller than 8B-GQA); unvalidated recurrent/auxiliary state is excluded from these ratios un-til measured. • Concurrent residency on one GPU (declared assumptions). Independent session reads can be batched, with each read using its own request-local state. Table T3 estimates memory capacity, not achieved concurrency or latency: roughly 385–850 8B-GQA reads or 1,400–3,300 reads for the two MLA configurations fit under these assumptions. Longer sessions reduce the counts. The assumed 70B weight allocation does not fit within the reserved-memory budget of one H200; it leaves space for roughly 30 reads on B200 or 165 on B300. Cold transfer, decode compute and queueing remain separate constraints (§7.1); actual performance must be measured (§8). 
+
+T3 — session states resident on one GPU (analytic estimate, not measured). 
+
+NVIDIA-listed HBM capacities [57]; BF16 state per §5; 2,000 session tokens plus a 128-token appended question/instruction suffix and 64 output tokens; one identical 500-token fixed prefix physically shared across reads; 10% of HBM reserved for run-time needs. BF16 model-weight allocations are illustrative budgets, with all experts resident for MoE. Counts are rounded; A.6 gives the formula and integer results con-ditional on these assumptions. Config (BF16) Weight budget State per read H200 (141 GB) B200 (180 GB) B300 (288 GB) MiniCPM3-4B (MLA) 8.15 GB ≈78 MB ≈1,500 ≈2,000 ≈3,200 DeepSeek-V2-Lite (MLA, MoE; all experts resident) 31.4 GB ≈68 MB ≈1,400 ≈1,900 ≈3,300 Qwen2.5-7B (GQA) 15.2 GB ≈126 MB ≈890 ≈1,170 ≈1,940 Llama-3.1-8B (GQA) 16.1 GB ≈287 MB ≈385 ≈510 ≈850 Llama-3.3-70B (GQA) 141.1 GB ≈718 MB 0 (no fit) ≈30 ≈165 28 7.3 Enabling techniques 
+
+• Tiered KV store (HBM/DRAM/NVMe): cross-query KV reuse and tiered KV stor-age [26]; disaggregated CPU/DRAM/SSD designs [27]; SSD-backed KV serving [29] — all qualitative; tested-setup magnitudes are not claimed here. • Prefix-cache infrastructure : PagedAttention/vLLM [23] and RadixAttention/SGLang [24] are the in-memory substrate our persistence extends. • KV quantization (FP8/INT4): reduces the quantized payload (≈2×/4× ideal, before scales/metadata; weights and non-quantized recurrent state unaffected) but is numerically lossy (class ii, §2.3) — validate per config before counting it [12]. • Batching and session-level parallelism : per-session reads are independent, so fan-out parallelizes across devices/processes; the aggregate work is unchanged (parallelism trades latency for resources; a single-GPU residency estimate is given in §7.2, T3). 
+
+## 7.4 What this chapter does not claim 
+
+No FLOPs-derived latency is presented as a real restore latency — those are marked 
+
+to-measure via the §8 replay. Bandwidth values are symbolic or declared assumptions, not datasheet facts. And the model deliberately reports regimes: which term domi-nates depends on retention size, residency, and hardware — that dependence is the point of §8’s measured cost axis. 
+
+# 8 Evaluation Design: Testing Without Implementation 
+
+This chapter defines how KV-LTM’s logical read path can be measured on public long-term-memory benchmarks without implementing persistent caching — per-session prefill stands in for state restoration (§2.2’s lemma), so the read path is em-ulated exactly under ideal arithmetic, with practical equality tested later by a small real-cache replay. 
+
+Framing caution. No arm below is a guaranteed bound on another. Published re-sults already show a retrieval system outscoring full-context reading on LongMemEval-S (Zep 71.2% vs full-context gpt-4o 60.2% [3, vendor preprint]) — more context is not automatically better. We therefore compare defined systems , not claimed ceilings. The Zep figures are vendor-reported under that study’s evaluation protocol, not a con-trolled KV-LTM experiment. Evaluation labels and judges can change reported scores (§9.1); the comparison is a framing caution, not a bound on any arm. 
+
+## 8.1 Arms 
+
+All arms read the same retained archive under the same retention policy (§4.8), use the §4.1 canonical serialization (roles, session timestamps), and receive the bench-mark’s question date; any whole-original-history variant is a separate, labelled con-trast (C concatenates the common retained history). The aggregator (model, prompt, bound S/e/o, overflow rule) and the joint tier (k_joint, trigger, context cap) are frozen before test runs and identical across A, A_k, O .29 Arm Definition Role 
+
+A Per-session prefill + appended question over ALL retained sessions → per-session outputs → aggregator (§4.6) + joint tier (§4.7) The KV-LTM logical read path, emulated without an implementation 
+
+A_k^pre / A_k^probe The frozen hybrid variants (§4.5): pre-load prefilter → top-k → read, resp. 1-token probe → top-k → read Optional selected variants, 
+
+reported as separate cost rows — the prefilter saves cold I/O, the probe saves decode; fusing them would conflate two mechanisms 
+
+C Full-concat long-context baseline: the common retained history in one context (a whole-original-history variant is separate and labelled) A different system (joint attention, lost-in-the-middle exposure) — not a bound. C uses the gate-selected reader where each full serialized input fits its effective context (prefix + history + question + output reserve; otherwise N/A with coverage stated); a named long-context model only as a separately labelled C variant 
+
+O Oracle: per-session reading on gold-evidence sessions only (same aggregator and joint rules) Diagnostic. Retained gold = original benchmark gold IDs ∩ the common retained archive; verified absent-evidence questions get the empty-read expected-abstention treatment; missing gold annotations mark O N/A (the A−O contrast is then reported unavailable); evidence removed by retention is out-of-retention coverage, not benchmark unanswerability; partial gold coverage is reported for multi-evidence items 30 Arm Definition Role 
+
+R Controlled retrieval baseline with the same 
+
+reader and judge: headline R_session (top-k 
+
+sessions , matching our unit) plus R_chunk 
+
+reported separately; retrieval unit, k, index build, and any embedder frozen on dev data before runs. R_session’s final-answer path (joint concatenation of retrieved sessions vs per-session reading + aggregation, with the context-fit rule) is stated per run — or declared deliberately equal to A_k^pre’s selection for parity Required for the headline comparison 
+
+D Published external scores (Mem0, Zep, …) Context only — models, judges, and prompts differ; never the controlled headline 
+
+## 8.2 Attribution rules, frozen parameters, and the controlled ablations 
+
+• A − O does not isolate aggregation loss (it mixes distractor exposure); A vs C 
+
+changes segmentation, joint attention, and context length at once. Differences are reported as descriptive contrasts, per question type — causal claims come only from the ablations below. • A ≥ A_k is not guaranteed for QA accuracy (dropping spurious outputs can help a bounded aggregator); monotonicity holds only for relevant-session coverage (A_k ≤ A). Causal claims require controlled contrasts like the ones below — the descriptive arm contrasts alone do not provide them. • Frozen before test runs: reader and aggregator model + prompt; aggregator bound (S, e, o) and overflow rule; prefilter/probe/top-k parameters (and any em-bedder); joint trigger, k_joint, and context cap; abstention/evidence thresholds; retrieval unit, k, and index build for R. Numerical values are later-run pins; the variables and what each contrast changes are fixed now. • Dedicated sensitivity contrasts (frozen before runs, reported per question type; interactions are not assumed additive): (i) aggregator-design sensitiv-ity — the §4.6 aggregator vs a frozen named alternative synthesizer over the same fixed gold-session outputs, with the same final-answer scorer and declared budgets (a bare aggregator-off arm producing several session answers cannot stand in for one final answer on multi-session questions); (ii) distractor sensi-
+
+31 tivity — gold-only vs gold plus frozen sampled non-gold sessions with the pipeline fixed; at k equal to all retained non-gold sessions the read sets match O and A, and smaller k measures distractor sensitivity (reproducing outputs also requires the same evidence generation, order, seeds, and protocol — not just nominal k); (iii) evidence-format sensitivity — fixed source-linked gold evidence vs per-session-generated evidence under a common aggregator. These measure design sensitivities; none is claimed as a pure isolated mechanism unless evidence con-tent, ordering, and budget are explicitly controlled. 
+
+## 8.3 Benchmark × arm feasibility mapping 
+
+Per benchmark and question, we record two properties: joint-evidence require-ment and arm/model feasibility . Joint evidence is annotated from gold evidence/session IDs (sessions spanned), not inferred from the question-type label — a temporal or multi-hop question can be answerable within one session, and cross-session evidence may be handled by aggregation without joint attention. Feasibility is conditional on actual session lengths, the reader’s effective context, the bounded joint fallback, and budget. Infeasible (arm × benchmark × reader) triples are marked N/A with the coverage stated — never silently truncated — and distinguished from attempted-but-failed answers. Aggregation impact is probed by the §8.2 sensitivity contrasts, not pre-declared (the A−O contrast alone mixes distractor exposure). Expected ab-stention is reserved for absent-evidence questions, not merely difficult ones. 
+
+## 8.4 Pinning before runs 
+
+Per benchmark, before any run: named release + hash, subset/category counts, and the official scorer. Concretely: LoCoMo — categories 1–4 scored, adversarial re-ported separately (exact n confirmed against the pinned 10-conversation release be-fore it is stated; the scoring exclusion and the abstention analysis use the same items, not double-counted) [5]; LongMemEval — S vs M tier pinned [1]; BEAM — 1M vs 10M bucket pinned [38]. Unequal feasible coverage is never pooled as comparable. Workload budgets are computed per the §7 model, not asserted feasible: arm A on 
+
+LongMemEval-S ≈ 500 questions × ~30–50 sessions ≈ 15K–25K per-session pre-fills (session count is source-dependent; the pinned release decides) ≈ 57.5M prefill tokens, and on LME-M ≈ 250K prefills ≈ 750M prefill tokens — these assume the cor-responding full histories are retained. The accompanying 7.5 TB / 98 TB figures are analytic cache-equivalent payload under all-cold assumptions, not observed emula-tion state reads; the proxy prefills themselves process the token totals. Extra prompt, joint-tier, and decode costs remain under §7. BEAM-10M is likewise computed or marked optional. Session state is assumed not shared across questions (histories are padded per question; if shared, cost drops — we state which). Arm decode costs use the §7 declared-γ conventions and are reported under both (serial-aggregate and ideal-parallel). 32 8.5 Reader-model selection gate (testing the “<70B suffices” hypoth-esis) 
+
+The hypothesis this article tests: the memory reader model needs text understand-ing, not programming or vision capability, and a <70B-class reader suffices for the retained-window read path (§9 carries the matching limitation line). The hypothesis is gated, not assumed. Before test runs, on held-out development data, we preregis-ter: task-quality and abstention targets relative to a named larger-reader baseline 
+
+(the 70B-class pinned config of §5, or a named larger model) with a numeric O-dev accuracy tolerance Δ; and a resource budget . Candidate readers are the §5 pinned configs (MiniCPM3-4B, DeepSeek-V2-Lite, Qwen2.5-7B, Llama-3.1-8B). Two reader-capability diagnostics — RULER [39] and NoLiMa [40] — screen effective context; they are labelled diagnostics, not memory benchmarks, and diagnostics alone do not establish sufficiency. Reader runs need the fixed prefix + session + question + out-put context of §4.2; aggregator and joint-fallback limits are reported separately (§8.7). The supporting argument: per-session reading relaxes the reader’s context require-ment from “the whole archive” to “one session + question” — which is exactly what makes a small reader plausible. Published studies find task- and model-dependent lim-its to long-context reasoning, including degradation at inputs of only a few thousand tokens; they motivate measuring the reader on actual session lengths rather than treating a small fraction of its advertised window as a quality guarantee. [55][56] 
+
+## 8.6 T4 — benchmark matrix 
+
+33 Tier Benchmark Measures Feasibility notes Tier-1 (run) LongMemEval-S (+M for scale) [1] 5 abilities over chat histories (S ≈ 115K tokens over ~30–50 sessions; M ≈ 1.5M tokens over ~500 sessions) Arms A/A_k/O/R feasible where each full serialized input (prefix + session + question + output reserve) fits the reader’s effective context — routine at per-session scale for the candidate readers; C is N/A wherever the retained history exceeds effective context (a nominal ≥128K class does not establish that every LME-S item fits; per-item coverage stated); O has gold session IDs Tier-1 LoCoMo [5] Single/multi-hop, temporal, open-domain, adversarial QA over ≤35 sessions Joint-evidence class derived per question from gold evidence IDs (sessions spanned); gold IDs available (O feasible); scoring exclusion and abstention analysis share the same adversarial items Tier-1 PersonaMem [41] Dynamic persona memory, ≤60 sessions, 32K/128K/1M versions Only the 32K version is a C candidate on a 32K-class reader — and only where prefix + history + question + output reserve fit its effective context 34 Tier Benchmark Measures Feasibility notes Tier-1 MemoryAgentBench [42] Incremental injection; retrieval, test-time learning, conflict resolution Broader agentic; injection-then-query matches the §4.3 write path Tier-1 BEAM [38] 10 abilities at 100K–10M tokens (incl. contradiction, event ordering) Scale frontier; arm C N/A at 1M/10M for 32K-class readers — coverage stated Tier-1 ConvoMem [34] (vendor-authored preprint, Salesforce) Full-context-vs-memory crossover by conversation count Setup-specific; used for the retention-window question Sensitivity (optional) LoCoMo-Refined [43] (non-archival) Stricter re-judging of LoCoMo predictions Separately reported; not a replacement judge Tier-2 (optional) PerLTQA [44]; PrefEval [45]; MemBench [46]; HaluMem [47] Personalization; preference following; factual/reflective memory; hallucina-tion/omission HaluMem: QA task only (write-time ops not covered by full-prefill QA) Sanity MSC/DMR [48] Single-fact recall Saturated in published full-context scores; low headroom. DMR is also the benchmark behind the Zep-paper baseline quoted in §3.2 [3] — not independent evidence Future-work boundary LongMemEval-V2 [49] (multimodal web-agent), MemoryArena [50] (agentic) Agentic/multimodal regimes Outside the text-PA scope Future-work deferral Memora [51] (Uddin et al., FAMA; not the same-named retrieval paper) Weeks-to-months evolving text memory; forgetting-aware evaluation Text-PA-relevant but deferred to later work 35 Tier Benchmark Measures Feasibility notes Excluded as LTM evidence vanilla NIAH, LongBench/v2, ∞Bench, LV-Eval, BAMBOO/L-Eval, HotpotQA family Single-document long-context Not memory benchmarks for this article’s claims 
+
+If scope must shrink, the Tier-1 order of precedence is: LongMemEval, LoCoMo, PersonaMem, MemoryAgentBench, BEAM. 
+
+## 8.7 Reporting 
+
+Per arm and question type: task quality, abstention and false-positive rates, evidence recall, tokens/context coverage — with uncertainty (per-cell n, binomial/bootstrap in-tervals, and the number of decoding runs — temperature 0 + seed list — preregis-tered); judge model + version + prompt pinned per benchmark (official where one exists). Per-answer coverage is logged (state-read n, text-fallback m, abstained a, un-available u; §4.4). Aggregator limits at the declared S/e/o and joint-fallback limits (k_joint, re-prefill tokens from text) are reported as their own rows. 
+
+Cost reporting keeps proxy and cache quantities separate (never conflated): (a) the emulation runs (arms A, A_k, C, O, R) report proxy costs — prefill tokens pro-cessed, decode tokens, wall-clock — labelled as proxy; (b) cache quantities — bytes read, prefill tokens avoided, restore TTFT — come from the §7 analytic model and are measured only on the minimal real-cache replay. The replay’s reader, runtime, native-state format, tolerance rule, equality checks, and cold/warm residency are pinned before it runs; each arm/config’s measured coverage is labelled. The replay will test 
+
+practical equality with tolerances (§2.2) — the outcome is not presupposed. “In-house measured numbers only” scopes to new empirical accuracy/performance claims; the analytic §5–§7 estimates and the arm-D context remain attributed as such. 
+
+## 8.8 What this chapter does not claim 
+
+No accuracy result is reported here — this is a protocol. No arm is called an upper bound or ceiling. The plan’s feasibility rests on declared workload budgets (§8.4) and the preregistered gate (§8.5), both of which are stated, not assumed away. 
+
+# 9 Failure Modes, Limitations & Next Steps 
+
+This chapter collects what can go wrong and what the article deliberately does not claim. Each item points to where the article handles it, or is stated here as a limitation. 
+
+## 9.1 Failure modes 
+
+36 Failure mode Mechanism Where handled Cross-session synthesis limit Per-session reads cannot jointly attend; answers needing joint evidence depend on the aggregator and the joint tier Exercised on per-question-annotated joint-evidence questions (§8.3, §8.6), with joint-fallback limits reported as their own rows (§8.7); the §8.2 contrasts cover aggregator, distractor, and evidence-format sensitivity (§4.6, §4.7) Scan cost at year scale The exhaustive reference path would read the whole retained state per query — an analytic cache-equivalent ≈1.44 TB at 8B-GQA (mid scenario, one full year retained, all-cold; §7; nothing measured, §8.7) — which is why the prefilter variant exists for this regime §4.5, §7.1–§7.2 Lost-in-the-middle inside long cached sessions Evidence in the middle of a long session is used less reliably even when present [52] — KV-LTM inherits this per session §5.2 session-length caps; §8.5 reader gate Reader long-context limits Claimed context ≠ effective context: many models’ effective context falls below their claimed context in controlled probes [39][40] §8.5 gate (diagnostics labelled as such) Session mis-bounding Sessions are the retention, cache, and retrieval unit; mis-bounded sessions can affect all three. A labelled mis-bounding-rate sensitivity sweep (accuracy vs mis-bounding rate) is planned, not implemented — no bare hypothetical rate is asserted §9.3 next steps (planned sweep); §9.2 session-identification dependency 37 Failure mode Mechanism Where handled Quantization-induced degradation KV quantization is numerically lossy and must be validated per config before counting its savings [12] §2.3 class (ii), §5.2 Benchmark ≠ deployment Benchmarks often hand you session boundaries and gold annotations; production traffic does not §8.3, §8.6 Judge/label noise Published benchmark scores are judge- and label-sensitive; stricter re-judging materially changes published memory-system scores [43] §8.4 release pinning; §8.6 sensitivity row; §8.7 judge pinning + preregistered uncertainty 
+
+## 9.2 Limitations 
+
+• Model-version lock-in. A stored state is valid only under the §4.2 contract; a model, tokenizer, or config change invalidates it, and migration is a re-prefill from text, linear in archive token volume for fixed/bounded session-length processing (§4.8, §7.1). The reader model is effectively frozen for the retention window. • Session-length cap. One cached session is bounded by the reader’s effective context — among the §5 candidates, MiniCPM3-4B (32,768, config value) and DeepSeek-V2-Lite (≈32K, model-card guidance) are the 32K-class cases, while Llama-3.1-8B publishes 131K; in every case the effective value is what §8.5’s gate decides (§5.2). Longer sessions need segmentation, which interacts with session identification. • Storage growth. The store grows with retention; §6 frames it as a bounded cost under a declared budget, with achievable-N degradation (§4.8, §6.3). • Per-architecture exactness. The §2.2 lemma guarantees equality for that model’s own computation, under the reuse contract and ideal arithmetic ; it gives no inter-architecture quality guarantee — reader quality is established per checkpoint by the §8.5 gate, and no universal MLA-vs-GQA ordering is claimed (§2.3). • Text-only scope. No claim that visual, table, or audio meaning survives prepro-cessing into text (§1.4). • Session identification is deferred. How raw interaction is segmented into sessions is a separate problem; the design depends on it (§1.4 scope; §4), and §8.3’s per-question annotation assumes benchmark-given boundaries. This is a stated dependency, not a solved component. • The reader-sufficiency hypothesis is unproven at drafting. §8.5 states and gates the “<70B-class reader suffices” hypothesis; it remains a hypothesis until the preregistered gate runs (§8.5, §8.7). • Privacy — data protection. The store holds raw text plus derived state — a high-value personal-data surface. GDPR Art. 17 [53]: per-session deletion helps but is 38 not a compliance guarantee ; derived copies must be erased or invalidated as applicable, and selective source redaction may require a state rebuild. Learned cache-erasure methods exist (KVEraser [54]) and are noted bibliographically — no deletion guarantees are claimed. • Privacy — threat model. We assume a conservative sensitive-state threat model; no state-to-text inversion is claimed. (Author assumption — no public source is cited for it.) • Privacy — instruction integrity. Persisted instructions are treated as untrusted historical data. 
+
+## 9.3 Next steps 
+
+1. A source-traced released-item instance of write-time loss (item ID, pinned pipeline and configuration, metadata-intact stored state, logged reader context, answer and evaluation; source-reported versus reproduced artifacts distinguished), as a future upgrade to the §3.2 mechanism evidence. 2. Controlled in-house runs of arms A, A_k pre/A_k probe (the §8.1 prefilter/probe variants), C, O, R on the pinned Tier-1 benchmarks (§8.4–§8.6), with the §8.2 sen-sitivity contrasts — plus the planned mis-bounding sweep : a frozen boundary-perturbation policy (splits/merges that do not change source tokens) over a fixed benchmark subset, reporting accuracy and coverage against the injected mis-bounding rate, with reader, selection, and aggregation budgets held fixed. The sweep is proposed here, not implemented; numerical rates are later-run pins. 3. The minimal real-cache replay : tests practical equality with tolerances (§2.2) plus the §8.7 measured cost axis — replay reader, runtime, state format, toler-ances, and residency pinned beforehand; the outcome is not presupposed. 4. Bounded question decomposition : a future optional planner could split a com-plex question into a bounded set of sub-questions, read selected sessions from unchanged checkpoints, and combine source-linked evidence against the origi-nal question. Its quality and full query-time cost would be evaluated separately, with the planner, query and round limits, and budgets frozen before runs. This is proposed here, not implemented. 
+
+# A Derivations for §5–§7 
+
+Every number used in §5/§6/§7, derived step by step. Parameters are labelled: [con-fig] = from a pinned model config [11][15]; [assumption] = declared; [symbolic] =left symbolic by design. GB/TB are decimal (10⁹/10¹² B) throughout. 
+
+## A.1 Per-config bytes/token (bf16, b = 2) 
+
+Formula (MHA/GQA): 2 · L · H_kv · d_head · b. Formula (MLA): L · (d_c + d_R) · b — assumes the runtime persists the compressed latent; a runtime caching decom-pressed per-head K/V stores H · (d_qk + d_v) · b · L instead, e.g. DeepSeek-V2-Lite: 16 × (192 + 128) × 2 × 27 = 276,480 B/tok ≈ 8.9× its latent figure (276,480 / 31,104) [config + declared runtime assumption] .39 Model Substitution Bytes/token Pin status MiniCPM3-4B 62 × (256 + 32) × 235,712 [config] [11] (HF config.json) DeepSeek-V2-Lite 27 × (512 + 64) × 231,104 [config] [11] (HF config.json) Qwen2.5-7B 2 × 28 × 4 × 128 × 257,344 [config] HF config.json, retrieved 2026-09-26 [11] Llama-3.1-8B 2 × 32 × 8 × 128 × 2131,072 [config] HF config.json, retrieved 2026-09-26 [11] Llama-3.3-70B 2 × 80 × 8 × 128 × 2327,680 [config] HF config.json, retrieved 2026-09-26 [11] DeepSeek-V3-class MLA 61 × (512 + 64) × 270,272 (bf16); 35,136 (ideal FP8, payload only, before scales/metadata) 
+
+[assumption: ideal halving] [assumption: published V3-class config — representative, not a pinned checkpoint] 
+
+Kimi-Linear-48B-A3B 7 × (512 + 64) × 2 (MLA layers of 20 KDA + 7 MLA) b_MLA = 8,064; plus S_recurrent per session 
+
+[symbolic, bytes/session] [config] [15] + its public config The shared fixed instruction prefix (§4.3) is stored once as a physically dedupli-cated, immutable prefix block; a 500-token prefix at 131,072 B/token = 65.5 MB once ≈ 0.005% of the 8B-GQA annual state [assumption: 500-token prefix] . Scenario token volumes count session tokens only. 
+
+## A.2 Annual volumes (declared assumptions) 
+
+• Anchor: 30,000 tokens/day × 365 = 10.95M tokens/year [assumption: mid coverage 35%, a planning anchor] .• Low: 10,000 × 365 = 3.65M [12%] . High: 85,500 × 365 = 31.2M [100% of the declared full-stream calibration: 64,300 words/day ≈ 13,000 said + 36,000 heard + 14,300 read + 1,000 written, × 1.33 tokens/word] .• tokens/word ≈ 1.33 and text ≈ 6 B/word (≈4.5 B/token) [assumption, owner planning ratios] ; [35] speech volume ≈16K words/day is public context only. 40 A.3 Annual state per config (mid scenario) 
+
+bytes/year = 10.95M × bytes/token (decimal TB): Model computation TB/yr Llama-3.1-8B 10.95e6 × 131,072 = 1.435e12 1.44 Llama-3.3-70B 10.95e6 × 327,680 = 3.588e12 3.59 Qwen2.5-7B 10.95e6 × 57,344 = 6.279e11 0.63 DeepSeek-V3-class 10.95e6 × 70,272 = 7.69e11 0.77 (bf16) / 0.385 (ideal FP8, payload only) MiniCPM3-4B 10.95e6 × 35,712 = 3.91e11 0.39 DeepSeek-V2-Lite 10.95e6 × 31,104 = 3.41e11 0.34 Kimi-Linear 10.95e6 × 8,064 = 8.83e10 0.088 TB (MLA part) + 5,475 × S_recurrent bytes 
+
+[symbolic term; session count from the declared 2,000-token sessions] 
+
+Low/high rows scale linearly (×3.65/10.95, ×31.2/10.95). 
+
+## A.4 KV/text ratio (per config) 
+
+Text density ≈ 4.5 B/token (6 B/word ÷ 1.33 tokens/word, declared planning ratios 
+
+[assumption] ). For Llama-3.1-8B: 131,072 / 4.5 = 29,127 ≈ 2.9×10⁴ . DeepSeek-V2-Lite: 31,104 / 4.5 ≈ 6.9×10³ . Ratios for other configs follow from A.1. No universal multiplier is stated. 
+
+## A.5 Retention budget → achievable-N (byte-only upper estimate) 
+
+Declared store budget B_store = 512 GB [assumption] ; L = 0 (whole budget to the re-cent set) [declared example] ; token payload only — the table divides by state bytes only (a byte-only upper estimate); the §4.8 invariant over the full record is checked including overhead in the §8 replay. Achievable-N (years) = B_store / (TB/yr), units matched: - 8B-GQA: 512 / 1,435 GB ≈ 0.357 yr ≈ 4.3 months . - DSv3-class bf16: 512 / 769 ≈ 0.67 yr ≈ 8.0 months . - MiniCPM3-4B: 512 / 391 ≈ 1.31 yr ≈ 16 months . -DSv2-Lite: 512 / 341 ≈ 1.50 yr ≈ 18 months . - Kimi-Linear (hybrid): N ≤ B_store /(tokens/yr × b_MLA + sessions/yr × S_recurrent + overhead/yr) , all terms in bytes; 5.8 years is the optimistic MLA-only byte ceiling (S_recurrent → 0) , not attainable full-hybrid retention. Illustrative sensitivity, explicitly BF16 recurrent-matrix-only : S_recurrent ≈ 20 × 32 × 128² × 2 B = 20,971,520 B ≈ 21 MB/session (excluding convolution/auxiliary state and possible wider accumulation dtype; config-derived, unvalidated) × 5,475 sessions/yr ≈ 115 GB/yr > 88 GB/yr MLA part → N ≈ 41 512e9 / (88.3e9 + 115e9) ≈ 2.5 years — an optimistic partial-state sensitivity, not a measured or complete-hybrid capacity. Overflow: oldest sessions drop to text-only (achievable-N shrinks; §4.8 shrink order: older set L first, then the recent window). Retention under a fixed budget scales inversely with coverage. 
+
+## A.6 Per-query worked examples 
+
+Declared: 2,000-token sessions; g = 64 output tokens/session; every selected state cold (no residency) [assumptions] . - Recent window: 300 × 2,000 × 131,072 B = 78.6 GB ≈ 79 GB cold transfer per exhaustive query; 600K tokens ≈ 20 days at 30K/day (600,000 / 30,000 = 20.0). Decode: Σ_s g_s = 300 × 64 = 19,200 tokens . -
+
+Coupling shown: transfer ≈ 78.6 GB / 5 GB/s [assumption] ≈ 15.7 s cold transfer. Decode = 19,200 / γ: under a declared serial aggregate γ = 30 tokens/s [assumption] 
+
+→ ≈ 640 s (serial elapsed, one active stream); under an ideal 300-way setup sustaining 30 tokens/s per stream, aggregate γ = 9,000 [assumption, additional resources] →≈2.13 s decode elapsed. Both are assumptions, not achieved latencies; γ depends on bandwidth/residency/compute — ordinary dense attention re-reads the cached state per generated token (≈ g × B_state ≈ 5 TB of logical KV reads here), so decode is not independent of transfer. Which term dominates is regime-dependent. - Year-scale: 10.95M × 131,072 B = 1.435 TB per exhaustive query. The cold-transfer component = 1.435 TB / β_eff; at the declared β_eff = 5 GB/s [assumption] : ≈287 s — a transfer component, not a full-query duration. β_eff otherwise stays [symbolic] 
+
+or uses a named dated datasheet (theoretical vs achieved distinguished). • Concurrent residency (§7.2 T3) [assumptions]: with all quantities in bytes, N = max(0, ⌊(0.9 × H − W − 500b) / (2,192b)⌋), where H is NVIDIA-listed per-GPU HBM [57], W is the illustrative weight budget in T3, and b is BF16 state bytes per token from §5. The 500b term counts one physically shared fixed prefix; each read adds 2,000 session, 128 suffix and 64 output tokens. Integer results for H200 / B200 / B300 are: MiniCPM3-4B, 1,516 / 1,965 / 3,206; DeepSeek-V2-Lite, 1,400 / 1,915 / 3,340; Qwen2.5-7B, 888 / 1,167 / 1,940; Llama-3.1-8B, 385 / 507 / 845; Llama-3.3-70B, 0 / 28 / 164. Without physical prefix sharing, remove 500b from the numerator and use 2,692b in the denominator. GB and MB are decimal. These are conditional accounting results, not measured capacities: actual weight allocations, state layout and runtime reserves can change them. Memory fit does not validate any decode rate or schedule (§7.1). 
+
+## A.7 Text-only contrast column (§6 T2) 
+
+Raw text at 6 B/word [assumption] : mid 10.95M tokens ÷ 1.33 = 8.23M words × 6 B/word ≈ 49 MB ; low ≈ 16 MB ; high ≈ 141 MB . Compressed at a declared 3:1 planning ratio [assumption — inside the documented 2.9–3.6× mixed-text range [37]] : low ≈5.5 MB, mid ≈16 MB, high ≈47 MB. 
+
+# References 
+
+[1] LongMemEval (Wu et al., ICLR 2025). https://arxiv.org/abs/2410.10813 https://github.com/xiaowu0162/longmemeval 
+
+42 [2] Mem0. https://arxiv.org/abs/2504.19413 Vendor-authored paper (ECAI 2025). [3] Zep. https://arxiv.org/abs/2501.13956 Vendor-authored preprint. [4] MemPalace. https://mempalace.net Project + independent analysis https:// arxiv.org/abs/2604.21284 
+
+[5] LoCoMo (Maharana et al., ACL 2024). https://arxiv.org/abs/2402.17753 https://github.com/snap-research/locomo 
+
+[6] CacheBlend. https://arxiv.org/abs/2405.16444 
+
+[7] EPIC. https://arxiv.org/abs/2410.15332 
+
+[8] TurboRAG. https://arxiv.org/abs/2410.07590 
+
+[9] Prompt Cache. https://arxiv.org/abs/2311.04934 
+
+[10] DeepSeek-V2 (MLA). https://arxiv.org/abs/2405.04434 
+
+[11] Candidate model checkpoints. Config-verified at pinned revision (con-fig.json re-fetched at the SHA, retrieved 2026-09-27): MiniCPM3-4B 
+
+https://huggingface.co/openbmb/MiniCPM3-4B @ d6b14dda; DeepSeek-V2-Lite https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite @604d5664; Qwen2.5-7B https://huggingface.co/Qwen/Qwen2.5-7B 
+
+@ d1497293; Kimi-Linear-48B-A3B-Instruct https://huggingface.co/ moonshotai/Kimi-Linear-48B-A3B-Instruct @ e1df551a. Revision-pinned only (gated license; config not re-fetched): Llama-3.1-8B https: //huggingface.co/meta-llama/Llama-3.1-8B @ d04e592b; Llama-3.3-70B-Instruct https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct @6f6073b4. DeepSeek-V3-class: representative published-config assumption; no checkpoint pinned. [12] KIVI https://arxiv.org/abs/2402.02750 ; KVQuant https://arxiv.org/abs/ 2401.18079 .[13] SCBench. https://arxiv.org/abs/2412.10319 
+
+[14] Pitfalls of KV Cache Compression. https://arxiv.org/abs/2510.00231 
+
+[15] Kimi Linear. https://arxiv.org/abs/2510.26692 
+
+[16] MemGPT / Letta. https://arxiv.org/abs/2310.08560 
+
+[17] MemoryBank. https://arxiv.org/abs/2305.10250 
+
+[18] MemoryOS. https://arxiv.org/abs/2506.06326 
+
+[19] OpenViking. https://docs.openviking.ai Vendor documentation. [20] LangMem. https://github.com/langchain-ai/langmem @ 9d033b47. Vendor source (LangChain), pinned. [21] Cognee. https://cognee.ai Vendor documentation. 43 [22] CAG ”Don’t Do RAG”. https://arxiv.org/abs/2412.15605 
+
+[23] vLLM PagedAttention. https://arxiv.org/abs/2309.06180 
+
+[24] SGLang RadixAttention. https://arxiv.org/abs/2312.07104 
+
+[25] CacheGen. https://arxiv.org/abs/2310.07240 
+
+[26] LMCache. https://arxiv.org/abs/2510.09665 
+
+[27] Mooncake. https://arxiv.org/abs/2407.00079 
+
+[28] MemServe. https://arxiv.org/abs/2406.17565 
+
+[29] Tutti. https://arxiv.org/abs/2605.03375 
+
+[30] Memorizing Transformers. https://arxiv.org/abs/2203.08913 
+
+[31] KV-cache management survey. https://arxiv.org/abs/2607.02574 
+
+[32] ”Fidelity Before Structure: Verbatim Chunks Beat Lossy Artifact Extraction in Long-Conversation LLM Memory” (T. An). https://arxiv.org/abs/2601. 00821v4 Preprint. Single author, under review. [33] Knowledge Objects for Persistent LLM Memory. https://arxiv.org/abs/2603. 17781 Preprint. [34] ConvoMem. https://arxiv.org/abs/2511.10523 Vendor-authored preprint (Salesforce). [35] Mehl et al. 2007 (Science). https://pubmed.ncbi.nlm.nih.gov/17615349 Con-text only (order-of-magnitude anchor); the article’s scenarios are declared as-sumptions. [36] Tokens-per-word planning ratio. Declared assumption (labelled parameter, mea-sured on the chosen tokenizer). [37] Meta Zstandard compression benchmark docs. https://github.com/facebook/ zstd/blob/dev/programs/README.md 
+
+[38] BEAM. https://arxiv.org/abs/2510.27246 
+
+[39] RULER (Hsieh et al., COLM 2024, NVIDIA). https://arxiv.org/abs/2404. 06654 https://github.com/NVIDIA/RULER 
+
+[40] NoLiMa. https://arxiv.org/abs/2502.05167 
+
+[41] PersonaMem. https://arxiv.org/abs/2504.14225 https://github.com/ bowen-upenn/PersonaMem 
+
+[42] MemoryAgentBench. https://arxiv.org/abs/2507.05257 
+
+[43] LoCoMo-Refined. https://github.com/mem-eval-suite/LoCoMo_refined Non-archival (repository). [44] PerLTQA. https://arxiv.org/abs/2402.16288 
+
+44 [45] PrefEval. https://arxiv.org/abs/2502.09597 
+
+[46] MemBench. https://arxiv.org/abs/2506.21605 
+
+[47] HaluMem. https://arxiv.org/abs/2511.03506 https://github.com/ MemTensor/HaluMem 
+
+[48] MSC / DMR. https://arxiv.org/abs/2107.07567 
+
+[49] LongMemEval-V2. https://arxiv.org/abs/2605.12493 
+
+[50] MemoryArena. https://arxiv.org/abs/2602.16313 
+
+[51] Memora (”From Recall to Forgetting”, Uddin et al.). https://arxiv.org/abs/ 2604.20006 
+
+[52] Lost in the Middle (Liu et al., TACL 2023). https://arxiv.org/abs/2307.03172 
+
+[53] GDPR Art. 17. https://eur-lex.europa.eu/legal-content/EN/ALL/?uri= celex:32016R0679 
+
+[54] KVEraser. https://arxiv.org/abs/2606.17034 
+
+[55] HELMET (Yen et al., ICLR 2025). https://arxiv.org/abs/2410.02694 https: //github.com/princeton-nlp/HELMET 
+
+[56] Same Task, More Tokens (Levy, Jacoby & Goldberg, ACL 2024). https: //aclanthology.org/2024.acl-long.818/ https://arxiv.org/abs/2402. 14848 
+
+[57] NVIDIA HGX AI Factory reference architecture, components (H200/B200/B300 SXM memory per GPU). https://docs.nvidia. com/enterprise-reference-architectures/hgx-ai-factory/latest/ components.html ; H200 product page https://www.nvidia.com/en-us/ data-center/h200/ ; DGX B300 user guide https://docs.nvidia.com/dgx/ dgxb300-user-guide/introduction-to-dgxb300.html . Vendor specifications, retrieved 2026-09-29. 45
