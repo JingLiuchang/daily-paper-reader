@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-20</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-21</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 6 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 15 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>3</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>3</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>6</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>9</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-20 01:22:46 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-21 00:39:23 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,9 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日精选6篇AI代理长期记忆研究，精读2篇、速读3篇，聚焦KV缓存与上下文交接。最值得关注的是将会话级KV缓存用作个人助手长期记忆，以及按需取证的语义上下文交接方案，两项均获8.0分。普通读者可先看这两篇精读，理解代理如何在多轮对话中“记住”并“交接”关键信息。</p>
+<p>今天扫完 15 篇论文，精读 6 篇、速读 9 篇，主线集中在检索增强与 LLM 智能体的记忆机制。</p>
+<p>最值得看的是 9.0 分的《Variants of Beam Search for DiskANN》和 8.0 分的《Forget Freely, Grep Later》，分别讲磁盘向量检索的束搜索变体、以及长程智能体“无损、免索引”的记忆方案。</p>
+<p>普通读者可先读这两篇精读文，再按兴趣从 LSP-RAG、HabitusMem、EvoMem 三篇速读里挑一个记忆或知识图谱方向跟进。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +80,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">3 篇</strong>
+    <strong class="dpr-home-dashboard-count">6 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="KV-LTM: Persistent Per-Session KV Caches as Long-Term Memory for Personal Assistants">KV-LTM: Persistent Per-Session KV Caches as Long-Term Memory for Personal Assistants</span></li><li><span class="dpr-home-dashboard-paper-title" title="Semantic Context Handoff with On-Demand Evidence for Long-Horizon Agents">Semantic Context Handoff with On-Demand Evidence for Long-Horizon Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Resolution as Attention for Efficient Agent Memory Perception">Resolution as Attention for Efficient Agent Memory Perception</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Variants of Beam Search for DiskANN">Variants of Beam Search for DiskANN</span></li><li><span class="dpr-home-dashboard-paper-title" title="Forget Freely, Grep Later: Lossless, Index-Free Memory for Long-Horizon LLM Agents">Forget Freely, Grep Later: Lossless, Index-Free Memory for Long-Horizon LLM Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Efficient Privacy-Preserving High-Dimensional Approximate Nearest Neighbor Search">Efficient Privacy-Preserving High-Dimensional Approximate Nearest Neighbor Search</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>3</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>2</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>2</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +93,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">3 篇</strong>
+    <strong class="dpr-home-dashboard-count">9 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="ARISE: Practical Self-Evolving Memory for Accurate and Cost-Efficient Enterprise Agents">ARISE: Practical Self-Evolving Memory for Accurate and Cost-Efficient Enterprise Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="KnowledgeClaw: Towards Agentic Knowledge Engineering via Omnimodal Hypergraphs">KnowledgeClaw: Towards Agentic Knowledge Engineering via Omnimodal Hypergraphs</span></li><li><span class="dpr-home-dashboard-paper-title" title="MemoSync: Co-Managing Developer-Agent Metamemory Across Contexts">MemoSync: Co-Managing Developer-Agent Metamemory Across Contexts</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="LSP-RAG: Latent Scoring Perspectives for Knowledge Graph Retrieval-Augmented Generation">LSP-RAG: Latent Scoring Perspectives for Knowledge Graph Retrieval-Augmented Generation</span></li><li><span class="dpr-home-dashboard-paper-title" title="HabitusMem: Belief Memory over Evolving User Preferences for LLM Agents">HabitusMem: Belief Memory over Evolving User Preferences for LLM Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="EvoMem: Self-Evolving Skills for Time-Aware Long Video Memory Agents">EvoMem: Self-Evolving Skills for Time-Aware Long Video Memory Agents</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>3</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>8</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 </div>
 
