@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-23</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-14 ~ 2026-11-23</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 3 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 17 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>0</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>3</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>6</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>11</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-23 03:22:39 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-23 03:44:46 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>2026-11-23 日报速读 3 篇、无精读，聚焦混合 RAG 框架、开放世界终身学习和参与式水治理的智能体 AI 生态。三篇均 6.0 分，最值得看的是用 RoBERTa-LoRA+FAISS+LLM 推理识别虚假评论，以及知识共享智能体群实现终身学习。建议普通读者优先浏览这两篇的方法思路，不必逐段精读。</p>
+<p>2026年11月14日至23日，共梳理17篇AI智能体研究，精读6篇、速读11篇，重点聚焦隐私审计、轨迹评测、记忆机制与长期运行安全。最值得关注的是两篇9.0分精读：AI智能体导出轨迹的隐私与可诊断性度量，以及交互式智能体的轨迹级精确评测。普通读者可先看这两篇精读摘要，再按兴趣补充智能体记忆和安全审计方向的速读。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +78,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">0 篇</strong>
+    <strong class="dpr-home-dashboard-count">6 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p class="dpr-home-dashboard-empty">今日暂无推荐。</p>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Where the Evidence Lives: Measuring Privacy and Diagnosability of Exported AI-Agent Traces">Where the Evidence Lives: Measuring Privacy and Diagnosability of Exported AI-Agent Traces</span></li><li><span class="dpr-home-dashboard-paper-title" title="DetourBench: Trajectory-Level Evaluation of Interactive Agents with Exact Minimum-Action Bounds">DetourBench: Trajectory-Level Evaluation of Interactive Agents with Exact Minimum-Action Bounds</span></li><li><span class="dpr-home-dashboard-paper-title" title="Agent Trajectories as Evidence for Software Quality Assurance">Agent Trajectories as Evidence for Software Quality Assurance</span></li></ul>
   </div>
-
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-trace <strong>6</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +91,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">3 篇</strong>
+    <strong class="dpr-home-dashboard-count">11 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="A Hybrid RAG Framework for Deceptive Review Detection: Integrating RoBERTa-LoRA, FAISS-Based Retrieval, and LLM Reasoning">A Hybrid RAG Framework for Deceptive Review Detection: Integrating RoBERTa-LoRA, FAISS-Based Retrieval, and LLM Reasoning</span></li><li><span class="dpr-home-dashboard-paper-title" title="OpenKAGE: Open-Ended Lifelong Learning in the Open World via Knowledge-Sharing Agent-Group Evolution">OpenKAGE: Open-Ended Lifelong Learning in the Open World via Knowledge-Sharing Agent-Group Evolution</span></li><li><span class="dpr-home-dashboard-paper-title" title="Democratizing Cross-Project Knowledge for Transforming Water Governance and Climate Resilience: an Agentic AI Ecosystem">Democratizing Cross-Project Knowledge for Transforming Water Governance and Climate Resilience: an Agentic AI Ecosystem</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="When Facts Change, Which Decisions Break? Dependency-Aware Context Graphs for Agents">When Facts Change, Which Decisions Break? Dependency-Aware Context Graphs for Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="Securing and Auditing Long-Horizon LLM Agents: State-Transfer Auditing and Controls in the Agent Harness">Securing and Auditing Long-Horizon LLM Agents: State-Transfer Auditing and Controls in the Agent Harness</span></li><li><span class="dpr-home-dashboard-paper-title" title="How Much Should an Agent Remember? Deployment Lessons from Self-Distilled Memory for LLM Agents">How Much Should an Agent Remember? Deployment Lessons from Self-Distilled Memory for LLM Agents</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>3</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-trace <strong>7</strong></span><span class="dpr-home-dashboard-tag">agent <strong>2</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>2</strong></span></div>
 </section>
 </div>
 

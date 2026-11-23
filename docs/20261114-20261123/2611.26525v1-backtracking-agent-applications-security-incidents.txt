@@ -1,0 +1,1606 @@
+Title: Backtracking Agent Applications Security Incidents
+
+URL Source: https://arxiv.org/pdf/2611.26525v1
+
+Published Time: Fri, 20 Nov 2026 03:49:36 GMT
+
+Number of Pages: 33
+
+Markdown Content:
+# Backtracking Agent Applications Security Incidents 
+
+Yicheng Cai 
+
+Pennsylvania State University University Park, PA, USA 
+
+yccai@psu.edu 
+
+Taegyu Kim 
+
+Pennsylvania State University University Park, PA, USA 
+
+tgkim@psu.edu 
+
+Peng Liu ∗
+
+Pennsylvania State University University Park, PA, USA 
+
+pxl20@psu.edu 
+
+Abstract 
+
+Agent applications are increasingly deployed, yet agent-specific attacks pose real threats to them. Upon a security incident, organizations backtrack to identify the CEP (com-promise entry point), remediate the damage, and prevent its recurrence. The main artifacts available for backtracking are trajectory logs, which record agent functionalities, and source code; app(lication)-specific function call logs are of-ten fairly limited. However, trajectory logs are at the agent functionality abstraction layer, while the CEP candidates are function calls at the app code execution layer. Due to this semantic gap, the analyst needs to manually inspect the relevant code for each CEP candidate to infer its cor-responding agent functionality. In this work, we present Origin, a backtracking tool for the analyst to submit a small number of queries to identify CEPs that existing tools can-not provide. Our approach poses two challenges: (1) define the intermediate abstraction that captures the mapping re-lationships between the two semantic layers; (2) determine the region-to-variable mapping for constructing the cross-layer graph defined in the intermediate abstraction. Each region is a specific group of agent functionalities. Origin addresses the challenges by (1) the cross-layer dependency graph ( CLDG ) that connects region-inferred functions at the semantic level to the variables in the low-level taint propa-gation subgraph, plus the associated query language, and (2) the region inference algorithm. Case studies on five popular agent applications across eight attack incidents show that an analyst using Origin correctly identifies all the CEPs. 
+
+CCS Concepts: • Security and privacy → Software and application security .
+
+Keywords: Backtracking, Agent application, Intermediate abstraction, Indirect prompt injection, Memory poisoning 
+
+1 Introduction 
+
+Agent applications powered by large language models (LLMs) have been widely deployed. For example, an open-source agent application, GPT-Researcher , accumulated over 24,000 GitHub stars after release [6]. Moreover, enterprise agent applications may increase from under 5% in 2025 to about 40% by the end of 2026, according to a recent Gartner fore-cast [32]. 
+
+> ∗Corresponding author.
+
+Meanwhile, such agent applications are under threat from emerging agent-specific attacks, among which indirect prompt injection (IPI) [29, 36, 48, 76] and memory & context poison-ing (MC-Poison) [23, 63, 82] are the most prevalent two of the OWASP Top 10 threats for agent applications [54]. For instance, a number of IPI CVEs [1, 5, 9, 58] and MC-Poison-based red-teaming [34, 49, 57] have been reported across multiple commercial agent applications. When a security incident occurs in deployed agent ap-plications, organizations backtrack the incident in order to identify the CEP (compromise entry point), remediate the damage, and prevent its recurrence. The main artifacts avail-able for backtracking are: (1) trajectory logs, which record a sequence of agent observations and actions [81] mapping to agent functionalities, such as planning, acting by invok-ing tools, and recalling information from memory [46]; (2) source code of the compromised applications. It is worth noting that application-specific function call logs are often fairly limited: developers may not anticipate which calls are diagnostically relevant to emerging agent-specific attacks and consequently omit the corresponding log printing state-ments [74], or complete logging is disabled due to overhead thresholds and privacy considerations [75, 80]. 
+
+Motivating example. Consider an MC-Poison security incident on GPT-Researcher , where an analyst received an incident report from a user/victim of the application (Sec-tion 3.1). There are three stakeholders: the analyst, the rem-edy administrator (usually the user), and the developers. The analyst aimed to backtrack the incident to identify the CEP, i.e., the function call that first introduced the malicious con-tent to the application (Section 4.3). When the corresponding input arguments of the CEP function call are already logged, the analyst can (1) provide the remedy admin with a concrete, actionable remedy, e.g., the exact poisoned file to remove from a knowledge base that may contain hundreds of docu-ments in various formats; when the corresponding function call log entry is missing, the analyst can (2) deliver to the developers the log printing statement placement around the CEP function call, enabling more efficient logging that makes the application diagnosable for future incidents. 
+
+Identifying the CEPs requires significant manual effort from the analyst. The analyst first triaged and ex-amined the trajectory log and narrowed down the suspect cause to a particular agent functionality (i.e., knowledge-base retrieval). However, it remains difficult to identify the CEPs 
+
+> 1arXiv:2611.26525v1 [cs.CR] 19 Nov 2026
+
+based only on the agent functionality since one agent func-tionality typically corresponds to many function calls, and no trajectory log records concrete function calls (Listing 1). Fundamentally speaking, trajectory logs are at the agent functionality abstraction layer, while function calls are at a lower layer (i.e., the app code execution layer). Static anal-ysis on the source code of the application can complement trajectory-log-based agent-functionality-level diagnosis by pinpointing the CEPs through variable-level taint analysis. However, the analysis is hindered by a large set of CEP can-didates: only a small subset is associated with the suspected initial compromise. After log-based pruning, there are still 1,518 candidates left in GPT-Researcher source code; to infer if a candidate belongs to the suspected initial compromise, the analyst spent hours on manual code inspection, detailed in Section 3.1. The main reason is that the code around the candidates carries little agent functionality semantics, and the analyst needs to gather enough evidence along the cor-responding code paths before making a deduction. 
+
+None of the existing approaches can provide stake-holders with the two “can provide” benefits mentioned in the motivating example , since trajectory-log-based failure diagnosis [52, 78, 81], detection-based failure attri-bution [24, 44, 79], and preventive information flow con-trol [28] do not provide the analyst with the CEPs but faulty agent execution state [52, 79, 81], faulty agent [78] or agent-owner [24], and LLM tool calls ( not function calls at the source code level) [28, 44] instead. 
+
+Our approach can provide stakeholders with the two benefits because it backtracks the security incident. 
+
+As mentioned in the motivating example, narrowing the CEPs during backtracking requires significant manual ef-fort since the analyst needs to do code inspection to recover the agent functionality semantics from the program source code. Our insight is to introduce a new intermediate abstraction (Section 4.4) that enables the analyst to write a few queries at the agent-functionality-level, and the query processing outputs can exclude irrelevant CEP candidates directly. However, identifying which CEP candidates seman-tically correspond to specific agent functionalities is hard since program structures and implementations vary, making it difficult to generalize how to identify the mapping rela-tionships. Fortunately, we observe that agent functionalities can be grouped into a small number of regions depending on the type of information source (Section 2) with which they interact. Each region is a set of program variables that imple-ment agent functionalities of the same group. The variables that receive the return values of the CEP candidates are also included. Based on this insight, we build a tool named Origin that realizes this abstraction as a graph across two layers. Origin takes as input the source code of an agent application and a small set of developer-provided la-bels, and produces the cross-layer graph that can be queried by analysts using a query language during security incident investigations: (i) narrow down candidates at the region lev-el/layer, (ii) identify the CEPs at the variable level. 
+
+Challenges. Our approach poses two challenges. First, de-fine the intermediate abstraction that captures the mapping relationships between two semantic layers: the agent func-tionality layer vs. the application code execution layer. Since the implementation of the same agent functionality by dif-ferent agent applications varies (e.g., the functions/variables naming, the used agent frameworks), we believe such an in-termediate abstraction can provide an analyst with the same interface when backtracking security incidents of different applications. Second, constructing the cross-layer graph (de-fined in the intermediate abstraction) requires determining which region each variable belongs to. This is because a vari-able’s region is determined by which information source its data came from or flows into, but a variable’s name, type, or enclosing function does not carry these semantics. 
+
+Solutions. For the first challenge, we design the Cross-Layer Dependency Graph ( CLDG ) (Section 5) that connects region-inferred functions to the underlying variables in the taint graph through cross-plane edges. We also design the as-sociated query language. As in BackTracker [45], the essence of backtracking is dependence analysis. Since the agent ap-plication CEPs are specific function calls, static taint analysis is suitable to identify the two types of dependencies a back-tracking tool can rely on: variable-level data dependencies and function-level data dependencies. For the second chal-lenge, we design region inference (Section 6.3) that mimics the analyst’s code inspection process by rules, which requires only a small set of developer-provided labels and automati-cally infers the regions for the variables. 
+
+Contributions. We make the following contributions. 
+
+• We design the CLDG plus the associated query lan-guage , a new intermediate abstraction that bridges the semantic gap between agent-functionality-level reasoning and program-variable-level application code execution. 
+
+• We design region inference , a technique that maps pro-gram variables into the relevant regions by rule-guided propagation of label information to the relevant functions along tainted program paths. 
+
+• We build and evaluate Origin on five real-world agent applications across eight attack incidents. Origin correctly identifies every CEP with a single candidate per incident, reducing the analyst’s inspection scope by 64–94% com-pared to the full taint graph and replacing exhaustive source code inspection with region-guided diagnosis. To foster research on this topic, we will release the source code of Origin to GitHub. 
+
+2 Background 
+
+Agent Applications. An LLM-powered agent application 
+
+interacts with diverse information sources for implementing 
+
+> 2
+
+various agent functionalities (e.g., perceiving the user instruc-tions, planning, acting by invoking tools, and recalling infor-mation from memory) [46]. Such applications produce tra-jectory logs to record the invocations of agent functionalities during a concrete execution [52, 81]. Two types of information sources are: (1) external information sources outside the appli-cations, including but not limited to user inputs, interactions with humans or agents, sensor readings, network-accessible content (e.g., web pages and emails), and LLM-generated con-tent; (2) internal information sources within the applications such as knowledge bases and memory. The memory stores multi-round interactions between the user and the agent, persisted on disk in either original or summarized form, so that the agent can recall prior context across sessions [46]. 
+
+Attacks on Agent Applications. Agent-specific attacks such as IPI [36, 48, 76] and MC-Poison [23, 54, 82] compro-mise the agent applications by injecting manipulated content into legitimate information sources of the applications. MC-Poison attacks usually involve two phases that occur in sep-arate executions: a poisoning phase , in which malicious data is written to an internal information source, and an exploita-tion phase , in which the stored data is retrieved and causes harm. In some incidents, poisoning occurs outside the appli-cation (e.g., an attacker directly modifies a knowledge base document), and only the exploitation phase is observable. 
+
+Static Taint Analyzers. Existing taint-analysis frameworks such as Joern [7], Pysa [17], and CodeQL [4] can already com-pute propagation paths over program variables and expres-sions. These capabilities can be repurposed for backtracking agent application security incidents. However, they expose only program code-level semantics and do not provide ab-stractions aligned with agent functionalities. 
+
+3 Motivation 
+
+3.1 Motivating Example Security Incident. Consider GPT-Researcher , an agent ap-plication that conducts research for users and generates syn-thesized content [6]. A security analyst receives an incident report from a user of the application. The report states that the application produced a research synthesis containing incorrect information for one particular research task, while other tasks were completed correctly. The report includes: a description of how the application is used, a PDF of the research synthesis, a trajectory log [81] of the application (Listing 1), and the application’s source code. According to the user description, the application used both a knowledge base and web data for this failed task. The analyst listed three likely accident causes: the LLM was hallucinating, the scraped webpages were manipulated, or the knowledge base was poisoned, where the latter two are security-oriented. 
+
+Three Stakeholders. There are three stakeholders in the incident: the analyst, the remedy administrator (usually the user), and the developers. The remedy admin needs a con-crete, actionable remedy for the damage, e.g., removing the exact poisoned file from the knowledge base with hundreds of documents; the developers need the log printing statement placement suggestion that makes the application more diag-nosable for future incidents, e.g., log the parameter values of the function call corresponding to the initial compromise im-mediately before that call (Listing 2, Line 83). To provide the two stakeholders with the two benefits, the analyst aimed to identify the CEP, i.e., the function call that first introduced the malicious content to the application (Section 4.3). 
+
+Log Triage. To identify the CEP of the incident, the analyst first triaged the trajectory log (Listing 1), which records the user task, the application’s research plan, links to scraped webpages, and HTTP requests to an LLM provider. These coarse-grained traces were sufficient to rule out LLM halluci-nation and manipulated webpages, leaving knowledge-base poisoning as the remaining suspect cause. However, the log could not help identify which function call is responsible for the initial compromise (i.e., retrieving poisoned content from the knowledge base), because the trajectory log did not record concrete function calls. Fundamentally speaking, tra-jectory logs are at the agent functionality abstraction layer, while function calls are at the app code execution layer.                                
+
+> 2025 -09 -07 20:43:26 ,657 - research - INFO -Starting research for query : Is Nvidia stock price going up ? ... 2025 -09 -07 20:43:36 ,913 - httpx - INFO -HTTP Request : POST https :// api . openai . com / v1 / chat / completions "200 OK " 2025 -09 -07 20:43:36 ,915 -research -INFO -Research outline planned: [' NVIDIA stock price forecast September 2025 analysts consensus ', ' NVIDIA real ...] ... 2025 -09 -07 20:43:46 ,662 - gpt_researcher . scraper . scraper -INFO -URL : https :// www . cnn . com / markets / stocks / AMD
+
+Listing 1. Triaged trajectory log. 
+
+Static Taint Analysis. To identify the CEP, the analyst complemented the trajectory-log-based agent-functionality-level diagnosis by variable-level static taint analysis on the application’s source code. The analysis extracted 1,895 API calls as taint source candidates, i.e., function calls that could potentially introduce untrusted content. Using distinctive log patterns (e.g., “Starting research for . . . ” colored red in Listing 1), the analyst located the corresponding log printing statements in the source code, identified their callers, and pruned program paths that cannot reach the callers, filtering out candidates on irrelevant paths. This log-guided pruning reduced the candidates from 1,895 to 1,518, but the analyst still needs to determine which of these candidates are related to knowledge-base retrieval functionality.                                   
+
+> 4from langchain_community . document_loaders import (5PDFLoader , TextLoader , ... , HTMLLoader )63 async def _load_document ( self , file_path , file_ext ): 64 ret_data =[] 65 loader_dict ={" pdf ": PDFLoader ( file_path ) , 66 " txt ": TextLoader ( file_path ) , ...
+> 372 " html ": HTMLLoader ( file_path )} 80 loader =loader_dict. get ( file_extension , None ) 83 ret_data =loader .load() 84 return ret_data
+
+Listing 2. Code snippet around the CEP function call. 
+
+Manual Code Inspection Burden. Without tool support to filter candidates by their functionality, the analyst’s only option is to inspect each candidate manually. Yet even de-termining whether a candidate is related to knowledge-base retrieval requires multi-step code inspection. For instance, to determine that the candidate loader.load() in Listing 2 retrieves facts from a knowledge base, the analyst had to (a) trace the variable loader back to its definition, (b) ex-amine each class in loader_dict and its load function, and (c) combine these observations with the caller name 
+
+_load_document to infer the developer’s intent. Repeating this process across 1,518 candidates would take hours. 
+
+3.2 Limitations of Existing Approaches 
+
+Existing approaches for analyzing and defending agent appli-cations cannot provide stakeholders with the two benefits illustrated above. The main reason is that trajectory-log-based failure diagnosis [52, 78, 81], detection-based failure attribution [24, 44, 79], and preventive information flow con-trol [28] do not provide the analyst with the CEPs . They instead provide the analyst with the faulty agent execution state [52, 79, 81] (e.g., an agent forming an incorrect plan), faulty agent [78] or agent-owner [24], and LLM tool calls (not function calls at the source code level) [28, 44]. 
+
+4 Approach Overview 
+
+4.1 Scope 
+
+Existing agent applications can be classified into two cate-gories: predefined workflow (C1), where application source code rather than LLM decides control flow among agent functionalities; OpenClaw-like agents [2, 13, 15] (C2), where the LLM decides at runtime which agent functionality to invoke next. The C2 agents have recently emerged; however, most existing applications belong to C1. Our approach is directly motivated by C1, not by C2. Hence, the scope of this work is C1; C2 and agent library frameworks [8, 11, 65] are out of scope and remain an area for future research. 
+
+4.2 Threat Model 
+
+We assume that adversaries can launch two categories of agent-specific attacks by methods proposed in existing works: IPI [36] and MC-Poison [23, 30]. The two attack classes are the most prevalent among the OWASP Top 10 threats for agent applications and can cover all the risk categories in the report that target agent functionalities of the applica-tions [54]. The remaining categories are either risks inherited from traditional software security (i.e., remote code execu-tion, privilege escalation, and supply chain integrity), or those reside outside the application (i.e., inter-agent commu-nication protocol, social engineering, and insider threats). Note: the non-protocol part of the insecure inter-agent com-munication risk category can be caused by IPI and MC-Poison. Such an attack incident is investigated in Section 9.3. 
+
+4.3 Compromise Entry Point 
+
+The agent-specific attack classes in Section 4.2 share a com-mon characteristic: malicious data enters the application through the return value of an API call and propagates through data flow to cause harm. We define the compromise entry point (CEP) based on the characteristic and standard static taint tracking [73]. Given a security incident in an agent application, the CEP is identified by: (i) the name of the API call whose return value contains the malicious data, (ii) the name of the corresponding source code program file, and (iii) the line number of the call site. We also provide the analyst with a set of taint propagation paths, where each path starts from a variable receiving the return value of the CEP function call and ends at a variable capturing the at-tack effect. Each variable in the paths is contained in exactly one function. Mapping each variable to its enclosing func-tion gives a function-level path: the sequence of functions through which the data passes from entry to effect. 
+
+4.4 Problem Statement Our insight: the need for an intermediate abstraction. 
+
+As the motivating example illustrates, the analyst reasons about executed agent functionalities observed from the tra-jectory log (e.g., “which code retrieves from the knowledge base?”), while static taint analysis operates at the level of program variables. However, no existing static analysis tech-nique can determine which program variables semantically correspond to which specific agent functionalities, because program structures and naming conventions vary across applications, making it hard to generalize such a mapping. Fortunately, we observe that agent functionalities can be grouped into a small number of groups based on the type of information source (Section 2) with which they interact. For instance, retrieving from a knowledge base and recalling memory are distinct functionalities, but both interact with internal information sources; hence, they belong to the same group. We call such a group a region : a set of program vari-ables that collectively implement agent functionalities of the same group. An analyst can query at the region level (e.g., “which region is for retrieving content from the knowledge base?”); the query processing outputs can exclude irrelevant CEP candidates directly, without manual code inspection. Concretely, the intermediate abstraction is composed of four elements: (1) a region set that partitions agent function-alities into finite groups; (2) a region-to-variable mapping 
+
+that associates each region with the program variables that implement it; (3) a region-level query interface (including the 
+
+> 4
+
+query language) through which analysts express their diag-nostic queries in terms of regions rather than variables; (4) a 
+
+region-to-variable query mapping that translates region-level queries into variable-level queries, supported by existing static analysis infrastructure. The goal of this work is to design a tool that realizes the new abstraction. 
+
+4.5 Challenges Challenge 1: Define the intermediate abstraction that captures the mapping relationships between two se-mantic layers: agent functionality layer vs. the appli-cation code execution layer. The implementation of the same agent functionality by different agent applications varies (e.g., the functions/variables naming, the used agent frameworks). We believe such an intermediate abstraction is needed so that an analyst can use the same interface for backtracking security incidents of different applications. 
+
+Challenge 2: Constructing the region-to-variable map-ping. The abstraction requires a concrete mapping from regions to program variables (element 2). No existing static analysis technique can infer agent functionalities from pro-gram source code. As illustrated in Section 3.1, variable names, such as ret_data , loader_dict , and loader in the function _load_document , do not carry the hints that they are used for retrieving from a knowledge base. Therefore, it is hard to determine which region they belong to. 
+
+4.6 Origin Overview 
+
+Origin takes as input (1) the source code of an agent appli-cation and (2) developer-provided labels. It outputs a CLDG 
+
+that analysts query to identify the CEPs of security incidents on the agent application. Figure 1 illustrates Origin. Source Code Static Taint Analyzer (§ . ) 
+
+> Query Language Parser (§ . )
+> Query
+> Taint Sources Taint Sinks
+> CLDG Construction (Section  )
+> Developer Provided Labels (§6.1)
+> Region Inference Engine (§ . )
+> Query Processing (Section  )
+> Perceiving Region Planning & Acting Region Recalling & Reflecting Region Variable Plane Function Plane Prompt Kitchen Region Query Engine (§ . )
+> Variable Plane of CLDG Inter-variable taint edge Cross-plane edge CEP + Path(s)
+> CLDG (Section  )
+
+Figure 1. Origin overview. 
+
+CLDG (Section 5). The CLDG is a two-plane directed graph: The function plane is a set of region-inferred function nodes (abstraction element 1 in Section 4.4); the cross-plane edges 
+
+connect each function to the variables in the variable plane 
+
+(element 2). The CLDG , together with the associated query language (elements 3 and 4, Section 7), addresses Challenge 1. 
+
+CLDG Construction (Section 6). Origin (i) performs for-ward taint propagation from the return values of every API call in the source code to build the variable plane of the CLDG 
+
+(Section 6.2); (ii) uses the developer-provided labels (Sec-tion 6.1) as input for region inference (Section 6.3), which classifies each function to a region (addressing Challenge 2). 
+
+Query Processing (Section 7). The analyst first sub-mits a region-level query against the CLDG ; then inspects the returned graph to identify the source/sink variables for a variable-level query (Section 7). The output is the CEP and the corresponding paths in Section 4.3. 
+
+5 Cross-Layer Dependency Graph 
+
+The CLDG realizes the intermediate abstraction as a directed graph of two planes: the function plane and the variable plane .
+
+Definition 5.1 (Cross-Layer Dependency Graph) . Let 𝑃 be an agent application with the function set F . The Cross-Layer Dependency Graph 𝐺 = (R , 𝑉 fn , 𝜆, 𝐸 cross , 𝑉 var , 𝐸 var ) of 𝑃 is a two-plane directed graph, where: 
+
+• Region set. R is a mapping from each region name to a set of agent functionalities. Each agent functionality is a mapping from the functionality name to a set of functions in the agent application program. Five representative regions (detailed in Appendix A) are: Per (Perceiving), PA (Planning & Acting), RR (Recalling & Reflecting), PK (Prompt Kitchen), and UNK (Unknown). 
+
+• Function plane. 𝑉 fn ⊆ F is the set of functions reachable from all API calls in 𝑃 via taint propagation. 𝜆 : 𝑉 fn →R ∪ { UNK } assigns each function node its inferred region. 
+
+• Variable plane. 𝑉 var is the set of program variables reach-able from all API calls in 𝑃 via taint propagation, and 𝐸 var ⊆
+
+𝑉 var × 𝑉 var is the set of taint edges among them. The same variable in different code statements is treated as different nodes (with different identifiers) in the variable plane. 
+
+• Cross-plane edges. 𝐸 cross ⊆ 𝑉 fn × 𝑉 var connects each func-tion node 𝑓 to every program variable defined/used in 𝑓 .
+
+The region set R can be determined by the security ana-lyst as long as the mapping relation is provided. Our design is applicable to any analyst-defined region set. Once a partic-ular region set is adopted, Origin requires a corresponding function-to-information-source mapping table from develop-ers of the agent application (Section 6.1). In addition, every cross-function taint edge in the variable plane is naturally mapped to an edge connecting two functions. Such edges appear on the function-level paths mentioned in Section 4.3. 
+
+6 CLDG Construction 
+
+Constructing the CLDG involves two steps: (1) taint propa-gation to build its variable plane (Section 6.2) and (2) infer regions for nodes in the planes (Section 6.3). Step (2) requires developer knowledge as input (Section 6.1). 
+
+6.1 Developer Knowledge Collection 
+
+Origin runs with a function-to-information-source mapping table showing which functions in an application interact with 
+
+> 5
+
+external (EXT) or internal (INT) information sources. This information is collected once from the agent applica-tion developer and reused across all incident investigations. Well-trained developers know only functions that directly call built-in or library APIs need examination, but they may still find it time-consuming to label this subset of functions, e.g., 353 out of 607 functions in GPT-Researcher. As in List-ing 3, to determine whether an API call execute() accesses an internal information source (INT), the developer needs to (1) trace variable commons back to common_dependencies 
+
+function definition to identify the Supabase client, (2) check the preceding calls before execute() against the API doc-umentation to determine that execute() retrieves content from the chat_history table, and (3) confirm that the chat_ history table is used as agent memory. The developer needs to examine all remaining API calls in the function to en-sure they are not interacting with external ( EXT ) information sources (e.g., a user, an LLM, or a web browser) before as-signing a label INT to the function.                   
+
+> 1def get_chat_history ( chat_id ): 2commons =common_dependencies () 3history =( commons [" supabase "] 4. from_ (" chat_history "). select ("*") ... 7. execute () ). data 8return [ ChatHistory (m) for min history or []]
+
+Listing 3. An example function for labeling, simplified. To address this, we use an LLM with a prompt contain-ing the function’s API calls, relevant source code, and rules for identifying information sources. The LLM produces a structured report: a decision for each call, its explanation, supporting code locations, and any missing information for labeling a function (Appendix F.1). Although human valida-tion is still needed, this reduces the developer’s work from labeling to reviewing a report. The experiment results show that the knowledge collection speed increases by 15.4–75.0% and the accuracy increases by 8.3–50.4% (Section 10.8). 
+
+6.2 Taint Graph Construction 
+
+With the developer labels in place, Origin constructs the graph. The variable plane ( 𝑉 var , 𝐸 var ) is produced by perform-ing context-, flow-, field-sensitive forward taint propagation from the return values of every API call (implementation described in Section 8). Because propagation starts from all API calls, any CEP function call that matches the definition in Section 4.3 lies on a path in the variable plane and is locat-able by queries against the CLDG . 𝑉 fn and 𝐸 cross are derived from the variable plane: 𝑓 ∈ 𝑉 fn if any of its variables appears in 𝑉 var ; 𝐸 cross connects each function to its variables. 
+
+6.3 Region Inference 
+
+The region inference algorithm implements the region-to-variable mapping element in the abstraction (Section 4.4). The goal is to classify the functions in the function plane of  
+
+> CLDG
+
+into the five regions detailed in Appendix A. We observe that a naive feature-based clustering approach, i.e., clustering by function names, API names, or program code syntactic features, is not suitable for this task: (1) func-tions/APIs of the same name could implement completely different agent functionality in different agent applications, and thus belong to different regions. For example, two func-tions named load may read a webpage (fall into the PA re-gion) or read a file from a knowledge base (fall into the RR 
+
+region). Similarly, (2) syntactically similar string operations, e.g., x.format(y) , may be used for prompt assembly or for non-agent functionalities, e.g., composing an error message. Fortunately, we find that an analyst, fully aware of the semantics of the five regions, usually gathers evidence dur-ing code inspection to answer four questions, and the fusion of the answers can determine which region a function be-longs to: (1) does the function interact with information source(s)? (2) does the function read from or write to the information source(s), or do both? (3) if the function interacts with multiple information source(s), which type of informa-tion source dominates (Section 2)? and (4) is the function mainly assembling prompts to appear in the LLM context window? Origin uses two categories of rules to mimic the aforementioned analyst’s reasoning process during code inspection for region inference: 
+
+Label propagation rules (3 in total) mimic the process of gathering evidence to answer the four questions about a function. Two rules propagate (along the tainted paths) the labels of the API calls that interact with information sources. Concretely, the two rules are: (1) if an API call reads an infor-mation source, propagate the label forward; (2) if an API call writes an information source, propagate the label backward. We also have a rule for propagating a special label of func-tion calls that assemble prompts rather than interact with information sources. Prompt-assembly-related function calls are assigned with such a label (e.g., text-composition func-tions like format ; function names or parameters with special names consisting of “prompt”). This rule propagates labels only within a function because we observe that prompt as-sembly is an agent functionality local to discrete function(s). 
+
+Condition-action rules (9 in total, Table 1) mimic the an-alyst’s reasoning process of region determination by com-bining answers to the four questions against the gathered evidence. For example, if a function receives a user request, it gathers the label of an external information source and no label of prompt assembly according to the label propagation rules; consequently, it is classified into the Per region, which only passively reads external information sources. Our evaluation shows that the two categories of rules work well in practice (Section 10.4). Meanwhile, our condition-action rules are intended to be practical rather than exhaus-tive. Initially, we observed that agents usually prepare a prompt shortly before writing to the LLM context window. 
+
+> 6
+
+Table 1. Condition-action rules for region inference.                                                   
+
+> Rule IS? R/W Main IS Asm.? Region
+> 1No ––No UNK 2Yes RExt No Per 3Yes WExt No PA 4Yes R+W Ext No PA 5Yes RInt No RR 6Yes WInt No RR 7Yes R+W Int No RR 8Yes R+W Ext Yes PK 9Yes R+W Int Yes PK IS: information source; R: read from an information source; W: write to an information source; Ext/Int: external/internal information source; Asm.: whether the function mainly assembles the prompt.
+
+Therefore, we only have Rule 8 for the PK region, since LLMs are treated as external information sources in Origin. How-ever, our case studies later showed that prompt assembly can also begin shortly after reading any information source, without immediately passing the partial prompt to the LLM context window. We added Rule 9 to cover this case. 
+
+7 Query Processing 
+
+Given a constructed CLDG , the analyst investigates a security incident by issuing queries against it using a query language. 
+
+7.1 Query Language 
+
+The query language implements the region-level query inter-face element in the abstraction (Section 4.4). The full gram-mar is provided in Appendix B. Each query begins with the keyword CHECK , followed by one or more atomic formulas joined by logical connectives. An atomic formula consists of the predicate DEPENDS_ON ,which asserts a taint data flow between two terms. A term can be either a region name or a program variable identifier, allowing queries at the region level or the variable level. Log-ical connectives include AND and OR . For example, CHECK (PK DEPENDS_ON PA) AND (PA DEPENDS_ON PK) is a commonly used region-level query for backtracking IPI incidents by an analyst (Table 5). The atom PK DEPENDS_ON PA asks whether data from the PA region (e.g., the crawled webpage), can flow into the PK region (e.g., to assemble a prompt). Similarly, the atom PA DEPENDS_ON PK asks whether data in the PK region (e.g., the assembled prompt) can flow back to the PA region (e.g., the LLM takes the prompt as input and the generated content flows to write a document). The language also provides a chaining operator →: the formula after → is evaluated against the subgraph returned by the preceding formula, allowing the analyst to progres-sively narrow down the variable-level results. For example, after writing the aforementioned region-level query, an ana-lyst can write →, followed by a second region/variable-level query. Origin first evaluates the first query; if the result is not empty, it continues to evaluate the second query against the result of the first query (Section 7.2). 
+
+7.2 Query Evaluation 
+
+This subsection implements the region-to-variable query map-ping element of abstraction (Section 4.4). 
+
+Region-Level Query Evaluation. A region-level query, such as CHECK PA DEPENDS_ON RR , returns a data depen-dency graph over function nodes through two steps: (1) iden-tify the variables in 𝑅 src functions and the variables in 𝑅 sink 
+
+functions by using 𝜆 and 𝐸 cross ; (2) compute forward reacha-bility from the 𝑅 src variables and backward reachability from the 𝑅 sink variables in the variable plane, producing two sets of reachable variable nodes. The intersection of these two sets contains all variables that lie on some taint path from 
+
+𝑅 src to 𝑅 sink . An edge (𝑓 1, 𝑓 2) appears in the result if a taint edge in 𝐸 var connects a variable in 𝑓 1 to a variable in 𝑓 2 within this intersection. When a query contains logical connectives, 
+
+AND and OR combine result graphs by intersection and union of their node and edge sets, respectively. 
+
+Variable-Level Query Evaluation. In a variable-level query, the source and sink are specified by their node identifiers in the variable plane (visible when the analyst inspects a function’s variables in the region-level query result). For ex-ample, CHECK node.5110 DEPENDS_ON node.4216 queries whether there is a taint path from variable 4216 to variable 
+
+5110 . To evaluate the variable-level query, a naive graph slicing of the CLDG variable plane may include paths that are not feasible in any real execution. Origin uses the applica-tion’s call graph and control flow graphs constructed during  
+
+> CLDG
+
+construction to enumerate only the control-flow feasi-ble taint paths between the source and sink variables. The returned paths are variable-level taint paths. As mentioned in Section 4.3, the taint paths can be naturally mapped to the corresponding function-level paths. 
+
+8 Implementation 
+
+We implement Origin as a Python program ( ∼16 KLoC) on top of Joern (v4.0.360) [3], with type inference enhancement by Pyrefly (v0.45.0) [16]. We address three limitations of Joern that cause false negatives in taint propagation. First, Joern does not parse generator expressions; we rewrite yield 
+
+and yield from to return before analysis. Second, taint stored in class instance variables (e.g., self.x ) is not tracked across functions; we propagate it explicitly via control-flow graph reachability. Third, Joern’s call graph is incomplete under dynamic dispatch. We first incorporate type-informed indirect call resolution by patching Pyrefly [16]; then we infer the targets of indirect calls by following Xia et al. [67] and Liu et al. [47] with two enhancements: context-sensitive type chain tracking in place of a global type-chain map, and value set analysis in place of full data-flow analysis. 
+
+9 Case Studies 
+
+We now discuss our experience applying Origin to back-tracking security incidents on real-world agent applications. 
+
+> 7
+
+Selected Applications. We have chosen five actively main-tained open-source agent applications (Table 2): two single-agent applications (SAAs) and three multi-agent applications (MAAs) with substantial real-world adoption, from four ma-jor domains, i.e., deep research (DR), conversational assistant (CA), coding copilot (CC), and software development (SD). 
+
+Table 2. Selected agent applications.                               
+
+> Application Domain Stars LoC Version Type
+> GPT-Researcher [6] DR 24,027 9,317 v3.3.3 MAA Quivr [10] CA 38,575 2,615 v0.0.33 SAA aider [12] CC 38,237 25,945 v0.86.0 SAA MetaGPT [14] SD 59,192 43,284 v0.8.2 MAA SWE-agent [18] SD 17,716 8,995 v1.1.0 MAA
+
+Investigated Security Incidents. Our eight investigated incidents are diverse in attack entry points and attack classes. As shown in Table 3, we cover both IPI [36] and MC-Poison [23, 30] attack classes, where MC-Poison is further divided into the subclasses of memory poisoning (M) and knowledge-base poisoning (KB); one incident is on a compound attack that combines IPI and MC-Poison (KB). Beyond directly mod-ifying files on the file system (e.g., the GPT-Researcher MC-Poison (KB) incident in the motivating example), we also consider attack scenarios where the malicious data enters through the application’s user interface: for instance, in the Quivr MC-Poison (M) incident, the attacker sent a crafted chat message that poisoned the memory of the agent. 
+
+9.1 Shared Backtracking Workflows 
+
+The analyst’s backtracking workflows are similar across the investigated incidents, despite the diversity in attack classes and entry points. Specifically, the analyst (i) identifies the sus-pect agent functionality from the trajectory log, (ii) submits a region-level query, (iii) inspects the resulting graph to iden-tify variable-level taint source/sink candidates, (iv) selects the source/sink to submit a variable-level query, and (v) iden-tifies the CEP and the corresponding paths. Typically, a CEP identification requires two queries (Table 3): one region-level query to narrow down the scope and one variable-level query to pinpoint the CEP. We show in Section 9.2 that inspecting the resulting graph of a region-level query usually narrows down the source/sink candidates for a variable-level query to one or two, respectively. With the knowledge obtained from the trajectory logs, the analyst can have a suspect ranking for source and sink candidates (detailed in Appendix C). In our case studies, these help the analyst submit the correct variable-level query with minimal trials. Besides, for attack incidents that span multiple phases in separate executions (e.g., Quivr MC-Poison (M)), the analyst repeats steps (i)–(iv) for each phase before identifying the CEP. 
+
+We observe that the variable-level query result, presented as a set of function-level paths, is typically sufficient for the analyst to identify and understand the CEP without inspect-ing the underlying variable-level taint propagation paths. In the Quivr MC-Poison (M) incident, the attack spans two phases (Section 2). The analyst submitted one variable-level query for each phase and obtained two valid function-level paths. Although the two paths correspond to two execu-tions within different time periods, the analyst identified the shared function call arguments (i.e., the chat_history table of Supabase) in the source node (blue, RR region) of Phase A path and sink node (blue) of Phase B path. This indicated that the malicious content can be first written to the agent memory in a chat with the attacker; then be retrieved back in another chat with the user. Therefore, the CEP is identified as the function call to the user-chat interface. The full incident and its backtracking process are detailed in Appendix C.1. For simpler single-phase incidents such as the motivating GPT-Researcher MC-Poison (KB) case, the analyst can di-rectly identify the CEP by examining the function-level paths returned by a variable-level query (detailed in Appendix C.2). 
+
+9.2 Common Practices for Graph Inspection 
+
+We report the common practices in step (iii) graph inspection, which replaces the time-consuming source code inspection: 
+
+(a) Not all nodes in the resulting graph of a region-level query require inspection. The graph contains nodes from the regions specified in the query as well as nodes from other regions that appear because they lie on the taint paths between the queried regions. Each node is colored by its region, so the analyst usually focuses only on nodes whose colors correspond to the queried regions and skips the rest. For example, in the Quivr MC-Poison (M) incident (phase A), the region-level query returns a graph of 21 function nodes, but only the 3 Per nodes (green) and 5 RR nodes (blue) match the queried regions and need examination (Figure 2(a)). 
+
+(b) Among the relevant nodes, it requires examining only a small number (usually less than 10) of function names and an even smaller number (usually 2 or 3) of variable-plane taint subgraphs corresponding to the functions. As in Figure 2(a), to identify the taint sink, the analyst examined the names of 3 green nodes of Per region, found create_question_handler 
+
+relevant to the incident, and clicked it to reveal a variable-plane taint subgraph of a single node (Figure 3 in Appendix) that is identified as the sink candidate. The analyst then takes a similar process to identify the taint source candidate from the 5 blue nodes of RR region. The entire process requires only examining 8 function names and 2 taint subgraphs, which is a huge manual effort reduction compared to 2,615 LoC of Quivr’s source code inspec-tion (Table 2). Origin also provides features that help the analyst handle larger graphs more efficiently, which are de-tailed in Appendix C.2 (Figure 4) and Appendix C.4 (Figure 5). 
+
+9.3 Notable Findings on Individual Applications 
+
+We report other notable observations from the case studies. 
+
+(a) An agentic loop within an execution does not prevent Origin from identifying the CEP, as long as both the CEP and 
+
+> 8
+
+Table 3. CEP backtracking results. UI means whether the attack is launched through user interface or not. #Queries denotes the number of queries submitted per diagnosis phase. #Paths is the number of function-level paths returned by the variable-level query. #Func is the number of functions on the path matching the actual attack execution. #Cand. is the number of CEP candidates identified by the analyst from the returned paths. Succ. indicates whether the diagnosis satisfies the success criteria.                                                                                         
+
+> Attack Description Diagnosis Detail Diagnosis Result Application Attack Class UI Phase #Queries #Paths #Func #Cand. Succ. CEP Description
+> GPT-Researcher IPI No A2313 1✓Obtaining web search result MC-Poison (KB) No A2419 1✓Loading knowledge document Quivr MC-Poison (M) Yes A2161✓Receiving chat message B228MC-Poison (KB) Yes A2291✓Receiving file upload B2113 IPI + MC-Poison (KB) Yes A2191✓Crawling URL content B2110 aider IPI No A2413 1✓Reading code file MetaGPT IPI No A2214 1✓Reading agent planned spec file SWE-agent IPI No A2121 1✓Fetching GitHub issue
+> An MC-Poison attack is not applicable to aider, MetaGPT, and SWE-agent; IPI attack alone is not applicable to Quivr because any external content (e.g., crawled webpages) is first transformed into vectors, saved to the vector database, and only reaches the LLM after retrieval, making it MC-Poison.
+
+the function call corresponding to the attack effect lie outside the loop. In the SWE-agent IPI incident, for example, each iteration of the agent loop in the attack execution queries the LLM for the next tool to invoke, executes that tool, and feeds the result back. However, since the loop appears in the middle of the returned taint path as pass-through functions and static taint analysis tracks data flow through variables in the source code, the taint propagation from source to sink remains intact, and Origin correctly identifies the CEP. 
+
+(b) When the source and sink functions are generic utilities shared by two or more agent functionalities in the application, specifying an intermediate variable as a waypoint is helpful in constraining the returned paths to the incident-relevant subset. 
+
+In both aider and MetaGPT, a single pair of file read/write functions ( read_text /write_text in aider; aread /awrite 
+
+in MetaGPT) serves as the major file I/O interface across the entire codebase. A standard source-to-sink query between these functions returns a large set of taint paths between file-read and file-write in the application, the majority of which are unrelated to the incident. We observe a good practice for getting a more incident-related result, i.e., identifying an intermediate function from the region-level query result and specifying a variable within it as a waypoint. These functions are identifiable because trajectory logs record semantically meaningful steps (e.g., named commands and task-level ac-tions) that map directly to function-plane nodes in the CLDG .
+
+(c) Origin can handle an attack incident rooted in inter-agent communication manipulation. In MetaGPT, the identi-fied CEP ( aread ) reads a specification file that the upstream architect agent planned and wrote to disk (the file is compro-mised by an attacker); the downstream engineer agent reads malicious data and generates code according to a manipu-lated task. The coordination mechanism between agents (i.e., shared files on disk) functions exactly as designed. However, due to a lack of verification for the artifacts produced by a pre-vious execution, the IPI happened across agent boundaries through the application’s normal coordination mechanism. 
+
+10 Evaluation 
+
+10.1 Research Questions (RQs) 
+
+We evaluate Origin on the same set of security incidents as in Section 9 to answer the following research questions: (RQ1) Can analysts use Origin to correctly identify the CEPs and the corresponding paths of the eight security incidents? (RQ2) How accurately does the region inference algorithm assign functions to regions? (RQ3) To what extent does Ori-gin reduce the portion of the CLDG that analysts must inspect compared to using static taint analysis alone? (RQ4) What are the execution time and memory costs of Origin? (RQ5) How much developer knowledge is needed for region inference? (RQ6) How useful is the LLM-generated report? 
+
+10.2 Experimental Setup 
+
+All experiments are conducted on a machine with an Intel Core Ultra 9 285 CPU, 128 GB RAM, running Ubuntu 24.04. We use the human-validated function-to-information-source mapping table (Section 6.1) for all RQ evaluations. 
+
+10.3 CEP + Path Identification Correctness (RQ1) Success Criteria. A diagnosis is considered successful iff 
+
+the ground truth CEP and corresponding taint propagation path (the one matching the actual attack execution) defined in Section 4.3 are identified. 
+
+Results. As shown in Table 3, an analyst using Origin cor-rectly identified the CEPs of all eight incidents, each having a single CEP candidate. The analyst can identify the CEPs by submitting two queries in five incidents and four queries in the other three incidents. 
+
+Comparison with Existing Tools. We also evaluate ex-isting static taint analyzers, i.e., Joern [7], CodeQL [4] and 
+
+> 9
+
+backend/routes/chat_routes.py create_question_handler L155 backend/llm/openai_functions.py OpenAIFunctionsBrainPicking.__init__ L42 backend/llm/openai.py OpenAIBrainPicking.generate_answer L136 backend/routes/chat_routes.py create_question_handler@endpoint L152 backend/llm/private_gpt4all.py PrivateGPT4AllBrainPicking.__init__ L19 backend/llm/openai_functions.py OpenAIFunctionsBrainPicking.generate_answer L162 backend/llm/openai.py OpenAIBrainPicking.__init__ L36 backend/routes/chat_routes.py create_stream_question_handler L210 backend/repository/chat/format_chat_history.py format_chat_history L1 backend/repository/chat/update_chat_history.py update_chat_history L8 backend/llm/openai.py OpenAIBrainPicking._call_chain L121 backend/llm/openai_functions.py OpenAIFunctionsBrainPicking._construct_prompt L130 backend/llm/openai_functions.py OpenAIFunctionsBrainPicking._get_model_response L85 backend/llm/openai_functions.py format_answer L19 backend/llm/openai.py OpenAIBrainPicking.generate_stream L179 backend/routes/chat_routes.py create_stream_question_handler@endpoint L205 backend/models/chat.py ChatHistory.__init__ L26 backend/llm/openai_functions.py OpenAIFunctionsBrainPicking._get_context L122 backend/vectorstore/supabase.py CustomSupabaseVectorStore.similarity_search L25 backend/repository/chat/get_chat_history.py get_chat_history L6 backend/llm/models/OpenAiAnswer.py OpenAiAnswer.__init__ L6 
+
+Per PA RR PK UNK (a) Region-level query result of Quivr MC-Poison (M) incident (phase A). Note that the node IDs are eliminated for simplicity. message (L19) →
+
+chat_dict (L26) RET (L26) →
+
+[].append(ChatHistory (messa... (L19) [ChatHistory(message) for m... (L19) 
+
+→ history (L145) chat_question (L197) 
+
+→ question (L162) question (L128) 
+
+→ query (L27) vector_store.similarity_sea... (L128) → chat_context (L154) Phase A Phase B get_chat_history get_chat_history.py L8 
+
+● src: commons["supabase"].from_("chat_history... __init__ chat.py L26 get_chat_history get_chat_history.py L19 generate_answer openai.py L145 _call_chain openai.py L121 generate_answer openai.py L151 create_question_handler chat_routes.py L197 create_question_handler@endpoint chat_routes.py L152 
+
+● sink: @chat_router.post("/chat/{ch... question (L151) → question (L121) transformed_history (L151) → history (L121) chain( { "question":questi... (L129) 
+
+→ model_response (L151) chat_answer (L162) →
+
+chat_answer (L197) chat_answer (L199) →
+
+@chat_router.post (L152) create_question_handler @endpoint chat_routes.py L152 
+
+● src: @chat_router.post ("/chat/{chat_id}/qu... create_question_handler chat_routes.py L158 generate_answer openai_functions.py L162 _construct_prompt openai_functions.py L131 question (L182) 
+
+→ question (L131) question (L193) 
+
+→ question (L131) question (L206) 
+
+→ question (L131) _get_context openai_functions.py L122 similarity_search supabase.py L27 _get_context openai_functions.py L128 _construct_prompt openai_functions.py L154 _get_model_response openai_functions.py L87 generate_answer openai_functions.py L192 update_chat_history update_chat_history.py L8 
+
+● sink: commons["supabase"].table("chat_history").insert(... @chat_router (L152) → chat_id (L158) @chat_router (L152) → request (L156) @chat_router (L152) → brain_id (L159) @chat_router (L152) → current_user (L160) @chat_router (L152) → chat_question (L157) question (L154) →
+
+question (L122) documents (L58) →
+
+self.vector_store (L128) system_messages (L160) → messages (L87) openai_client.completion (L105) → response (L192) openai_client.completion (L105) → response (L204) openai_client.completion (L105) → response (L181) formatted_response (L216) 
+
+→ assistant (L8) question (L215) 
+
+→ user_message (L8) drawn by the analyst 
+
+(b) Function-level paths returned by two variable-level queries. Each node shows the function name, the file name of the enclosing Python file, and the line number of the first taint-path variable within that function. A solid edge denotes a call from the enclosing function to the callee; a dashed edge denotes a return from the callee back to the caller. Each edge label shows the mapping from a variable in the source function to a variable in the target function, with the line number indicating the location of that variable in the corresponding Python file. 
+
+Figure 2. Backtracking the CEP for the Quivr MC-Poison (M) incident. Pysa [17], on the same incidents. Since they lack the interme-diate abstraction compared to Origin, we assume the tools are provided with the ground-truth source (i.e., the CEP) and sink as input and evaluate if analysts can use the tools to verify the correctness of the CEP. Specifically, for Joern and CodeQL: Success means the correct taint propagation path is identified and Fail means the opposite; For Pysa: Success 
+
+means at least one reported function call lies on the correct taint propagation path; Fail means the expected function on the correct path is not reported. 
+
+As shown in Table 4, the tools fail on most incidents, primar-ily due to unresolved indirect call targets, missing data depen-dencies through language constructs, API calls, and first-writes-later-reads of object attributes, files, or databases (Appendix E). 
+
+Table 4. Diagnostic outcomes of Joern, CodeQL, and Pysa 
+
+Application Attack Joern CodeQL Pysa 
+
+GPT-Researcher IPI Fail Fail Fail MC-Poison (KB) Fail Fail Fail Quivr MC-Poison (M) Fail Fail Fail MC-Poison (KB) Fail Fail Fail IPI + MC-Poison (KB) Fail Fail Fail aider IPI Fail Fail Fail MetaGPT IPI Fail Fail Success SWE-agent IPI Fail Fail Fail 
+
+For example, in SWE-agent IPI, Joern fails to propagate taint through nested dictionary accesses. In Quivr MC-Poison (M), CodeQL fails to propagate taint from an LLM API call ar-gument to its returned value because it does not model the corresponding library. In GPT-Researcher MC-Poison (KB), 
+
+10 Pysa fails to resolve the target of an application function call, interrupting taint propagation from a variable used within the callee to a returned variable in the caller. 
+
+The limited data-flow information in Pysa’s output is in-sufficient for the analyst to identify the CEPs. For example, in MetaGPT IPI incident, Pysa reports four function calls, of which only one ( WriteCode.run at write_code.py:142 )lies on the correct path. When comparing against the path of 14 functions returned by Origin, WriteCode.run is the 4th function on the path: 3 functions from the CEP aread 
+
+and 10 functions from the attack effect awrite . Therefore, the analyst would need extra analysis to identify the CEP. 
+
+10.4 Region Inference Accuracy (RQ2) 
+
+Table 6 reports region inference accuracy per application. For each function in 𝑉 fn , the algorithm classifies it into one of the four regions (excluding UNK). The description of the region set and the ground truth region distribution across the applications can be found in Appendix A. Across all five applications, precision and recall range from 0.70 to 0.88. aider exhibits the lowest accuracy because the coding copilot provides a set of commands to use interac-tively (e.g., adding files, prompting the LLM, committing edits) rather than the application chaining them automati-cally. Origin produces short, disjoint taint paths for each 
+
+aider command, and labels propagated from an API call along one taint path (detailed in Section 6.3) cannot reach functions that belong to a different command’s taint path. 
+
+10.5 Inspection Scope Reduced by Region-level Queries (RQ3) 
+
+Region-level queries can significantly reduce the graph in-spection scope for the analyst. We measure this by comparing 
+
+|𝑉 𝑞 |, the number of variable-plane nodes in the region-level query result, against |𝑉 var |, the full variable plane of the CLDG .Lower |𝑉 𝑞 |/| 𝑉 var | means the analyst encounters a smaller fraction of the taint graph. As shown in Table 5, across all incidents, region-level queries reduce the variable plane to between 6.49% and 35.76% of its original size. We note that: 
+
+(a) PK is a key factor in this reduction and appears in 9 of the 11 region-level queries. This is because PK is where data from other regions converges to be assembled into the LLM prompt, and it typically contains very few functions (e.g., 1 in Quivr, 2 in aider, 3 in SWE-agent; more details in Appendix A). When a query involves PK, the returned graph is limited to function nodes that are transitively connected to this small set of PK functions, which substantially reduces the number of variable-plane nodes the analyst must inspect. 
+
+(b) The reduction ratio also depends on the size of the regions involved in the query, which varies across applications. The IPI incidents across the four applications use the same query 
+
+CHECK (PK DEPENDS_ON PA) AND (PA DEPENDS_ON PK) ,yet the ratios range from 9.56% (SWE-agent) to 35.76% (GPT-Researcher). Regarding the ratio difference, we observe that a larger PA in an application often gives a larger result graph: PA contains 133 of 244 functions in GPT-Researcher but only 64 of 160 in SWE-agent (more details in Appendix A). 
+
+10.6 Performance of Origin (RQ4) 
+
+Table 7 reports the execution time and peak memory usage (Mem.) for each incident. Three stages of Origin execution time are reported separately: CLDG construction (CLDG), re-gion inference (Infer.), and the queries evaluation time of each application averaged on corresponding incidents ( ¯ 𝑄 ).  
+
+> CLDG
+
+construction dominates execution time, accounting for over 95% of the total in every application. CLDG construc-tion and region inference are one-time offline costs. The set of query evaluations is the only per-incident cost, and they were completed in under 90 ms across all five applications on average. Peak memory remains under 7 GB. 
+
+10.7 Required Developer Knowledge Amount (RQ5) 
+
+Table 8 reports the number of application functions and the numbers of EXT /INT labels, with the total number of labels also expressed as a percentage of application functions. Across the five applications, only 2.4%–8.9% of functions receive labels, indicating that Origin requires only a small amount of application-specific knowledge from developers. 
+
+10.8 Utility of LLM-Generated Report (RQ6) Human Study Setup. We recruit four participants with different levels of agent-application knowledge and Python familiarity to examine whether the EXT/INT report benefits users with different backgrounds. Each participant completes two 10-minute tests: manual labeling (M) and LLM report’s label validation (L). In the M test, participants follow the developer workflow described in Section 6.1. In the L test, participants are provided with the LLM-generated report. We prepare two non-overlapping sets, A and B, each containing 200 functions from the five applications, so that participants do not encounter the same function twice. We set up a one-to-one mapping between the four participants and the four test sequences: 𝑀 𝐴 →𝐿 𝐵 , 𝐿 𝐴 →𝑀 𝐵 , 𝑀 𝐵 →𝐿 𝐴 , and 𝐿 𝐵 →𝑀 𝐴 ,where subscripts identify the function sets. This counterbal-ancing reduces the influence of the test order and differences between the function sets. Before the tests, we provide a labeling guide and 15 func-tions for practice, followed by 15 functions to check their understanding. We also provide an example showing partici-pants how to use the report’s explanations and code refer-ences to validate its proposed labels. We measure speed as the number of functions labeled during the given 10 minutes and accuracy in terms of the reference answers, including decisions that neither label is needed. 
+
+Results. Table 9 reports speed changes relative to M ( ΔSpeed), accuracy in L (Acc .𝐿 ), and accuracy differences between L and M in percentage points ( ΔAcc.). All four participants achieve higher labeling speed and accuracy in the L test. 
+
+> 11
+
+Table 5. Inspection-scope reduction via region-level queries.                                                       
+
+> Application Attack Class [(Subclass)] Region-level Query |𝑉 𝑞 ||𝑉 var ||𝑉 𝑞 |/| 𝑉 var |
+> GPT-Researcher IPI CHECK (PK DEPENDS_ON PA) AND (PA DEPENDS_ON PK) 2,605 7,284 35.76% MC-Poison (KB) CHECK (PK DEPENDS_ON RR) AND (PA DEPENDS_ON PK) 2,213 7,284 30.38% Quivr MC-Poison (M) CHECK (PK DEPENDS_ON Per) AND (RR DEPENDS_ON PK) 157 2,018 7.78%
+> CHECK (PK DEPENDS_ON RR) AND (Per DEPENDS_ON PK) 131 2,018 6.49% MC-Poison (KB) CHECK RR DEPENDS_ON RR 321 2,018 15.91%
+> CHECK (PK DEPENDS_ON RR) AND (PA DEPENDS_ON PK) 224 2,018 11.10% IPI + MC-Poison (KB) CHECK RR DEPENDS_ON PA 378 2,018 18.73%
+> CHECK (PK DEPENDS_ON RR) AND (Per DEPENDS_ON PK) 131 2,018 6.49% aider IPI CHECK (PK DEPENDS_ON PA) AND (PA DEPENDS_ON PK) 4,649 13,820 33.64% MetaGPT IPI CHECK (PK DEPENDS_ON PA) AND (PA DEPENDS_ON PK) 3,749 19,135 19.59% SWE-agent IPI CHECK (PK DEPENDS_ON PA) AND (PA DEPENDS_ON PK) 775 8,105 9.56%
+
+Table 6. Region inference accuracy per application.                               
+
+> Application TP FP FN Precision Recall
+> GPT-Researcher 196 48 42 0.8033 0.8235 Quivr 50 12 90.8065 0.8475 aider 229 100 95 0.6960 0.7068 MetaGPT 571 101 78 0.8497 0.8798 SWE-agent 140 20 20 0.8750 0.8750
+
+Table 7. Performance of Origin.                          
+
+> Application CLDG (s) Infer. (s) ¯𝑄 (ms) Mem. (GB)
+> GPT-Researcher 19.20 0.29 36.00 2.51 Quivr 6.38 0.03 5.63 2.56 aider 109.09 1.97 89.38 5.57 MetaGPT 72.15 0.77 67.50 7.00 SWE-agent 18.74 0.14 9.38 4.27
+
+Table 8. Application functions and labels received.                               
+
+> Application App. funcs EXT INT Total %
+> GPT-Researcher 607 35 641 6.8 Quivr 246 715 22 8.9 aider 837 51 354 6.5 MetaGPT 2,872 84 35 119 4.1 SWE-agent 713 17 017 2.4
+
+Speed increases by 15.4–75.0%, while accuracy improves by 8.3–50.4 percentage points, reaching 88.9–100%. 
+
+Table 9. Effect of LLM reports on function labeling.                               
+
+> ID First Agent Python ΔSpeed Acc. 𝐿 ΔAcc.(pp)
+> P1 𝑀 𝐴 Low Med. +15 .4% 88 .9% +50 .4P2 𝐿 𝐴 Med. Low +55 .6% 92 .9% +32 .9P3 𝑀 𝐵 High High +26 .7% 92 .1% +22 .1P4 𝐿 𝐵 Low High +75 .0% 100 .0% +8.3
+
+11 Discussion 
+
+Framework-Induced Indirect Call Resolution. Our static analysis cannot resolve framework-induced indirect call tar-gets (e.g., LangChain [8] tool dispatch). This causes the corre-sponding taint propagation path to be missing from the CLDG .Addressing this limitation requires either framework-specific modeling or dynamic analysis, which is future work. 
+
+Agents with An LLM-driven Agentic Loop. Autonomous agents such as OpenClaw [15] and Hermes [13] are driven by an agentic loop in which, for each iteration, the LLM decides at runtime which agent functionality to invoke next. For such agents, static analysis alone cannot determine the CEP function call (e.g., which tool introduced the malicious data), except for the case discussed in Section 9.3, Finding (b). This remains an area for future research. 
+
+12 Related Work 
+
+Root Cause Analysis for Software Systems. Diagnos-ing the root cause of exploits and failures in software sys-tems is the first step to repairing programs. Most existing works are based on backtracking [20, 27, 70, 71], reconstruc-tion [26, 33, 38, 72], or statistical analysis [19, 42, 43, 55, 69]. These approaches focus on diagnosing the buggy code lo-cation(s) triggering memory safety violations [19, 20, 26, 27, 38, 55, 69–72] and data races [42, 43]. However, in agent application security incidents, the application code itself is not buggy in terms of condition expressions and statement orders. The problem is that the application lacks validation or sanitization at the boundary between untrusted external information sources and the application. Consequently, the attacker-controlled data is entered through a legitimate API call and propagated through the pipeline unimpeded. 
+
+Causality Analysis for APT Attacks. A large body of work investigates APT attacks by constructing attack provenance graphs from OS-level audit logs [31, 35, 45, 53]. Subsequent work refines the granularity of logs by partitioning long-running processes into finer execution units [40, 50, 51] or by fusing application-layer logs with system audit data to recover application semantics [37]. The logs and audit data used in these systems are sufficient for analyzing traditional APT attacks. In agent applications, however, analysts rely on trajectory logs and static analysis on program code. Trajec-tory logs record agent behaviors at the agent functionality abstraction layer but miss the app-specific function call log-ging needed for pinpointing the CEP function calls. Static analysis does not provide the agent-functionality semantics that analysts need for reasoning. The bridging between the agent functionalities and the program code is difficult due to a semantic gap. Our work addresses this by implementing an intermediate abstraction that connects them. 
+
+Agent Application Attacks and Defenses. Agent attacks have targeted a wide range of commercial and open-source agents [56], most notably IPI attacks [29, 36, 48, 76] and MC-Poison attacks [23, 63]. In real-world settings, adversaries often employ compound attacks that combine both methods across different stages of agent execution [77]. Defenses have been proposed at multiple layers: data-instruction separation-based LLM hardening [21, 22, 62] 
+
+> 12
+
+and prompt hardening [39] against IPI attacks, memory writes/retrieval-stage filtering against MC-Poison attacks [60, 64, 68], and application-level taint tracking and policy enforcement at runtime [25, 28, 41, 59, 66]. All these defenses, however, are preventive in nature and can still be bypassed. When an attack does succeed, we still need to backtrack the initial compromise of the incident. In addition, detection of IPI attacks and MC-Poison attacks has been investigated in [44, 79] and [61, 64], respectively. However, detection and diagnosis (through backtracking) are two different problems. 
+
+13 Conclusion 
+
+We present Origin, a backtracking tool for security incidents in agent applications. Origin implements a new interme-diate abstraction as CLDG , which connects region-inferred functions with variable-level taint subgraphs, and provides the associated query language that allows analysts to identify the CEPs with a small number of queries. Origin constructs the region-to-variable mapping in the CLDG by rule-guided region inference, which only takes a small set of developer-provided labels. Case studies on five applications and eight diverse attack incidents show that an analyst using Origin can correctly identify the CEPs of all incidents. 
+
+References 
+
+[1] 2025. 5ire - CVE-2025-58357. https://nvd.nist.gov/vuln/detail/cve-2025-58357 . (accessed 2026-02-01). [2] 2025. AutoGPT. https://agpt.co/ . (accessed 2025-09-01). [3] 2025. Code Property Graph Specification. https://cpg.joern.io/ .(accessed 2025-02-07). [4] 2025. CodeQL. https://codeql.github.com/ . (accessed 2025-09-01). [5] 2025. Cursor - CVE-2025-54130. https://nvd.nist.gov/vuln/detail/CVE-2025-54130 . (accessed 2026-02-01). [6] 2025. GPT Researcher. https://gptr.dev . (accessed 2026-09-01). [7] 2025. Joern. https://joern.io/ . (accessed 2025-09-01). [8] 2025. LangChain. https://www.langchain.com . (accessed 2025-09-01). [9] 2025. Neuron - CVE-2025-67510. https://nvd.nist.gov/vuln/detail/CVE-2025-67510 . (accessed 2026-02-01). [10] 2025. Quivr. https://core.quivr.com/en/latest/ . (accessed 2025-09-01). [11] 2025. SmolAgents. https://huggingface.co/docs/smolagents/en/index .(accessed 2025-09-01). [12] 2026. Aider. https://github.com/Aider-AI/aider . (accessed 2026-04-13). [13] 2026. Hermes Agent. https://hermes-agent.nousresearch.com/ .(accessed 2026-02-01). [14] 2026. MetaGPT. https://github.com/FoundationAgents/MetaGPT .(accessed 2026-04-13). [15] 2026. OpenClaw. https://openclaw.ai/ . (accessed 2026-02-01). [16] 2026. Pyrefly. https://github.com/facebook/pyrefly . (accessed 2026-02-18). [17] 2026. Pysa (Static Analysis for Security). https://pyre-check.org/docs /pysa-basics/ . (accessed 2026-03-31). [18] 2026. SWE-agent. https://github.com/SWE-agent/SWE-agent .(accessed 2026-04-13). [19] Tim Blazytko, Moritz Schlögel, Cornelius Aschermann, Ali Abbasi, Joel Frank, Simon Wörner, and Thorsten Holz. 2020. AURORA: Statistical Crash Analysis for Automated Root Cause Explanation. In Proceedings of the 29th USENIX Security Symposium . Virtual Event, 235–252. [20] Boyu Chang, Binbin Zhao, Qiao Zhang, Peiyu Liu, Yuan Tian, Raheem Beyah, and Shouling Ji. 2025. FirmRCA: Towards Post-Fuzzing Anal-ysis on ARM Embedded Firmware with Efficient Event-Based Fault Localization. In Proceedings of the 46th IEEE Symposium on Security and Privacy . San Francisco, CA, USA, 3783–3800. [21] Sizhe Chen, Julien Piet, Chawin Sitawarin, and David Wagner. 2025. StruQ: Defending Against Prompt Injection with Structured Queries. In Proceedings of the 34th USENIX Security Symposium . Seattle, WA, USA, 2383–2400. [22] Sizhe Chen, Arman Zharmagambetov, Saeed Mahloujifar, Kamalika Chaudhuri, David Wagner, and Chuan Guo. 2025. SecAlign: Defending Against Prompt Injection with Preference Optimization. In Proceedings of the 2025 ACM SIGSAC Conference on Computer and Communications Security . Taipei, Taiwan, 2833–2847. [23] Zhaorun Chen, Zhen Xiang, Chaowei Xiao, Dawn Song, and Bo Li. 2024. AgentPoison: Red-teaming LLM Agents via Poisoning Memory or Knowledge Bases. In Proceedings of the 38th Annual Conference on Neural Information Processing Systems . Vancouver, BC, Canada, 130185–130213. [24] Ruben Chocron, Doron Jonathan Ben Chayim, Eyal Lenga, Gilad Gres-sel, Alina Oprea, and Yisroel Mirsky. 2026. Who Owns This Agent? Tracing AI Agents Back to Their Owners. http://arxiv.org/abs/2605.1 6035 .[25] Manuel Costa, Boris Köpf, Aashish Kolluri, Andrew Paverd, Mark Russinovich, Ahmed Salem, Shruti Tople, Lukas Wutschitz, and Santi-ago Zanella-Béguelin. 2025. Securing AI Agents with Information-Flow Control. https://arxiv.org/abs/2505.23643 .[26] Weidong Cui, Xinyang Ge, Baris Kasikci, Ben Niu, Upamanyu Sharma, Ruoyu Wang, and Insu Yun. 2018. REPT: Reverse Debugging of Failures in Deployed Software. In Proceedings of the 13th USENIX Symposium on Operating Systems Design and Implementation . Carlsbad, CA, USA, 17–32. [27] Weidong Cui, Marcus Peinado, Sang Kil Cha, Yanick Fratantonio, and Vasileios P. Kemerlis. 2016. RETracer: Triaging Crashes by Reverse Execution from Partial Memory Dumps. In Proceedings of the 38th International Conference on Software Engineering . Austin, TX, USA, 820–831. [28] Edoardo Debenedetti, Ilia Shumailov, Tianqi Fan, Jamie Hayes, Nicholas Carlini, Daniel Fabian, Christoph Kern, Chongyang Shi, An-dreas Terzis, and Florian Tramèr. 2025. Defeating Prompt Injections by Design. https://arxiv.org/abs/2503.18813 .[29] Edoardo Debenedetti, Jie Zhang, Mislav Balunovic, Luca Beurer-Kellner, Marc Fischer, and Florian Tramèr. 2024. AgentDojo: A Dy-namic Environment to Evaluate Prompt Injection Attacks and Defenses for LLM Agents. In Proceedings of the 38th Conference on Neural Infor-mation Processing Systems Datasets and Benchmarks Track . Vancouver, BC, Canada, 82895–82920. [30] Shen Dong, Shaochen Xu, Pengfei He, Yige Li, Jiliang Tang, Tianming Liu, Hui Liu, and Zhen Xiang. 2025. Memory Injection Attacks on LLM Agents via Query-Only Interaction. https://arxiv.org/abs/2503.03704 .[31] Peng Gao, Xusheng Xiao, Zhichun Li, Kangkook Jee, Fengyuan Xu, Sanjeev R. Kulkarni, and Prateek Mittal. 2018. AIQL: Enabling Efficient Attack Investigation from System Monitoring Data. In Proceedings of the 2018 USENIX Annual Technical Conference . Boston, MA, USA, 113– 126. [32] Gartner. 2025. Gartner Predicts 40% of Enterprise Apps Will Feature Task-Specific AI Agents by 2026, up from Less than 5% in 2025. https: //www.gartner.com/en/newsroom/press- releases/2025- 08- 26-gartner-predicts-40-percent-of-enterprise-apps-will-feature-task-specific-ai-agents-by-2026-up-from-less-than-5-percent-in-2025 .(accessed 2026-02-01). [33] Xinyang Ge, Ben Niu, and Weidong Cui. 2020. Reverse Debugging of Kernel Failures in Deployed Systems. In Proceedings of the 2020 USENIX Annual Technical Conference . Virtual Event, 281–292. 
+
+> 13
+
+[34] Dan Goodin. 2025. New hack uses prompt injection to corrupt Gemini’s long-term memory. https://arstechnica.com/security/2025/02/new-ha ck-uses-prompt-injection-to-corrupt-geminis-long-term-memory/ .(accessed 2026-06-04). [35] Akul Goyal, Gang Wang, and Adam Bates. 2024. R-CAID: Embedding Root Cause Analysis within Provenance-Based Intrusion Detection. In 
+
+Proceedings of the 45th IEEE Symposium on Security and Privacy . San Francisco, CA, USA, 3515–3532. [36] Kai Greshake, Sahar Abdelnabi, Shailesh Mishra, Christoph Endres, Thorsten Holz, and Mario Fritz. 2023. Not What You’ve Signed Up For: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection. In Proceedings of the 16th ACM Workshop on Artificial Intelligence and Security . Copenhagen, Denmark, 79–90. [37] Wajih Ul Hassan, Mohammad A. Noureddine, Pubali Datta, and Adam Bates. 2020. OmegaLog: High-Fidelity Attack Investigation via Trans-parent Multi-Layer Log Analysis. In Proceedings of the 2020 Network and Distributed System Security Symposium . San Diego, CA, USA. [38] Liang He, Hong Hu, Purui Su, Yan Cai, and Zhenkai Liang. 2022. FreeWill: Automatically Diagnosing Use-after-free Bugs via Refer-ence Miscounting Detection on Binaries. In Proceedings of the 31st USENIX Security Symposium . Boston, MA, USA, 2497–2512. [39] Keegan Hines, Gary Lopez, Matthew Hall, Federico Zarfati, Yonatan Zunger, and Emre Kıcıman. 2024. Defending against Indirect Prompt Injection Attacks with Spotlighting. In Proceedings of the 7th Conference on Applied Machine Learning for Information Security . Arlington, VA, USA, 48–62. [40] Yang Ji, Sangho Lee, Evan Downing, Weiren Wang, Mattia Fazzini, Taesoo Kim, Alessandro Orso, and Wenke Lee. 2017. RAIN: Refin-able Attack Investigation with On-demand Inter-Process Information Flow Tracking. In Proceedings of the 2017 ACM SIGSAC Conference on Computer and Communications Security . Dallas, TX, USA, 377–390. [41] Zimo Ji, Daoyuan Wu, Wenyuan Jiang, Pingchuan Ma, Zongjie Li, Yudong Gao, Shuai Wang, and Yingjiu Li. 2026. Taming Various Privi-lege Escalation in LLM-Based Agent Systems: A Mandatory Access Control Framework. http://arxiv.org/abs/2601.11893 .[42] Baris Kasikci, Weidong Cui, Xinyang Ge, and Ben Niu. 2017. Lazy Diagnosis of In-Production Concurrency Bugs. In Proceedings of the 26th Symposium on Operating Systems Principles . Shanghai, China, 582–598. [43] Baris Kasikci, Benjamin Schubert, Cristiano Pereira, Gilles Pokam, and George Candea. 2015. Failure Sketching: A Technique for Automated Root Cause Diagnosis of in-Production Failures. In Proceedings of the 25th Symposium on Operating Systems Principles . Monterey, CA, USA, 344–360. [44] Juhee Kim, Woohyuk Choi, and Byoungyoung Lee. 2025. Prompt Flow Integrity to Prevent Privilege Escalation in LLM Agents. https: //arxiv.org/abs/2503.15547 .[45] Samuel T. King and Peter M. Chen. 2003. Backtracking Intrusions. In 
+
+Proceedings of the 19th ACM Symposium on Operating Systems Principles .Bolton Landing, NY, USA, 223–236. [46] Bang Liu, Xinfeng Li, Jiayi Zhang, Jinlin Wang, Tanjin He, Sirui Hong, Hongzhang Liu, Shaokun Zhang, Kaitao Song, Kunlun Zhu, Yuheng Cheng, Suyuchen Wang, Xiaoqiang Wang, Yuyu Luo, Haibo Jin, Peiyan Zhang, Ollie Liu, Jiaqi Chen, Huan Zhang, Zhaoyang Yu, Haochen Shi, Boyan Li, Dekun Wu, Fengwei Teng, Xiaojun Jia, Jiawei Xu, Jinyu Xi-ang, Yizhang Lin, Tianming Liu, Tongliang Liu, Yu Su, Huan Sun, Glen Berseth, Jianyun Nie, Ian Foster, Logan Ward, Qingyun Wu, Yu Gu, Mingchen Zhuge, Xinbing Liang, Xiangru Tang, Haohan Wang, Jiax-uan You, Chi Wang, Jian Pei, Qiang Yang, Xiaoliang Qi, and Chenglin Wu. 2025. Advances and Challenges in Foundation Agents: From Brain-Inspired Intelligence to Evolutionary, Collaborative, and Safe Systems. http://arxiv.org/abs/2504.01990 .[47] Dinghao Liu, Shouling Ji, Kangjie Lu, and Qinming He. 2024. Improving Indirect-Call Analysis in LLVM with Type and Data-Flow Co-Analysis. In Proceedings of the 33rd USENIX Security Symposium . Philadelphia, PA, USA, 5895–5912. [48] Yupei Liu, Yuqi Jia, Runpeng Geng, Jinyuan Jia, and Neil Zhenqiang Gong. 2024. Formalizing and Benchmarking Prompt Injection Attacks and Defenses. In Proceedings of the 33rd USENIX Security Symposium .Philadelphia, PA, USA, 1831–1847. [49] Jessica Lyons. 2025. Atlas vuln lets crims inject malicious prompts ChatGPT won’t forget between sessions. https://www.theregiste r.com/special-features/2025/10/27/atlas-vuln-allows-malicious-memory-injection-into-chatgpt/741516 . (accessed 2026-06-04). [50] Shiqing Ma, Juan Zhai, Fei Wang, Kyu Hyung Lee, Xiangyu Zhang, and Dongyan Xu. 2017. MPI: Multiple Perspective Attack Investigation with Semantic Aware Execution Partitioning. In Proceedings of the 26th USENIX Security Symposium . Vancouver, BC, Canada, 1111–1128. [51] Shiqing Ma, Xiangyu Zhang, and Dongyan Xu. 2016. ProTracer: To-wards Practical Provenance Tracing by Alternating between Logging and Tainting. In Proceedings of the 2016 Network and Distributed System Security Symposium . San Diego, CA, USA. [52] Xuyan Ma, Xiaofei Xie, Yawen Wang, Junjie Wang, Boyu Wu, Mingyang Li, and Qing Wang. 2025. Demystifying the Lifecycle of Failures in Platform-Orchestrated Agentic Workflows. https: //arxiv.org/abs/2509.23735 .[53] Sadegh M. Milajerdi, Rigel Gjomemo, Birhanu Eshete, R. Sekar, and V.N. Venkatakrishnan. 2019. HOLMES: Real-Time APT Detection through Correlation of Suspicious Information Flows. In Proceedings of the 40th IEEE Symposium on Security and Privacy . San Francisco, CA, USA, 1137–1152. [54] OWASP GenAI Security Project. 2025. OWASP Top 10 for Agentic Applications for 2026. https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/ . (accessed 2026-02-04). [55] Younggi Park, Hwiwon Lee, Jinho Jung, Hyungjoon Koo, and Huy Kang Kim. 2024. Benzene: A Practical Root Cause Analysis System with an Under-Constrained State Mutation. In Proceedings of the 45th IEEE Symposium on Security and Privacy . San Francisco, CA, USA, 1865– 1883. [56] Johann Rehberger. 2024. Trust No AI: Prompt Injection Along The CIA Security Triad. In BlackHat Europe 2024 . London, United Kingdom. [57] Johann Rehberger (wunderwuzzi). 2024. Spyware Injection Into Your ChatGPT’s Long-Term Memory (SpAIware). https://embracethered.co m/blog/posts/2024/chatgpt-macos-app-persistent-data-exfiltration/ .(accessed 2026-02-01). [58] Johann Rehberger (wunderwuzzi). 2025. Claude Code: Data Exfiltra-tion with DNS (CVE-2025-55284). https://embracethered.com/blog /posts/2025/claude-code-exfiltration-via-dns-requests/ . (accessed 2026-02-01). [59] Tianneng Shi, Jingxuan He, Zhun Wang, Hongwei Li, Linyu Wu, Wenbo Guo, and Dawn Song. 2025. Progent: Securing AI Agents with Privilege Control. http://arxiv.org/abs/2504.11703 .[60] Balachandra Devarangadi Sunil, Isheeta Sinha, Piyush Maheshwari, Shantanu Todmal, Shreyan Mallik, and Shuchi Mishra. 2026. Memory Poisoning Attack and Defense on Memory Based LLM-Agents. http: //arxiv.org/abs/2601.05504 .[61] Xue Tan, Hao Luan, Mingyu Luo, Xiaoyan Sun, Ping Chen, and Jun Dai. 2025. RevPRAG: Revealing Poisoning Attacks in Retrieval-Augmented Generation through LLM Activation Analysis. In Proceedings of the Findings of the Association for Computational Linguistics: EMNLP 2025 .Suzhou, China, 12999–13011. [62] Eric Wallace, Kai Xiao, Reimar Leike, Lilian Weng, Johannes Heidecke, and Alex Beutel. 2024. The Instruction Hierarchy: Training LLMs to Prioritize Privileged Instructions. https://arxiv.org/abs/2404.13208 .[63] Yifei Wang, Dizhan Xue, Shengjie Zhang, and Shengsheng Qian. 2024. BadAgent: Inserting and Activating Backdoor Attacks in LLM Agents. In Proceedings of the 62nd Annual Meeting of the Association for Com-putational Linguistics . Bangkok, Thailand, 9811–9827. 
+
+> 14
+
+[64] Qianshan Wei, Tengchao Yang, Yaochen Wang, Xinfeng Li, Lijun Li, Zhenfei Yin, Yi Zhan, Thorsten Holz, Zhiqiang Lin, and XiaoFeng Wang. 2025. A-MemGuard: A Proactive Defense Framework for LLM-Based Agent Memory. http://arxiv.org/abs/2510.02373 .[65] Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu, Li Jiang, Xiaoyun Zhang, Shaokun Zhang, Jiale Liu, Ahmed Has-san Awadallah, Ryen W. White, Doug Burger, and Chi Wang. 2024. AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Con-versations. In Proceedings of the 1st Conference on Language Modeling .Philadelphia, PA, USA. [66] Yuhao Wu, Franziska Roesner, Tadayoshi Kohno, Ning Zhang, and Umar Iqbal. 2025. IsolateGPT: An Execution Isolation Architecture for LLM-Based Agentic Systems. In Proceedings of the 32nd Annual Network and Distributed System Security Symposium . San Diego, CA, USA. [67] Tianrou Xia, Hong Hu, and Dinghao Wu. 2024. DEEPTYPE: Refin-ing Indirect Call Targets with Strong Multi-layer Type Analysis. In 
+
+Proceedings of the 33rd USENIX Security Symposium . Philadelphia, PA, USA, 5877–5894. [68] Chong Xiang, Tong Wu, Zexuan Zhong, David Wagner, Danqi Chen, and Prateek Mittal. 2024. Certifiably Robust RAG against Retrieval Corruption. https://arxiv.org/abs/2405.15556 .[69] Dandan Xu, Di Tang, Yi Chen, XiaoFeng Wang, Kai Chen, Haixu Tang, and Longxing Li. 2024. Racing on the Negative Force: Efficient Vul-nerability Root-Cause Analysis through Reinforcement Learning on Counterexamples. In Proceedings of the 33rd USENIX Security Sympo-sium . Philadelphia, PA, USA, 4229–4246. [70] Jun Xu, Dongliang Mu, Ping Chen, Xinyu Xing, Pei Wang, and Peng Liu. 2016. CREDAL: Towards Locating a Memory Corruption Vulnera-bility with Your Core Dump. In Proceedings of the 2016 ACM SIGSAC Conference on Computer and Communications Security . Vienna, Austria, 529–540. [71] Jun Xu, Dongliang Mu, Xinyu Xing, Peng Liu, Ping Chen, and Bing Mao. 2017. POMP: Postmortem Program Analysis with Hardware-Enhanced Post-Crash Artifacts. In Proceedings of the 26th USENIX Security Symposium . Vancouver, BC, Canada, 17–32. [72] Carter Yagemann, Matthew Pruett, Simon P. Chung, Kennon Bittick, Brendan Saltaformaggio, and Wenke Lee. 2021. ARCUS: Symbolic Root Cause Analysis of Exploits in Production Systems. In Proceedings of the 30th USENIX Security Symposium . Virtual Event, 1989–2006. [73] Heng Yin, Dawn Song, Manuel Egele, Christopher Kruegel, and Engin Kirda. 2007. Panorama: Capturing System-Wide Information Flow for Malware Detection and Analysis. In Proceedings of the 14th ACM Conference on Computer and Communications Security . Alexandria, VA, USA, 116–127. [74] Ding Yuan, Soyeon Park, Peng Huang, Yang Liu, Michael M. Lee, Xiaoming Tang, Yuanyuan Zhou, and Stefan Savage. 2012. Be Con-servative: Enhancing Failure Diagnosis with Proactive Logging. In 
+
+Proceedings of the 10th USENIX Symposium on Operating Systems De-sign and Implementation . Hollywood, CA, 293–306. [75] Ding Yuan, Jing Zheng, Soyeon Park, Yuanyuan Zhou, and Stefan Sav-age. 2012. Improving Software Diagnosability via Log Enhancement. 
+
+ACM Transactions on Computer Systems 30, 1 (2012), 4:1–4:28. [76] Qiusi Zhan, Zhixiang Liang, Zifan Ying, and Daniel Kang. 2024. In-jecAgent: Benchmarking Indirect Prompt Injections in Tool-Integrated Large Language Model Agents. In Proceedings of the Findings of the As-sociation for Computational Linguistics: ACL 2024 . Bangkok, Thailand, 10471–10506. [77] Hanrong Zhang, Jingyuan Huang, Kai Mei, Yifei Yao, Zhenting Wang, Chenlu Zhan, Hongwei Wang, and Yongfeng Zhang. 2025. Agent Security Bench (ASB): Formalizing and Benchmarking Attacks and Defenses in LLM-based Agents. In Proceedings of the 13th International Conference on Learning Representations . Singapore. [78] Shaokun Zhang, Ming Yin, Jieyu Zhang, Jiale Liu, Zhiguang Han, Jingyang Zhang, Beibin Li, Chi Wang, Huazheng Wang, Yiran Chen, and Qingyun Wu. 2025. Which Agent Causes Task Failures and When? On Automated Failure Attribution of LLM Multi-Agent Systems. In 
+
+Proceedings of the 42nd International Conference on Machine Learning .Vancouver, Canada, 76583–76599. [79] Tian Zhang, Yiwei Xu, Juan Wang, Keyan Guo, Xiaoyang Xu, Bowen Xiao, Quanlong Guan, Jinlin Fan, Jiawei Liu, Zhiquan Liu, and Hongxin Hu. 2026. AgentSentry: Mitigating Indirect Prompt Injection in LLM Agents via Temporal Causal Diagnostics and Context Purification. 
+
+https://arxiv.org/abs/2602.22724 .[80] Xu Zhao, Kirk Rodrigues, Yu Luo, Michael Stumm, Ding Yuan, and Yuanyuan Zhou. 2017. Log20: Fully Automated Optimal Placement of Log Printing Statements under Specified Overhead Threshold. In 
+
+Proceedings of the 26th Symposium on Operating Systems Principles .Shanghai, China, 565–581. [81] Kunlun Zhu, Zijia Liu, Bingxuan Li, Muxin Tian, Yingxuan Yang, Jiaxun Zhang, Pengrui Han, Qipeng Xie, Fuyang Cui, Weijia Zhang, Xiaoteng Ma, Xiaodong Yu, Gowtham Ramesh, Jialian Wu, Zicheng Liu, Pan Lu, James Zou, and Jiaxuan You. 2025. Where LLM Agents Fail and How They can Learn From Failures. http://arxiv.org/abs/2509.25370 .[82] Wei Zou, Runpeng Geng, Binghui Wang, and Jinyuan Jia. 2025. Poisone-dRAG: Knowledge Corruption Attacks to Retrieval-Augmented Gen-eration of Large Language Models. In Proceedings of the 34th USENIX Security Symposium . Seattle, WA, USA, 3827–3844. 
+
+> 15
+
+A Configured Region Set 
+
+Region set. Our observations, consistent with prior work [81], show that program variables serving the same agent func-tionality cluster naturally into five regions as follows: 
+
+• Perceiving (Per): Variables that receive input from external sources where the application does not initi-ate the interaction (e.g., user queries, incoming agent messages, sensor readings). 
+
+• Planning & Acting (PA): Variables that store LLM-generated responses and variables involved in application-initiated interactions with external sources (e.g., tool invocations, outgoing messages to other agents). 
+
+• Recalling & Reflecting (RR): Variables that retrieve information from internal sources (e.g., knowledge bases, experience repositories, execution logs) or store summarized experiences derived from prior activity. 
+
+• Prompt Kitchen (PK): Variables that assemble prompts for the LLM context window, which combine informa-tion drawn from the other three regions into a coherent input. 
+
+• Unknown (UNK): Variables that implement function-alities not belonging to the Per , PA , RR , or PK regions. 
+
+Region distribution across the evaluated applica-tions with the configured region set. Table 10 reports the ground-truth classification of functions in each evaluated ap-plication using this region set. Here, |𝑉 fn | is the total number of functions in the CLDG function plane; S denotes functions belonging to a single region, and M denotes functions span-ning two or more regions. 
+
+Table 10. Ground truth region distribution.                                                  
+
+> Application |𝑉 fn |Per PA RR PK UNK AM:S
+> GPT-Researcher 244 3133 17 18 69 42.34% Quivr 62 414 31 1936.00% aider 329 2156 02168 10.63% MetaGPT 672 6359 40 20 225 22 5.18% SWE-agent 160 164 0392 00.00%
+
+Across all five applications, the multi-region ratio M:S stays at or below 6%, confirming that the vast majority of functions implement a single agent functionality and can be reliably classified to exactly one region. The few multi-region functions are those that orchestrate several agent functionalities within a single function; for example, 
+
+ResearchConductor.conduct_research in GPT-Researcher retrieves context from web pages (PA), loads documents from the knowledge base (RR), and assembles prompts for the LLM (PK), thereby spanning three regions. The remaining functions in 𝑉 fn that do not belong to any region are utility functions that parse configuration files, log the execution trace, calculate token consumption, or handle errors; they are taint-reachable from CEP candidates and therefore included in 𝑉 fn , but they do not implement any agent functionality. 
+
+B Query Language Grammar                                                                                             
+
+> < letter > ::= "A" |... |"Z" |"a" |... |"z" < digit > ::= "0" |... |"9" < number > ::= < digit > {< digit > }< identifier > ::= < letter > {< letter > |< digit > |"_" |"." }< qualified -id > ::= < identifier > "." < identifier > |< identifier > "." < number > < region > ::= Per (= PERCEIVING ) |PA (= PLANNING_ACTING ) |RR (= RECALLING_REFLECTING ) |PK (= PROMPT_KITCHEN ) < variable > ::= < identifier > |< qualified -id > <term > ::= < region > |< variable > <term - list > ::= <term > |<term > " ," <term - list > < dependency > ::= <term > DEPENDS_ON <term - list > <atom > ::= < dependency > |"(" < formula > ") " < formula > ::= <atom > {< logical - operator > <atom > }< logical - operator > ::= AND |OR < query > ::= CHECK < formula > {" - >" < formula > }
+
+Listing 4. Query language grammar 
+
+C Case Studies In-depth Details 
+
+We present details of four representative case studies that demonstrate the analyst’s backtracking workflow on differ-ent types of incidents. 
+
+C.1 Case Study 1: Quivr MC-Poison (M) Incident. An attacker sends a crafted chat message through Quivr’s user interface. The message poisoned the memory database of Quivr. In a later chat session with the user, the malicious content is retrieved during question answering and reaches the LLM, producing a manipulated response. 
+
+Log investigation. The analyst triaged the trajectory log and found text of misinformation repeatedly appeared when the user asked questions about "Nvidia stock price". The log further showed that the files uploaded to the knowledge base did not contain the misinformation. The analyst deduced that Quivr’s memory database was poisoned. 
+
+CEP + path identification: exploitation phase. The analyst started to use Origin to identify the CEP. From the log, the analyst came up with the query on whether the mali-cious content in the memory database can pollute responses to the user. Consequently, the analyst submitted: CHECK (PK DEPENDS_ON RR) AND (Per DEPENDS_ON PK) . The query returns a subgraph of the CLDG where each node is a function with attributes: node id, function name, and location (i.e., corresponding Python program file and line number of the function definition in the file). As shown in Figure 2(a), the graph contains 21 nodes, of which 3 are in the Per region (colored in green), 1 in the PK (red), and 5 in the RR (blue). Because the region-level query was submitted by the analyst, 
+
+> 16
+
+the analyst knew only the 3 nodes in the Per and 5 nodes in the RR need to be examined. To formulate a variable-level query, the analyst needed to identify one or more variable-level taint sources in the RR and one or more variable-level taint sinks in the Per. The analyst began with the 3 nodes colored in green to identify the taint sinks. By examining the function names, the analyst identified two functions that may contain the taint sink can-didates: create_question_handler and create_stream_ question_handler . From the log, the analyst found that the error traceback for the failed chat task passes through 
+
+create_question_handler at chat_routes.py:197 , con-firming that this handler processed the incident request. The analyst clicked this node to reveal its variable plane. As shown in Figure 3, only one variable node appears: it holds the response to be delivered to the user. The analyst identi-fied this variable (id 30064775110 ) as the taint sink. backend/llm/private_gpt4all.py:PrivateGPT4AllBrainPicking.__init__ backend/routes/chat_routes.py:create_question_handler@endpoint                             
+
+> 115964117319 chat_id backend/llm/private_gpt4all.py:PrivateGPT4AllBrainPicking.__init__ 21 param 115964117320 brain_id backend/llm/private_gpt4all.py:PrivateGPT4AllBrainPicking.__init__ 22 param 128849019019 RET backend/llm/private_gpt4all.py:PrivateGPT4AllBrainPicking.__init__ 19 method_return
+> =str(brain_id), streaming =False) check_user_limit(current_user)
+> user.user_openai_api_key) check_user_limit(current_user)
+> 30064775110 @chat_router.post("/chat/{chat_id}/question", dependencies =[Depends(AuthBearer())], tags =["Chat"]) backend/routes/chat_routes.py:create_question_handler@endpoint 152 endpoint
+> PrivateGPT4AllBrainPicking(chat_id =str(chat_id), brain_id =str(brain_id), streaming =False) PrivateGPT4AllBrainPicking(chat_id =str(chat_id), brain_id =str(brain_id), streaming =False)
+> ser.user_openai_api_key)
+> check_user_limit(current_user) current_user
+
+Figure 3. Click the relevant node in the Per to zoom in. The analyst then inspected the 5 RR nodes colored in blue. By examining function names, get_chat_history is the most relevant to retrieving content from the memory database. The analyst clicked it and found one variable that receives the return value of the Supabase retrieval API call. The analyst identified this variable (id 30064774216 ) as the taint source. With the taint sink and taint source identified, the analyst submitted a variable-level query: CHECK node.30064775110 DEPENDS_ON node.30064774216 . The query returns a set of paths in the variable plane that are mapped to 1 function-level path passing through 6 functions (Figure 2(b), phase A (left)). The path traces data from get_chat_history (RR) through _call_chain (PA, containing the API call to the LLM) to create_question_handler (Per), confirming that the poisoned content from the memory database went to the context window of the LLM and polluted the response that was delivered to the user. 
+
+CEP + path identification: poisoning phase. The taint source found in the exploitation phase might not be the CEP, because poisoning a memory database directly [23] is hard. Such an attack requires the attacker to (1) get the access credential to the user system; (2) to obtain the secret of the memory database running on the system; (3) to find the exact table in the memory database corresponding to the chat history of the user; (4) to identify the exact embedding model that the user is using and transform the malicious content into vectors using the model before inserting them into the table. Therefore, the analyst knew that the attacker is more likely to poison the memory database through user interfaces. With this, the analyst submitted: CHECK (PK DEPENDS_ON Per) AND (RR DEPENDS_ON PK) .The resulting subgraph contains 23 nodes. Similarly, the analyst only needed to examine 3 nodes in the Per (green) and 8 nodes in the RR (blue). The analyst went through a sim-ilar process of (1) examining the function names; (2) clicking interesting nodes to inspect their variable planes; (3) identify-ing the candidates for taint source and taint sink. As a result, the analyst identified one taint source and one taint sink and submitted a variable-level query: CHECK node.30064774368 DEPENDS_ON node.30064775110 .The query returns a set of paths in the variable plane that are mapped to 2 function-level paths. The path that corre-sponds to the execution in the incident is within them. As shown in Figure 2(b) (phase B (right)), it passes through 8 functions. The path traces data from create_question_hand ler (Per) through _construct_prompt (PK), and _get_model _response that sends the prompt to the LLM before saving the response into the chat history via update_chat_history .
+
+CEP identified. The diagnosis results showed that the CEP of the attack incident is the API call in the create_ question_handler function that receives the HTTP request containing the malicious content at line number 152 in the file backend/routes/chat_routes.py .
+
+C.2 Case Study 2: GPT-Researcher MC-Poison (KB) 
+
+This case study demonstrates how to backtrack the incident described in Section 3.1. 
+
+Region-level query. Following the workflow in Section C.1, the analyst submitted a region-level query CHECK (PK DEPEN DS_ON RR) AND (PA DEPENDS_ON PK) , which returns 135 functions (8 in RR, 41 in PK, 64 in PA). 
+
+Variable-level taint sink candidate identification. The analyst started with 64 PA nodes colored in yellow. Since the attack effect is a PDF file of manipulated research synthesis that was downloaded by the user, the analyst proactively searched for functions that write content to file when ex-amining the function names of nodes. The analyst quickly found that only functions whose names start with write are relevant to the functionality. To get a cleaner view of the graph, the analyst utilized the features of Origin to filter out irrelevant nodes and edges: (1) using regular expression 
+
+.*write.* to batch select the relevant nodes; (2) choosing the option to preserve only call-out edges in the graph. The filtered subgraph is shown in Figure 4, which contains only 10 nodes with edges showing who calls who in the call chain. The analyst could easily deduce that write_md_to_pdf is more relevant than other functions such as write_md_to_word ,
+
+write_report_introduction , and write_report . By click-ing on the write_md_to_pdf node, the analyst quickly iden-tified as the taint sink candidate the API call md2pdf (id 30064773841) in the variable plane. 
+
+Variable-level taint source candidate identification. 
+
+The analyst then inspected 8 RR nodes to identify the taint 
+
+> 17 111669149808 backend/server/server.py write_report 124 111669149865 backend/utils.py write_md_to_pdf 35 callchain 111669149866 backend/utils.py write_md_to_word 61 callchain 111669149930 gpt_researcher/actions/report_generation.py write_report_introduction 12 callchain 111669149960 gpt_researcher/agent.py GPTResearcher.write_report 369 callchain 111669149961 gpt_researcher/agent.py GPTResearcher.write_report_conclusion 387 callchain 111669149962 gpt_researcher/agent.py GPTResearcher.write_introduction 393 callchain 111669150706 gpt_researcher/skills/writer.py ReportGenerator.write_report 30 callchain 111669150707 gpt_researcher/skills/writer.py ReportGenerator.write_report_conclusion 90 callchain 111669150708 gpt_researcher/skills/writer.py ReportGenerator.write_introduction 129 callchain callchain callchain callchain callchain callchain
+
+Figure 4. Filtered subgraph of region-level query result. source. Upon examining the function names, the analyst identified the most relevant functions to retrieve content from knowledge base: DocumentLoader._load_document ,
+
+AzureDocumentLoader.load , and LangChainDocumentLoa der.load . By examining the variable plane of the 3 functions, the analyst determined that they are for retrieving knowl-edge from a local file, a cloud file, and in-memory vectors, respectively. Based on the user report that the knowledge base was stored locally, the analyst deduced that the API call 
+
+loader.load (id 30064778131) in DocumentLoader._load_ document could be the taint source candidate. 
+
+Variable-level query to identify the CEP. With all of these, the analyst submitted a variable-level query: CHECK node.30064773841 DEPENDS_ON node.30064778131 . The query returned 4 paths, one of which is the correct path that the malicious content took to cause the harm in the particular incident. The CEP in the motivating example was identified thereby. As shown in Figure 6(b), the malicious content from the knowledge base was combined with the crawled web page in the PK (red) before going to the LLM context window and generating the report. 
+
+C.3 Case Study 3: SWE-agent IPI Incident. SWE-agent fetched a GitHub issue to begin a soft-ware engineering task. The issue body was embedded with invisible malicious instructions. The SWE-agent followed the instructions in the issue and caused the target software to delay showing the user interface for 10,000 seconds, which appeared to be a denial-of-service to the user. 
+
+Log investigation. The analyst triaged the trajectory log and obtained two key observations. First, the task originated from a GitHub issue. Second, the agent applied a patch that inserted a denial-of-service delay into the target repository’s source code. 
+
+Region-level query. Following the workflow in Case Study 1, the analyst submitted a region-level query CHECK (PK DEPENDS_ON PA) AND (PA DEPENDS_ON PK) , which returns 47 functions (26 in PA, 2 in PK). The analyst knew that only the the 26 PA nodes needed to be examined. 
+
+Variable-level taint source candidate identification. 
+
+The analyst started with the 26 PA-region nodes. Since the attack entered through a GitHub issue, the analyst searched for functions related to fetching issue content. By searching 
+
+github in function names, the analyst found two relevant functions: _get_problem_statement_from_github_issue 
+
+and GithubIssue.get_problem_statement . The analyst clicked to examine the variable planes of these two functions and identified the taint source as the API call api.issues.get 
+
+(id 30064790320 ) in _get_problem_statement_from_gith ub_issue .
+
+Variable-level taint sink candidate identification. The analyst continued inspecting the 26 PA-region nodes to iden-tify the taint sink. Since the attack effect was modification of source code in the target repository, the analyst looked for functions that apply code changes. By examining func-tion names, only _apply_patch is most relevant to applying patches. The analyst clicked to examine its variable plane and identified the taint sink as the API call subprocess.run 
+
+(id 30064783612 ) in SaveApplyPatchHook._apply_patch .
+
+Variable-level query to identify the CEP. With the taint source and taint sink identified, the analyst submitted a variable-level query: CHECK node.30064783612 DEPENDS_ON node.30064790320 . The query returns 1 path passing through 21 functions (Figure 9(b)). The path traces data from _get_pr oblem_statement_from_github_issue (PA) through get_ problem_statement into the agent’s message history con-struction ( _get_format_dict , _add_templated_messages_ to_history ), then through the agent’s forward loop ( forward _with_handling , forward , handle_action , handle_submis sion ), and finally to the patch application hooks ( on_instance _completed , _save_patch , _apply_patch ), where subproce ss.run executes git apply .
+
+CEP identified. The results showed that the CEP of the at-tack incident is the API call api.issues.get in the _get_pro blem_statement_from_github_issue function that fetches the GitHub issue content containing the malicious instruc-tions at line 96 in the file sweagent/utils/github.py .
+
+C.4 Case Study 4: Quivr IPI + MC-Poison (KB) Incident. An attacker compromised a user-trusted website. The user then used Quivr’s crawl functionality to add the website’s content to a personal knowledge base, unknow-ingly storing the malicious content as document embeddings. Days later, when the user asked questions about the topic covered by the compromised page, the application retrieved the malicious content and produced manipulated responses. 
+
+Log investigation. The analyst triaged the log and ob-tained two key observations: the user had crawled a URL 
+
+> 18
+
+into a knowledge base, and the user later received manip-ulated responses when asking questions against the same knowledge base. 
+
+From knowledge base retrieval to the manipulated response. The analyst first investigated how the malicious content in the knowledge base reaches the chat response. The analyst submitted CHECK (PK DEPENDS_ON RR) AND (Per DEPENDS_ON PK) , which returns a graph of 21 nodes (3 in Per, 1 in PK, 5 in RR). The analyst began with the 3 Per nodes to identify the taint sink. Following the same process as in Case Study 1 (Section C.1), the analyst identified 
+
+update_chat_history and the variable (id 30064774368 ), the API call that persists the LLM response to the chat history, as the taint sink. The analyst then inspected the 5 RR nodes to identify the taint source. Two functions are relevant to data retrieval: 
+
+get_chat_history and CustomSupabaseVectorStore.sim ilarity_search . By examining their variable planes, the analyst found that get_chat_history retrieves multi-round conversation records, while similarity_search retrieves document chunks from the knowledge base. Since the mali-cious content was stored in the knowledge base, the analyst identified the API call that queries the vector store for sim-ilar documents (id 146028888356 ) in similarity_search 
+
+as the taint source. With these, the analyst submitted a variable-level query: 
+
+CHECK node.30064774368 DEPENDS_ON node.146028888356 .The query returns 1 path (Figure 8(a), phase A (left)). The path traces data from similarity_search (RR) through 
+
+_construct_prompt (PK, where the retrieved documents are injected into the LLM prompt as context) to the LLM call and finally to update_chat_history (Per), confirming that the malicious content stored in the knowledge base reached the LLM context window and polluted the chat response. 
+
+From crawled website to knowledge base storage. The taint source identified above ( similarity_search ) reads from the knowledge base but is not the CEP. The analyst must determine how the malicious content entered the knowledge base in the first place. Since the log shows that the user added external content to the knowledge base through the crawl functionality, the analyst submitted CHECK RR DEPENDS_ON PA , which returns a graph of 47 nodes (12 in PA, 25 in RR). The result graph contains two disconnected subgraphs (Figure 5): one centered around crawl_endpoint and the crawl-related functions ( CrawlWebsite._crawl , CrawlWeb site.process ), the other centered around the chat handlers (create_question_handler , create_chat_handler ). Since the analyst has already confirmed that the malicious content resides in the knowledge base rather than the chat history, the chat subgraph does not need to be examined. The analyst focused on the crawl subgraph, which contains 3 PA nodes and 16 RR nodes. The analyst started with the 3 PA nodes to identify the taint source. These three functions, CrawlWebsite._crawl ,
+
+CrawlWebsite.process , and crawl_endpoint , form a sin-gle call chain, where crawl_endpoint calls process , which in turn calls _crawl . Since the taint source must be the entry point where untrusted external content first enters the appli-cation, the analyst examined the innermost function _crawl ,which sends an HTTP request to retrieve the webpage con-tent. By examining its variable plane, the analyst identified the API call that fetches the webpage (id 30064771354 ) as the taint source. The analyst then inspected the 16 RR nodes to identify the taint sink. When the analyst examined the function names, most nodes were file-processing utilities or content parsers unrelated to knowledge base storage. Only Neurons.create_ vector directly suggests the function is writing to the vector store. By examining its variable plane, the analyst identified the API call that stores document embeddings into the knowl-edge base (id 30064776465 ) as the taint sink. The analyst submitted a variable-level query: CHECK node. 30064776465 DEPENDS_ON node.30064771354 . The query returns 1 path passing through 10 functions (Figure 8(a), phase B (right)). The path traces data from _crawl (PA), through file processing and content parsing, to create_vector 
+
+(RR), where the malicious content was embedded and stored in the knowledge base. 
+
+CEP identified. The analyst connected the two paths through the knowledge base: the crawl path writes the ma-licious content into the same knowledge base that the chat path later retrieves from. Although the write occurred days before the read, the log confirmed that both operations tar-geted the same knowledge base. The CEP of the incident is the API call that fetches the webpage in CrawlWebsite._crawl 
+
+at line 19 of backend/crawl/crawler.py .
+
+D CEPs + Paths identified in all incidents 
+
+We show the function-level paths identified in all eight in-cidents, except for the one (Quivr MC-Poison (M)) that is already included in the main body of the paper (Figure 2(b)). The CEPs are identified as the source node of the path in the five single-phase incidents; for the other two incidents (Quivr MC-Poison (KB) and Quivr IPI + MC-Poison (KB)), the CEPs are identified as the source node of the path in Phase B. 
+
+> 19
+
+111669149771 backend/llm/models/OpenAiAnswer.py OpenAiAnswer.__init__ 6111669149809 backend/llm/openai_functions.py format_answer 19 111669149820 backend/llm/openai_functions.py OpenAIFunctionsBrainPicking.generate_answer 162 111669150042 backend/routes/chat_routes.py create_question_handler 155 111669150006 backend/repository/chat/update_chat_history.py update_chat_history 8111669149816 backend/llm/openai_functions.py OpenAIFunctionsBrainPicking._get_model_response 85 111669149819 backend/llm/openai_functions.py OpenAIFunctionsBrainPicking._construct_prompt 130 111669149777 backend/llm/openai.py OpenAIBrainPicking.__init__ 36 111669150043 backend/routes/chat_routes.py create_stream_question_handler 210 111669149788 backend/llm/openai.py OpenAIBrainPicking.generate_answer 136 111669149811 backend/llm/openai_functions.py OpenAIFunctionsBrainPicking.__init__ 42 111669149835 backend/llm/private_gpt4all.py PrivateGPT4AllBrainPicking.__init__ 19 30064775110 backend/routes/chat_routes.py create_question_handler@endpoint 152 111669149790 backend/llm/openai.py OpenAIBrainPicking.generate_stream 179 30064775146 backend/routes/chat_routes.py create_stream_question_handler@endpoint 205 111669149787 backend/llm/openai.py OpenAIBrainPicking._call_chain 121 111669149991 backend/repository/chat/format_chat_history.py format_chat_history 1111669150008 backend/repository/chat/update_message_by_id.py update_message_by_id 8111669149899 backend/models/chat.py ChatHistory.__init__ 26 111669149995 backend/repository/chat/get_chat_history.py get_chat_history 6111669149818 backend/llm/openai_functions.py OpenAIFunctionsBrainPicking._get_context 122 111669150104 backend/vectorstore/supabase.py CustomSupabaseVectorStore.similarity_search 25 111669150044 backend/routes/chat_routes.py get_chat_history_handler 258 111669149989 backend/repository/chat/create_chat.py create_chat 19 111669150041 backend/routes/chat_routes.py create_chat_handler 140 30064775064 backend/routes/chat_routes.py create_chat_handler@endpoint 139 111669149722 backend/crawl/crawler.py CrawlWebsite._crawl 18 111669149723 backend/crawl/crawler.py CrawlWebsite.process 25 111669150046 backend/routes/crawl_routes.py crawl_endpoint 21 111669149914 backend/models/ fi les.py File.__init__ 31 111669149964 backend/parsers/github.py process_github 14 111669150083 backend/utils/processors.py 
+
+fi lter_ fi le 42 30064775275 backend/routes/crawl_routes.py crawl_endpoint@endpoint 20 111669149915 backend/models/ fi les.py File.compute_ fi le_sha1 39 111669149916 backend/models/ fi les.py File.compute_documents 49 111669149920 backend/models/ fi les.py File. fi le_is_empty 120 111669149921 backend/models/ fi les.py File.link_ fi le_to_brain 123 111669150055 backend/routes/upload_routes.py upload_ fi le 17 111669149919 backend/models/ fi les.py File. fi le_already_exists_in_brain 103 111669150088 backend/utils/vectors.py Neurons.create_vector 18 111669150082 backend/utils/processors.py create_response 38 111669149917 backend/models/ fi les.py File.set_ fi le_vectors_ids 71 111669150079 backend/utils/ fi le.py compute_sha1_from_ fi le 29 111669150078 backend/utils/ fi le.py get_ fi le_size 19 30064775468 backend/routes/upload_routes.py upload_ fi le@endpoint 16 111669150080 backend/utils/ fi le.py compute_sha1_from_content 36 111669149956 backend/parsers/common.py process_ fi le 10 Figure 5. Region-level query result of IPI + MC-Poison (KB) incident (phase B). 
+
+20 get nodriver_scraper.py L52 
+
+● src: driver.get(url, new_tab = new_window) scrape_async nodriver_scraper.py L208 
+
+await self.driver.get(url, ... (L52) → page (L208) 
+
+extract_data_from_url scraper.py L105 
+
+text, image_urls, title (L239) → tmp12 (L105) 
+
+run scraper.py L51 
+
+{ "url": link, "raw_content... (L117) → <operator>.genExp.append(se... (L51) { "url": link, "raw_content... (L135) → <operator>.genExp.append(se... (L51) { "url": link, "raw_content... (L142) → <operator>.genExp.append(se... (L51) 
+
+scrape_urls web_scraping.py L35 
+
+res (L55) → scraped_data (L35) 
+
+browse_urls browser.py L33 
+
+scraped_data, images (L42) → tmp0 (L33) 
+
+_get_context_by_urls researcher.py L197 
+
+scraped_content (L62) → scraped_content (L197) 
+
+get_similar_content_by_query context_manager.py L14 
+
+scraped_content (L204) → pages (L14) 
+
+_get_context_by_urls researcher.py L203 
+
+await context_compressor.as... (L29) → context (L203) 
+
+conduct_research researcher.py L114 
+
+context (L206) → research_data (L114) 
+
+conduct_research agent.py L321 
+
+researcher.context (L188) → context (L321) 
+
+write_report agent.py L378 
+
+context (L321) → context (L378) context (L321) → relevant_written_contents (L375) 
+
+main main.py L27 
+
+report (L385) → report (L27) 
+
+write_md_to_pdf utils.py L35 
+
+● sink: md2pdf( fi le_path, md_content = text, ... 
+
+report (L28) → fi lename (L35) report (L28) → text (L35) (a) GPT-Researcher IPI. _load_document document.py L83 
+
+● src: loader.load() load document.py L29 
+
+ret_data (L92) → tasks.append(self._load_doc... (L29) 
+
+write_md_to_pdf utils.py L35 
+
+● sink: md2pdf( fi le_path, md_content = text, ... conduct_research researcher.py L142 
+
+docs (L61) → document_data (L142) 
+
+generate_report_ fi les server_utils.py L197 _get_context_by_web_search researcher.py L145 
+
+document_data (L145) → scraped_data (L243) 
+
+handle_start_command server_utils.py L166 _process_sub_query researcher.py L328 
+
+scraped_data (L328) → scraped_data (L426) 
+
+start_streaming websocket_manager.py L84 get_similar_content_by_query context_manager.py L14 
+
+scraped_data (L504) → pages (L14) 
+
+run_agent websocket_manager.py L167 async_get_context compression.py L72 
+
+documents (L24) → query (L72) 
+
+run basic_report.py L58 pretty_print_docs prompts.py L436 
+
+relevant_docs (L77) → docs (L436) 
+
+write_report writer.py L30 _combine_mcp_and_web_context researcher.py L508 
+
+context_str (L77) → web_context (L508) 
+
+write_report agent.py L375 _get_context_by_web_search researcher.py L338 
+
+combined_context (L508) → context (L338) 
+
+conduct_research agent.py L321 join_local_web_documents prompts.py L445 
+
+docs_context (L145) → docs_context (L445) web_context (L146) → web_context (L445) 
+
+conduct_research researcher.py L188 
+
+research_data (L147) → researcher.context (L188) researcher.context (L188) → context (L321) context (L321) → ext_context (L378) ext_context (L378) → ext_context (L30) report (L77) → report (L58) report (L59) → report (L167) report (L172) → report (L84) report (L92) → report (L180) report (L181) → report (L197) sanitized_ fi lename (L181) → fi lename (L197) report (L198) → text (L35) 
+
+fi lename (L198) → fi lename (L35) (b) GPT-Researcher MC-Poison (KB). 
+
+Figure 6. Paths in GPT-Researcher IPI and MC-Poison (KB) incidents. 
+
+21 Phase A Phase B
+
+similarity_search supabase.py L35 
+
+● src: self._client.rpc(table,{"query_embedding... _get_context openai_functions.py L128 
+
+documents (L58) → tmp9 = self.vector_store tm... (L128) 
+
+create_brain_vector brains.py L138 sink: insert into brains_vectors _construct_prompt openai_functions.py L154 
+
+vector_store.similarity_sea... (L128) → chat_context (L154) 
+
+_get_model_response openai_functions.py L87 
+
+system_messages (L160) → messages (L87) 
+
+generate_answer openai_functions.py L181 
+
+openai_client.completion_wi... (L105) → response (L181) openai_client.completion_wi... (L105) → response (L204) openai_client.completion_wi... (L105) → response (L192) 
+
+format_answer openai_functions.py L19 
+
+response (L184) → model_response (L19) response (L197) → model_response (L19) response (L210) → model_response (L19) 
+
+__init__ OpenAiAnswer.py L8 
+
+content (L30) → content (L8) 
+
+format_answer openai_functions.py L30 
+
+RET (L6) → OpenAiAnswer(content=conten... (L30) 
+
+generate_answer openai_functions.py L184 
+
+OpenAiAnswer(content=conten... (L30) → formatted_response (L184) OpenAiAnswer(content=conten... (L30) → formatted_response (L210) OpenAiAnswer(content=conten... (L30) → formatted_response (L197) 
+
+create_question_handler chat_routes.py L197 
+
+chat_history (L219) → chat_answer (L197) 
+
+create_question_handler@endpoint chat_routes.py L152 
+
+● sink: @chat_router.post("/chat/{chat_id}/qu... 
+
+chat_answer (L199) → @chat_router.post("/chat/{c... (L152) 
+
+upload_ fi le@endpoint upload_routes.py L16 src: @upload_router.post('/upload', dependencies=[Depends(AuthBearer())], tags=['Upload']) upload_ fi le upload_routes.py L21 
+
+@upload_router.post(...) (L16) -> request (L18) @upload_router.post(...) (L16) -> uploadFile (L19) @upload_router.post(...) (L16) -> brain_id (L20) @upload_router.post(...) (L16) -> enable_summarization (L21) 
+
+__init__ 
+
+fi les.py L31 
+
+uploadFile (L50) -> kwargs/ fi le (L31) 
+
+upload_ fi le upload_routes.py L50 
+
+RET (L31) -> fi le (L50) 
+
+fi lter_ fi le processors.py L47 
+
+fi le (L59) -> fi le (L44) enable_summarization (L60) -> enable_summarization (L45) brain_id (L61) -> brain_id (L46) request.headers.get('Openai-Api-Key', None) (L62) -> openai_api_key (L47) 
+
+compute_ fi le_sha1 
+
+fi les.py L42 
+
+fi le.compute_ fi le_sha1() (L49) -> self. fi le (L42) 
+
+compute_sha1_from_ fi le 
+
+fi le.py L29 
+
+tmp_ fi le.name (L45) -> fi le_path (L29) 
+
+compute_sha1_from_content 
+
+fi le.py L36 
+
+bytes (L32) -> content (L36) 
+
+compute_sha1_from_ fi le 
+
+fi le.py L32 
+
+readable_hash (L38) -> readable_hash (L32) 
+
+compute_ fi le_sha1 
+
+fi les.py L45 
+
+readable_hash (L33) -> self. fi le_sha1 (L45) 
+
+fi lter_ fi le processors.py L52 
+
+RET (L45) -> fi le. fi le_sha1 (L51/L52) 
+
+fi le_already_exists 
+
+fi les.py L91 
+
+fi le (L52) -> self (L87) 
+
+set_ fi le_vectors_ids 
+
+fi les.py L78 
+
+self. fi le_sha1 (L91/L93) -> self. fi le_sha1 (L81) 
+
+fi le_already_exists 
+
+fi les.py L98 
+
+self.vectors_ids (L84) -> len(self.vectors_ids) (L98) self.vectors_ids (L84) -> return True (L101) 
+
+fi lter_ fi le processors.py L53 
+
+return True (L101) -> fi le_exists (L52/L61) 
+
+fi le_already_exists_in_brain 
+
+fi les.py L105 
+
+fi le (L53) -> self (L103) brain_id (L53) -> brain_id (L103) 
+
+set_ fi le_vectors_ids 
+
+fi les.py L78 
+
+self. fi le_sha1 (L105/L111) -> self. fi le_sha1 (L81) 
+
+fi le_already_exists_in_brain 
+
+fi les.py L115 
+
+response.data (L84) -> response.data (L115) 
+
+fi lter_ fi le processors.py L59 
+
+return False (L116) -> fi le_exists_in_brain (L53/L55) 
+
+fi le_is_empty 
+
+fi les.py L121 
+
+fi le (L59) -> self. fi le. fi le._ fi le (L121) 
+
+fi lter_ fi le processors.py L61 
+
+return False (L121) -> elif fi le_exists (L61) 
+
+link_ fi le_to_brain 
+
+fi les.py L123 
+
+fi le (L62) -> self (L123) Brain(id=brain_id) (L62) -> brain (L123) 
+
+set_ fi le_vectors_ids 
+
+fi les.py L78 
+
+self. fi le_sha1 (L124/L127) -> self. fi le_sha1 (L81) 
+
+link_ fi le_to_brain 
+
+fi les.py L126 
+
+self.vectors_ids (L84) -> self.vectors_ids (L126) drawn by the analyst vector_id['id'] (L127) -> vector_id (L138) self. fi le_sha1 (L127) -> fi le_sha1 (L138) Figure 7. Paths in Quivr MC-Poison (KB) incident. 
+
+22 Phase A Phase B
+
+similarity_search supabase.py L35 
+
+● src: self._client.rpc(table,{"query_embedding... _get_context openai_functions.py L128 
+
+documents (L58) → tmp9 = self.vector_store tm... (L128) 
+
+_crawl crawler.py L19 
+
+● src: requests.get(url) _construct_prompt openai_functions.py L154 
+
+vector_store.similarity_sea... (L128) → chat_context (L154) 
+
+_get_model_response openai_functions.py L87 
+
+system_messages (L160) → messages (L87) 
+
+generate_answer openai_functions.py L181 
+
+openai_client.completion_wi... (L105) → response (L181) openai_client.completion_wi... (L105) → response (L204) openai_client.completion_wi... (L105) → response (L192) 
+
+format_answer openai_functions.py L19 
+
+response (L184) → model_response (L19) response (L197) → model_response (L19) response (L210) → model_response (L19) 
+
+__init__ OpenAiAnswer.py L8 
+
+content (L30) → content (L8) 
+
+format_answer openai_functions.py L30 
+
+RET (L6) → OpenAiAnswer(content=conten... (L30) 
+
+generate_answer openai_functions.py L184 
+
+OpenAiAnswer(content=conten... (L30) → formatted_response (L184) OpenAiAnswer(content=conten... (L30) → formatted_response (L210) OpenAiAnswer(content=conten... (L30) → formatted_response (L197) 
+
+create_question_handler chat_routes.py L197 
+
+chat_history (L219) → chat_answer (L197) 
+
+create_question_handler@endpoint chat_routes.py L152 
+
+● sink: @chat_router.post("/chat/{chat_id}/qu... 
+
+chat_answer (L199) → @chat_router.post("/chat/{c... (L152) 
+
+process crawler.py L26 
+
+response.text (L21) → content (L26) 
+
+crawl_endpoint crawl_routes.py L50 
+
+temp_ fi le_path (L36) → tmp2 (L50) 
+
+__init__ 
+
+fi les.py L31 
+
+uploadFile (L58) → kwargs (L31) 
+
+fi le_is_empty 
+
+fi les.py L121 
+
+fi le (L34) → fi le (L121) 
+
+fi le (L35) → fi le (L121) 
+
+fi le (L36) → fi le (L121) 
+
+fi le. fi le (L36) → fi le. fi le (L121) 
+
+fi le. fi le._ fi le (L36) → fi le. fi le._ fi le (L121) 
+
+compute_ fi le_sha1 
+
+fi les.py L42 
+
+fi le (L121) → fi le (L42) 
+
+fi le (L121) → fi le (L41) 
+
+compute_sha1_from_ fi le 
+
+fi le.py L29 
+
+tmp_ fi le (L45) → fi le_path (L29) 
+
+compute_sha1_from_content 
+
+fi le.py L36 
+
+bytes (L32) → content (L36) 
+
+process_github github.py L35 
+
+readable_hash (L38) → tmp1[" fi le_sha1"] (L35) 
+
+create_vector vectors.py L18 
+
+● sink: commons["documents_vector_store"].add... 
+
+doc_with_metadata (L54) → doc (L18) drawn by the analyst (a) Quivr IPI + MC-Poison (KB), phase A (left) and phase B (right). read_text io.py L459 
+
+● src: f.read() main main.py L1138 
+
+f.read() (L459) → message_from_ fi le (L1138) 
+
+write_text io.py L478 
+
+● sink: f.write(content) run base_coder.py L876 
+
+message_from_ fi le (L1140) → with_message (L876) 
+
+apply_edits editblock_coder.py L48 run_one base_coder.py L924 
+
+with_message (L880) → user_message (L924) user_message (L887) → user_message (L924) 
+
+abs_root_path base_coder.py L572 send_message base_coder.py L1419 
+
+message (L934) → inp (L1419) 
+
+safe_abs_path utils.py L96 move_back_cur_messages base_coder.py L1037 
+
+cur_messages (L1425) → cur_messages (L1037) cur_messages (L1425) → cur_messages (L1046) saved_message (L1594) → message (L1036) cur_messages (L1537) → cur_messages (L1037) cur_messages (L1537) → cur_messages (L1046) cur_messages (L1538) → cur_messages (L1037) cur_messages (L1538) → cur_messages (L1046) cur_messages (L1576) → cur_messages (L1046) cur_messages (L1576) → cur_messages (L1037) cur_messages (L1579) → cur_messages (L1046) cur_messages (L1579) → cur_messages (L1037) cur_messages (L1580) → cur_messages (L1037) cur_messages (L1580) → cur_messages (L1046) cur_messages (L1611) → cur_messages (L1037) cur_messages (L1611) → cur_messages (L1046) 
+
+abs_root_path repo.py L576 send_message base_coder.py L1576 
+
+cur_messages (L1037) → cur_messages (L1576) cur_messages (L1037) → cur_messages (L1537) cur_messages (L1046) → cur_messages (L1537) cur_messages (L1046) → cur_messages (L1576) 
+
+auto_commit base_coder.py L2375 
+
+edited (L1589) → edited (L2375) cur_messages (L1425) → cur_messages (L2380) cur_messages (L1425) → context (L2380) edited (L1601) → edited (L2375) cur_messages (L1537) → cur_messages (L2380) cur_messages (L1538) → cur_messages (L2380) cur_messages (L1576) → cur_messages (L2380) cur_messages (L1579) → cur_messages (L2380) cur_messages (L1580) → cur_messages (L2380) gpt_prompts (L1592) → gpt_prompts (L2387) cur_messages (L1611) → cur_messages (L2380) 
+
+commit repo.py L131 
+
+edited (L2383) → fnames (L131) context (L2383) → context (L131) fn (L281) → path (L576) res (L578) → res (L96) str(res) (L99) → res (L572) res (L574) → full_path (L48) full_path (L71) → fi lename (L478) new_content (L71) → content (L478) (b) aider IPI. 
+
+Figure 8. Paths in Quivr IPI + MC-Poison (KB) and aider IPI incidents. 
+
+23 aread common.py L696 
+
+● src: reader.read() get 
+
+fi le_repository.py L103 
+
+content (L703) → doc.content (L103) 
+
+get_codes write_code.py L167 
+
+doc (L104) → task_doc (L167) doc (L104) → doc (L196) doc (L104) → doc (L208) 
+
+run write_code.py L113 
+
+"".join(codes) (L213) → code_context (L113) "".join(codes) (L213) → code_context (L109) 
+
+write_code write_code.py L88 
+
+prompt (L142) → prompt (L88) 
+
+_aask action.py L106 
+
+prompt (L89) → prompt (L106) 
+
+aask base_llm.py L130 
+
+prompt (L108) → msg (L130) system_msgs (L108) → system_msgs (L131) 
+
+acompletion_text base_llm.py L198 
+
+message (L152) → messages (L198) 
+
+_achat_completion openai_api.py L146 
+
+messages (L203) → messages (L146) 
+
+_achat_completion_function openai_api.py L175 
+
+aclient (L148) → aclient (L175) aclient.chat (L148) → aclient.chat (L175) aclient.chat.completions (L148) → aclient.chat.completions (L175) 
+
+aask_code openai_api.py L192 
+
+rsp (L177) → rsp (L192) 
+
+gpt_msgs_to_code ut_writer.py L285 
+
+get_choice_function_argumen... (L193) → result (L285) 
+
+ask_gpt_and_save ut_writer.py L261 
+
+result (L287) → result (L261) 
+
+awrite common.py L706 
+
+● sink: writer.write(data) 
+
+data (L265) → data (L706) (a) MetaGPT IPI. _get_problem_statement_from_github_issue github.py L96 
+
+● src: api.issues.get(owner, repo, issue_num... get_problem_statement problem_statement.py L122 
+
+f"{title} {body} " (L99) → _get_problem_statement_from... (L122) 
+
+_apply_patch apply_patch.py L102 
+
+● sink: subprocess.run(cmd, cwd = local_dir, ... _get_format_dict agents.py L625 
+
+_get_problem_statement_from... (L122) → dict(command_docs = self.to... (L625) 
+
+on_instance_completed apply_patch.py L34 _add_templated_messages_to_history agents.py L648 
+
+dict( command_docs=self.too... (L625) → format_dict (L648) 
+
+_save_patch apply_patch.py L72 _append_history agents.py L525 
+
+history_item (L671) → item (L525) 
+
+on_instance_completed apply_patch.py L32 __init__ agents.py L450 
+
+history.append(item) (L528) → history (L450) 
+
+on_instance_completed abstract.py L65 messages agents.py L517 
+
+history_processors (L440) → history_processors (L517) history_processors (L440) → tmp42 (L517) history (L450) → history_processors (L517) history (L450) → history (L513) history (L450) → tmp40 (L513) 
+
+run run_single.py L193 forward_with_handling agents.py L1020 
+
+messages (L520) → history (L1020) 
+
+run agents.py L1249 forward agents.py L965 
+
+history (L1067) → history (L965) 
+
+get_trajectory_data agents.py L729 handle_action agents.py L895 
+
+step (L1010) → step (L895) 
+
+add_step_to_trajectory agents.py L1176 handle_submission agents.py L829 
+
+step (L963) → step (L829) 
+
+step agents.py L1208 handle_action agents.py L963 
+
+step (L849) → handle_submission(step) (L963) step (L852) → handle_submission(step) (L963) step (L864) → handle_submission(step) (L963) 
+
+forward_with_handling agents.py L1067 forward agents.py L1010 
+
+step (L915) → handle_action(step) (L1010) handle_submission(step) (L963) → handle_action(step) (L1010) handle_action(step) (L1010) → forward(history) (L1067) forward(history) (L1067) → step_output (L1208) step_output (L1216) → step (L1176) trajectory.append(trajector... (L1189) → trajectory (L729) attempt_data (L736) → data (L1249) AgentRunResult(info=data["i... (L1250) → result (L193) result (L198) → result (L65) result (L67) → result (L32) result (L34) → info (L72) patch_output_ fi le (L91) → patch_path (L34) patch_path (L45) → patch_ fi le (L93) (b) SWE-agent IPI. 
+
+Figure 9. Paths in MetaGPT IPI and SWE-agent IPI incidents. 
+
+24 E Failure Analysis of Existing Tools 
+
+Existing static taint analyzers do not support end-to-end CEP identification. We therefore provide the ground-truth CEP as the source and the operation capturing the attack effect as the sink. We evaluate whether their outputs satisfy the tool-specific success criteria for verifying the given CEP. We then examine the causes that prevent verification of the given CEP in Table 4. The used tool versions are: Joern 4.0.360, CodeQL CLI 2.27.0 with codeql/python-all 7.2.5, and Pysa 0.9.25. Table 11 reports the findings for every incident, phase, and tool; the following subsections explain selected examples. 
+
+E.1 Unresolved Indirect Call Targets 
+
+An incomplete call graph omits possible targets of a call. When an unresolved callee returns a tainted value, the ana-lyzer may fail to propagate that taint to the caller. In GPT-Researcher’s IPI case, scraper.scrape_async() 
+
+retrieves webpage content and returns it to the caller, which assigns it to content (Listing 5, #6). Pysa cannot resolve which function this call invokes, so it cannot propagate the tainted webpage content returned by that function to content . Pysa’s fallback taint model propagates taint from arguments to a call’s return value. However, 
+
+scrape_async() takes no explicit arguments: the webpage content is retrieved inside the callee, rather than passed into the call. The fallback therefore does not mark the returned value, or content , as tainted. Pysa also cannot resolve the target of browse_urls 
+
+(Listing 5, #11), which prevents the returned tainted value from reaching scraped_content . In our diagnos-tic experiment, we added type casts to a copy of the application’s source code and reran Pysa. The casts tell Pysa to treat scraper as a NoDriverScraper and 
+
+self.researcher.scraper_manager as a BrowserManager .With both casts, Pysa reported the call to write_md_to_pdf 
+
+at main.py:28 , indicating that its report argument contains tainted webpage content. This call lies on the expected attack path and therefore satisfies our Pysa success criterion. With either cast alone, Pysa did not report this call.                              
+
+> 1#scraper . py :96 -105
+> 2Scraper =self . get_scraper ( link )
+> 3scraper =Scraper ( link , session )
+> 4#...
+> 5content , image_urls , title =(
+> 6await scraper . scrape_async ()
+> 7)
+> 89#researcher . py :197
+> 10 scraped_content =await (
+> 11 self . researcher . scraper_manager . browse_urls (
+> 12 new_search_urls
+> 13 )
+> 14 )
+
+Listing 5. Unresolved calls in GPT-Researcher. In Quivr’s KB exploitation, self.vector_store is a CustomSupabaseVectorStore object. The call to its 
+
+similarity_search method (Listing 6, #2) retrieves KB documents and returns them at #5. Joern and CodeQL cannot identify this method as the target of the call. Both tools mark documents at #5 as a taint source, but neither propagates that taint to the value returned by the call at #2. In a copy of Quivr’s source code, we replaced the call at #2 with the call at #8–#10 and reran both tools. The replacement names the class’s method directly, passes the vector-store object explicitly, and keeps the same query. Both tools then identified the method and marked the call’s return value as tainted. However, this change alone did not recover the complete source-to-sink path; Table 11 lists the other causes.                     
+
+> 1#llm / openai_functions . py :128
+> 2return self . vector_store . similarity_search ( query = question )
+> 34#vectorstore / supabase . py :58
+> 5return documents
+> 67#Replacement in our diagnostic source - code copy
+> 8return CustomSupabaseVectorStore . similarity_search (
+> 9self . vector_store , query = question
+> 10 )
+
+Listing 6. Unresolved document retrieval in Quivr. 
+
+E.2 Missing Data Dependencies Through Language Constructs 
+
+Taint propagation can be interrupted when an analyzer does not fully represent the data dependencies of a language con-struct (e.g., nested dictionary accesses, comprehension). This includes argument binding, container accesses, object con-struction, and field access. In SWE-agent’s IPI case, tool_call["function"] ["arguments"] reads the tool call’s arguments through two nested dictionary accesses (Listing 7, #2). The first retrieves the dictionary describing the requested function; the second retrieves a JSON string containing the argu-ment names and values. json.loads converts this string into the Python dictionary values . Joern represents both accesses but omits the data-dependence edge from the first access’s result to the second access. Consequently, taint reaches the inner dictionary but not the argument string. In a source-code copy, we separated the accesses into function = tool_call["function"] and values = json.loads(function["arguments"]) . With the other diagnostic changes held fixed, Joern then propagated taint to values without an additional JSON-decoding model. In GPT-Researcher’s IPI case, CodeQL fails to propagate taint through an awaited tuple return. The tuple returned by scrape_async() contains webpage text, which the caller assigns to content (Listing 5, #5–#7). CodeQL does not carry the text’s taint across the await expression to this variable. Summaries that propagate the contained values across the affected await expressions, together with the call and API 
+
+> 25
+
+models in Table 11, allow CodeQL to report a source-to-PDF path containing the required functions. Argument binding is separate from resolving the called function. For example, in Quivr’s memory-exploitation case, replacing the named arguments to update_chat_history 
+
+with positional arguments lets Joern propagate the answer into self.assistant . An additional constructor-content rule is needed for that taint to reach the constructed object returned to the caller.                                    
+
+> 1#tools / parsing . py :401
+> 2values =json . loads ( tool_call [" function " ][ " arguments " ])
+> 3#... validation omitted ...
+> 4#tools / parsing . py :418 -425
+> 5formatted_args ={
+> 6arg . name : Template ( arg . argument_format ). render (
+> 7value = quote ( values [ arg . name ])
+> 8if _should_quote ( values [ arg . name ], command )
+> 9else values [ arg . name ]
+> 10 )
+> 11 if arg . name in values
+> 12 else ""
+> 13 for arg in command . arguments
+> 14 }
+
+Listing 7. Nested dictionary accesses in SWE-agent. 
+
+E.3 Missing Data Dependencies Across API Calls 
+
+An API call may read, transform, or store data. To follow tainted data through the call, the analyzer needs to know what the API does with it. The analyzer can obtain this information by analyzing the API’s implementation or using a summary that describes how data flows through the API. If the relevant behavior is neither analyzed nor summarized, the analyzer may lose track of the tainted data at the call. We include database insertion/readback within an API operation here; separate writes and later reads across application stages belong to Section E.4. In Quivr’s memory-exploitation case, the application sup-plies stored user and assistant messages to a model chain to generate a new answer. It then stores the answer in the data-base, constructs a ChatHistory object from the returned record, and returns that object from the handler. After we supplied rules connecting the configured history source to its message fields, CodeQL propagated taint to the model-chain input but not its result (Listing 8, #2). We added a summary relating the request dictionary to the call result. CodeQL then tracked taint into the generated answer and the record passed to the database insertion, but not into the returned database data (#5–#10). Adding a second summary relating the inserted record to the returned data allowed taint to reach the input of ChatHistory . A separate field-read probe con-firmed that taint subsequently reached the returned object’s 
+
+assistant field.                      
+
+> 1#llm / openai . py :129 -134
+> 2return chain ({ " question ": question , " chat_history ": history })
+> 34#repository / chat / update_chat_history . py :10 -21
+> 5response =(
+> 6commons [" supabase " ]. table (" chat_history ")
+> 7. insert ({ " chat_id ": str ( chat_id ) ,
+> 8" user_message ": user_message , " assistant ": assistant })
+> 9. execute ()
+> 10 ). data
+
+Listing 8. Answer generation and storage in Quivr. 
+
+E.4 Missing Data Dependencies Through Stored Data 
+
+Tracking taint through stored data requires the analysis to connect a write to a subsequent read of the same data. With-out this connection, taint on the written value may not prop-agate to the value read from a file, database, or object field. In the non-GitHub branch examined for Quivr’s compound-attack poisoning phase, the crawler writes webpage text to a file (Listing 9, #5). The handler opens that file and copies its contents into spooled_file (#12–#13), which it then wraps for upload. The crawler returns only names derived from the URL (#7); the webpage text reaches the handler through the file contents. In the evaluated configurations, Joern, CodeQL, and Pysa do not connect the write to this later use, so they do not propagate the webpage taint into the uploaded content. An explicit file-transfer model connects the written webpage content to the upload object. With this model and the other dependencies in Table 11, Joern and CodeQL report paths from the crawler source to the document argument of add_documents . Pysa’s model uses an in-strumented source copy that exposes the written content to a helper returning the upload object. Pysa reports 
+
+filter_file in crawl_endpoint , identifying its file argu-ment at crawl_routes.py:62 as carrying crawler taint to the configured create_vector sink. Its aggregate object model does not distinguish loaded document text from metadata.                                         
+
+> 1#crawl / crawler . py :26 -36
+> 2content =self . _crawl ( self . url )
+> 3#... URL - derived path construction ...
+> 4with open ( temp_file_path , "w") as temp_file :
+> 5temp_file . write ( content )
+> 6if content :
+> 7return temp_file_path , file_name
+> 89#routes / crawl_routes . py :50 -54
+> 10 file_path , file_name =crawl_website . process ()
+> 11 spooled_file =SpooledTemporaryFile ()
+> 12 with open ( file_path , " rb ") as f:
+> 13 shutil . copyfileobj (f , spooled_file )
+
+Listing 9. Writing and reading crawled content in Quivr. 
+
+> 26
+
+Table 11. Observed failure causes by incident, phase, and tool. C: unresolved indirect call targets (Section E.1); L: missing data dependencies through language constructs (Section E.2); A: missing data dependencies across API calls (Section E.3); S: missing data dependencies through stored data (Section E.4). —: no cause listed in these four categories. 
+
+Incident / phase Joern CodeQL Pysa GPT-Researcher IPI 
+
+C Scraper, research and report targets. 
+
+L Conditional logging interrupts content flow. Argument binding at repaired calls. 
+
+A Page-preservation effects of wait/scroll helpers. 
+
+S Research context passed into report generation. 
+
+C Browser/scraper, coroutine extraction, browser-manager, URL-context and selected prompt targets. 
+
+L Container contents lost across three selected awaits; document-field reads. 
+
+A Page/HTML/text extraction, gathered results, retrieval/compression/thread invocation, streaming request and chunk content. 
+
+S Stored context passed into report generation. 
+
+C Source-bearing returns at 
+
+scrape_async and browse_urls ;both targets are needed for the reconstructed PDF report. GPT-Researcher MC-Poison (KB) 
+
+C Document-loader, context, research, and report targets. 
+
+L Conditional logging interrupts context/report flow. Argument binding at repaired calls. 
+
+S Research context passed to report generation. 
+
+C Context-manager target; explicit join binding restores its required function waypoint. 
+
+L Awaited document-collection contents; document-field reads. The retained research-comprehension rewrite changes capture and target inference together, so its cause is not isolated. 
+
+A Both gathers, retrieval/compression/thread invocation, streaming request, and chunk content. 
+
+S Stored report context. 
+
+C Unresolved 
+
+manager.start_streaming 
+
+prevents the document source from reaching the PDF-generation report. Supplying the manager type restores the qualifying call under reconstructed declarations. Quivr MC-Poison (M) Exploitation 
+
+L Named answer argument does not bind to the history-update function’s formal parameter. Initialized 
+
+ChatHistory content does not reach the constructed object returned to the caller. 
+
+L History-object source does not taint selected message fields; tainted assistant field does not satisfy the whole-record sink. An explicit constructor-content rule satisfies that endpoint. 
+
+A Missing chain request-to-response and database insertion-to-readback summaries. 
+
+C The handler’s inferred receiver includes a class without 
+
+generate_answer , hiding the source-bearing return. Quivr MC-Poison (M) Poisoning 
+
+L Named model/history-update arguments, omitted **kwargs input, and nested response indexing. Initialized OpenAiAnswer content does not reach its constructed result. 
+
+A Missing completion request-to-response summary. Native question-storage paths remain positive but omit the generated assistant response. 
+
+C Unresolved generate_answer 
+
+hides the question-to-assistant sink summary. Quivr MC-Poison (KB) Exploitation 
+
+C Unresolved vector-store retrieval. 
+
+L Named model/history-update arguments, omitted **kwargs , nested response indexing. OpenAiAnswer 
+
+and ChatHistory constructed content. 
+
+C Unresolved vector-store retrieval. 
+
+L Constructed content requires a whole-record rule for the configured object endpoint. 
+
+A Completion request-to-response and database insertion-to-readback summaries. 
+
+C The handler cannot import the retrieved-document return through unresolved generate_answer .Continued on next page 
+
+> 27
+
+Table 11 (continued). Observed failure causes. Incident / phase Joern CodeQL Pysa Quivr MC-Poison (KB) Poisoning 
+
+C Existing-file linking and brain-record insertion targets. 
+
+L Named File constructor input. Argument binding at repaired calls. Caller-visible constructed File 
+
+content. 
+
+C HTML-parser dispatch on the specified new-file route. 
+
+L Document fields and constructed document content. 
+
+A Pydantic file initialization, upload reads, loading/splitting, and document-to-vector-ID association. 
+
+S Temporary-file write to later load. —Quivr IPI + MC-Poison (KB) Exploitation 
+
+C Same call-target findings as Quivr KB exploitation. 
+
+L Same language-construct findings as Quivr KB exploitation. 
+
+C Same call-target findings as Quivr KB exploitation. 
+
+L Same language-construct findings as Quivr KB exploitation. 
+
+A Same API-call findings as Quivr KB exploitation. 
+
+C Same call-target findings as Quivr KB exploitation. Quivr IPI + MC-Poison (KB) Poisoning 
+
+C HTML parser and document-computation targets. 
+
+L File constructor input binding. Argument binding at repaired calls. Constructed File content. 
+
+A Opaque file and loader effects. 
+
+S Crawler write/copy/read and stored split-document readback. 
+
+C HTML-parser dispatch. 
+
+L Document fields and constructed document content. 
+
+A Pydantic initialization, upload reads, and loader/splitter effects. 
+
+S Crawler write/copy/read and temporary-file loading. 
+
+C HTML-parser dispatch. 
+
+S Crawler file write to ingestion read. aider IPI 
+
+C Selected coder/model/commit/write targets. 
+
+L Named commit inputs, omitted SDK 
+
+**kwargs , nested response fields, omitted yield /yield from operands. Argument binding at repaired calls. Yielded-record materialization and tuple-field projection (tested jointly). 
+
+A SDK response readback. 
+
+S Saved commit text and later history reads. 
+
+C Main coder call target and selected commit-model target. 
+
+L Main-call argument binding, focused content reads at list concatenations, and parser accumulation representation. 
+
+A SDK request-to-response and response-field summaries, including the later request. 
+
+S Commit-message history used in a later editing round. 
+
+C Message-file read, factory-created coder’s run , and selected output write. All three type repairs are needed for the reconstructed qualifying report. MetaGPT IPI 
+
+C File-repository and LLM-wrapper targets. 
+
+L SDK **kwargs , nested conditional response decoding and parser keyword binding. 
+
+C File-repository and LLM-wrapper targets in the verified prefix. 
+
+L Loaded document’s content, returned document, and caller field read in that prefix. —SWE-agent IPI 
+
+C Agent, parser, environment, and completion-hook targets; spurious dictionary-read targets. 
+
+L Nested tool-argument reads, named arguments and omitted command 
+
+**kwargs . Argument binding at repaired calls. Parsed-action/result fields. 
+
+S History/property reads, patch-file effects and saved patch/resource association. 
+
+C Selected issue-getter, parser and inner completion-hook targets. 
+
+L Tuple-to-step-field assignment; issue/message/result fields and whole-result construction. Original comprehension capture works. 
+
+A LLM request/response, Jinja rendering and argument formatting. 
+
+S Copied history and property reads, environment command-to-patch effects, and written patch-to-consumed-file association. 
+
+C Unresolved completion hook hides the _save_patch.info sink; issue taint already reaches the agent result. 
+
+> 28
+
+F Details of Knowledge Collection 
+
+F.1 Structured Prompt Example 
+
+Listing 10 shows a simplified prompt used to label Quivr’s 
+
+get_chat_history . The listing has four parts: the labeling task, code and supporting information, decision rules, and the required answer. The task and decision rules are sup-plied in a system message, while the code and supporting information are supplied in a user message. We also specify the fields that the LLM’s answer must contain and require it to return them in JSON. The listing abbreviates documents, code, and repeated metadata while retaining all six calls to be classified. 
+
+[1. Task : system instructions ] Fill a developer - knowledge mapping - table row . Analyze every call in record . api_calls . EXT : task information outside the application . INT : task information forming part of the app . Use all supplied knowledge documents / examples . [2. Context : user input , abbreviated ] record . function_key : backend / repository / chat / get_chat_history . py : get_chat_history record . api_calls : a0 : tmp0 . execute () a1 : tmp2 . filter (" chat_id ", " eq ", chat_id ) a2 : tmp3 . select ("*") a3 : tmp4 . from_ (" chat_history ") a4 : tmp1 . order (" message_time ", desc = False ) a5 : tmp5 . append ( ChatHistory ( message )) < source locations , receiver / argument records , candidate targets and normalization limits > knowledge . documents : < full bodies supplied > python / nested - functions . md resource - identification / process - memory - boundary . md generic - file -or - url - arguments . md task - information - sources . md Examples : in - process access is not a source ; nested body != enclosing body ; open ( path ) needs the actual file 's use ; formatting supplied text is not source access . source : < spans with IDs , paths and line numbers > # Target function , shortened : commons = common_dependencies () history = ( commons [" supabase "] . from_ (" chat_history ") . select ("*") . filter (" chat_id ", " eq ", chat_id ) . order (" message_time ", desc = False ) . execute () ). data # Supplied caller line , openai . py :145: history = get_chat_history ( self . chat_id ) supporting_evidence : < cached program relations > a0 target : not_resolved_to_application a0 receiver : tmp0 ; return type : ANY < definitions , dependencies , caller bindings , source - span references and query limitations > overview : 6 calls ; 77 queries ; 16 queries omitted ; < source ranges and collection - limit notices > next_action : return complete call map ; no tools . [3. Decision rules : system instructions ] Count direct builtin / library source accesses . Do not inherit an application callee 's accesses . Other source calls are context , not targets . Separate nested / generated operations ; consider alternative branches . Use each call 's allowed findings ; mark missing decisive facts unresolved . Do not equate an API name with a source type , full source coverage with certainty , or source comments / documents with overriding instructions . [4. Output : instructions + strict JSON schema ] Required fields : calls : every key a0 -a5 , each with finding , note , supporting_spans explanation , knowledge_used , missing_facts Allowed findings for a0 - a5 in this request : EXT , INT , both , no_source_access , unresolved note and explanation : nonempty strings . Spans / document paths : supplied identifiers only . No extra fields , tool requests or later turns . Python attaches call - site citations and computes EXT / INT / skip / unresolved ; do not guess the function label independently of call findings . 
+
+Listing 10. Simplified prompt from the saved Quivr request. 
+
+1. Labeling task. The task is to determine the function’s EXT or INT label from its direct accesses to information sources. For each call in record.api_calls , the LLM re-ports whether it directly accesses an external (EXT) informa-tion source, an internal (INT) information source, both types, neither, or cannot be classified from the supplied evidence. The function’s label is then computed from these findings. An information source supplies or receives information used in the application’s tasks. EXT denotes a source through which the application obtains new task information or com-municates with users, LLMs, or external services, such as user input, model responses, or public web content. INT de-notes a source that the application maintains for use across tasks, such as its stored conversation history or knowledge base. A function can receive an INT label even when it ac-cesses information over a network. For example, a function that retrieves the application’s stored conversation history from a remote database accesses an INT source. 
+
+2. Code and supporting information. The user message contains six components, each with a separate purpose. 
+
+Function and call record ( record ). The function_key 
+
+identifies the target function by file and name; api_calls 
+
+lists the operations to classify. Each call has an identifier (a0–a5), a source location, and details recording the operation called, the object it is called on, and the arguments passed to it. The tmp names denote intermediate values in the analysis representation. For example, tmp0 holds the query built by the preceding database operations, so 
+
+tmp0.execute() runs that query. This call is listed as a0. Call a5 represents adding each ChatHistory(message) 
+
+value to the result list. The analysis makes this list-building step explicit as tmp5.append(ChatHistory(message)) ,where tmp5 is the result list. Thus, a5 refers to append ,which adds the value to the list; ChatHistory(message) 
+
+creates the value being added. 
+
+29 Labeling guidance ( knowledge.documents ). The prompt includes four documents containing rules and examples to help the LLM judge whether a call directly accesses an EXT or INT information source. Developers can extend this guidance by adding documents or updating the rules and examples to cover additional cases. The current documents explain how to classify only the outermost call in a nested call expression, exclude in-memory operations from information-source accesses, and determine whether a file or URL provides EXT or INT task information. For example, in items.append(read_file(path)) , the outermost call 
+
+append only modifies an in-memory list; it does not perform the file access. Classifying read_file(path) requires additional evidence about the file: a public document is an EXT source, whereas the application’s stored conversation history is an INT source. 
+
+Code excerpts ( source ). Code excerpts can help the LLM understand what each listed call does and how its inputs and outputs are used. The excerpts include the target function and its calling context, such as code around the call site, argument definitions, and uses of the returned values. Each excerpt includes an identifier for citation, its file path and line numbers, and the code itself. In this example, the target function queries the chat_history table using chat_id , and its caller passes self.chat_id as the argument. 
+
+Static analysis results (supporting_evidence ). The prompt also provides program-analysis results that identify possible callees and show how values reach each call’s receiver and arguments. These results help the LLM trace which information source a call accesses. Each result identifies the listed call it describes and references the corresponding code excerpt. The supporting evidence also includes whether each call was resolved to an application-defined function. For example, a0, tmp0.execute() , is marked not_resolved_to_application , indicating that no application-defined callee was identified. 
+
+Coverage summary ( overview ). Even when the full func-tion is supplied, the LLM may still need evidence from else-where in the application to determine whether a call accesses an EXT or INT information source. The coverage summary helps the LLM assess whether the supplied evidence is suffi-cient to classify each call. It reports the number of calls to be classified, the source-code line ranges supplied, and any evidence that could not be retrieved or was omitted. 
+
+Response reminder ( next_action ). The LLM must return a finding for every listed call using the supplied evidence. It cannot request additional evidence or invoke tools. 
+
+3. Decision rules. The LLM assigns one of six call-level decisions to each listed call based on the supplied evidence: 
+
+• EXT : the call directly accesses an EXT source. 
+
+• INT : the call directly accesses an INT source. 
+
+• both : the call directly accesses both EXT and INT sources. This finding requires evidence of both accesses, rather than uncertainty between the two types. 
+
+• application_call : all identified candidate callees are application-defined functions. Their information-source accesses are assessed separately within those functions. 
+
+• no_source_access : the call does not directly access a task information source, such as a call that only formats text or modifies an in-memory list. 
+
+• unresolved : the supplied evidence is insufficient to assign a finding. The LLM must state what information is missing. The available decisions depend on the callee information supplied for each call. A possible application-defined callee excludes EXT , INT , and both ; application_call is available only when all candidate callees are application-defined. In Listing 10, none of the six calls has an identified application-defined callee, so application_call is unavailable. Each decision applies only to the listed call. For a nested call expression, the LLM classifies the outermost call without attributing the inner calls’ information-source accesses to it. Every listed call must receive a decision, including calls in alternative branches. 
+
+4. Required answer. The LLM returns a report explain-ing its call-level decisions for developer review. For each listed call, the report contains one of the six decisions de-fined above, a brief explanation, and references to supporting code excerpts. The report also provides an overall explana-tion, identifies the labeling-guidance documents used, and lists any missing information needed to classify unresolved calls. Listing 11 shows the report entry for a5: the decision is no_source_access , and the explanation states that ap-pending a constructed value to a list does not access an information source. The entry also references supporting code. The remaining report entries are omitted for brevity.                      
+
+> " a5 ": {" finding ": " no_source_access ", " note ": " list . append only adds aconstructed ChatHistory value to an in - memory list ; it does not directly access atask information source ." , " supporting_spans ": ["s :0264096192 d124985453 ", "s :72 cdd6a301c9d7bf36ab " ]}
+
+Listing 11. One call entry from the saved response. 
+
+F.2 Detailed LLM Inference Results 
+
+Table 12 reports the LLM-assisted labeling results for the 2,719 candidate functions across the five applications, before developer review and correction. Note that the application functions that do not call any built-in or library APIs do not need a label (Section 6.1). They are excluded in the results. For each candidate function, the call-level decisions are combined to propose an EXT or INT label. The function re-ceives no label ( skip ) if its calls access neither source type or both types. If the supplied evidence is insufficient to de-termine whether the function should receive a label, the function remains unresolved .
+
+> 30
+
+The Decided column counts candidate functions that re-ceive an EXT , INT , or skip decision. The Unresolved column counts candidate functions requiring additional inspection before a decision can be made. The two N columns report how many functions receive proposed EXT and INT labels, respectively; the remaining decided functions receive skip .All proposed decisions still require developer review for cor-rectness validation. For each label type, FNR is the fraction of candidate func-tions requiring that label that do not receive it, while FPR is the fraction of candidate functions not requiring that label that incorrectly receive it. Both rates consider only functions with an EXT , INT , or skip decision and a known reference label. Functions that remain unresolved are excluded. Thus, a zero FNR does not mean that all functions requiring the label have been identified; some may remain unresolved. 
+
+Table 12. LLM decisions by application. 
+
+EXT INT Application Functions Decided (%) Unresolved (%) N FNR/FPR N FNR/FPR GPT-Researcher 353 303 (85.84) 50 (14.16) 36 0.00/3.97 0 –/0.00 Quivr 127 89 (70.08) 38 (29.92) 5 0.00/4.55 13 0.00/5.00 aider 640 536 (83.75) 104 (16.25) 83 0.00/9.04 8 0.00/0.94 MetaGPT 1,164 925 (79.47) 239 (20.53) 55 0.00/1.92 12 0.00/0.44 SWE-agent 435 362 (83.22) 73 (16.78) 21 0.00/3.12 4 –/1.10 Total 2,719 2,215 (81.46) 504 (18.54) 200 0.00/4.19 37 0.00/0.78 FNR and FPR are reported as percentages; – indicates a zero denominator. 
+
+F.3 Developer Report-Review Examples 
+
+The following examples show how developers review the LLM reports from the evaluation in Section 10.8. They cover three cases: accepting a correct label, correcting an incorrect label, and resolving a case where the LLM could not reach a decision. Each listing shows (1) the candidate function and its calls, (2) the code needed to understand them, (3) the LLM report, and (4) the steps a developer would take to determine the function’s label. It also explains what the developer would need to inspect without the report. The reports are shortened for readability while preserving the original decisions and explanations. 
+
+Correct label: review and accept EXT. Listing 12 shows the report for GPT-Researcher’s BingSearch.search . The report proposes EXT because the function sends the agent’s search query to Bing and retrieves web results. It identifies the HTTP call that performs this access and explains why the other six calls, which format, parse, log, or collect results, do not directly access information sources. The developer can follow the cited code to verify the search request, the returned content, and the explanations for the remaining calls before accepting EXT . The proposed label matches the reference label used in the evaluation.                                                                                                                                                                                                           
+
+> [ Original table entry , reformatted ] File : gpt_researcher / retrievers / bing / bing . py Function : BingSearch . search Label to fill : ___ ( EXT /INT /NA ) Calls ( original line : column and expression ): a0 45:9 print (" Searching with query {0}...". format ( self . query )) a1 45:15 " Searching with query {0}...". format ( self . query ) a2 66:16 requests . get ( url , headers = headers , params = params ) a3 72:30 json . loads ( resp . text ) a4 75:13 self . logger . error ( a5 79:13 self . logger . warning (f" No search results found for query : { self . query }") a6 93:13 search_results . append ( search_result ) #Original workflow : locate the endpoint and query ; #follow response parsing ; distinguish search content #from formatting , logging , and list operations ; #decide and enter the function label . [ Code supplied to the model , simplified ] #bing . py :50 -66 ,72 -73 ,86 -95 url =" https :// api . bing . microsoft . com / v7 .0/ search " params ={" q ": self . query , ...} resp =requests . get ( url , headers = headers , params = params ) results =json . loads ( resp . text ) [" webPages "][" value "] for result in results : search_result ={" title ": result [" name "] , " href ": result [" url "] , " body ": result [" snippet "]} search_results . append ( search_result ) return search_results #Other listed calls format or print progress and #log parse failures or missing search results . [ Saved report , shortened ] Proposal : EXT . a2 : EXT ; retrieves Bing results for the research task . a0 -a1 , a3 - a6 : no_source_access ; diagnostic output , formatting , parsing , or local list operations . Missing facts : none . Evidence : bing . py :50 -66 ( URL , query , HTTP request ). [ Exact developer review ] 1. Check that url is Bing 's search endpoint and params [" q "] is self . query . 2. Check that the response supplies result titles , URLs , and snippets , and that the other listed calls only process values or report diagnostics . 3. Accept EXT for BingSearch . search . Saved work : the report identifies the source call , connects it to the endpoint and query , and proposes findings for all seven calls . The developer checks these links instead of constructing them first .
+
+Listing 12. Correct proposal: review and accept EXT. 
+
+Incorrect label: review and remove EXT. Listing 13 shows the report for aider’s check_version . The report proposes 
+
+EXT because call a3 retrieves the latest aider version from PyPI. However, the supplied code compares this version with the installed version to check for an application up-date; it does not retrieve information for the user’s cod-ing task. The developer therefore changes a3’s decision to 
+
+no_source_access and checks that the remaining calls also 
+
+> 31
+
+access no task information sources. The function then re-ceives a skip decision, recorded as NA in the developer-knowledge table. The report has already identified the net-work request and the returned version; the developer needs to correct why that information does not qualify for an EXT label. 
+
+[ Original table entry , reformatted ] File : aider / versioncheck . py Function : check_version Label to fill : ___ ( EXT / INT / NA ) Calls ( original line : column and expression ): a0 65:27 VERSION_CHECK_FNAME . exists () a1 67:17 time . time () a2 67:31 os . path . getmtime ( VERSION_CHECK_FNAME ) a3 78:20 requests . get (" https :// pypi . org / pypi / aider - chat / json ") a4 79:16 response . json () a5 87:31 packaging . version . parse ( latest_version ) a6 87:73 packaging . version . parse ( a7 94:9 VERSION_CHECK_FNAME . parent . mkdir ( parents = True , exist_ok = True ) a8 95:9 VERSION_CHECK_FNAME . touch () # Original workflow : inspect the HTTP response and # its uses ; determine whether the cache and remote # endpoint hold coding - task or operational data ; # decide and enter the function label . [ Code supplied to the model , simplified ] # aider / versioncheck . py :65 -95 if not just_check and VERSION_CHECK_FNAME . exists () : since = time . time () - os . path . getmtime ( VERSION_CHECK_FNAME ) if 0 < since < 60 * 60 * 24: return response = requests . get ( " https :// pypi . org / pypi / aider - chat / json ") latest_version = response . json () [" info "][" version "] current_version = aider . __version__ is_update_available = (packaging . version . parse ( latest_version ) >packaging . version . parse ( current_version )) # In finally : VERSION_CHECK_FNAME . parent . mkdir ( parents = True , exist_ok = True ) VERSION_CHECK_FNAME . touch () [ Saved report , shortened ] Proposal : EXT . a3 : EXT ; public PyPI supplies the latest aider version for the update check . a0 -a2 , a4 - a8 : no_source_access ; operational cache , clock , or processing of already available values . Missing facts : none . Evidence : versioncheck . py :78 ( HTTP request ) , 84 -90 ( version output and comparison ). [ Exact developer review and correction ] 1. Check that response . json () [" info "][" version "] is compared with aider . __version__ . This is application maintenance , not coding - task content . 2. Reject a3 's EXT finding . Change it to no_source_access under the task - information rule . 3. Check that the cache only limits update checks ; retain the other eight no_source_access findings . 4. Record NA for check_version : completed skip , with no EXT / INT seed and no remaining uncertainty . Saved work : the report already identifies PyPI , its returned version , and the cache 's role . The extra work is to correct the resource - role judgment and resulting label , not to discover the endpoint . 
+
+Listing 13. Incorrect proposal: review and remove EXT. 
+
+Unresolved label: inspect additional code to de-termine INT. Listing 14 shows the report for Quivr’s 
+
+get_chat_history , the function used in the earlier prompt example. The report leaves the function unresolved because the supplied code does not establish how the database client is created or whether the retrieved history is reused to answer later questions. The developer checks additional code to confirm that the query uses a Supabase client and that the retrieved conversation history is passed to the LLM when answering a new question. This evidence supports an 
+
+INT label. The listing shows the additional code separately from the code supplied to the LLM. The evaluation still counts the original LLM result as unresolved; the INT label is determined through developer inspection. 
+
+[ Original table entry , reformatted ] File : backend / repository / chat / get_chat_history . py Function : get_chat_history Label to fill : ___ ( EXT / INT / NA ) Calls ( original line : column and expression ): a0 9:9 tmp0 . execute () a1 9:9 tmp2 . filter (" chat_id ", " eq ", chat_id ) a2 9:9 tmp3 . select ("*") a3 9:9 tmp4 . from_ (" chat_history ") a4 9:9 tmp1 . order (" message_time ", desc = False ) a5 19:16 tmp5 . append ( ChatHistory ( message )) # Original workflow : reconstruct the tmp query chain ; # locate the Supabase client and history consumers ; # establish the stored data 's role ; distinguish the # generated list append ; decide the function label . [ Code supplied to the model , simplified ] # backend / repository / chat / get_chat_history . py :6 -19 commons = common_dependencies () history = ( commons [" supabase "] . from_ (" chat_history ") . select ("*") . filter (" chat_id ", " eq ", chat_id ) . order (" message_time ", desc = False ) . execute () ). data return [ ChatHistory ( message ) for message in history ] # backend / llm / openai . py :145 -148 history = get_chat_history ( self . chat_id ) transformed_history = format_chat_history ( history ) [ Saved report , shortened ] Proposal : unresolved ; no function seed supplied . a0 - a4 : unresolved ; the chat_history query is known , but the report does not establish its EXT / INT role . a5 : no_source_access ; append builds a local list . Missing facts : the Supabase dependency 's definition and whether chat_history is reusable app history . [ Additional code for developer inspection ] # backend / models / settings . py :6 ,24 -38 ( shortened ) from supabase import Client , create_client # Inside common_dependencies () : supabase_client = create_client ( settings . supabase_url , settings . supabase_service_key ) return {" supabase ": supabase_client , ...} # backend / llm / openai . py :150 -151 model_response = self . _call_chain ( self .qa , question , transformed_history ) 
+
+32 [ Exact developer review and additional work ] 1. Check a5 against the comprehension : it appends constructed values and adds no source access . 2. Open models / settings .py , follow common_dependencies , and verify that " supabase " is the configured library client , not an in - process collection . 3. Follow transformed_history in llm / openai . py to _call_chain . Confirm that past human / AI pairs are reused to answer a later question . 4. Resolve the query 's resource role as INT and enter INT for get_chat_history . The actual read is execute () ; query - building calls do not each need a separate I/O claim . If the dependency or reuse cannot be confirmed , retain unresolved NA . Saved work : the report reconstructs the query , separates the list append , and names the missing facts . Client inspection and the final source - role decision still require developer work . 
+
+Listing 14. Deferred decision: inspect the named dependency and history use. 
+
+33

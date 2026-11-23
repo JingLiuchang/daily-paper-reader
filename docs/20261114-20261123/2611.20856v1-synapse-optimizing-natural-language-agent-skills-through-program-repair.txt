@@ -1,0 +1,781 @@
+Title: Synapse: Optimizing Natural-Language Agent Skills through Program Repair
+
+URL Source: https://arxiv.org/pdf/2611.20856v1
+
+Published Time: Tue, 17 Nov 2026 05:08:59 GMT
+
+Number of Pages: 35
+
+Markdown Content:
+# Synapse: Optimizing Natural-Language Agent Skills through Program Repair 
+
+LIJUAN LI, Nanjing University 
+
+ZHENPENG CHEN, Tsinghua University 
+
+CHENXI ZHANG, Xidian University 
+
+YIHAO HUANG, East China Normal University 
+
+YANG LIU, Nanyang Technological University 
+
+CHONG WANG, Nanyang Technological University Large language model (LLM) agents can improve task performance by optimizing reusable natural-language skills without updating model parameters. However, the execution feedback that guides this optimization identifies failed tasks without directly revealing which instructions should be modified, which other instructions a fault involves, or which other tasks an edit may break. For programs, fault localization, dependence analysis, and regression test selection answer these three questions. Our key insight is that, although a skill is not a program, the procedure it describes can be partly recovered as one, and that this partial program can serve as an editable view of the skill. We propose Synapse , which casts skill optimization as generate-and-validate repair over this view. A deterministic compiler that, like an island grammar, recognizes only the constructs of interest translates a skill into SkIR, a source-linked intermediate representation that exposes operations, conditions, and data references and keeps every other requirement in the text. Synapse localizes faults from traces of repair tests, the tasks with reference answers that guide the search, and relates each fault to neighboring instructions through control-flow and dependence relations derived from SkIR. It admits only typed SkIR mutations, which it writes back to the mapped spans of the instructions they target and recompiles. It screens each patch on related repair tests, including previously passing ones, before validation decides whether to accept it. Whatever the LLMs that execute the skill and propose patches return, every accepted patch yields a well-formed skill and leaves the source span of every untargeted instruction unchanged, and if the execution agent is one-hop local, the selected tests include every test that an edit can affect. On two single-turn question-answering benchmarks, DocVQA and LiveMath, with three execution models, Synapse improves task success rates over SkillOpt by 3.74–4.54 percentage points on DocVQA and 2.40–4.00 on LiveMath and outperforms Trace2Skill and SkillBoost in all six settings of benchmark and execution model. In an ablation, replacing SkIR-based repair and its test screening with constrained text editing screened only on failing tests reduces DocVQA success rates by 2.40 and 2.67 percentage points for GPT-5.6 Luna and GPT-6 Sol, respectively. In two recorded DocVQA repair runs, control-flow and dependence relations add related repair tests to the screening of 23 of 37 patches, and in one repair, a test added only through a control-flow relation exposes a regression that coverage of the edited instruction misses. Additional Key Words and Phrases: Large Language Models, Agent Skills, Intermediate Representation, Program Analysis, Skill Optimization 
+
+1 Introduction 
+
+LLM agents increasingly perform complex tasks by planning actions, invoking tools, and interacting with external environments [42, 55, 57, 63, 65], yet many tasks require procedural knowledge that is difficult to encode in the model itself. Agent Skills, introduced by Anthropic [4] and released as an open standard [1], supply such knowledge externally. A skill document tells an agent which steps to follow, when they apply, what information to check, and how to return an answer. Skills have been adopted by many agent products [1], and as of October 2026, the cross-agent directory skills.sh ranks about 1.5 million skills by installation [54]. 
+
+Authors’ Contact Information: Lijuan Li, Nanjing University; Zhenpeng Chen, Tsinghua University; Chenxi Zhang, Xidian University; Yihao Huang, East China Normal University; Yang Liu, Nanyang Technological University; Chong Wang, Nanyang Technological University. arXiv:2611.20856v1 [cs.SE] 16 Nov 2026 2 Li et al. 
+
+Because skills are written in natural language, often by community authors or by LLMs, their quality is hard to guarantee. On SkillsBench, model-generated skills perform worse than no skill, whereas curated skills help [26]; skills that appear relevant can still cause a task to fail [14]; and in a study of three skill libraries, regressions offset 59% of the gains that skills bring [52]. Skills therefore need to be improved from their effects on task execution. Recent work on skill optimization revises a skill from tasks with reference answers so that an agent following it answers unseen tasks of the same kind correctly more often [29, 36, 64]. Improving a skill, however, takes more than rewriting its text. Consider a DocVQA skill whose 
+
+value-span instruction tells the agent to return only the requested value span and to omit units unless the question asks for them. Asked for the total turnover in a document that prints “41,809.82 crores”, an agent that follows the skill answers “41,809.82” and drops the scale word “crores”, which multiplies the amount by ten million. A repair must answer three questions. Which instruction should change, and what kind of change does it need? Which other instructions does the failure involve, such as the condition under which this instruction applies? Which passing answers might the edit break, such as a receipt amount in words? Existing optimizers answer them only in part. These optimizers differ in how they find and make an edit. Trace-driven methods revise or patch skill documents from execution trajectories [36, 56, 64], attribution-guided methods first identify the sections, skills, or fields responsible for failures [13, 30], structure-aware methods apply typed operators to steps, rules, or workflow paths [33, 50], and library-level methods expand and consolidate skill collections [20]. Measured against the three questions, they share three limitations. 
+
+(L1) Imprecise edit targets. Trace-driven and attribution-guided methods express the edit itself as rewritten text, and structure-aware methods, including the concurrent GraphSkillAA [44], apply typed edits to a separate structured representation of the prompt or skill [33, 50], which does not determine which span of an existing skill an edit replaces. To our knowledge, no skill optimizer ties an edit to a typed element of the existing skill, namely the instruction it modifies, the kind of change it makes, and the span it replaces. Without this tie, an optimizer has no declared target and kind of change against which to check an edit before running the edited skill, such as a rewrite confined to the value-span instruction in the turnover example. (L2) Implicit instruction dependences. 
+
+Structure-aware and library-level methods organize instructions into steps, rules, workflow paths, or typed skill-graph edges [33, 44, 50] or manage relationships among skills [20], and SkVM extracts the dependencies between steps to run independent steps in parallel [10]. To our knowledge, no skill optimizer derives the control and data dependences among the instructions of an existing skill from its text, so an optimizer must infer which other instructions a failure involves. In the turnover example, the condition under which the value-span instruction applies is stated in a separate clause, so the repair model must also see a clause outside the instruction. (L3) Untargeted regression checks. Existing methods check an edit against the motivating failure [13], source tasks [20], a fixed task set [29, 64], or the examples that an update affects in a skill graph [44]. An edit can also change the answer to a task whose trace never covers the edited instruction, through a related instruction that the trace does cover. In the turnover example, the receipt is such a task, since its trace covers a neighboring condition but not the value-span instruction. To our knowledge, no skill optimizer selects the tasks to recheck through dependences recovered from an existing skill’s text, so such a regression is caught only if that task happens to be checked. For programs, generate-and-validate repair has an established answer to each of these limitations. Fault localization [23] and repair operators [25] determine where and how a patch changes a program (L1), dependence analysis reveals which statements relate to a fault [3, 16] (L2), and regression test selection identifies the tests that a change may affect [41] (L3). These techniques operate on programs, however, and a skill is a document. Structured skill representations [28, 62] Synapse : Optimizing Agent Skills through Program Repair 3
+
+and work that treats prompts as programs [27, 43, 47] show that skills carry program-like structure, but none recovers this structure from an existing skill’s text and repairs the skill through it. Our key insight is that the procedure a skill describes can be partly recovered as a program that serves as an editable view of the skill. Like an island grammar [35], which parses only the constructs of interest in a text and skips the rest, a deterministic compiler can extract a skill’s operations, conditions, and data references and link each of them to its span in the document. Every other requirement stays in the text of its instruction, where the analyses ignore it but the agent that follows the skill still reads it. We call the result a partial program view .Even on this view, two properties of skills keep the program-repair techniques from transferring directly. First, instructions resist reliable parsing, so the recovered structure is incomplete, and an edit made on it must still land in the authored text. In the turnover example, the exception about units is not a recognized element, yet it is the text that the repair must change. Second, the interpreter of a skill, its execution agent , is an LLM agent. The interpreter cannot be instrumented, so which instructions it used is known only from its report, its answers vary across requests, and no static relation predicts the effect of an edit, so edits must be checked by running the skill. We present Synapse , which casts skill optimization as generate-and-validate repair over the partial program view of a skill. Synapse compiles a skill into SkIR, a source-linked intermediate representation, and derives its control-flow and dependence graphs. It localizes each failing repair test, a task with a reference answer that guides the search, to the instructions that the execution agent reports using. A second LLM, the repair model, sees each suspicious instruction together with its directly related instructions and may propose only typed mutations of SkIR elements, such as an instruction, a condition, or a dependency (L1, L2). Synapse writes each patch back to the mapped spans of the instructions it targets and recompiles the result, so every patch is checked for well-formedness before any test runs. To catch regressions that coverage alone misses (L3), it screens a patch on the repair tests that the reported coverage and the control-flow and dependence relations select. It accepts a patch only if it raises the pass count on a separate validation suite. Because a deterministic host checks every LLM result, the properties it enforces in each iteration hold whatever the LLMs return. For programming languages, the approach repairs a language with a partial grammar and an LLM interpreter, through a recovered view whose edits stay within their spans and whose test selection is safe under a weaker locality assumption than coverage needs. Following SkillOpt [64], we evaluate Synapse on DocVQA [34], which asks questions about documents, and LiveMath [19], which poses multiple-choice mathematical problems, with one repair model, three execution models, and held-out test tasks. The optimized skills improve test success rates over the initial skill by 4.28–14.71 percentage points on DocVQA and 4.80–9.60 on LiveMath, and exceed SkillOpt [64], Trace2Skill [36], and SkillBoost [29] in all six settings of benchmark and execution model, by 1.60–4.54 points over the strongest in each setting. In an ablation with two execution models, replacing SkIR-based repair and its screening with constrained text editing lowers success rates by 1.60–3.20 points. In two recorded DocVQA repair runs, control-flow and dependence relations add related repair tests to the screening of 23 of 37 patches, and in the turnover repair, a test selected only through a control-flow relation exposes a regression that coverage of the edited instruction misses. Only the final skill of Synapse answers the turnover question with “41,809.82 crores”. In summary, this paper makes the following contributions: 
+
+• Partial program views of skills. We introduce SkIR, a source-linked intermediate rep-resentation that a deterministic island-grammar-style compiler recovers from skills, with write-back and recompilation checks that make it editable. Whatever the LLMs return, accepted patches leave every untargeted instruction’s source span unchanged. 4 Li et al. 
+
+• Program repair for an LLM-interpreted language. We adapt fault localization, depen-dence analysis, and regression test selection to skills, where SkIR relations choose a repair’s context and screening tests. Selection through these relations is safe if the execution agent is one-hop local, a weaker assumption than coverage-only selection needs. 
+
+• Evaluation. On DocVQA and LiveMath with three execution models, Synapse achieves higher success rates than SkillOpt, Trace2Skill, and SkillBoost in all six settings. We ablate SkIR-based repair with its test screening, analyze how localization, write-back, and test selection operate, and will release the implementation, skills, and repair logs. 
+
+2 Synapse in a Nutshell 
+
+Synapse recovers a partial program from a skill and repairs the skill the way a generate-and-validate tool repairs code (Figure 1). We first show what program structure a skill leaves implicit and then follow one repair of the turnover example through the steps of the figure. 
+
+2.1 Implicit Program Structure in Skills 
+
+A skill resembles a program but leaves its structure implicit. Its instructions describe operations, the conditions under which they apply, the information they use, and the form of the answer, often several in one instruction, as structured skill representations make explicit [28, 62]. For example, one instruction may say to return a selected value and when to omit units. No syntax marks an operation, a condition, or a value. A condition stated in one instruction may govern an operation described in another, and a value may be referred to by different phrases. Textual order gives the sequence of steps, but neither it nor authors’ labels reveal which condition governs which operation or which instruction supplies a value that another uses. Although no dedicated syntax marks these elements, document conventions mark part of this structure. A skill is a Markdown document, in which headings delimit sections, list items and paragraphs delimit instructions, and inline code marks the files, fields, and values that instructions refer to. Procedural prose adds conventional forms. An applicability clause such as “When to use” states when the next instruction applies, a conditional clause such as “if . . . ” or “provided that . . . ” restricts the action of its instruction, and an imperative verb names that action. Structure stated in these forms can be read off the text, whereas structure stated otherwise remains implicit. 
+
+2.2 Illustrative Example 
+
+To see what a repair of the turnover failure needs, consider the initial DocVQA skill of our experi-ments, a Markdown document of instructions for answering questions about scanned documents. A separate “When to use” clause placed before the value-span instruction states when this instruction applies, not when the skill as a whole is invoked, and restricts it to questions that ask for a value, count, page number, date, or graph reading. The action of the instruction reads 
+
+> return only the requested value span; omit nearby labels, category names, units, or explanatory words unless the question explicitly asks for them.
+
+The turnover question of the introduction is held out, and the initial skill answers it with “41,809.82”. The numeric text is recognized correctly, but the value-span instruction excludes a word needed to express the requested amount. Because “crores” is printed as part of the selected value and sets the scale in which the amount is expressed, keeping the value’s unit here means keeping this word. The final skills selected by SkillOpt [64], SkillBoost [29], and Trace2Skill [36] also answer “41,809.82”. A repair must therefore distinguish a marker printed with the selected value, such as a unit or scale word, from one supplied by a header, a separate column, or the question. To draw this distinction without breaking other answers, the repair model needs the instruction to edit, the Synapse : Optimizing Agent Skills through Program Repair 5Skill St      
+
+> value-span :return the span, omit units unless asked
+> Island-grammar compilation
+> SkIR + CFG/PDG
+> if asks for a value: return value-span
+> CFG neighbor: choose among similar nearby strings
+> Coverage-based fault localization
+> Suspicious instructions
+> value-span :answers drop a value’s marker; context: its guard, CFG neighbor
+> Repair tests
+> Typed patch generation
+> Typed patch ∆
+> keep a marker only if it is part of the value;
+> only the span of
+> value-span changes
+> Analysis-guided test selection
+> Selected tests
+> L(S′)
+> tests that cover
+> value-span ;
+> + tests that cover its CFG neighbor
+> Screen and validate
+> Skill St+1
+> failures fixed; held-out turnover: 41,809.82 →
+> 41,809.82 crores
+
+Fig. 1. One repair iteration of Synapse. Blocks are steps and icons are the artifacts they produce, and the grey italic text under each artifact shows it for the turnover example. The two solid blocks are the program-analysis steps, which call no LLM. One compiles the skill into a partial program view, and the other selects the tests that screen a patch through the control-flow and dependence relations of that view. SkIR, linked to the skill text by its source map, forms that view, shown with its control-flow graph (CFG) and program dependence graph (PDG). Steps marked call an LLM. The execution agent runs the skill to localize failures and to screen and validate patches, and the repair model forms repair hypotheses and generates typed patches. Each patch is written back to the skill text and recompiled before its tests are selected. 𝑆 𝑡 is the current skill, Δ a typed patch, 𝐿 (𝑆 ′) the tests selected for the patched skill 𝑆 ′, and 𝑆 𝑡 +1 the next skill. A patch is accepted only if the patched skill passes more validation tests than the current skill. 
+
+condition under which it applies, and passing tests that delimit the change. The partial program view connects the instruction to the other two. The instruction’s return operation is governed by its “When to use” condition and is adjacent in the control-flow graph (CFG) to a condition for choosing among similar nearby strings. Because an edit to one step can change how the agent handles the steps next to it, tests that cover this neighboring condition can check an edit to the return operation even when the agent does not report using that operation on them. 
+
+2.3 How Synapse Repairs the Skill 
+
+Figure 1 shows the repair iteration that this subsection follows for the value-span instruction. 
+
+Compile and analyze. The repair needs an editable location, its context, and a neighborhood from which to select tests, so Synapse compiles the skill into SkIR and derives its graphs. The value-span instruction yields a return operation, linked by the source map to its span in the Markdown document, while the exception about units remains part of the instruction’s text. Its “When to use” clause yields a branch condition that governs this operation, and the control dependence graph (CDG) records the governing relation. The CFG also links the return to the condition “When several nearby strings look similar”. 
+
+Localize. To decide which instruction to change, Synapse starts not from the turnover question, which is held out, but from failing repair tests whose answers likewise omit markers printed with the requested values. On each test, the execution agent reports which instructions it used. These reports, the recorded coverage of the tests, point to the value-span instruction, which becomes a suspicious location with a source span (L1). From the blanket requirement to omit units, the repair 6 Li et al. 
+
+model hypothesizes that the returned span excludes markers of the requested value itself, not only markers supplied by the context. 
+
+Patch and write back. To change the instruction without breaking the answers around it, the request for a patch supplies the text of the instruction together with these two conditions and passing tests that constrain the intended change (L2). From this request and the hypothesis, the repair model proposes a typed patch that rewrites the text of the value-span instruction (L1). The host offers this operator only at an instruction with a mapped source span, so before any test runs it knows that the patch replaces exactly this span. It replaces the unit-omission requirement by distinguishing markers integral to the value from markers supplied only by context. 
+
+> Return only the requested value span. Preserve a currency symbol or measurement unit when it is visibly part of the selected value text or the same filled value field and semantically completes that value; otherwise omit nearby labels, category names, explanatory words, and symbols or units shown only in the question, a header, a separate column, unrelated text, or general context.
+
+Writing the patch back replaces the span of this instruction and leaves every other instruction’s source span unchanged, and recompilation checks that the new SkIR is well formed. 
+
+Select tests and validate. Addressing L3, Synapse screens the patch on more tests than the repair model names with it. The named tests are the failures that the patch should fix, control tests that pass, and boundary tests at the edge of the intended change. Synapse adds the tests whose recorded coverage includes the edited instruction and, through the CFG and dependence relations, the tests that cover related instructions. One of them, a receipt test about a written-out monetary amount, enters screening only through the CFG relation. Its recorded coverage maps to the neighboring condition for choosing among similar strings but not to the edited instruction, and the repair model did not name it. Under the patched skill, its previously correct answer gains a comma after “Pounds” and is scored incorrect. Because the patch still repairs the two failing repair tests that motivated it and keeps its control tests passing, screening keeps it, and because of the regression, it ranks behind any patch that fixes its failures without one. Validation on the separate suite then decides, and the patched skill passes more validation tests than the current skill, is accepted, and remains the final selected skill. Because “crores” is printed as part of the selected value text, the revised instruction keeps it as a marker of the value itself, and the final skill returns “41,809.82 crores” on the held-out turnover question. 
+
+3 Skill Optimization with Synapse 
+
+The repair techniques of the introduction assume a complete program and a deterministic interpreter, whereas Synapse works on an incomplete view of a skill whose interpreter is an LLM. This section formalizes skill optimization as generate-and-validate repair, motivates each step of an iteration under these conditions, and closes with the properties that hold whatever the LLMs return. 
+
+3.1 Skill Optimization as Generate-and-Validate Repair 
+
+We first formalize how an agent executes a skill and how its answers are judged, and then state skill optimization as repair over these executions. A skill is executed by an execution agent 𝐸 , which we treat as the interpreter of the skill 𝑆 . The agent is built on an LLM with fixed parameters, the 
+
+execution model , and reads 𝑆 to answer a task. Changing 𝑆 is the only way to change how 𝐸 answers. The answers of 𝐸 are judged by tests. A test 𝑖 pairs a task input 𝑥 𝑖 with a reference answer, and a fixed scoring rule, the oracle, decides whether the answer that 𝐸 returns for 𝑥 𝑖 under 𝑆 passes. For a suite 𝐷 of tests, 𝐽 𝐷 (𝑆 ) is the fraction of 𝐷 that 𝑆 passes. Because the same input can receive different answers [38], 𝐽 𝐷 (𝑆 ), like every outcome in this section, refers to a recorded run. An incorrect answer may expose a fault in 𝑆 , but it may also come from a reading or reasoning error of 𝐸 that no change to 𝑆 removes. Skill repair seeks changes to 𝑆 that remove faults in 𝑆 .Synapse : Optimizing Agent Skills through Program Repair 7
+
+Definition 3.1 (Skill repair). Given an initial skill 𝑆 0 and disjoint suites of repair tests 𝐷 rep and validation tests 𝐷 val , skill repair seeks a skill 𝑆 , obtained from 𝑆 0 by a sequence of patches, that answers unseen tasks of the same kind correctly more often than 𝑆 0. Since this rate cannot be observed, the repair tests guide the search and the validation tests decide whether each patch is accepted. A third suite 𝐷 test , held out, only estimates the final skill’s pass rate on unseen tasks. The repair tests play the part of the test suite in generate-and-validate repair [25, 40], and those that a skill 𝑆 fails, written 𝐹 (𝑆 ), point to the faults that a patch should remove. As in that setting, the repair tests are an incomplete specification, and a patch that makes them pass may still fail on other tasks [49]. Synapse therefore checks each patch on tests beyond the failure that motivated it and then on a separate validation suite. 
+
+One repair iteration. Synapse repairs a skill iteratively, and each iteration follows the generate-and-validate loop. Algorithm 1 turns one skill version 𝑆 𝑡 into the next. It compiles 𝑆 𝑡 with the compiler C into its SkIR 𝐼 𝑡 and source map 𝑀 𝑡 and records a trace for each repair test (lines 1–2), asks a repair model 𝑂 , also an LLM, for typed patches that it writes back and recompiles (lines 3–8), and screens and validates the patched skills, of which it accepts at most one (lines 9–13). An accepted patch yields 𝑆 𝑡 +1, and after a fixed number of iterations the final skill is evaluated on 
+
+𝐷 test . The execution agent and the repair model are reached only through three procedures with different roles. Execute runs the skill, as running a test does in program repair, and is how Synapse observes the behavior of the skill, both to localize faults and to validate patches. Diagnose and Propose call the repair model, which plays the role of the patch generator. 
+
+Definition 3.2 (Execution and repair procedures). Execution. Execute (𝑆, 𝑥 ) runs the execution agent 𝐸 on task input 𝑥 with the skill 𝑆 , extended by a deterministic address contract that labels its instructions and the data dependencies among them, and returns the answer of 𝐸 together with the addresses that 𝐸 reports using. Repair. The repair model 𝑂 is called through two procedures. Diagnose (Λ) receives a localization context Λ, which lists the failing repair tests and the suspicious instructions with their evidence, and returns repair hypotheses, each naming a failure mechanism, the failing tests it explains, and the instructions it affects. Propose (ℎ, Γ) receives a hypothesis ℎ
+
+and an edit context Γ, which offers the edits allowed at each affected instruction together with the context needed to choose among them. It returns a patch Δ and the repair tests on which Δ is to be checked. These are the source failures 𝐹 Δ that it should fix, control tests 𝐶 Δ that pass and should not break, and boundary tests 𝐵 Δ at the edge of the intended change. These procedures are nondeterministic, and Synapse assumes nothing about which result a call returns. We write, for example, 𝑟 ∈ Propose (ℎ, Γ) when 𝑟 is a possible result of that call. The deterministic host builds every argument from SkIR, the dependence graphs, and the recorded traces, and checks every result before using it. It discards addresses that do not resolve, drops hypotheses whose tests are not current failures or whose instructions were not presented, type-checks patches, and validates named tests against the repair tests. We write 𝐻 for the hypotheses that Diagnose returns and that pass the checks on their tests and instructions. 
+
+3.2 SkIR: A Partial Program View of Skills 
+
+To localize a fault and relate it to other instructions, Synapse needs a skill’s operations, conditions, and data references as explicit program elements, yet the execution agent keeps reading the prose. Synapse therefore builds a partial program view of the skill. A deterministic compiler divides the document into instructions and applies a fixed set of recognizers that map parts of an instruction to program elements. It keeps all unrecognized content in the instruction’s text and records the source span of every instruction and element, so that a change made to an element can be written back to the text. Like an island grammar [35], the compiler interprets only the constructs that its 8 Li et al. 
+
+Algorithm 1 One repair iteration of Synapse. Lines marked 𝐸 and 𝑂 call the execution agent and the repair model, and all other lines are deterministic. Symbols are defined with their steps. 
+
+Require: current skill 𝑆 𝑡 with its recorded validation outcomes, repair tests 𝐷 rep , validation tests 
+
+𝐷 val , budget 𝐾  
+
+> 1:
+
+(𝐼 𝑡 , 𝑀 𝑡 ) ← C( 𝑆 𝑡 ); derive SkAST, the CFG, and the PDG  
+
+> 2:
+
+record the trace 𝜏 𝑖 of Execute (𝑆 𝑡 , 𝑥 𝑖 ) for each 𝑖 ∈ 𝐷 rep 𝐸  
+
+> 3:
+
+𝐻 ← the checked hypotheses of Diagnose (Λ𝑡 ), where Λ𝑡 holds the retained suspicious in-structions in Ð𝑖 ∈𝐹 (𝑆 𝑡 ) cov (𝜏 𝑖 ) 𝑂  
+
+> 4:
+
+for all ℎ ∈ 𝐻 do  
+
+> 5:
+
+(Δℎ, 𝐹 Δℎ , 𝐶 Δℎ , 𝐵 Δℎ ) ← Propose (ℎ, Γ𝑡 (ℎ)) 𝑂  
+
+> 6:
+
+reject Δℎ if it is ill-typed  
+
+> 7:
+
+𝑆 ′ 
+
+> ℎ
+
+← Materialize (ApplyMutation (𝐼 𝑡 , Δℎ ), 𝑀 𝑡 ) 
+
+> 8:
+
+reject 𝑆 ′ 
+
+> ℎ
+
+if its recompiled SkIR is not well formed; record round-trip observations  
+
+> 9:
+
+Execute (𝑆 ′
+
+> ℎ
+
+, 𝑥 𝑖 ) for each 𝑖 ∈ 𝐿 (𝑆 ′ 
+
+> ℎ
+
+); compare the outcomes with those of 𝑆 𝑡 𝐸  
+
+> 10:
+
+end for  
+
+> 11:
+
+Top ← at most 𝐾 highest-ranked patched skills that fix a source failure  
+
+> 12:
+
+Execute (𝑆 ′, 𝑥 𝑖 ) for each 𝑆 ′ ∈ Top and 𝑖 ∈ 𝐷 val 𝐸  
+
+> 13:
+
+return an 𝑆 ′ ∈ Top that satisfies the acceptance rule, with its validation outcomes, or else 𝑆 𝑡 
+
+recognizers accept, and the rest of the method depends only on the recognized elements and their source spans, not on which textual constructs are recognized. 
+
+Definitions. A skill document 𝑆 is a string, and a span [𝛼, 𝛽 ) is a range of its character offsets, which denotes the substring 𝑆 [𝛼, 𝛽 ). Two spans [𝛼, 𝛽 ) and [𝛾, 𝜂 ) are disjoint if 𝛽 ≤ 𝛾 or 𝜂 ≤ 𝛼 .Appendix A.1 gives the definitions of this subsection with all components spelled out. 
+
+Definition 3.3 (SkIR). A SkIR 𝐼 consists of a finite set 𝑁 of instructions and a finite set 𝑃 of program elements, which are operations, branch conditions, and the merge points that close the conditions. Each element 𝑝 ∈ 𝑃 is owned by the instruction own (𝑝 ) ∈ 𝑁 from which it was extracted, and each operation records the data items that it defines and uses. Each instruction keeps its text in full, including the content that no element represents, together with its section path and its attributes ,computed from its text alone, such as its modality ( MUST , SHOULD , MAY , or NEVER ) and trigger, the condition that opens a conditional instruction. Its status is partial if its elements represent only some of its requirements. Each instruction also has a canonical identifier, stable under offset shifts. 
+
+Definition 3.4 (Source map). A source map 𝑀 from 𝐼 to 𝑆 assigns a span 𝑀 (𝑛 ) of 𝑆 to each instruction 𝑛 ∈ 𝑁 , and a span 𝑀 (𝑝 ), its source anchor , to each element 𝑝 that the compiler anchors in the text, such that (i) the text of 𝑛 is obtained from 𝑆 [𝑀 (𝑛 )] by removing Markdown syntax such as list markers and line breaks; (ii) 𝑀 (𝑛 ) and 𝑀 (𝑛 ′) are disjoint for distinct instructions 𝑛 and 
+
+𝑛 ′; and (iii) 𝑀 (𝑝 ) lies inside 𝑀 (own (𝑝 )) .The compiler is a function C from skill documents to pairs (𝐼, 𝑀 ). We call (𝐼, 𝑀 ) = C( 𝑆 ) the 
+
+partial program view of 𝑆 , in which 𝐼 exposes the recognized structure and 𝑀 anchors it in 𝑆 .
+
+Definition 3.5 (Recognizers). A recognizer extracts program elements from instruction text to-gether with their source anchors. An operation recognizer yields operations together with the data items that they define and use; a guard recognizer identifies a branch condition 𝑏 , whose merge point and governed operations, gov (𝑏 ), are established by the compiler using instruction boundaries and document order; and a reference recognizer identifies the occurrences of data items, which are matched across instructions. The compiler C is parameterized by its set of recognizers. Synapse : Optimizing Agent Skills through Program Repair 9
+
+Recognizers in Synapse. The compiler uses fixed rules and no language-model calls (line 1; Table 6 in Appendix A.2). Fixed rules make compilation deterministic, so recompiling a patched skill checks the patch rather than the variation of another LLM call. The rules implement the document conventions of Section 2.1. Headings define sections, and list items and paragraphs, or the sentences into which the parser splits them, become instructions. Action verbs from a fixed lexicon become operations, which define or use the data items that inline code spans name, as “read” defines and “return” uses them. Instruction-initial or postposed conditionals such as “if” or “provided that” govern the operations of their own instruction, whereas a “When to use:” clause governs those of the next instruction in its section. Under these rules, the value-span instruction of Section 2.2 yields one return operation, while its exception about units stays in its text. The view is partial in two senses. First, like analyses of incomplete code [12], the analyses see only relations stated in recognized text. Second, patches can still target unrecognized content. 
+
+Well-formedness. Every later step looks up instructions, elements, and relations through the view, so the view must resolve every reference that it hands out. We call (𝐼, 𝑀 ) well formed if every address of the address contract and every data reference resolves to an instruction, element, or def–use relation of 𝐼 , and 𝑀 satisfies Definition 3.4 for the compiled document. Synapse checks well-formedness before SkIR and its graphs are used and again for every patched skill. 
+
+3.3 Static Dependence Analysis 
+
+A fault reported at one instruction often involves others, because the instruction may run only under a condition stated elsewhere or consume a value that another instruction produces. These relations (L2) determine what the repair model inspects and which tests a patch may affect. Synapse derives them with standard program analyses [3, 16] over SkAST, the syntax tree of the recognized elements, and lifts the results to instructions, the unit that traces report and patches edit. 
+
+Definition 3.6 (SkAST). SkAST is the abstract syntax tree of the recognized elements, a term of the grammar 
+
+𝜋 :: = 𝜖 | 𝑎 | 𝜋 1; 𝜋 2 | if 𝑏 then 𝜋 1 else 𝜋 2 | scope 𝜋, 
+
+where 𝑎 ranges over operations and 𝑏 over branch conditions. It sequences the operations of each block in source order and places the operations that a branch condition governs in its true or false arm, closed by the condition’s merge point, which preserves authored operation order and makes branch scope and rejoining points explicit. Appendix A.1 gives the four construction rules. The repair model needs the steps around a suspicious element, and the dependence analyses need an order on the elements, so Synapse builds the control-flow graph (CFG) over the elements of 𝑃 and an entry and an exit node from SkAST by structural induction in the standard way. A sequence links its parts. An if links its condition to the first node of each branch, or to its merge point when the branch adds no nodes, and links the last node of each nonempty branch to its merge point. A scope and 𝜖 add no nodes. The CFG orders the elements but does not say which of them depend on each other, so Synapse derives the two dependence graphs from it [16]. The data dependence graph (DDG) links a definition of a data item to each use that it reaches, as computed by reaching-definitions analysis over the CFG [3]. The control dependence graph (CDG) has an edge (𝑏, 𝑤 ) if 𝑤 postdominates one successor of the branch condition 𝑏 but does not strictly postdominate 𝑏 . Together, the DDG and CDG form the program dependence graph (PDG). We write 
+
+𝐴 cfg , 𝐴 cdg , and 𝐴 ddg for the edge sets. The DDG gives the repair model the elements that produce the inputs of a suspicious element and consume its outputs, and the CDG the conditions that decide whether it runs. Synapse uses these graphs only to choose what the repair model sees and which repair tests screen a patch, and the acceptance rule compares validation outcomes only. 10 Li et al. (a) SkAST: how steps are grouped                                        
+
+> scope: n1; if ; n6
+> n1if n2n6
+> n3n4
+> then else
+> n3and n4lie in different arms; the merge point n5closes the if, and n6follows.
+> (b) CFG: possible next steps
+> n1: read xn2: available?
+> n3:y←xn4:y←N/A
+> n5: merge
+> n6: return y
+> exit true false
+> (c) DDG: where values come from
+> n1
+> n3n4
+> n6
+> xyy
+> (d) CDG: conditions and steps
+> n2
+> n3n4
+> true false
+> n5and n6follow both branches; their execution is not controlled by n2.edited instruction n4in Rel (n4)through this graph outside Rel (n4)
+
+Fig. 2. SkAST, CFG, DDG, and CDG of one schematic procedure, whose nodes are defined in Appendix A.3. 
+
+Synapse lifts the graphs from elements to instructions through a bounded neighborhood, which consists of the first hop of the backward and forward slices used in program slicing [21, 59] and of adjacent steps in the CFG. One hop already reaches the steps, producers, consumers, and conditions described above, and it keeps the context of each suspicious instruction small. 
+
+Definition 3.7 (Related instructions). For 𝑝 ∈ 𝑃 , its immediate structural neighbors are 
+
+Nbr (𝑝 ) = {𝑞 ∈ 𝑃 | ( 𝑝, 𝑞 ) or (𝑞, 𝑝 ) is in 𝐴 cfg ∪ 𝐴 cdg ∪ 𝐴 ddg }.
+
+The instructions related to 𝑛 ∈ 𝑁 are 
+
+Rel (𝑛 ) = {𝑛 } ∪ 
+
+Ø  
+
+> 𝑝 ∈𝑃
+> own (𝑝 )=𝑛
+
+{own (𝑞 ) | 𝑞 ∈ Nbr (𝑝 )} .
+
+An instruction with no elements in 𝑃 is related only to itself. 
+
+Example. Figure 2 shows all four structures on a schematic procedure in which all three relations matter. There, a patch to the fallback assignment 𝑛 4 is related to its governing condition and its consumer through the PDG and to adjacent steps through the CFG, but not to the other branch. 
+
+3.4 Dynamic Analysis and Fault Localization 
+
+Static dependences describe how instructions may relate, but not which instructions a failing execution involved. Synapse obtains this dynamic evidence by running the current skill on the repair tests (line 2). Localizing a failure to source-linked instructions gives a patch its location (L1). Localization starts from coverage, as spectrum-based fault localization [23] does, except that coverage is reported by the interpreter itself rather than measured by instrumentation. 
+
+Recording traces. To obtain this coverage, Synapse asks the execution agent to report which parts of the skill it used. The address contract of Execute assigns an address to every instruction and every recognized dependency. The trace 𝜏 𝑖 of test 𝑖 under 𝑆 records the input, the answer, its outcome, and the reported addresses of the recorded call Execute (𝑆, 𝑥 𝑖 ). Resolving these addresses Synapse : Optimizing Agent Skills through Program Repair 11 
+
+against SkIR gives the coverage cov (𝜏 𝑖 ) ⊆ 𝑁 . An instruction address contributes that instruction, and a dependency address contributes the instructions that own its producer and consumer. Like the graphs, these reports only choose what the repair model sees and which tests screen a patch. 
+
+Fault localization. The instructions covered by failing tests, Ð𝑖 ∈𝐹 (𝑆 ) cov (𝜏 𝑖 ), are the suspicious locations. Because a failing trace also covers instructions that played no part in the failure, Synapse grades each suspicious instruction by the strength of its evidence and retains those whose level reaches a fixed threshold. The evidence comprises reported uses and graph witnesses , which connect a failure to a candidate source instruction through a chain of execution evidence and graph relations checked by the host. Appendix A.6 gives the other kinds of evidence, the levels, and the thresholds. The localization context Λ𝑡 contains the failing tests and, for each retained instruction, its text, its one-hop CFG, CDG, and DDG relations, and the repair tests whose traces cover it, passing ones included, so that the repair model can see what a patch should preserve. 
+
+Repair hypotheses. A patch should address a failure mechanism rather than a single failing test, so Diagnose groups the failures in Λ𝑡 into repair hypotheses (line 3). The repair model, not the host, decides which failures share a mechanism, since this judgment requires reading the wrong answers. So that every edit has a location the host can check, the host lists, for each instruction that a hypothesis affects, its repair targets , which are the instruction itself, its recognized elements and dependencies, and the insertion anchor after it, that is, the position immediately after its source span. Each target admits at least one repair operator. The condition that governs the value-span instruction belongs to a separate clause, so the targets of that instruction are the instruction itself and the anchor after it. A failure may yield several hypotheses, each leading to a separate patch, and a patch may coordinate edits to several interacting instructions. 
+
+3.5 Patch Generation 
+
+To be checked before any test runs, a change must name its location and its kind (L1), which free-form rewriting does not require. Synapse therefore requires every change to be a typed mutation at a location resolved from SkIR and its source map, so that every patch has a location in SkIR and in the source text, can be checked before any test runs, and can be compared with earlier patches to the same element. As in GenProg, which deletes, inserts, or swaps statements [25], the mutations come from a fixed set of repair operators, each typed by the kind of target it applies to and by the content it requires. Let 𝐼 𝑡 and 𝑀 𝑡 be the SkIR and source map of the current skill 𝑆 𝑡 .
+
+Definition 3.8 (Patch). Each target of a patch is of one of four kinds. It is an instruction ( Instr ,whose text or attributes are edited), a branch condition ( Cond ), a dependency ( Dep , an existing def–use relation or a pair of endpoints for adding one), or an insertion anchor ( Anchor , the position immediately after an instruction’s source span). Each repair operator 𝑜 has a signature 𝜅 𝑜 ⇒ 𝜎 𝑜 and a precondition pre 𝑜 . It applies to targets of kind 𝜅 𝑜 whose current state in 𝐼 𝑡 satisfies pre 𝑜 , and its new content must satisfy the schema 𝜎 𝑜 . A single-edit patch is a typed mutation Δ = (𝑒, 𝑜, 𝑐 ) with a target 𝑒 : 𝜅 𝑜 resolved from (𝐼 𝑡 , 𝑀 𝑡 ) and content 𝑐 : 𝜎 𝑜 . For example, the operator that rewrites an instruction has the signature Instr ⇒ Text and replaces the instruction’s text. Applying a patch yields 𝐼 ′ = ApplyMutation (𝐼 𝑡 , Δ). A coordinated patch contains several mutations whose edits rewrite, delete, or insert after distinct instructions, all constructed against 𝐼 𝑡 .The repair model does not edit the skill directly but chooses among the typed mutations that the host offers. For each hypothesis ℎ, the host builds the edit context Γ𝑡 (ℎ), which offers at each target 
+
+𝑒 the legal operators Opt 𝑡 (𝑒 ) = {𝑜 | 𝑒 : 𝜅 𝑜 ∧ pre 𝑜 (𝑒, 𝐼 𝑡 )} . For example, a dependency can be removed only if it exists. Propose (ℎ, Γ𝑡 (ℎ)) chooses a target, an operator, and new content (line 5), and the host type-checks the choice against Opt 𝑡 (𝑒 ), the current state of the target, and the operator’s schema and rejects ill-typed patches before they reach the document (line 6). The patches of an 12 Li et al. 
+
+iteration are constructed and checked independently. In Synapse, the operators delete, insert, or rewrite instructions and edit their conditions, attributes, and dependencies (Table 8 and Figure 3 in Appendix A.7). The patch in Section 2.3 rewrites the text of the value-span instruction. Because the execution agent reads the document, not SkIR, every patch is written back to the text (line 7). To write a patch back, the host first turns it into edits of source spans. The host records the source edits of a patch as EΔ = (( 𝛼 𝑗 , 𝛽 𝑗 , 𝑐 ′ 
+
+> 𝑗
+
+)) 𝑘 𝑗 =1, where the offsets refer to characters in 𝑆 𝑡 , 𝑐 ′ 
+
+> 𝑗
+
+includes all host-generated formatting, and an insertion has 𝛼 𝑗 = 𝛽 𝑗 . The footprint 𝑋 Δ ⊆ 𝑁 , against which untouched text and affected tests are defined, contains the authored target of each edit, that is, the instruction whose text, attribute, or condition is rewritten, the deleted instruction, the instruction that states the relation for a relation edit, or the instruction after which an insertion is placed. 
+
+Definition 3.9 (Materialization). For each mutation, the host renders replacement Markdown 𝑐 ′
+
+from the content 𝑐 and the current text of the target. A text edit is formatted as the instruction’s Markdown, an attribute or condition edit changes only the corresponding expression in the original text, and a relation edit rewrites the text of the instruction that states the relation. The host places 
+
+𝑐 ′ at a source span [𝛼, 𝛽 ), which is the span of its authored target for a rewriting or deletion and the empty span at the end of its anchor’s span for an insertion. Materialization applies the edits from the end of the document backward, so that each edit uses its original offsets. For a single span, 
+
+𝑆 ′ = Materialize (𝐼 ′, 𝑀 𝑡 ) = 𝑆 𝑡 [0, 𝛼 ) · 𝑐 ′ · 𝑆 𝑡 [𝛽, |𝑆 𝑡 |) . (1) Lemma 3.10 (Edit locality). If the nonempty intervals in EΔ are pairwise disjoint and no insertion position lies strictly inside one of them, then every fragment [𝛾, 𝜂 ) of 𝑆 𝑡 such that each edit ends at or before 𝛾 or starts at or after 𝜂 occurs unchanged in 𝑆 ′, shifted by the net length change of earlier edits. 
+
+Appendix A.8 states the lemma with explicit offsets, proves it, and shows when it also preserves the compiled attributes of untargeted instructions. 
+
+Checking the round trip. The patch was made on SkIR but takes effect in the text, so Synapse recompiles every patched skill before running any test (line 8). It enforces well-formedness and records two round-trip observations. Target recovery is whether the recompiled view contains the intended edit, and stability is whether every instruction that the patch neither rewrites nor removes keeps its canonical identifier, text, and compiled attributes. Both are recorded rather than enforced, because the agent reads the text, which Edit locality already preserves outside the edited spans, and the tests judge the effect of the edited text. With C as the get and materialization as the put 
+
+direction of a bidirectional transformation [17], target recovery is a syntactic analogue of the lens law that an update made through the view is visible in the recomputed view. 
+
+3.6 Patch Screening and Validation 
+
+A patch that fixes its source failures may break other tests that these failures do not reveal, including tests that never reach the edited instruction (L3). For programs, regression test selection reruns the modification-traversing tests, whose executions reach changed code [41], or the tests whose behavior a change may affect through dependences [6]; change impact analysis derives an impact set 
+
+of affected entities from the coverage of executions that traverse a change [37]; and program repair applies such selection to candidate patches [32]. As in that impact analysis, Synapse combines a static impact set with dynamic coverage (line 9). For 𝑋 ⊆ 𝑁 , let 𝑇 (𝑋 ) = {𝑖 ∈ 𝐷 rep | cov (𝜏 𝑖 ) ∩ 𝑋 ≠ ∅} 
+
+be the repair tests whose traces cover part of 𝑋 .
+
+Definition 3.11 (Selected repair tests). For a patch Δ with footprint 𝑋 Δ, let 
+
+𝑄 Δ =
+
+Ø
+
+> 𝑛 ∈𝑋 Δ
+
+Rel (𝑛 )
+
+!
+
+\ 𝑋 ΔSynapse : Optimizing Agent Skills through Program Repair 13 
+
+contain the one-hop CFG, CDG, and DDG neighbors of the instructions in 𝑋 Δ. We call 𝑋 Δ ∪ 𝑄 Δ the one-hop impact set of Δ. Let 𝐹 Δ, 𝐶 Δ, and 𝐵 Δ be the source failures, control tests, and boundary tests that Propose returns with Δ, as validated by the host. The selected repair tests of the patched skill 
+
+𝑆 ′ obtained from Δ are 
+
+𝐿 (𝑆 ′) = 𝐹 Δ ∪ 𝐶 Δ ∪ 𝐵 Δ ∪ 𝑇 (𝑋 Δ ∪ 𝑄 Δ). (2) Beyond the tests that Propose names, 𝑇 (𝑋 Δ) holds the repair tests that traverse the change according to the reported coverage, and 𝑇 (𝑄 Δ) adds tests that traverse the rest of the impact set, including tests that do not cover an edited instruction. Section 2.3 illustrates them for one patch. 
+
+Ranking and acceptance. Screening requires a patch to fix at least one of the failures that motivated it and prefers patches that break no previously passing test, and validation then decides. Running 
+
+𝑆 ′ on 𝐿 (𝑆 ′) and comparing its outcomes with those of 𝑆 𝑡 recorded in line 2 classifies the selected tests in the manner of the fail-to-pass and pass-to-pass tests of SWE-bench [22]. Fail-to-pass tests are those that 𝑆 𝑡 fails and 𝑆 ′ passes, and regressions are those that 𝑆 𝑡 passes and 𝑆 ′ fails. 𝑅 target (𝑆 ′)
+
+counts the fail-to-pass tests among the source failures 𝐹 Δ. Screening discards the patched skills with 𝑅 target (𝑆 ′) = 0 and ranks the rest by a lexicographic fitness , as GenProg ranks variants by a weighted count of the tests they pass [25]. The fitness puts patches without regressions first and then those whose fail-to-pass tests outnumber their regressions, with the groups and ties defined in Appendix A.9. Computing this fitness on selected repair tests follows repair tools that reduce evaluation cost through test subsets [15]. At most 𝐾 proceed to validation (line 11). Synapse evaluates the shortlisted patched skills on the frozen validation suite (line 12) and accepts the one with the highest validation pass rate if 𝐽 𝐷 val (𝑆 ′) > 𝐽 𝐷 val (𝑆 𝑡 ), and otherwise keeps 𝑆 𝑡 (line 13). A regression observed in screening therefore does not by itself reject a patch, since the selected tests are only a subset and the separate validation suite weighs gains against regressions. It ranks the patch behind those without regressions, possibly below the top-𝐾 cut. 
+
+Recorded outcomes. Because answers vary across requests, screening compares a patched skill with the recorded outcomes of 𝑆 𝑡 , and acceptance adopts the accepted skill’s recorded validation outcomes as the next baseline, so each decision is reproducible from the logs. 
+
+What the selection assumes. Running only the selected tests is justified if the tests left out cannot change their outcomes. A test selection is safe if it contains every test whose outcome the change can affect [41]. For deterministic programs under controlled regression testing [41], safety follows from the semantics, since a test whose execution does not reach changed code behaves as before. A skill has no such semantics, because its interpreter is an LLM, so safety can hold only relative to an assumption about the execution agent. We state that assumption, in the manner of analyses that name the behaviors they do not model [31]. For a repair test 𝑖 , let Ctx 𝑡 (𝑖 ) = Ð𝑛 ∈cov (𝜏 𝑖 ) Rel (𝑛 )
+
+hold the instructions that its trace covers together with their related instructions, and let Out 𝑆 (𝑖 ),unlike recorded outcomes, be the distribution of the outcome, pass or fail, of Execute (𝑆, 𝑥 𝑖 ).
+
+Definition 3.12 (Interpretation locality). The execution agent is one-hop local for a well-typed patch Δ at 𝑆 𝑡 if every repair test 𝑖 with 𝑋 Δ ∩ Ctx 𝑡 (𝑖 ) = ∅ satisfies Out 𝑆 ′ (𝑖 ) = Out 𝑆 𝑡 (𝑖 ), where 𝑆 ′ is the patched skill. It is coverage local for Δ at 𝑆 𝑡 if the same holds for every 𝑖 with 𝑋 Δ ∩ cov (𝜏 𝑖 ) = ∅.Both conditions have the form of noninterference [18]. Intuitively, one-hop locality says that an edit can change the outcome of a test only through the instructions that the test uses or their immediate neighbors in the CFG, CDG, or DDG. Each states that a patch whose footprint lies outside a test’s neighborhood does not interfere with the test’s outcome. Because 𝑛 ∈ Rel (𝑛 ),we have cov (𝜏 𝑖 ) ⊆ Ctx 𝑡 (𝑖 ), so coverage locality implies one-hop locality. Coverage locality thus requires unchanged outcomes for more tests, including those that cover a related instruction but none that the patch edits. 14 Li et al. 
+
+Proposition 3.13 (Relative safety of test selection). Let Δ be a well-typed patch of 𝑆 𝑡 with patched skill 𝑆 ′. (i) If the execution agent is one-hop local for Δ at 𝑆 𝑡 , then Out 𝑆 ′ (𝑖 ) = Out 𝑆 𝑡 (𝑖 ) for every repair test 𝑖 ∉ 𝐿 (𝑆 ′). (ii) The coverage-only selection 𝐿 0 (𝑆 ′) = 𝐹 Δ ∪ 𝐶 Δ ∪ 𝐵 Δ ∪ 𝑇 (𝑋 Δ) has the property of (i) if the execution agent is coverage local for Δ, but not, in general, under one-hop locality. 
+
+The proof, given in Appendix A.9, rests on the symmetry of Rel .Proposition 3.13 states what the control-flow and dependence relations contribute. They weaken the locality that safe selection requires, from the instructions a test covers to their one-hop neigh-borhood, which holds the instructions linked to them by a dependence or an adjacent CFG step. 
+
+3.7 Properties of an Iteration 
+
+Because the execution agent and the repair model are reached only through calls whose results the host checks, three properties of every iteration hold by construction, whatever the LLMs return. The next skill compiles to a well-formed partial program view. An accepted patch leaves the source span of every instruction it does not target unchanged, since the host writes each mutation back only to the spans of its targets, which are disjoint from the spans of all other instructions (Lemma 3.10). The recorded validation pass rate never decreases and rises with every accepted patch, so the number of accepted patches is bounded by the number of validation tests that the initial skill fails. Appendix A.9 states them as a theorem and proves it. These properties and Proposition 3.13 answer the two difficulties of the introduction. An edit made on incomplete structure lands in the authored text without disturbing the rest, and although the interpreter is an LLM, the choice of screening tests is safe relative to a stated locality assumption, while acceptance rests on running the skill. 
+
+4 Experiments 
+
+We evaluate Synapse on three research questions and close with a case study of one repair. 
+
+• RQ1: Skill Optimization Effectiveness. Can Synapse improve task performance com-pared with the initial skill and existing skill optimization methods, Trace2Skill, SkillBoost, and SkillOpt, across different benchmarks and execution models? 
+
+• RQ2: Contribution of SkIR-Based Repair and Screening. What is the combined con-tribution of SkIR-based repair (L1, L2) and the screening of Synapse (L3), relative to constrained text editing screened only on failing repair tests? 
+
+• RQ3: Repair Mechanism Analysis. Does SkIR-based localization tie repair targets to existing instructions and does write-back recover every well-typed patch in the text (L1), and does program-analysis-guided test selection add screening tests that coverage of the edited instruction misses (L3)? 
+
+4.1 Experimental Setup 
+
+Benchmarks. For DocVQA [34], we use 534 questions from the official validation split, divided into 107 repair tests, 53 validation tests, and 374 held-out test questions. For LiveMathematician-Bench [19] (LiveMath), we use a fixed subset of 177 questions, with 35 repair tests, 17 validation tests, and 125 held-out test questions. All compared methods use the same partitions, which the sample identifiers and preparation scripts in the artifact define. Both benchmarks pose single-turn questions with reference answers, so answers are scored by rule, without an LLM judge. 
+
+Initial skills. All skill-based methods start from the same benchmark-specific initial skills, released with SkillOpt [64]. The instruction labels, rule titles, and applicability clauses give compilation and repair addressable instruction units and explicit contexts. Within the DocVQA initial skill, the Synapse : Optimizing Agent Skills through Program Repair 15 
+
+value-span instruction of Section 2.2 retains the wording of SkillOpt’s released GPT-5.5 reference skill, with its condition and action represented separately. 
+
+Models and metrics. GPT-6.1 Sol with medium reasoning effort is the repair model in all exper-iments, and GPT-5.6 Luna, GPT-6 Sol, and Gemini 3.6 Flash are the execution models on both benchmarks. We report the pass rate 𝐽 𝐷 test on the held-out tests (Section 3.1) as the task success rate. DocVQA counts an answer as correct when its average normalized Levenshtein similarity (ANLS) [7] is at least 0 .999, and LiveMath uses SkillOpt’s multiple-choice scoring rule. 
+
+Baselines. We compare Synapse with the Initial Skill, which measures the improvement brought by optimization, with No Skill, which runs each execution model without a skill document, and with three methods that revise natural-language skills from execution feedback. Trace2Skill [36] merges patches distilled from individual trajectories, SkillBoost [29] bounds regressions on a fixed task set, and SkillOpt [64] applies bounded patches accepted on a split held out from patch generation. All methods use the same execution models and scoring rules within each setting. Trace2Skill performs one trajectory-analysis and patch-merging pass and selects between its initial and evolved skill by validation performance. SkillOpt runs four epochs on DocVQA and three on LiveMath and is evaluated on the held-out tests at the checkpoint with the highest validation success rate. SkillBoost uses budgeted rounds with Best-of-4 generation and Top-2 evaluation on the full repair-test set, and selects the checkpoint with the highest validation success rate. Synapse runs three repair iterations with the selection procedure of Section 3.6. All skill-optimization methods use GPT-6.1 Sol with medium reasoning effort, the repair model of Synapse, to revise their skills. The execution interfaces preserve each benchmark’s task inputs and required answer format. Synapse additionally supplies an address contract and requests a usage report (Section 3.4). 
+
+Repair protocol. For each benchmark and execution model, a repair run has three repair iterations, at most 𝐾 = 4 patches per iteration proceed to validation, and the final selected skill is evaluated on the held-out tests. Test scores of earlier method versions were recorded during development. 
+
+4.2 Skill Optimization Effectiveness 
+
+Table 1 shows that Synapse achieves the highest test success rate in all six settings (RQ1). Synapse exceeds SkillOpt by 3.74–4.54 percentage points on DocVQA and 2.40–4.00 on LiveMath, Trace2Skill by 1.87–4.54 and 5.60–10.40, and SkillBoost by 1.60–5.88 and 3.20–13.60.                                            
+
+> Table 1. Task success rate (%) on DocVQA and LiveMath. Each value is a success rate on the held-out tests. The best result in each row is in bold. Percentages are truncated, not rounded, to two decimals. Differences in the text are computed from untruncated rates and then truncated.
+> Benchmark Execution model No Skill Initial Skill Trace2Skill SkillBoost SkillOpt Synapse DocVQA GPT-5.6 Luna 55.61 71.92 82.88 81.55 82.35 86.63
+> GPT-6 Sol 62.56 77.54 86.09 84.75 86.09 90.64
+> Gemini 3.6 Flash 90.64 91.17 93.58 93.85 91.71 95.45
+> LiveMath GPT-5.6 Luna 31.20 36.80 36.00 32.80 44.00 46.40
+> GPT-6 Sol 48.00 54.40 55.20 55.20 58.40 62.40
+> Gemini 3.6 Flash 32.80 32.80 32.00 34.40 34.40 37.60
+
+Strongest baseline. No baseline is the strongest in every setting. Trace2Skill leads the baselines for GPT-5.6 Luna on DocVQA, SkillBoost for Gemini 3.6 Flash on DocVQA, and SkillOpt for GPT-5.6 Luna and GPT-6 Sol on LiveMath, and two baselines tie in each of the other two settings. Synapse 16 Li et al. 
+
+exceeds the strongest baseline of every setting, by 1.60 to 4.54 points. Measured from the initial skill, its gain is 1.3 to 3.0 times the gain of the strongest baseline in each setting. 
+
+Gains over the initial skill. The Initial Skill helps much on DocVQA for GPT-5.6 Luna and GPT-6 Sol, little for Gemini 3.6 Flash, less on LiveMath, and not at all for Gemini 3.6 Flash on LiveMath. On DocVQA, Synapse removes about half of the held-out errors of the initial skill with every execution model (48–58%), even for Gemini 3.6 Flash, whose initial skill already answers 91.17% of the questions correctly, while the strongest baseline of each setting removes 30–39%. This share stays near one half although the success rate of the initial skill ranges from 71.92% to 91.17%. On LiveMath, Synapse removes 7–18% of the errors of the initial skill, and the strongest baseline 2–11%. Synapse thus improves on the initial skill in every setting, which not every optimizer does. Trace2Skill and SkillBoost end below the initial skill on LiveMath with GPT-5.6 Luna (36.00 and 32.80 versus 36.80), and Trace2Skill also with Gemini 3.6 Flash (32.00 versus 32.80), whereas Synapse and SkillOpt improve on it in all six settings. 
+
+Skill versus execution model. On DocVQA, the repaired skill can outweigh a stronger execution model. With the skill repaired by Synapse, GPT-5.6 Luna answers 86.63% of held-out questions, more than GPT-6 Sol with the initial skill (77.54%) or with any baseline’s final skill (at most 86.09%). 
+
+Size of the change. Each of the three repair iterations accepts at most one patch, so every final skill of Synapse results from at most three accepted patches, and by Section 3.7, each of them leaves the source span of every instruction it does not target unchanged. The gains above therefore come from a few edits confined to the instructions they target. 
+
+Answer to RQ1. Synapse achieves the highest success rate in every setting, exceeds the strongest baseline of each setting by 1.60 to 4.54 points, removes about half of the initial skill’s errors on DocVQA, and never ends below the initial skill, with at most three localized patches per skill. 
+
+4.3 Contribution of SkIR-Based Repair and Screening 
+
+To measure the combined contribution of SkIR-based repair and the screening of Synapse (RQ2), we compare the full Synapse approach with a variant that replaces SkIR-based repair with constrained text editing and narrows screening. The comparison keeps the initial skill, repair tests, execution models, dataset splits, repair iterations, and the validation-based acceptance rule fixed. The w/o SkIR variant differs from Synapse in two respects. First, it removes SkIR, SkAST, CFG, CDG, DDG, source-map links, and typed SkIR mutations, which it replaces with constrained text editing, with the host limiting each patch to at most 120 line additions and deletions in total, while retaining execution traces. The repair model still receives the complete repair-test results of the current skill. Second, it screens each patched skill only on the failing repair tests of the current skill, 𝐹 (𝑆 𝑡 ),instead of on 𝐿 (𝑆 ′) (Equation 2). It thus omits the control tests 𝐶 Δ, the boundary tests 𝐵 Δ, and the coverage-based tests 𝑇 (𝑋 Δ ∪ 𝑄 Δ), so its screening observes no regressions, and only validation can reject a patch that breaks passing tests. Ranking and validation are otherwise unchanged. Replacing SkIR-based repair and its screening with the w/o SkIR variant reduces test success rates in all four evaluated settings (Table 2), by 2.40 and 2.67 percentage points on DocVQA and 1.60 and 3.20 on LiveMath for GPT-5.6 Luna and GPT-6 Sol. The drop is larger for GPT-6 Sol than for GPT-5.6 Luna on both benchmarks. The broader screening gives the ranking results from control tests, boundary tests, and structurally related repair tests, so that patches that fix their source failures while keeping the selected passing tests are preferred before validation. At the question level, in the GPT-6 Sol DocVQA test evaluation, Full Synapse answers 17 questions that w/o SkIR misses, and w/o SkIR answers 7 that Full Synapse misses, a net gain of 10 of 374 questions. Full Synapse achieves this held-out gain with a validation score of 50 of 53, compared with 51 of 53 for w/o SkIR. Synapse : Optimizing Agent Skills through Program Repair 17              
+
+> Table 2. Effect of SkIR-based repair and its screening on DocVQA and LiveMath. Results are test success rates (%). Higher is better. The w/o SkIR variant replaces SkIR-based repair with constrained text editing and screens candidates only on failing repair tests.
+> Benchmark Execution model Full Synapse w/o SkIR DocVQA GPT-5.6 Luna 86.63 84.22 GPT-6 Sol 90.64 87.97 LiveMath GPT-5.6 Luna 46.40 44.80 GPT-6 Sol 62.40 59.20
+
+Answer to RQ2. Replacing SkIR-based repair and its screening with constrained text editing lowers success rates in all four settings, so together they contribute to the gains of Synapse. 
+
+4.4 Repair Mechanism Analysis 
+
+To examine how the mechanisms behind L1 and L3 operate (RQ3), we analyze two recorded DocVQA runs of the full Synapse, one with GPT-5.6 Luna and one with GPT-6 Sol. Table 3 summarizes the four stages of repair that the analysis follows. 
+
+Localization and write-back. The first two stages give each patch the location and kind of change that L1 requires. Across six iterations of the two runs, 292 of the 315 recorded repair targets are existing instructions with valid source mappings and 23 are insertion anchors, so most failures localize to an instruction that a patch can rewrite rather than to a gap that needs a new one. Of the 38 proposals that the repair model produces from these targets, 37 pass type checking, and all 37 are written back as complete skill documents that pass the round-trip observations of Section 3.5. 
+
+Source-failure fixes. Screening first requires a patch to fix a failure that motivated it. Of the 37 patches, each evaluated on its selected repair tests, 19 (51.35%) fix at least one of their source failures (𝑅 target (𝑆 ′) > 0), and screening discards the other 18 before any validation call. Appendix A.11 compares evaluated and accepted patches in archived trajectories. 
+
+Where repair falls short. The discarded patches fail in two ways. Some leave the target error unchanged. In the GPT-6 Sol run, a patch that tells the agent to return multiple rows only when they tie still yields the same incorrect two-name answer to a question that asks for the unique maximum. Others move an answer toward the reference without reaching the ANLS threshold, such as three patches that raise the ANLS of one answer from 0.720 to 0.885. Fixing a source failure does not guarantee a net gain either. A GPT-5.6 Luna patch corrects a page-number answer from “2 OF 2” to “2” but recovers three answers and regresses on six others, so screening ranks it below every patch whose fixes outnumber its regressions. 
+
+Program-analysis-guided test selection. Coverage of the related instructions adds repair tests beyond the source failures, control tests, boundary tests, and coverage of the edited instructions (L3) for 14 of 21 GPT-5.6 Luna patches and 9 of 16 GPT-6 Sol patches, 23 of 37 overall (62.16%). The added tests cover related instructions, and under the one-hop locality assumption of Proposition 3.13, a patch can affect a test beyond its direct reported coverage only if the test covers such an instruction. These are exactly the tests that the coverage-only selection 𝐿 0 of Proposition 3.13 leaves out, so for 23 of the 37 patches, selection through the relations checks tests that coverage alone would not. In the case-study run of Section 2.3, coverage of a CFG neighbor adds tests associated with the similar-strings condition, and the receipt test of Section 2.3 is one of them. 18 Li et al.           
+
+> Table 3. Repair mechanism analysis from two DocVQA runs of the full Synapse, one with GPT-5.6 Luna and one with GPT-6 Sol. Counts pool the three iterations of both runs, and each row is one stage of repair.
+> Repair stage Metric Result Localization Repair targets that are existing instructions rather than insertion anchors 292/315 (92.70%) Write-back Well-typed patches passing the round-trip observations 37/37 (100.00%) Source-failure fix Patches fixing a source failure 19/37 (51.35%) Test selection Patches with tests added through related instructions 23/37 (62.16%)
+
+Answer to RQ3. Localization ties most repair targets to existing instructions that a patch can rewrite, and write-back recovers every well-typed patch before any test runs (L1). Related instruc-tions add tests for 23 of 37 patches, including one whose regression coverage misses (L3). 
+
+4.5 Case Study 
+
+The repair of Section 2.3 lets us follow each limitation through a recorded run. It comes from a separate historical DocVQA run with GPT-6 Sol as the execution model, and Table 4 compares the final answers of the four methods to the held-out turnover question, all with the same execution model, initial skill, and partitions. 
+
+Location and kind of change (L1). The traces of the failing repair tests map to the value-span instruction, and the accepted patch is a single rewrite of that instruction at its mapped span (line 31 of the initial skill). Recompilation yields a well-formed view, and no other source span changes. 
+
+Related instructions (L2). The request for the patch contains the condition that governs the instruction, linked by a CDG edge from the “When to use” clause at line 29, and the neighboring condition for similar strings at line 35, linked by a CFG edge, and the saved response matches the applied edit. 
+
+Screening (L3). The patch fixes both failing repair tests that motivated it. Among the named passing tests, table cells keep their concise numeric answers, and monetary fields keep the currency symbols printed with their values. The receipt test, which enters screening only through the neighboring condition, regresses, so the patch ranks behind regression-free patches. 
+
+Outcome. Generated in the first repair iteration, the patch passes more validation tests than the initial skill, is accepted, and remains the final selected skill. On the held-out turnover question, the revised instruction keeps “crores”, which specifies the scale of the amount and serves as its unit of expression, whereas the final skills of SkillOpt, SkillBoost, and Trace2Skill drop it (Table 4). Appendix A.10 gives the identifiers of the run, the instructions, and the patch. 
+
+5 Discussion and Limitations 
+
+Beyond single-turn question answering. The partial program view does not depend on the task format. Skills for multi-step tool use state the same kinds of elements, namely operations, the conditions under which they apply, and the data they pass on, and the address contract can label the instructions that request a tool call. What changes is the trace, which spans several turns, so coverage and outcomes would be recorded per turn and a test could fail at an intermediate step. 
+
+Recognized structure. The analyses see only the structure that the fixed recognizers of Section 3.2 accept, so a skill that uses other verbs, refers to an item by different phrases, or describes iteration in prose yields sparser dependence graphs, and the initial skills of our benchmarks may suit these Synapse : Optimizing Agent Skills through Program Repair 19           
+
+> Table 4. Final answers to the held-out turnover question with GPT-6 Sol (reference “41,809.82 crores”).
+> Method Final answer Assessment Synapse 41,809.82 crores Correct SkillOpt 41,809.82 Incomplete SkillBoost 41,809.82 Incomplete Trace2Skill 41,809.82 Incomplete
+
+rules better than skills written in other styles. Richer recognizers, including learned ones, could extend the view, provided that compilation stays deterministic and passes the same checks. 
+
+Self-reported coverage and locality. Localization and test selection rely on the instruction usage that the execution agent reports, and test selection is safe only for a one-hop local agent (Proposition 3.13). The properties of Section 3.7 hold whether or not the reports are accurate, but this paper measures neither the reports nor the locality assumption. Counterfactual checks, such as removing an instruction and rerunning the tests that report using it, could validate coverage, and rerunning all repair tests for sampled patches would show how often locality fails. 
+
+One-hop neighborhoods. The repair model sees, and screening adds, only the instructions one hop away from a suspicious or edited instruction. An effect that travels further, such as the influence of the condition that lies two hops from the return in Figure 2, is covered only if the agent’s reports or the named tests reach it. Neighborhoods that grow with the skill, or that follow dependence chains beyond the instructions a test covers, would trade a larger context for wider coverage. 
+
+Acceptance on a small validation suite. Synapse accepts a patch when it passes at least one more validation test than the current skill. With small suites, such as the 53 and 17 validation tests here, and answers that vary across requests, a patch can be accepted by chance [9]. Requiring a margin or repeated validation runs would make acceptance more robust at a higher cost. 
+
+6 Related Work 
+
+Automatic skill optimization. Skill optimization continues work that improves LLM behavior from feedback without changing model parameters, such as the verbal reflections of Reflexion [48] and the feedback that TextGrad passes through a computation graph [66]. Trace-driven methods revise a skill from execution trajectories [56], SkillOpt bounds text edits and accepts them only after validation improvement [64], and Trace2Skill consolidates trajectory-local patches with conflict and format checks [36]. Attribution-guided methods first localize a failure to skill sections, fields, or mechanism relations [13, 30]. These methods express the edit as rewritten text, whereas Synapse localizes to source-linked instructions, edits them through typed mutations (L1), and relates them to other instructions through control and data dependences (L2). Structure-aware methods are the closest in how they edit. SEPO applies typed operators to the steps and rules of a prompt outline [33], and GraphSkillEvo mutates the step nodes and workflow paths of a graph-structured skill [50]. They edit a structured representation of the prompt or skill, whereas Synapse recovers structure from the prose of an existing skill and writes every edit back to it. We do not include SEPO, GraphSkillEvo, and GraphSkillAA as baselines, because their editing units are prompt outlines and graph-structured skills rather than shared skill documents. Library-level methods expand, consolidate, and relate skill collections [20], whereas Synapse revises the instructions within one skill. To check an edit, SkillBoost bounds regressions on a fixed task set [29] and SkillCommit rechecks source tasks [20]. The closest concurrent approach, GraphSkillAA [44], applies typed edits to an addressable skill graph and uses a Local Gate to retest affected examples. Synapse instead 20 Li et al. 
+
+grounds both editing and test selection in a source-linked partial program view recovered from the authored skill text. Its source map confines typed edits to their mapped source spans and preserves the surrounding text, while control-flow and dependence relations derived from the same view select related repair tests, including those outside the edited instruction’s direct coverage (L3). 
+
+Prompt and context optimization. Prompt optimization searches over instructions for a fixed task [39, 68], DSPy and GEPA optimize or reflectively rewrite the prompts of the modules of an LM program [2, 24], Trace propagates feedback along a workflow’s execution graph [11], SAMMO and MPO edit the components of a prompt separately [43, 45], and ACE revises playbook entries for agent contexts [67]. These systems optimize the components of LM programs, whereas Synapse analyzes the dependences among the instructions of one skill. 
+
+Structured skill representations. Agent Workflow Memory learns reusable procedures from expe-rience [58], SSL organizes skills into usage conditions, steps, actions, and resources [28], SkillSmith compiles skills into runtime interfaces with operator contracts [62], SkVM extracts step depen-dencies to run independent steps in parallel [10], and SkillZip builds section graphs to compress skill libraries [51]. These approaches organize skills for reuse, execution, or compression, whereas Synapse uses recovered structure to modify an existing skill. 
+
+Program analysis and prompts as programs. Synapse applies standard ASTs, control-flow graphs, and program dependence graphs [3, 16] to the structure extracted from skills. Like analyses of incomplete code [12] and island grammars [35], it analyzes only the recognized part of its input, and like origin tracking [53] and lenses [17], it carries edits made on a derived structure back to the source text. Prompt programming languages such as LMQL let authors write prompt structure explicitly [5], whereas Synapse recovers structure from existing prose, and empirical work shows that prompt programs need tool support [27]. PromptPex generates tests from the input specifications and output rules of a prompt [47], and ContextCov compiles agent instruction files into executable checks [46]. These works test or enforce what a prompt requires, whereas Synapse analyzes the instructions themselves to decide where to edit and which tests to rerun. 
+
+Automated program repair. Generate-and-validate repair generates candidate patches with repair operators and validates them by running tests. GenProg mutates statements and ranks variants by a test-based fitness [25], and LLM-based repair keeps this structure with an LLM as the generator, from zero-shot patch generation [61] to agents and pipelines that localize faults, generate patches, and run tests [8, 60]. A plausible patch, which passes all tests used to develop it [40], can still fail on independent tests [49], so Synapse separates selection on repair and validation tests from estimation on held-out tests [9]. Section 3.6 discusses regression test selection and impact analysis [6, 32, 37, 41]. Unlike program repair, Synapse makes edits on a recovered structure while an LLM reads the text, so the source map carries each edit back to the skill, and running the skill shows its effects. 
+
+7 Conclusion 
+
+We cast natural-language skill optimization as generate-and-validate repair over a partial program view. Synapse compiles a skill into SkIR so that fault localization, dependence analysis, and regression test selection decide where to edit, what an edit relates to, and which tests to recheck. It writes every typed mutation back to the mapped span of its target, and the properties of each iteration hold by construction whatever the LLMs return. On DocVQA and LiveMath, Synapse achieves higher success rates than SkillOpt, Trace2Skill, and SkillBoost in all six settings, and an ablation of its SkIR-based mechanisms and broader screening lowers success rates in all four evaluated settings. The repair of the turnover example shows the pattern behind these results, a single rewrite at the mapped span of one instruction, informed by the condition that governs it and checked on a test reached only through its neighbor. More broadly, the approach shows how program repair can work on a language with only a partial grammar and an LLM as its interpreter, Synapse : Optimizing Agent Skills through Program Repair 21 
+
+by editing a recovered view whose edits stay within their spans. Future work will apply Synapse to skills for multi-step tool use and to a broader range of agent tasks. 
+
+References 
+
+[1] Agent Skills. 2025. Agent Skills: Overview and Specification. https://agentskills.io. Accessed 18 October 2026. [2] Lakshya A. Agrawal, Shangyin Tan, Dilara Soylu, Noah Ziems, Rishi Khare, Krista Opsahl-Ong, Arnav Singhvi, Herumb Shandilya, Michael J. Ryan, Meng Jiang, Christopher Potts, Koushik Sen, Alexandros G. Dimakis, Ion Stoica, Dan Klein, Matei Zaharia, and Omar Khattab. 2026. GEPA: Reflective Prompt Evolution Can Outperform Reinforcement Learning. In International Conference on Learning Representations . https://arxiv.org/abs/2507.19457 [3] Alfred V. Aho, Monica S. Lam, Ravi Sethi, and Jeffrey D. Ullman. 2006. Compilers: Principles, Techniques, and Tools 
+
+(2 ed.). Addison-Wesley. https://www.pearson.com/en-us/subject-catalog/p/compilers-principles-techniques-and-tools/P200000003472/9780321486813 [4] Anthropic. 2025. Introducing Agent Skills. https://claude.com/blog/skills. Published 16 October 2025; updated 18 December 2025. Accessed 18 October 2026. [5] Luca Beurer-Kellner, Marc Fischer, and Martin Vechev. 2023. Prompting Is Programming: A Query Language for Large Language Models. Proceedings of the ACM on Programming Languages 7, PLDI (2023). doi:10.1145/3591300 [6] David Binkley. 1997. Semantics Guided Regression Test Cost Reduction. IEEE Transactions on Software Engineering 23, 8 (1997), 498–516. doi:10.1109/32.624306 [7] Ali Furkan Biten, Ruben Tito, Andres Mafla, Lluis Gomez, Marcal Rusinol, Ernest Valveny, C. V. Jawahar, and Dimosthenis Karatzas. 2019. Scene Text Visual Question Answering. In Proceedings of the IEEE/CVF International Conference on Computer Vision . 4291–4301. doi:10.1109/ICCV.2019.00439 [8] Islem Bouzenia, Premkumar Devanbu, and Michael Pradel. 2025. RepairAgent: An Autonomous, LLM-Based Agent for Program Repair. In Proceedings of the 47th IEEE/ACM International Conference on Software Engineering (ICSE ’25) . IEEE, 2188–2200. doi:10.1109/ICSE55347.2025.00157 [9] Gavin C. Cawley and Nicola L. C. Talbot. 2010. On Over-fitting in Model Selection and Subsequent Selection Bias in Performance Evaluation. Journal of Machine Learning Research 11, 70 (2010), 2079–2107. https://www.jmlr.org/ papers/v11/cawley10a.html [10] Le Chen, Erhu Feng, Yubin Xia, and Haibo Chen. 2026. SkVM: Revisiting Language VM for Skills across Heterogenous LLMs and Harnesses. arXiv preprint arXiv:2604.03088 (2026). https://arxiv.org/abs/2604.03088 [11] Ching-An Cheng, Allen Nie, and Adith Swaminathan. 2024. Trace is the Next AutoDiff: Generative Optimization with Rich Feedback, Execution Traces, and LLMs. In Advances in Neural Information Processing Systems . https: //arxiv.org/abs/2406.16218 [12] Barthélémy Dagenais and Laurie Hendren. 2008. Enabling Static Analysis for Partial Java Programs. In Proceedings of the 23rd ACM SIGPLAN Conference on Object-Oriented Programming Systems, Languages and Applications . 313–328. doi:10.1145/1449764.1449790 [13] Mengyi Deng, Xin Li, Duyi Pan, Zilin Wang, Zhiwei Li, Zhijiang Guo, and Wei Wang. 2026. RESKILL: Explicit Failure Attribution and Structured Repair for Interactive Language Agents. arXiv preprint arXiv:2609.15684 (2026). arXiv:2609.15684 [cs.CL] https://arxiv.org/abs/2609.15684 [14] Gen Dong, Yanjie Gao, Liqun Li, Tianyin Xu, Yu Hua, and Fan Yang. 2026. Agent Skills Can Be Harmful: An Empirical Study of Skill-Induced Failures in LLM Agents. arXiv preprint arXiv:2608.11888 (2026). https://arxiv.org/abs/2608.11888 [15] Ethan Fast, Claire Le Goues, Stephanie Forrest, and Westley Weimer. 2010. Designing Better Fitness Functions for Automated Program Repair. In Proceedings of the 12th Annual Conference on Genetic and Evolutionary Computation (GECCO ’10) . Association for Computing Machinery, 965–972. doi:10.1145/1830483.1830654 [16] Jeanne Ferrante, Karl J. Ottenstein, and Joe D. Warren. 1987. The Program Dependence Graph and Its Use in Optimization. ACM Transactions on Programming Languages and Systems 9, 3 (1987), 319–349. doi:10.1145/24039.24041 [17] J. Nathan Foster, Michael B. Greenwald, Jonathan T. Moore, Benjamin C. Pierce, and Alan Schmitt. 2007. Combinators for Bidirectional Tree Transformations: A Linguistic Approach to the View-Update Problem. ACM Transactions on Programming Languages and Systems 29, 3, Article 17 (2007). doi:10.1145/1232420.1232424 [18] Joseph A. Goguen and José Meseguer. 1982. Security Policies and Security Models. In Proceedings of the 1982 IEEE Symposium on Security and Privacy . 11–20. doi:10.1109/SP.1982.10014 [19] Linyang He, Qiyao Yu, Hanze Dong, Baohao Liao, Xinxing Xu, Micah Goldblum, Jiang Bian, and Nima Mesgarani. 2026. LiveMathematicianBench: A Live Benchmark for Mathematician-Level Reasoning with Proof Sketches. arXiv preprint arXiv:2604.01754v1 (2026). arXiv:2604.01754v1 [cs.CL] doi:10.48550/arXiv.2604.01754 [20] Yu He and Weikai Yang. 2026. SkillCommit: Evolving Agent Skills through Behaviorally Validated Scope Expansion. 
+
+arXiv preprint arXiv:2608.15165 (2026). arXiv:2608.15165 [cs.AI] https://arxiv.org/abs/2608.15165 22 Li et al. 
+
+[21] Susan Horwitz, Thomas Reps, and David Binkley. 1990. Interprocedural Slicing Using Dependence Graphs. ACM Transactions on Programming Languages and Systems 12, 1 (1990), 26–60. doi:10.1145/77606.77608 [22] Carlos E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir Press, and Karthik R. Narasimhan. 2024. SWE-bench: Can Language Models Resolve Real-world GitHub Issues?. In The Twelfth International Conference on Learning Representations (ICLR ’24) . https://openreview.net/forum?id=VTF8yNQM66 [23] James A. Jones, Mary Jean Harrold, and John Stasko. 2002. Visualization of Test Information to Assist Fault Localization. In Proceedings of the 24th International Conference on Software Engineering . Association for Computing Machinery, 467–477. doi:10.1145/581339.581397 [24] Omar Khattab, Arnav Singhvi, Paridhi Maheshwari, Zhiyuan Zhang, Keshav Santhanam, Sri Vardhamanan, Saiful Haq, Ashutosh Sharma, Thomas T. Joshi, Hanna Moazam, Heather Miller, Matei Zaharia, and Christopher Potts. 2024. DSPy: Compiling Declarative Language Model Calls into Self-Improving Pipelines. In International Conference on Learning Representations . https://arxiv.org/abs/2310.03714 [25] Claire Le Goues, ThanhVu Nguyen, Stephanie Forrest, and Westley Weimer. 2012. GenProg: A Generic Method for Automatic Software Repair. IEEE Transactions on Software Engineering 38, 1 (2012), 54–72. doi:10.1109/TSE.2011.104 [26] Xiangyi Li, Yimin Liu, Wenbo Chen, Bingran You, Zonglin Di, Yifeng He, Shenghan Zheng, Kyoung Whan Choe, Jiankai Sun, Shuyi Wang, et al. 2026. SkillsBench: Benchmarking How Well Agent Skills Work Across Diverse Tasks. arXiv preprint arXiv:2602.12670 (2026). Version 4, June 2026. arXiv:2602.12670v4 [cs.AI] https://arxiv.org/abs/2602.12670v4 [27] Jenny T. Liang, Melissa Lin, Nikitha Rao, and Brad A. Myers. 2025. Prompts Are Programs Too! Understanding How Developers Build Software Containing Prompts. Proceedings of the ACM on Software Engineering 2, FSE (2025). https://arxiv.org/abs/2409.12447 [28] Qiliang Liang, Hansi Wang, Zhong Liang, and Yang Liu. 2026. From Skill Text to Skill Structure: The Scheduling-Structural-Logical Representation for Agent Skills. arXiv preprint arXiv:2604.24026 (2026). arXiv:2604.24026 [cs.CL] doi:10.48550/arXiv.2604.24026 [29] Hongqiang Lin, Chao Liu, Xiaofan Bai, Xuan Jin, Yuhong Li, Nenggan Zheng, and Xipeng Cao. 2026. Rethinking Self-Evolution: A Constrained Exploration-Exploitation Process for Mitigating Skill Overfitting. arXiv preprint arXiv:2607.26643 (2026). https://arxiv.org/abs/2607.26643 [30] Zibin Lin, Shengli Zhang, Taotao Wang, Yihan Xia, Deen Ma, and Guofu Liao. 2026. Workflow-Localized Mechanism Learning: Attribution-Guided Repair and Knowledge Reuse for Structured Agent Skills. arXiv preprint arXiv:2607.20999 
+
+(2026). https://arxiv.org/abs/2607.20999 [31] Benjamin Livshits, Manu Sridharan, Yannis Smaragdakis, Ondřej Lhoták, J. Nelson Amaral, Bor-Yuh Evan Chang, Samuel Z. Guyer, Uday P. Khedker, Anders Møller, and Dimitrios Vardoulakis. 2015. In Defense of Soundiness: A Manifesto. Commun. ACM 58, 2 (2015), 44–46. doi:10.1145/2644805 [32] Yiling Lou, Jun Yang, Samuel Benton, Dan Hao, Lin Tan, Zhenpeng Chen, Lu Zhang, and Lingming Zhang. 2024. When Automated Program Repair Meets Regression Testing—An Extensive Study on Two Million Patches. ACM Transactions on Software Engineering and Methodology 33, 7 (2024), 1–23. doi:10.1145/3672450 [33] Xiaoyu Ma, Haoyue Liu, Yiwen Li, Jionghao Zhu, Zhichao Wang, Ye Chen, and Xiaoying Tang. 2026. SEPO: Evidence-Grounded Prompt Optimization via Structural Editing. In Findings of the Association for Computational Linguistics: EMNLP 2026 . https://arxiv.org/abs/2608.28067 [34] Minesh Mathew, Dimosthenis Karatzas, and C. V. Jawahar. 2021. DocVQA: A Dataset for VQA on Document Images. In 
+
+Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision . 2200–2209. doi:10.1109/WACV48630. 2021.00225 [35] Leon Moonen. 2001. Generating Robust Parsers using Island Grammars. In Proceedings of the 8th Working Conference on Reverse Engineering . IEEE Computer Society, 13–22. doi:10.1109/WCRE.2001.957806 [36] Jingwei Ni, Yihao Liu, Xinpeng Liu, Yutao Sun, Mengyu Zhou, Pengyu Cheng, Dexin Wang, Erchao Zhao, Xiaoxi Jiang, and Guanjun Jiang. 2026. Trace2Skill: Distill Trajectory-Local Lessons into Transferable Agent Skills. arXiv preprint arXiv:2603.25158 (2026). arXiv:2603.25158 [cs.AI] doi:10.48550/arXiv.2603.25158 [37] Alessandro Orso, Taweesup Apiwattanapong, and Mary Jean Harrold. 2003. Leveraging Field Data for Impact Analysis and Regression Testing. In Proceedings of the 9th European Software Engineering Conference Held Jointly with the 11th ACM SIGSOFT International Symposium on Foundations of Software Engineering (ESEC/FSE ’03) . Association for Computing Machinery, 128–137. doi:10.1145/940071.940089 [38] Shuyin Ouyang, Jie M. Zhang, Mark Harman, and Meng Wang. 2025. An Empirical Study of the Non-Determinism of ChatGPT in Code Generation. ACM Transactions on Software Engineering and Methodology 34, 2 (2025). doi:10.1145/ 3697010 [39] Reid Pryzant, Dan Iter, Jerry Li, Yin Tat Lee, Chenguang Zhu, and Michael Zeng. 2023. Automatic Prompt Optimization with “Gradient Descent” and Beam Search. In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing . https://arxiv.org/abs/2305.03495 Synapse : Optimizing Agent Skills through Program Repair 23 
+
+[40] Zichao Qi, Fan Long, Sara Achour, and Martin Rinard. 2015. An Analysis of Patch Plausibility and Correctness for Generate-and-Validate Patch Generation Systems. In Proceedings of the 2015 International Symposium on Software Testing and Analysis . Association for Computing Machinery, 24–36. doi:10.1145/2771783.2771791 [41] Gregg Rothermel and Mary Jean Harrold. 1997. A Safe, Efficient Regression Test Selection Technique. ACM Transactions on Software Engineering and Methodology 6, 2 (1997), 173–210. doi:10.1145/248233.248262 [42] Timo Schick, Jane Dwivedi-Yu, Roberto Dessì, Roberta Raileanu, Maria Lomeli, Eric Hambro, Luke Zettlemoyer, Nicola Cancedda, and Thomas Scialom. 2023. Toolformer: Language Models Can Teach Themselves to Use Tools. In Advances in Neural Information Processing Systems , Vol. 36. https://proceedings.neurips.cc/paper/2023/hash/ d842425e4bf79ba039352da0f658a906-Abstract.html [43] Tobias Schnabel and Jennifer Neville. 2024. Symbolic Prompt Program Search: A Structure-Aware Approach to Efficient Compile-Time Prompt Optimization. In Findings of the Association for Computational Linguistics: EMNLP 2024 . 670–686. https://arxiv.org/abs/2404.02319 [44] Ziqiao Shang, Ling-Yue Ge, and Lan-Zhe Guo. 2026. GraphSkillAA: Attribution-Guided Skill-Graph Updating with Targeted Validation and Rollback. arXiv preprint arXiv:2609.20455 (2026). arXiv:2609.20455 [cs.AI] https://arxiv.org/ abs/2609.20455 [45] Prith Sharma and Austin Z. Henley. 2026. Modular Prompt Optimization: Optimizing Structured Prompts with Section-Local Textual Gradients. arXiv preprint arXiv:2601.04055 (2026). https://arxiv.org/abs/2601.04055 [46] Reshabh K. Sharma. 2026. ContextCov: Deriving and Enforcing Executable Constraints from Agent Instruction Files. 
+
+arXiv preprint arXiv:2603.00822 (2026). https://arxiv.org/abs/2603.00822 [47] Reshabh K. Sharma, Jonathan De Halleux, Shraddha Barke, Dan Grossman, and Benjamin Zorn. 2025. PromptPex: Automatic Test Generation for Language Model Prompts. arXiv preprint arXiv:2503.05070 (2025). https://arxiv.org/ abs/2503.05070 [48] Noah Shinn, Federico Cassano, Ashwin Gopinath, Karthik Narasimhan, and Shunyu Yao. 2023. Reflexion: Language Agents with Verbal Reinforcement Learning. In Advances in Neural Information Processing Systems , Vol. 36. Curran Associates, Inc., 8634–8652. doi:10.52202/075280-0377 [49] Edward K. Smith, Earl T. Barr, Claire Le Goues, and Yuriy Brun. 2015. Is the Cure Worse Than the Disease? Overfitting in Automated Program Repair. In Proceedings of the 2015 10th Joint Meeting on Foundations of Software Engineering .Association for Computing Machinery, 532–543. doi:10.1145/2786805.2786825 [50] Rui Sun, Zhi Zheng, Zhenkun Wang, and Zhichao Lu. 2026. GraphSkillEvo: Evolutionary Optimization of Graph-Structured Agent Skills. arXiv preprint arXiv:2609.21749 (2026). https://arxiv.org/abs/2609.21749 [51] Xingyu Tan, Xiaoyang Wang, Qing Liu, Xiwei Xu, Xin Yuan, Liming Zhu, and Wenjie Zhang. 2026. SkillZip: Contract-Preserving Graph Compression for Scalable Agent Skill Libraries. arXiv preprint arXiv:2608.05604 (2026). https: //arxiv.org/abs/2608.05604 [52] Darshan Tank and Baran Nama. 2026. The Regression Tax: Decomposing Why Skills Help and Hurt LLM Agents. 
+
+arXiv preprint arXiv:2607.22520 (2026). https://arxiv.org/abs/2607.22520 [53] Arie van Deursen, Paul Klint, and Frank Tip. 1993. Origin Tracking. Journal of Symbolic Computation 15, 5–6 (1993), 523–545. [54] Vercel. 2026. skills.sh: The Agent Skills Directory. https://skills.sh. All-time installation leaderboard lists 1,489,086 skills. Accessed 24 October 2026. [55] Guanzhi Wang, Yuqi Xie, Yunfan Jiang, Ajay Mandlekar, Chaowei Xiao, Yuke Zhu, Linxi Fan, and Anima Anandkumar. 2024. Voyager: An Open-Ended Embodied Agent with Large Language Models. Transactions on Machine Learning Research (2024). https://arxiv.org/abs/2305.16291 [56] Hanyu Wang, Yifan Lan, Bochuan Cao, Lu Lin, and Jinghui Chen. 2026. SkillGrad: Optimizing Agent Skills Like Gradient Descent. arXiv preprint arXiv:2605.27760 (2026). arXiv:2605.27760 [cs.AI] doi:10.48550/arXiv.2605.27760 [57] Lei Wang, Chen Ma, Xueyang Feng, Zeyu Zhang, Hao Yang, Jingsen Zhang, Zhiyuan Chen, Jiakai Tang, Xu Chen, Yankai Lin, Wayne Xin Zhao, Zhewei Wei, and Jirong Wen. 2024. A Survey on Large Language Model Based Autonomous Agents. Frontiers of Computer Science 18, 6 (2024), 186345. doi:10.1007/s11704-024-40231-1 [58] Zora Zhiruo Wang, Jiayuan Mao, Daniel Fried, and Graham Neubig. 2025. Agent Workflow Memory. In Proceedings of the 42nd International Conference on Machine Learning (Proceedings of Machine Learning Research, Vol. 267) . PMLR, 63897–63911. https://proceedings.mlr.press/v267/wang25bx.html [59] Mark Weiser. 1984. Program Slicing. IEEE Transactions on Software Engineering SE-10, 4 (1984), 352–357. doi:10.1109/ TSE.1984.5010248 [60] Chunqiu Steven Xia, Yinlin Deng, Soren Dunn, and Lingming Zhang. 2025. Demystifying LLM-Based Software Engineering Agents. Proceedings of the ACM on Software Engineering 2, FSE (2025), 801–824. doi:10.1145/3715754 [61] Chunqiu Steven Xia and Lingming Zhang. 2022. Less Training, More Repairing Please: Revisiting Automated Program Repair via Zero-Shot Learning. In Proceedings of the 30th ACM Joint European Software Engineering Conference and Symposium on the Foundations of Software Engineering . Association for Computing Machinery, 959–971. doi:10.1145/ 24 Li et al. 
+
+3540250.3549101 [62] Duling Xu, Zheng Chen, Zaifeng Pan, Jiawei Guan, Dong Dong, Jialin Li, and Bangzheng Pu. 2026. SkillSmith: Compiling Agent Skills into Boundary-Guided Runtime Interfaces. arXiv preprint arXiv:2605.15215 (2026). https: //arxiv.org/abs/2605.15215 [63] John Yang, Carlos E. Jimenez, Alexander Wettig, Kilian Lieret, Shunyu Yao, Karthik Narasimhan, and Ofir Press. 2024. SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering. In Advances in Neural Information Processing Systems , Vol. 37. doi:10.52202/079017-1601 [64] Yifan Yang, Ziyang Gong, Weiquan Huang, Qihao Yang, Ziwei Zhou, Zisu Huang, Yan Li, Xuemei Gao, Qi Dai, Bei Liu, Kai Qiu, Yuqing Yang, Dongdong Chen, Xue Yang, and Chong Luo. 2026. SkillOpt: Executive Strategy for Self-Evolving Agent Skills. arXiv preprint arXiv:2605.23904 (2026). arXiv:2605.23904 [cs.AI] doi:10.48550/arXiv.2605.23904 [65] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik R. Narasimhan, and Yuan Cao. 2023. ReAct: Synergizing Reasoning and Acting in Language Models. In International Conference on Learning Representations .arXiv:2210.03629 [cs.CL] https://arxiv.org/abs/2210.03629 [66] Mert Yuksekgonul, Federico Bianchi, Joseph Boen, Sheng Liu, Pan Lu, Zhi Huang, Carlos Guestrin, and James Zou. 2025. Optimizing Generative AI by Backpropagating Language Model Feedback. Nature 639, 8055 (2025), 609–616. doi:10.1038/s41586-025-08661-4 [67] Qizheng Zhang, Changran Hu, Shubhangi Upasani, Boyuan Ma, Fenglu Hong, Vamsidhar Kamanuru, Jay Rainton, Chen Wu, Mengmeng Ji, Hanchen Li, Urmish Thakker, James Zou, and Kunle Olukotun. 2026. Agentic Context Engineering: Evolving Contexts for Self-Improving Language Models. In International Conference on Learning Representations .https://arxiv.org/abs/2510.04618 [68] Yongchao Zhou, Andrei Ioan Muresanu, Ziwen Han, Keiran Paster, Silviu Pitis, Harris Chan, and Jimmy Ba. 2023. Large Language Models Are Human-Level Prompt Engineers. In International Conference on Learning Representations .https://arxiv.org/abs/2211.01910 
+
+A Implementation Details 
+
+This appendix gives the formal definitions and proofs that the main text summarizes, implementation details of Synapse, the record of the running example, and further analyses of repair outcomes. 
+
+A.1 Formal Definitions 
+
+This subsection restates the definitions of Section 3.2 with all components named. A span [𝛼, 𝛽 )
+
+with 0 ≤ 𝛼 ≤ 𝛽 ≤ | 𝑆 | denotes the substring 𝑆 [𝛼, 𝛽 ) of a skill document 𝑆 . We write [𝛼, 𝛽 ) ⊆ [ 𝛾, 𝜂 ) if 
+
+𝛾 ≤ 𝛼 and 𝛽 ≤ 𝜂 , and the two spans are disjoint if 𝛽 ≤ 𝛾 or 𝜂 ≤ 𝛼 .
+
+SkIR. A SkIR is a tuple 𝐼 = (𝑁 , 𝑃, own , sec , st , attr , Def , Use , gov , mg ), where gov and mg (𝑏 ) = 𝑚 𝑏 
+
+are the maps that the compiler establishes below and 𝑁 is a finite set of instructions, each with text txt (𝑛 ), which retains in full the content not represented in 𝑃 ; 𝑃 = 𝑃 op ⊎ 𝑃 br ⊎ 𝑃 mg is a finite set of program elements, namely operations, branch conditions, and merge points; own : 𝑃 → 𝑁 
+
+maps each element to the instruction from which it was extracted; sec (𝑛 ) is the path of sections that contain 𝑛 ; st : 𝑁 → { full , partial } marks instructions whose requirements are only partly represented by elements of 𝑃 ; attr (𝑛 ) is a finite map from attribute names, such as modality and trigger, to the values that the compiler extracts from txt (𝑛 ); and Def , Use : 𝑃 → 2𝑍 give the data items, drawn from a finite set 𝑍 of recognized data references, that an element defines and uses, with 
+
+Def (𝑝 ) = ∅ for 𝑝 ∉ 𝑃 op . For each branch condition 𝑏 ∈ 𝑃 br that a guard recognizer identifies, the compiler establishes, from instruction boundaries and document order, its merge point 𝑚 𝑏 ∈ 𝑃 mg 
+
+and the operations gov (𝑏 ) ⊆ 𝑃 op that it governs. 
+
+Source map. Let 𝜌 ( · ; 𝜃 𝑛 ) denote the parser’s projection from an instruction’s source span to its text, which removes Markdown syntax such as list markers and line breaks according to the parsing rule 𝜃 𝑛 that produced the instruction. Let 𝑃 src ⊆ 𝑃 contain the program elements that the compiler anchors to a span of text. A source map from 𝐼 to 𝑆 is a function 𝑀 from 𝑁 ∪ 𝑃 src to the spans of 𝑆 such that (i) txt (𝑛 ) = 𝜌 (𝑆 [𝑀 (𝑛 )] ; 𝜃 𝑛 ) for every 𝑛 ∈ 𝑁 ; (ii) 𝑀 (𝑛 ) and 𝑀 (𝑛 ′) are disjoint for distinct 𝑛, 𝑛 ′ ∈ 𝑁 ; and (iii) 𝑀 (𝑝 ) ⊆ 𝑀 (own (𝑝 )) for every 𝑝 ∈ 𝑃 src .Synapse : Optimizing Agent Skills through Program Repair 25 
+
+SkAST construction. SkAST is built from the recognized elements by four rules. (1) A block is an ordered container whose statements are instructions, recognized branch conditions, or nested blocks. Instructions and conditions are translated by rules (2)–(4), and nested blocks are translated recursively by this rule. The block becomes a scope whose body sequences the resulting terms in source order. (2) The operations of an instruction form a sequence in the order of their source anchors. (3) For each branch condition 𝑏 , recognized source syntax determines arm membership. Operations governed by a positive guard such as “if” 𝑏 or “when” 𝑏 enter the true arm, whereas those governed by “unless” 𝑏 or a recognized “else” region of the same branch enter the false arm. A branch condition 𝑏 becomes if 𝑏 then 𝜋 t 
+
+> 𝑏
+
+else 𝜋 f 
+
+> 𝑏
+
+, where 𝜋 t 
+
+> 𝑏
+
+and 𝜋 f 
+
+> 𝑏
+
+sequence the operations in 
+
+gov (𝑏 ) assigned to the true and false arms, respectively. If no operations are recognized for an arm, its term is 𝜖 . These operations are placed within their corresponding arms and removed from the surrounding sequence, and the if takes the position of 𝑏 and is closed by its merge point. (4) An instruction without recognized elements contributes 𝜖 .
+
+A.2 Compilation 
+
+This subsection describes the identifiers, recognition rules, data references, source maps, and sentence splitting of the compiler and closes with a table of its compilation rules. 
+
+Identifiers. Each instruction receives a sequential parsing identifier and a canonical identifier. The canonical identifier is formed by prefixing S to the first 16 hexadecimal characters of a SHA-256 digest over the normalized section path, inferred instruction type, normalized instruction text, and duplicate-occurrence index. Absolute source offsets do not enter this identifier, so an earlier edit that merely shifts an instruction’s span leaves its canonical identity unchanged, whereas changing its normalized text, section, type, or duplicate index may change it. Labels that the initial skill gives to instructions, such as D010 , are retained separately as external provenance. 
+
+Action and condition recognition. Action recognition uses a fixed, word-bounded lexicon over the complete instruction text. The lexicon includes source verbs such as “read” and “load”, selection verbs such as “find” and “choose”, checking and transformation verbs such as “validate” and “normalize”, and output or mutation verbs such as “return” and “patch”. Recognized occurrences produce operations in their order in the text. Instructions beginning with “if”, “when”, “unless”, “in case”, or “for” are classified as conditional. The first three forms additionally expose a trigger when the condition ends at a comma, colon, or “then”. The compiler also recognizes postposed “provided that” and “only if” clauses, whose conditions govern the preceding action. Loop-related words such as “repeat”, “until”, and “while” also affect instruction classification. The authored loop-related requirements remain available in the retained instruction text. Table 5 lists the element types that these rules produce.           
+
+> Table 5. How the compiler represents supported skill content. Text that cannot be fully parsed is preserved and marked as partially parsed.
+> Skill content SkIR element An instruction instruction ( 𝑁 )An explicit operation operation ( 𝑃 op )An explicit condition branch condition ( 𝑃 br )A branch merge merge point ( 𝑃 mg )A recognized data reference data item / def–use relation Unresolved content instruction text with status partial 26 Li et al.
+
+Conditions and data references. A “When to use:” clause conditions the immediately following prose instruction in the same section if it contains a recognized action verb. The clause instruction owns the branch condition and its merge point, and the condition is source-mapped to the clause. A control edge connects the branch to the governed instruction without changing that instruction’s stored trigger or predicate. During compilation, each use of a data item is linked to the most recent preceding definition of the same normalized item in document order. An operation’s uses are processed before its outputs update that producer. The IR-to-AST pass assigns a separate variable to each producer definition and uses these relations to select call arguments. The final def–use edges in 𝐴 ddg are then generated by fixed-point reaching-definitions analysis over the CFG. This analysis joins definitions of the same variable across predecessors, where the pass that builds SkAST from SkIR gives each definition of a data item its own variable. 
+
+Source maps and well-formedness. In addition to offsets, each mapping records the source file, a hash of the source text, and line and column positions. Materialization replaces only the mapped span and leaves all surrounding text, including sibling sentences and Markdown formatting, unchanged byte for byte. For the repair of Section 2.3, recompilation recovers the replacement text, so target recovery holds, and maps the rewritten instruction to its source span. The well-formedness checks verify that every address of the address contract and every data reference resolve, and that the source map satisfies the definition of a source map for the compiled document. Source-map integrity checks validate the source text and hashes, instruction-span bounds and stored offsets, and the links between the canonical identifier, parsing identifier, and imported label of each instruction. 
+
+Sentence splitting and status. Sentence splitting determines the instruction units passed to the recognizers. For ordinary single-line prose, the parser splits a list item or paragraph when con-servative punctuation rules, excluding recognized abbreviations, identify at least two nonempty sentence spans. Otherwise, it retains the entire item or paragraph, as it does for multiline prose, code blocks, and tables. In either case, the resulting instructions retain source spans that anchor them in the document. The compiler then applies its recognizers to each instruction and assigns its status from the semantic evidence found. If no explicit semantic evidence is recognized, the instruction is marked partial , while its authored text remains available through its source span in the partial program view. 
+
+Source-map granularity. Instruction mappings follow the parser’s granularity. Sentence-split instructions receive exact, disjoint sentence spans, for which the projection is the identity, and unsplit instructions retain the source-line intervals consumed by the parser, including any list markers and terminal line separators. Program-element mappings may identify exact textual spans or coarser source anchors, which need not denote independently authored text. The metadata 𝜃 𝑛 
+
+describes the parser’s extraction rule and is not an additional field stored in the source map. Table 6 summarizes the compilation rules of Section 3.2. 
+
+A.3 Analysis Example 
+
+Figure 2 illustrates the analyses on a schematic procedure in which all three relations matter. Each instruction contains a single element, which we identify with the instruction. We write 𝑥 ← 𝑎 (. . . )
+
+for an operation 𝑎 with Def (𝑎 ) = {𝑥 }, and, to show all three relations, give the condition 𝑛 2 two branches and its merge point 𝑛 5 an instruction of its own: 
+
+𝑛 1 : 𝑥 ← read () , 𝑛 2 : available ? , 𝑛 3 : 𝑦 ← 𝑥, 𝑛 4 : 𝑦 ← N/A , 𝑛 5 : merge , 𝑛 6 : return (𝑦 ). (3) In SkAST, 𝑛 3 and 𝑛 4 are the branches of an if on 𝑛 2, followed by 𝑛 6. Figure 2 shows the resulting edges. The CDG connects 𝑛 2 to 𝑛 3 and 𝑛 4, whereas 𝑛 5 and 𝑛 6 postdominate 𝑛 2 and are not control-dependent on it. The DDG connects the return 𝑛 6 to the two assignments that may supply 𝑦 . The Synapse : Optimizing Agent Skills through Program Repair 27              
+
+> Table 6. Compilation rules of SkIR. Each row gives a textual pattern, what the compiler produces from it, and its effect on Def and Use .
+> Pattern in instruction text Element Def /Use Example Word-bounded action from the fixed lexicon operation Source actions define; checking or transformation actions use and define; other actions use “return only the requested value span” Line-initial or postposed conditional, or “When to use:” branch condition, merge point Both have empty Def/Use sets
+> When to use: For tables
+> Loop-related control term instruction classification No independent loop Def/Use rule
+> repeat validation
+> Inline Markdown-code span data item Role determined by the referencing operation
+> Validate ‘report’
+> Other authored content retained instruction text No additional extracted Def/Use sets The units exception of the value-span instruction
+
+condition 𝑛 2 that chooses between them is two hops away in the dependence graphs and so lies outside Rel (𝑛 6). For a patch to the fallback 𝑛 4, the dependence neighbors are 𝑛 2 and 𝑛 6 and the CFG neighbors are 𝑛 2 and 𝑛 5, so Rel (𝑛 4) = {𝑛 2, 𝑛 4, 𝑛 5, 𝑛 6 }, which excludes the alternative assignment 𝑛 3.
+
+A.4 Components 
+
+Table 7 lists the components of Synapse and the procedure, if any, through which the execution agent or the repair model performs them. The repair model explains failures, selects affected instruc-tions, names the source failures, control tests, and boundary tests of a patch, and proposes the target, repair operator, and new content of a typed mutation. The host validates these choices, expands the selected instructions through one-hop CFG/CDG/DDG relations, and retrieves repair tests through runtime instruction coverage. Type checking, source-map materialization, recompilation, test classification, and validation-based acceptance follow fixed rules. 
+
+A.5 Execution Traces 
+
+This subsection describes the address contract, the usage report that the execution agent returns, how the host resolves it into coverage, and when recorded executions are reused. The execution agent receives the authored skill together with a version-specific address contract. The contract preserves public provenance labels, such as D010 for instructions and E101 for dependencies, when available. Otherwise, it assigns deterministic public addresses. Canonical SkIR identifiers are not shown to the execution agent. Alongside its answer, the execution agent is instructed to return a usage report that lists the instruction and dependency addresses it used, optionally supplemented by condition outcomes, operation states, and artifact events. The same execution-address contract and graph_usage schema are used across repair, validation, and held-out tests, and in the matched w/o SkIR ablation. Validation and test traces are not fed back into repair. Held-out test evaluation occurs only after selection. The host resolves instruction addresses against the current SkIR. A 28 Li et al.                                             
+
+> Table 7. Components of Synapse and the procedure, if any, through which the execution agent or the repair model performs them. Steps marked – are performed by the deterministic host.
+> Step By Input →output Compilation, SkAST, CFG, CDG, DDG –skill →SkIR, source map, graphs Execution of a test Execute skill, task input →answer, reported addresses Fault localization –, Diagnose traces, SkIR →suspicious instructions with static context; Diagnose groups failures Repair hypotheses Diagnose localization context, traces →hypotheses anchored to repair targets Patch content Propose hypothesis, current content of target →typed mutation (𝑒, 𝑜, 𝑐 )
+> Affected instructions and boundary tests Diagnose, Propose localization context, repair-test traces →affected instructions and boundary tests Type check, materialization, recompilation –mutation, SkIR, source map →patched skill or rejection Round-trip observation –mutation, rebuilt SkIR →target recovery and stability Choice of 𝑄 Δ–footprint 𝑋 Δ,Rel →one-hop related instructions Test selection, classification, acceptance –𝑄 Δ, source failures, model-selected tests, coverage, outcomes →𝐿 (𝑆 ′), groups A–D, decision
+
+dependency address names a dependency of SkIR, and the host adds the instructions that own its producer and consumer to the coverage. Resolved elements are projected through their ownership to obtain cov (𝜏 𝑖 ) ⊆ 𝑁 . References are resolved individually, so an unresolved reference does not discard the resolved references of the same trace. Traces are bound to the skill and representation versions that produced them. Each patched skill is executed on its selected repair tests 𝐿 (𝑆 ′). A recorded execution is reused only when the skill, its SkIR, the test partition, the execution model, the address contract, and the scoring rule match. 
+
+A.6 Localization and Repair Hypotheses 
+
+This subsection gives the evidence levels of localization, the retrieval tools and repair memory available to the repair model, and the checks on hypotheses and repair boundaries. Synapse retains all failures of the current skill on the repair tests. Diagnose receives a record for every failure and reviews each record exactly once. The repair model determines which failures share a mechanism rather than inheriting a host-defined clustering. Graph witnesses provide evidence for localizing these failures by linking recorded execution facts to candidate source instructions through program relations. A runtime event is an execution record containing the run and task identifiers, the operation and its status, the record’s provenance, and any reported program-element identifier or observed condition, data, or artifact. The host represents runtime events and program elements as typed graph nodes. A registered edge is a relation stored in the host’s graph registry between registered nodes. To connect the execution evidence to the program analyses, cross-representation mappings link corresponding elements in the execution graph, SkAST, CFG, and applicable dependence graphs. The host checks that the witness path is connected by its recorded edges and that these mappings consistently identify the same recognized action and source instruction. These checks establish the structural consistency of the witness, while Synapse : Optimizing Agent Skills through Program Repair 29 
+
+two distinct confidence scores assess the strength of its localization evidence. Binding confidence 
+
+grades the runtime-to-program association according to the event’s provenance, whereas causal confidence grades the failure-specific evidence supporting the candidate localization, such as a recorded requirement violation or contrasting outcomes. The localization levels below use these deterministic, rule-based scores to grade evidence from graph witnesses. Activation contrasts—the difference between activation rates on failing and passing repair tests—help organize the evidence. Diagnose considers all distinct repair targets of the instructions retained by localization, rather than committing to the highest-scoring instruction. Strong evidence comprises requirement violations confirmed by the execution agent or complete graph witnesses with binding and causal confidence at least 0 .9. Medium evidence includes direct runtime usage, complete graph witnesses meeting the 0.6 thresholds but not Strong, and verified missing-capability insertion anchors. The evidence levels are ordered Weak, Medium, and Strong. Synapse uses Medium as the fixed retention threshold and supplies diagnosis with locations that meet or exceed it and have valid source mappings and mutation authorization. For each affected instruction of a hypothesis ℎ, the edit context Γ𝑡 (ℎ)
+
+contains its exact text, source-linked representation, incident one-hop CFG/CDG/DDG relations, runtime usage statistics, and repair-test executions whose runtime facts overlap the instruction. The repair model can retrieve further failure records through a retrieval tool, read_train_ evidence , which returns the input, answer, reference answer, trace, the instructions to which the trace resolves, and the related instructions and graph relations. Each repair-model request supports one batched retrieval turn. After the model selects affected instructions, the host supplies an index of the earlier patches to these instructions. The index records original target IDs together with available canonical IDs rebuilt from the edited source span, so that earlier repair outcomes can be linked to the corresponding instructions across skill versions. Through a second tool call, the model can inspect earlier edits, fixed and broken tests, preserved and unresolved cases, and repair-boundary observations. The history does not determine the initial grouping of failures. Hypotheses have fields for the proposed mechanism, supporting failure records, and affected canonical instruction identifiers. The repair model also returns a review that accounts for every failure exactly once. The host verifies that supporting failures belong to the current failure set and that affected instructions belong to the supplied set of candidate instructions. Each hypothesis is validated independently, so an invalid hypothesis does not remove valid ones. The suspicious instructions are derived from repair targets that the traces cover, that have valid source mappings, and that admit at least one repair operator, including insertion anchors. Each target retains its supporting evidence and source-linked authored instruction. There is no fixed hypothesis-count limit. Each hypothesis that calls for an edit receives a separate call of Propose, which returns at most one patch for it. A proposal may coordinate edits to multiple interacting instructions. During generation, the model also supplies a repair_boundary , which consists of an activation condition, the intended behavior change, behavior to preserve, relevant interactions with other instructions, and repair-test expectations labeled repair , boundary , or 
+
+preserve . The host validates the referenced test identities, includes these tests in local screening, and records their paired before/after outcomes for subsequent repair iterations. 
+
+A.7 Patch Construction 
+
+This subsection describes how the host turns a proposal into a typed mutation and materializes it, the preconditions of each repair operator, and the request sent to Propose. The host supplies the selected instructions, their one-hop graph context, the repair tests whose traces cover them, the earlier patches to them, and the legal edit options available at each target. Using this information, the model chooses an instruction identifier, a supplied operator, and replacement content satisfying that operator’s schema. The host then matches this choice to a precomputed edit option and constructs 30 Li et al. 
+
+the typed mutation, which fixes its canonical target, the current state of that target, its evidence references, and the source span it may change. It checks that the before-state agrees with the current representation and that the replacement satisfies the operator schema. Finally, it applies the validated mutation to a copy of the current representation and uses the source map to serialize the updated content within the authorized mapped span. Materialization constructs 𝑆 ′ = 𝑆 𝑡 [0, 𝛼 ) · 𝑐 ′ · 𝑆 𝑡 [𝛽, |𝑆 𝑡 |) ,where [𝛼, 𝛽 ) is that span and 𝑐 ′ is the serialized replacement, so the prefix and suffix are unchanged. The formal SkIR models instructions, program elements, and their Def and Use sets. Within this representation, typed attributes support targeted edits. MODIFY_ATTRIBUTE updates an instruction’s 
+
+modality (MUST , SHOULD , MAY , or NEVER ), while MODIFY_CONSTRAINT updates its modality and optionally the trigger of an existing conditional instruction. For these edits, the host derives the updated content from the original text by changing only the corresponding marker or condition. The same operator set also supports instruction insertion through ADD_NODE , at the end of the anchor’s mapped span, and deletion through REMOVE_NODE , over the target’s mapped span. For a relation edit, the host designates a resolved source-mapped instruction as the instruc-tion that states the relation and fixes its canonical identifier in the edit option. When resolving this anchor from the relation itself, the host uses the recorded source instruction or a uniquely resolved common instruction of its endpoints. The model then supplies the manifestation text, with which the host rewrites the designated instruction. On this basis, the host constructs Opt 𝑡 (𝑒 )
+
+from the edit operators whose target, source authority, and typed preconditions hold in the current representation. For instruction edits, MODIFY_NODE and REMOVE_NODE require an existing editable in-struction with a mapped source span, while ADD_NODE requires an authorized insertion boundary at a mapped anchor. MODIFY_ATTRIBUTE and MODIFY_CONSTRAINT additionally require a new modal-ity from {MUST , SHOULD , MAY , NEVER }. When the instruction has an existing condition representa-tion, MODIFY_CONDITION supports a source-representable trigger change, and MODIFY_CONSTRAINT 
+
+may include such a change with its modality update. For relation edits, every option fixes the manifestation instruction and supplies the permitted endpoint, dependency-kind, and data-item do-mains. Within these domains, ADD_RELATION requires a new relation, whereas REMOVE_RELATION ,
+
+MODIFY_RELATION , and CHANGE_DEPENDENCY require a uniquely identified existing relation with a matching before-state. The replacement relation, where applicable, must satisfy the supplied typed domains, and its manifestation text must be attached to the fixed instruction. Table 8 lists the repair operators, and Figure 3 shows the request for one call of Propose. 
+
+A.8 Round-Trip Consistency 
+
+With explicit offsets, Lemma 3.10 states the following. Suppose the nonempty intervals in EΔ are pairwise disjoint and no insertion position lies strictly inside one of these intervals. Let [𝛾, 𝜂 ), with 
+
+𝛾 < 𝜂 , be an unedited source fragment, that is, every edit satisfies 𝛽 𝑗 ≤ 𝛾 or 𝛼 𝑗 ≥ 𝜂 . Then 𝑆 𝑡 [𝛾, 𝜂 )
+
+occurs unchanged in 𝑆 ′ at [𝛾 + 𝛿, 𝜂 + 𝛿 ), where 
+
+𝛿 =∑︁  
+
+> 𝛽 𝑗 ≤𝛾
+
+ |𝑐 ′ 
+
+> 𝑗
+
+| − ( 𝛽 𝑗 − 𝛼 𝑗 ).
+
+An insertion at 𝛾 is included in this shift, whereas one at 𝜂 is not. Proof of Lemma 3.10. Each edit interval or insertion position lies entirely before or after the fragment, so by the materialization equation applying that edit copies every character of the fragment unchanged. An edit ending at or before 𝛾 shifts the fragment by |𝑐 ′ 
+
+> 𝑗
+
+| − ( 𝛽 𝑗 − 𝛼 𝑗 ), and an edit starting at or after 𝜂 does not shift it. Materialization applies the edits in descending order of their start offsets and breaks ties by descending end offset, so that a nonempty replacement precedes an insertion at the same position. Under the stated non-overlap conditions, each edit Synapse : Optimizing Agent Skills through Program Repair 31 
+
+Table 8. Repair operators. Each row gives the operators, the kind of target they apply to (an instruction, a branch condition, a dependency, or an insertion anchor), the new content they require, and their effect on SkIR and on the skill text. 
+
+Operator Target New content Effect on SkIR and on the text 
+
+MODIFY_NODE Instr instruction text replaces the instruction’s text and recompiles its extracted elements 
+
+MODIFY_ATTRIBUTE Instr modality changes the instruction’s modality and rewrites its authored modality expression 
+
+MODIFY_CONDITION Cond condition text rewrites an existing instruction trigger and recompiles the corresponding branch and merge structure 
+
+MODIFY_CONSTRAINT Instr modality, optional trigger changes the modality and optionally the trigger of a conditional instruction 
+
+ADD_RELATION ,
+
+REMOVE_RELATION ,
+
+MODIFY_RELATION ,
+
+CHANGE_DEPENDENCY 
+
+Dep authored manifestation text; relation specification for addition or replacement adds, removes, or replaces a canonical dependency and rewrites its designated manifestation instruction 
+
+ADD_NODE Anchor instruction text inserts a new instruction after the anchor instruction’s source span 
+
+REMOVE_NODE Instr none deletes the instruction and its source span; dependencies are rebuilt from the resulting text 
+
+Task Propose one typed patch for the repair hypothesis, using only the listed edit options. 
+
+Hypothesis ⟨failure mechanism ⟩, ⟨supporting failing repair tests ⟩, ⟨affected instructions ⟩
+
+Instruction Relevant instruction text; available local graph facts and related instruction text; usage statistics on current repair tests; and legal edit options with their content schemas. 
+
+Evidence ⟨related failing and passing repair tests of the current skill: input context, answer, reference, outcome ⟩
+
+Memory ⟨node-linked repair memory: earlier patches and their paired repair-test outcomes ⟩
+
+Tools read_train_evidence , read_repair_memory , and inspect_train_resources , as available (at most one optional batched retrieval turn). 
+
+Output node_id , operation , and replacement for each edit, with a required repair_boundary :activation condition, intended change, behavior to preserve, interacting instructions, and a required train_expectations list, which may be empty. Each expectation names a repair test, an expected behavior, and a role repair , boundary , or preserve .
+
+Fig. 3. Structure of the request for one call Propose (ℎ, Γ𝑡 (ℎ)) , which carries the edit context of hypothesis ℎ.Angle brackets mark content that the host fills in from the hypothesis, the traces, and repair memory. 
+
+applied later in the descending order ends at or before the start of every edit applied earlier, so each edit is applied at its original source coordinates. The resulting shifts therefore compose to give the stated sum. □
+
+Definition A.1 (Round-trip consistency). Let (𝐼 ′′ , 𝑀 ′′ ) = C( 𝑆 ′). The patched skill 𝑆 ′ is round-trip consistent if (a) (𝐼 ′′ , 𝑀 ′′ ) passes the well-formedness checks; (b) each mutation passes its operator-specific reconstruction check ( target recovery ), that is, text and attribute edits recover the requested 32 Li et al. 
+
+instruction content and fields, insertions and deletions establish the intended structural change, and relation edits recover the requested relation changes in the recompiled representation; and (c) each instruction that is neither rewritten nor removed, including an insertion anchor, retains a counterpart with the same canonical identifier and the same text, modality, trigger, predicate, node type, semantic role, section path, code-block status, and referenced-assets list ( stability ). Target recovery does not require an edited instruction to keep its canonical identifier. Synapse enforces (a) before any test runs and records the outcomes of (b) and (c) as round-trip observations. Stability does not follow from edit locality alone, because recompilation also segments the text and assigns each instruction its syntactic class, such as single-line prose, multiline prose, code block, or table, and its section. We call C segmentation-local for a patch if every instruction outside 𝑋 Δ is reparsed at its shifted source span with the same boundaries, syntactic class, local source-to-text projection, and section assignment. Within a fixed syntactic class, an attribute is context-free if C
+
+computes it from the instruction’s text and section alone. Modality, trigger, predicate, instruction type, semantic role, and referenced assets are context-free in this sense. Code-block status follows from the syntactic class. Canonical identifiers additionally depend on preceding occurrences of the same normalized section, instruction type, and text. Lemma A.2 (Stability of context-free attributes). Suppose the source edits satisfy the non-overlap conditions of Edit locality, every source span 𝑀 𝑡 (𝑛 ) for 𝑛 ∉ 𝑋 Δ is an unedited fragment as defined above, and C is segmentation-local for the patch. Then each such instruction has a counterpart in 𝐼 ′′ with the same text, section, syntactic class, and context-free attributes. 
+
+Proof. Edit locality preserves the characters of 𝑀 𝑡 (𝑛 ) at its shifted position. Segmentation-locality preserves the instruction’s boundaries, syntactic class, local source-to-text projection, and section assignment. Applying that same projection to the preserved characters therefore recovers the same instruction text. Each context-free attribute is a function of this text and section within the preserved syntactic class, so its value is unchanged. □
+
+The occurrence-dependent canonical identifier remains subject to the stability check after re-compilation, and it does not follow from preservation of the context-free attributes. 
+
+A.9 Test Selection and Iteration 
+
+This subsection states the properties of Section 3.7 as a theorem and proves it together with Proposition 3.13. To separate what the host decides from what the LLMs return, Figure 4 restates one iteration of Algorithm 1 as inference rules. Of the premises of the rules, only the results of the three procedures depend on the LLMs. These are the hypotheses 𝐻 returned by Diagnose in line 3, the patch that Propose returns for a hypothesis ℎ ∈ 𝐻 , and the answers of Execute calls, from which the host computes 𝑅 target (𝑆 ′) and 𝐽 𝐷 val . T-Patch types a mutation against the current SkIR. The target must exist in 𝐼 𝑡 with the operator’s expected kind, the host must offer the operator at that target ( Opt 𝑡 (𝑒 )), and the new content must satisfy the operator’s schema. A coordinated patch Δ is well typed, written 𝐼 𝑡 ⊢ Δ ok , if 𝐼 𝑡 ⊢ Δ𝑗 ok holds for each of its mutations Δ𝑗 and their edits rewrite, delete, or insert after distinct instructions. Cand materializes a well-typed patch and requires the recompiled SkIR to be well formed, Screen keeps the patched skills that fix a source failure, and Accept and Keep choose the next skill from the validation outcomes of the shortlist 
+
+Top of at most 𝐾 screened patched skills. Theorem A.3 (Guarantees of an iteration). Suppose that C( 𝑆 𝑡 ) is well formed and 𝑆 𝑡 =⇒ 𝑆 𝑡 +1.For all results of Execute, Diagnose, and Propose, (i) C( 𝑆 𝑡 +1) is well formed; (ii) if Accept applies, 
+
+𝑆 𝑡 +1 is obtained from 𝑆 𝑡 by one well-typed patch Δ, and the source span 𝑀 𝑡 (𝑛 ) of every instruction 
+
+𝑛 ∉ 𝑋 Δ occurs unchanged in 𝑆 𝑡 +1, shifted by the edits that precede it; and (iii) the recorded validation pass rates satisfy 𝐽 𝐷 val (𝑆 𝑡 +1) ≥ 𝐽 𝐷 val (𝑆 𝑡 ), strictly if Accept applies. Synapse : Optimizing Agent Skills through Program Repair 33 
+
+𝑒 : 𝜅 in 𝐼 𝑡 𝑜 : 𝜅 ⇒ 𝜎 𝑜 ∈ Opt 𝑡 (𝑒 ) 𝑐 : 𝜎 𝐼 𝑡 ⊢ ( 𝑒, 𝑜, 𝑐 ) ok T-Patch 𝑆 𝑡 ⊢ 𝑆 ′ cand 𝑅 target (𝑆 ′) > 0
+
+𝑆 𝑡 ⊢ 𝑆 ′ screened Screen 
+
+ℎ ∈ 𝐻 (Δ, 𝐹 Δ, 𝐶 Δ, 𝐵 Δ) ∈ Propose (ℎ, Γ𝑡 (ℎ)) 
+
+𝐼 𝑡 ⊢ Δ ok 𝑆 ′ = Materialize (ApplyMutation (𝐼 𝑡 , Δ), 𝑀 𝑡 ) C( 𝑆 ′) well formed 
+
+𝑆 𝑡 ⊢ 𝑆 ′ cand Cand 
+
+𝑆 ′ ∈ Top 𝐽 𝐷 val (𝑆 ′) > 𝐽 𝐷 val (𝑆 𝑡 ) ∀𝑆 ′′ ∈ Top . 𝐽 𝐷 val (𝑆 ′′ ) ≤ 𝐽 𝐷 val (𝑆 ′)
+
+𝑆 𝑡 =⇒ 𝑆 ′ Accept 
+
+∀𝑆 ′ ∈ Top . 𝐽 𝐷 val (𝑆 ′) ≤ 𝐽 𝐷 val (𝑆 𝑡 )
+
+𝑆 𝑡 =⇒ 𝑆 𝑡 
+
+Keep 
+
+Fig. 4. Rules of one repair iteration. 𝐻 is the set of hypotheses returned by Diagnose (Λ𝑡 ) that pass the host’s checks, and Top holds at most 𝐾 skills 𝑆 ′ with 𝑆 𝑡 ⊢ 𝑆 ′ screened, ranked as described in Section 3.6, and Accept takes the first in this order among those with the highest 𝐽 𝐷 val . 𝑅 target (𝑆 ′) and 𝐽 𝐷 val are recorded outcomes, and 𝐽 𝐷 val (𝑆 𝑡 ) is the recorded validation pass rate that the iteration receives with 𝑆 𝑡 .
+
+Part (ii) rests on Edit locality and on the disjointness of source spans, and the other parts follow from the rules and Algorithm 1. Proof of Proposition 3.13. The relation Rel is symmetric. For 𝑚 ≠ 𝑛 , 𝑚 ∈ Rel (𝑛 ) holds iff some 𝑝 with own (𝑝 ) = 𝑛 and 𝑞 with own (𝑞 ) = 𝑚 satisfy 𝑞 ∈ Nbr (𝑝 ), and Nbr is symmetric by definition, so 𝑛 ∈ Rel (𝑚 ). For (i), let 𝑖 ∉ 𝐿 (𝑆 ′). Then 𝑖 ∉ 𝑇 (𝑋 Δ ∪ 𝑄 Δ), so no instruction in cov (𝜏 𝑖 )
+
+lies in 𝑋 Δ ∪ 𝑄 Δ. Suppose some 𝑢 ∈ 𝑋 Δ lies in Ctx 𝑡 (𝑖 ), that is, 𝑢 ∈ Rel (𝑣 ) for some 𝑣 ∈ cov (𝜏 𝑖 ). By symmetry, 𝑣 ∈ Rel (𝑢 ) ⊆ 𝑋 Δ ∪ 𝑄 Δ, a contradiction. Hence 𝑋 Δ ∩ Ctx 𝑡 (𝑖 ) = ∅, and one-hop locality for Δ gives the claim. For (ii), if 𝑖 ∉ 𝐿 0 (𝑆 ′), then 𝑋 Δ ∩ cov (𝜏 𝑖 ) = ∅, and coverage locality for Δ gives the claim. For the negative part, let 𝑢 ∈ 𝑋 Δ be an instruction whose text Δ rewrites or deletes, let 𝑣 ∈ Rel (𝑢 ) \ 𝑋 Δ, and let 𝑖 be a repair test outside 𝐹 Δ ∪ 𝐶 Δ ∪ 𝐵 Δ whose trace covers 𝑣 but no instruction of 𝑋 Δ. Consider an execution agent whose outcome on each test 𝑗 depends only on the text of the instructions in Ctx 𝑡 ( 𝑗 ). It is one-hop local for Δ, because Δ leaves the source text of every instruction outside 𝑋 Δ unchanged (Theorem A.3(ii) and Edit locality). Yet 𝑣 ∈ cov (𝜏 𝑖 ) and, by symmetry, 𝑢 ∈ Rel (𝑣 ), so 𝑢 ∈ Ctx 𝑡 (𝑖 ), and the rewritten or deleted text of 𝑢 may change the outcome of 𝑖 , although 𝑖 ∉ 𝐿 0 (𝑆 ′). □
+
+Proof of Theorem A.3. If Keep applies, (i)–(iii) hold trivially. Otherwise Accept gives 𝑆 𝑡 +1 ∈
+
+Top , so by Screen and Cand, 𝑆 𝑡 +1 is the materialization of some Δ with 𝐼 𝑡 ⊢ Δ ok and C( 𝑆 𝑡 +1) is well formed, which is (i). For (ii), the premises of Edit locality hold for Δ. By the typing of coordinated patches, the mutations of Δ target distinct instructions; materialization rewrites or deletes the source span of each authored target, or inserts at the end of an anchor’s span; and the source map gives distinct instructions disjoint spans (Definition 3.4(ii)). Hence the nonempty edit intervals are pairwise disjoint, no insertion position lies strictly inside one of them, and 𝑀 𝑡 (𝑛 ) is an unedited fragment for every 𝑛 ∉ 𝑋 Δ, so Edit locality applies. Part (iii) is the second premise of Accept, with the outcomes of 𝑆 𝑡 +1 carried over to the next iteration. □
+
+The repair-boundary tests 𝐵 Δ are the tests that the repair model labels boundary to probe cases at the edge of the change. The host deduplicates the selected repair tests and orders them according to the frozen repair split. The repair model names source failures, control tests, and boundary tests, and the host validates these tests, determines the footprint 𝑋 Δ, and computes 𝑄 Δ. Section 2.3 34 Li et al. 
+
+illustrates these tests for the running-example patch, and Appendix A.10 gives its provenance. Patched skills with an empty 𝐿 (𝑆 ′) are removed before validation. A patched skill is in group A
+
+if 𝑅 target > 0 and it has no regression; B if 𝑅 target > 0 and it has regressions but more fail-to-pass tests than regressions; C if 𝑅 target > 0 and it has no more fail-to-pass tests than regressions; and D
+
+if 𝑅 target = 0. Patches in D are discarded, and the rest are ordered A before B before C. Within a group, patches are ordered by a larger excess of fail-to-pass tests over regressions, then by more fail-to-pass tests, then by fewer regressions. Remaining ranking ties are broken by the identifiers of the patched skills in the run log, in ascending lexicographic order. If several patched skills satisfy the acceptance rule, Synapse accepts the one with the highest validation pass rate. Equal rates are resolved by their order in the shortlist Top . The initial skill is evaluated on all repair tests. An accepted patched skill becomes 𝑆 𝑡 +1. If another iteration remains, that iteration starts by evaluating the new skill on all repair tests to obtain its version-specific traces. If the current skill is retained, its previously computed full-suite report is reused. Earlier patch outcomes remain available to the repair model through node-linked repair memory. 
+
+A.10 Case Study Provenance 
+
+This subsection gives the identifiers behind the case study of Section 4.5. The turnover ques-tion is DocVQA question 15094 . The patch is r0-c1 , a single MODIFY_NODE rewrite of instruc-tion S94e07a875c83510a , labeled D010 in the initial skill. The supplied CDG context links the value/count/page condition S079d0e6ec05dc1f4 to that instruction through true_control , and the CFG links the edited instruction to S414bf500cbf5fe15 , the similar-nearby-strings condition, through sequential . The host uses the latter condition’s saved coverage to include tests beyond those directly covering the edited instruction. The instruction, generation request and response, local comparison, and acceptance record belong to the DocVQA run recorded in the repair logs as run-096f00aabdc74c16a4fa2150f24aa9fb , which uses the GPT-6 Sol snapshot gpt-6-sol-2026-09-22 as its execution model. Its saved evaluation records the complete turnover answer of Table 4. The recorded skill hashes bind the repair and comparisons to the corresponding versions. 
+
+A.11 Patch Quality in Archived Trajectories 
+
+Beyond the two repair runs of the repair mechanism analysis, we examine archived repair tra-jectories to compare patches before and after selection. This archive, which mixes trajectories from several versions of Synapse, contains 201 evaluated patches and 20 accepted patches from 13 trajectories with improved final test scores. Table 9 compares all evaluated patches with the subset of accepted patches. The columns summarize sets of patches and their repair-test outcomes rather than paired before-and-after evaluations of the same tests. Accepted patches more often fix the failing tests that motivated them. Of the accepted patches, 95.0% fix at least one source failure, compared with 48.8% of all evaluated patches, and they fix 68.4% of their source failures, compared with 40.6% overall. The archive includes one trajectory that accepted a group-D patch, whereas the current selection rule excludes such patches before validation. Because Screen admits only patches that fix at least one target test, the higher target-repair rate of accepted patches partly follows from the selection rule, and because the archive keeps only trajectories whose final test scores improved, these rates describe successful runs rather than all runs. At the same time, 94.6% of previously passing repair tests still pass under accepted patches, which also keep 92.6% and 93.3% of their declared control and boundary tests passing. These controls are repair tests declared with the preserve or boundary role (Appendix A.6). Only evaluated controls that passed under the parent skill enter these rates. The preservation rates differ less between the two sets than the repair rates (94.6% versus 93.1%, 92.6% versus 87.5%, and 93.3% versus 92.8%). Synapse : Optimizing Agent Skills through Program Repair 35 
+
+Table 9. Repair-test outcomes (%) for all 201 evaluated patches and the 20 accepted patches in 13 archived DocVQA and LiveMath repair trajectories with improved final test scores. Rates pool the corresponding counts across records. Control rows include only declared and evaluated controls that passed under the parent skill. 
+
+Measurement All patches Accepted patches Patches fixing at least one source failure 48.8 95.0 Source failures fixed 40.6 68.4 Previously passing repair tests still passing 93.1 94.6 Declared control tests still passing 87.5 92.6 Declared boundary tests still passing 92.8 93.3
