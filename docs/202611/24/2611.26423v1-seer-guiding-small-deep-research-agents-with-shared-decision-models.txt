@@ -1,0 +1,2209 @@
+Seer: Guiding Small Deep-Research Agents with Shared Decision Models
+Yuhao Zhou1, Yang Zhou1, Yuanxi Li2, Jindi Lv1, Dan Si3, Qing Ye1, Jiancheng Lv1*
+1Sichuan University
+2University of Illinois at Urbana-Champaign
+3Lenovo Group Limited
+Abstract
+Deep-research agents repeatedly decide what to search, read,
+and verify, often using large cloud-hosted language models
+for action proposal. However, privacy and local control moti-
+vate running agents on users’ devices, where limited memory
+and compute favor smaller models and complicate on-device
+training. Yet inference-time guidance faces three obstacles:
+exploring alternatives through real execution adds tool calls,
+prompted self-evaluation is bounded by the agent’s judgment,
+and model-specific guidance risks repeated adaptation costs.
+We introduce Seer, an inference-time framework providing
+local guidance that separates the agent’s action proposal
+from learned consequence prediction and value estimation.
+From a shared corpus of real research trajectories, we train
+two models: a tool-response simulator on observed call–
+response pairs and a value estimator on histories labeled
+with discounted terminal correctness. The simulator and es-
+timator are trained offline and reused across agents without
+further training. Moreover, Seer executes only the selected
+action and adds only real tool responses to the commit-
+ted history, avoiding tool calls on discarded candidates at
+additional inference cost. Across multiple deep-research
+benchmarks, Seer substantially improves agent performance
+for different language models. For instance, GAIA accu-
+racy rises from 13.6% to 41.7% for Qwen3.5-4B and from
+22.3% to 50.5% for Qwen3.5-9B. Furthermore, our analy-
+ses suggest that broader candidate coverage can compen-
+sate for imperfect simulation, while prediction and scoring
+errors limit the benefits of wider imagined search. These
+findings highlight the potential of reusable models for pre-
+diction and evaluation to strengthen small research agents
+through extra local computation without the real execution
+of the discarded candidates.
+1. Introduction
+Deep-research agents use language models to decide what to
+search, read, and verify, integrating evidence across sources
+to answer complex questions [64]. In practice, OpenAI
+Deep Research [43] and Gemini Deep Research [11] offer
+*Corresponding author: Jiancheng Lv.
+multi-step web investigation and source-linked reports, while
+open efforts such as DeepResearcher [65] and Tongyi Deep-
+Research [53] advance research on sustained information
+seeking. Meanwhile, benchmarks from GAIA’s real-world
+reasoning and tool-use questions [39] to BrowseComp’s chal-
+lenging web information-seeking tasks [58] evaluate agents’
+ability to gather and integrate evidence.
+For users applying these capabilities to sensitive tasks,
+keeping an agent’s reasoning and decision-making on-device
+offers greater local control, a motivation reflected in privacy-
+oriented personal assistants [2]. However, deploying these
+agents on users’ devices requires managing both local com-
+putational resources and external tool-use costs. Memory
+and compute constraints favor smaller language models [4],
+while tool-call fees make repeated searches and page re-
+trievals an additional deployment expense [34].
+Under these constraints, training small models specifi-
+cally for research is a natural way to improve agent perfor-
+mance. However, collecting training data and optimizing
+each model require additional resources, making repeated
+adaptation costly for resource-constrained deployments. In-
+stead, inference-time methods offer an alternative by improv-
+ing agent decisions without updating the deployed model.
+Specifically, output-level refinement [56, 57, 63] selects
+or revises completed answers but cannot redirect actions
+already executed. Decision-level evaluation [28, 59, 60, 66]
+guides intermediate choices through search or learned critics,
+but evaluating branches through real execution incurs tool
+costs even for discarded candidates. Model-based looka-
+head [5, 21, 24] reduces this overhead by evaluating pre-
+dicted consequences before execution. To avoid shifting
+adaptation costs to supporting components, such guidance
+should transfer across agent models without retraining. Yet
+approaches relying on the agent’s model for prompted pre-
+diction and scoring remain bounded by its capabilities [55].
+Figure 1 summarizes these limitations. The challenge is
+therefore to provide reusable guidance that strengthens small
+agents without model-specific retraining or the real execu-
+tion of discarded candidates.
+We introduce Seer, an inference-time framework provid-
+ing local guidance in deep research. Our key idea is to decou-
+ple action proposal from tool-response prediction and value
+1
+arXiv:2611.26423v1  [cs.AI]  19 Nov 2026
+
+
+(a) High error rate.
+(b) Biased revision.
+(c) Additional tool costs.
+(d) Limited generalization across agent models.
+Figure 1. How can we provide reusable guidance that strengthens small agents without model-specific retraining or the real execution of
+every discarded candidate?
+estimation to enable reusable guidance across agents. From
+a shared corpus of real research trajectories collected across
+tasks and agents, we train two models: a tool-response simu-
+lator on observed call–response pairs and a value estimator
+on interaction histories labeled with discounted terminal cor-
+rectness. These complementary supervision signals teach
+the simulator to predict what an action may reveal and the
+estimator to assess how the resulting history relates to even-
+tual task success. The simulator and estimator are trained
+offline and shared across agents powered by different mod-
+els. Deployment requires neither updating the agent’s model
+nor retraining the simulator or estimator. Specifically, at
+inference, the agent proposes candidate actions, the simu-
+lator predicts their tool responses, and the estimator scores
+the resulting imagined histories to guide action selection.
+Seer executes only the selected action and adds real tool
+responses to the committed history. Candidate evaluation
+therefore uses additional inference computation rather than
+real tool calls on discarded alternatives, while the agent re-
+tains real rather than simulated responses as evidence. Our
+contributions are threefold.
+1. We propose Seer, an inference-time framework that decou-
+ples action proposal from shared tool-response prediction
+and history-level value estimation across agents. This de-
+sign enables reusable guidance for frozen agents without
+any model-specific retraining or the real execution of the
+discarded candidates.
+2. We develop a shared training pipeline that collects real
+trajectories across agents and tasks through Monte Carlo
+branching on existing datasets. The resulting large-scale
+training corpus provides complementary supervision: ob-
+served call–response pairs for the simulator and history
+prefixes labeled with discounted terminal correctness for
+the value estimator.
+3. Experiments with different models across extensive
+benchmarks demonstrate substantial gains for small
+agents, with benefits extending to larger-model settings.
+Ablations and analyses reveal the trade-off between can-
+didate coverage and imperfect prediction and scoring.
+2. Related Work
+Research agents and tool use.
+Research agents cou-
+ple a language model’s parametric knowledge with infor-
+mation acquired through tools: WebGPT [41] combines
+browser-assisted question answering with human feedback,
+ReAct [62] interleaves reasoning with actions, and Tool-
+former [48] learns when to invoke APIs from self-supervised
+examples. Within this setting, the task determines which
+observations matter: an agent must judge which query or
+goal-conditioned page visit is likely to reveal useful evi-
+dence, which creates two deployment costs—the local com-
+pute to run the model and the external tool calls to gather
+evidence. Quantization [32], context management [55], and
+tool budgeting [34] address deployment costs, while compact
+research agents [6, 30, 54] target research capability. Distil-
+lation [1, 20] and reinforcement learning [27, 65] strengthen
+the agent’s model but require optimization for each adapted
+model. Seer instead trains reusable decision models, com-
+plementing these efficiency-oriented approaches without up-
+dating or retraining the deployed agent.
+Inference-time guidance. Guidance can act on com-
+pleted outputs or intervene at intermediate decisions, and the
+distinction matters because producing a candidate answer
+may already consume substantial tool calls. Output-level
+methods select or revise solutions: self-consistency [57]
+aggregates independently sampled reasoning paths, Self-
+Refine [38] alternates generation with feedback, and learned
+verifiers [12] score candidates, with asymmetric verifica-
+tion [63] allocating a modest verification budget to select
+2
+
+
+among expensive search trajectories. These methods cannot
+recover tool calls already spent on discarded trajectories,
+as our BoN@4 and AV@4 baselines illustrate. Decision-
+level methods intervene earlier: Tree of Thoughts [61] ex-
+plores intermediate reasoning states with self-evaluation,
+Reflexion [50] uses verbal feedback from earlier attempts,
+LATS [66] and web-agent tree search [28] combine search
+with environmental feedback, and AgentRM [59] learns
+a transferable reward model. Process-supervision evalua-
+tors [9, 31, 36, 60] further supply learned ranking signals,
+but branches explored through real interaction still incur tool
+calls even when discarded, and prompted self-evaluation
+depends on the agent’s judgment.
+Model-based lookahead. A learned or prompted world
+model can instead predict aspects of a candidate’s outcome
+before execution. Dyna [52] integrates real experience with
+model-based planning, MuZero [49] learns latent dynamics
+together with planning-relevant predictions, and Dreamer-
+style agents [23, 26] train behavior from imagined rollouts;
+for language agents, DreamGym [8] and DynaWeb [14] use
+predicted experience to train the agent itself. At inference
+time, RAP [24] repurposes an LLM as a world model within
+tree search, while WMA [5] and WebDreamer [21] learn
+transition predictions for web navigation; SiRA [13] plans
+with natural-language belief states, and MCP-Cosmos [18]
+couples world models with tool interfaces. However, pre-
+dicted experience in these works either trains the agent or
+guides a single navigation decision, and avoiding real candi-
+date execution does not by itself ensure that both prediction
+and evaluation transfer across agent models without retrain-
+ing. To enable this reuse, Seer separates call-level response
+prediction and history-level evaluation from the agent model,
+training the evaluator on discounted terminal correctness
+and reusing both checkpoints across agents. It executes only
+the selected action and retains real responses as evidence,
+trading additional local inference for candidate comparison
+without tool calls on discarded candidates.
+3. Problem Formulation
+Given a request q, a deep-research agent G uses a language
+model to decide what to search, read, and verify, integrat-
+ing evidence across sources to produce an answer or report
+ˆa [64]. During a run, the agent maintains a committed in-
+teraction history st, which initially contains q and the agent
+instructions. At round t, it uses this history to select an ac-
+tion at that either submits a final answer without tool calls
+or issues one or more tool calls. To describe this choice
+mathematically, let πG(· | st) denote the agent’s distribution
+over actions given the current history.
+Let E denote the real tool-execution operator, which in-
+vokes the tools specified in at with their arguments in the
+current external environment and returns the responses ot.
+Action selection and the history update for a nonterminal
+interaction are then written as
+at ∼πG(· | st),
+ot = E(at),
+st+1 = st ⊕(at, ot), (1)
+where ⊕denotes concatenation. Thus, the next action is
+selected using a history that includes the previous history, the
+selected action, and its real tool responses. A final-answer
+submission instead terminates the run with ot = ∅.
+We denote the full execution record by ξ and assess
+its outcome using a task-dependent terminal quality score
+Rterm(ξ; q) ∈[0, 1]. For the question-answering tasks con-
+sidered here, this score is 1 for a correct final answer and
+0 otherwise, including unanswered tasks. Gold answers
+are used only for evaluation and offline supervision, not for
+inference-time decisions. For requests q ∼D drawn from
+the task distribution and traces ξ generated by G through real
+tool interactions, the objective is
+max
+G
+Eq∼D,ξ
+
+Rterm(ξ; q)
+
+.
+(2)
+When the agent’s reasoning and decision-making run on-
+device, this objective is constrained by local model memory
+and the cost of real tool calls to external services. We denote
+the total number of locally deployed model parameters by
+cparam and the number of real tool calls by ctool, and collect
+them in
+c(G, ξ) =
+ cparam(G), ctool(ξ)
+⊤.
+(3)
+Given the corresponding budget vector B, the on-device
+problem becomes
+max
+G
+Eq∼D,ξ
+
+Rterm(ξ; q)
+
+s.t.
+c(G, ξ) ⪯B,
+(4)
+where ⪯denotes componentwise inequality. The per-run
+count ctool includes all real calls recorded in ξ, including
+those made for discarded candidates, with batched calls
+counted individually. A run stops on submission or when the
+budget is exhausted.
+To compare candidates without increasing ctool, let bE
+denote a local approximation to tool responses, following
+planning with predicted action outcomes [21, 24]. For a
+candidate action a(i) at history st, the predicted response
+and imagined history are
+ˆo(i) = bE(a(i)),
+ˆs(i) = st ⊕(a(i), ˆo(i)),
+(5)
+with ˆo(i) = ∅for final-answer candidates. These imagined
+histories support candidate comparison, while the committed
+update still uses ot = E(at). Our focus is therefore to
+improve the objective in Eq. (4) for a fixed agent model using
+predicted outcomes for action selection, while satisfying the
+same resource budgets. Appendix A summarizes the notation
+used throughout the paper.
+3
+
+
+Figure 2. Seer overview. Monte Carlo branching collects real trajectories to train the simulator on tool responses and the estimator on
+discounted terminal correctness. At inference, these shared models guide search over imagined histories, while only selected actions are
+executed to obtain real evidence.
+4. Our Approach
+The response approximation in §3 leaves two questions:
+what might a candidate action reveal, and how useful is the
+resulting history for completing the task? Seer addresses
+them with a tool-response simulator Wϕ and a value esti-
+mator Vθ supervised by observed responses and discounted
+terminal correctness, respectively, while the agent’s frozen
+model proposes actions (Figure 2). We refer to these two
+components jointly as the decision models, and individually
+as the simulator and estimator.
+4.1. Decoupling Prediction from Evaluation
+Predicting tool responses. Let π denote the frozen agent
+model’s action-proposal distribution and calls(a) the tool in-
+vocations in action a. For each call c, containing a tool name
+and arguments, Wϕ generates a response ˆoc conditioned only
+on that call and a tool-specific instruction. Collecting these
+responses in call order implements the local approximation
+ˆoc ∼Wϕ(· | c),
+bE(a) =
+ ˆoc
+
+c∈calls(a).
+(6)
+This interface omits conversation history and agent identity,
+allowing reuse across agents with a common tool schema.
+Evaluating candidate histories. Predicting a response
+does not establish its usefulness; Vθ therefore evaluates the
+resulting history using supervision from terminal task out-
+comes. For each proposal a(i) ∼π(· | st), we construct the
+imagined history as in Eq. (5) and evaluate it with Vθ:
+ˆs(i) = st ⊕
+ a(i), bE(a(i))
+
+,
+v(i) = Vθ(ˆs(i)).
+(7)
+For final-answer candidates, bE(a(i)) = ∅, so the esti-
+mator scores the history with the proposed answer ap-
+pended. Search uses these scores to change the overall
+action-selection distribution πG, not the proposal distribution
+π. Both learned components are trained offline and reused
+across agents without further training.
+4.2. Learning from Real Research Trajectories
+We collect a shared corpus using agents powered by different
+frozen language models on training questions disjoint from
+the evaluation questions. Inspired by Monte Carlo search
+for process-supervision collection [36], we branch from in-
+termediate histories to collect alternative continuations, all
+through real tool execution. The same trajectories thus sup-
+ply two complementary signals: observed responses for Wϕ
+and discounted terminal correctness for Vθ.
+Learning Tool-Response Prediction: We extract indi-
+vidual call–response pairs from the corpus, normalize calls,
+remove infrastructure failures, and deduplicate to obtain
+DW = {(ci, oi)}NW
+i=1 with NW retained pairs. Unlike value
+supervision, response supervision does not depend on termi-
+4
+
+
+nal correctness: even an unsuccessful trajectory can contain
+valid tool outputs.
+Starting from a pretrained autoregressive language model,
+we optimize its trainable parameters ϕ using a response-only
+negative log-likelihood:
+LW (ϕ) = −E(c,o)∼DW
+|o|
+X
+ℓ=1
+log Wϕ(oℓ| c, o<ℓ),
+(8)
+where oℓis response token ℓand o<ℓdenotes its preceding
+tokens. The tool-specific instruction and call are omitted
+from the loss; training and inference use the same input
+template (Appendix D).
+Learning Outcome-Supervised Value Estimation: For
+value supervision, we deduplicate trajectories with submitted
+answers, excluding unanswered error or timeout runs. A
+judge compares each submission with its gold answer to
+assign Rterm(ξ; qξ) ∈{0, 1}; gold answers enter only label
+construction, never the estimator input. For a trajectory ξ
+with question qξ and terminal history index Tξ, we label each
+retained prefix by discounted terminal correctness:
+DV = {(sξ,t, Gξ,t)}ξ,t,
+Gξ,t = γTξ−tRterm(ξ; qξ),
+(9)
+where 0 < γ < 1 discounts remaining interaction steps,
+not tokens or individual tool calls. Incorrect trajectories
+receive zero throughout; correct ones receive increasing tar-
+gets toward completion. Consequently, Vθ ranks histories by
+outcome and proximity to completion rather than estimating
+a calibrated success probability for a deployment model.
+We replace a pretrained language model’s head with an
+HL-Gauss classification head [16], with θ denoting the re-
+sulting model’s trainable parameters. Let β0 < · · · < βK
+delimit K uniform bins over an interval covering the targets,
+with centers zb = (βb−1 + βb)/2. For a target G, Gaussian
+smoothing with standard deviation σ assigns the normalized
+bin masses
+yb(G) = Φ((βb −G)/σ) −Φ((βb−1 −G)/σ)
+Φ((βK −G)/σ) −Φ((β0 −G)/σ) ,
+(10)
+where Φ is the standard normal cumulative distribution func-
+tion. Given predicted bin probabilities pθ(b | s), we mini-
+mize soft-label cross-entropy and decode by expectation:
+LV (θ) = −E(s,G)∼DV
+K
+X
+b=1
+yb(G) log pθ(b | s),
+Vθ(s) =
+K
+X
+b=1
+zbpθ(b | s).
+(11)
+For efficient training, each trajectory is encoded once in a
+causal forward pass, with scores read at its labeled prefix
+endpoints. This requires token-identical shared prefixes and
+exclusion of trajectories beyond the context limit. Training
+and validation are split by question, keeping all trajectories
+and prefixes for the same question together.
+4.3. Imagined Search and Real Execution
+At each real round, Seer builds a fresh tree rooted at the com-
+mitted history st and runs Nsim simulations using predictor
+upper confidence bound applied to trees (PUCT) [47, 51].
+Algorithm 1 in Appendix C gives the complete round, with
+candidate width k and depth cap dmax. Here, a search simu-
+lation is one tree traversal and value backup, distinct from
+predicting an individual tool response with the simulator.
+Candidate expansion. At an expandable history ¯s, we
+independently sample m valid actions from π(· | ¯s), with
+1 ≤m ≤k, and batch their tool calls through Wϕ. The
+resulting imagined histories become children with uniform
+edge priors P(e) = 1/m; final-answer children are terminal.
+Because Vθ is trained on real histories, simulation errors can
+distort its rankings, motivating the depth cap.
+Selection and backup. For an edge e with parent node
+u, selection uses
+score(e) = Q(e) + cpuctP(e)
+p
+N(u) + 1
+1 + N(e) ,
+(12)
+where N(u) and N(e) are visit counts, Q(e) is the mean
+backed-up value, and cpuct controls exploration. Each sim-
+ulation scores its endpoint with Vθ and backs up that value
+along the traversed path, including when the endpoint is
+terminal or depth-capped. Thus, terminal candidates are
+evaluated by the learned estimator, not by real execution or
+gold-answer judgments.
+Real execution. After search, we commit the action on
+the most-visited root edge:
+e∗∈arg
+max
+e∈root edges N(e),
+at = action(e∗).
+(13)
+A final-answer submission terminates the run; otherwise, we
+execute at and update st+1 = st ⊕(at, E(at)). Imagined
+branches are discarded, so only real responses enter the next
+round’s root history. Accordingly, Seer’s real tool-call count
+is given by
+ctool(ξ) =
+X
+t
+calls(at)
+,
+(14)
+where final-answer actions contribute zero. Discarded candi-
+dates incur local inference but no real calls. Total calls can
+nevertheless differ from the unassisted agent because action
+choices and run length change. In addition, Seer uses addi-
+tional local computation and model memory for candidate
+comparison without relaxing the resource budgets.
+5
+
+
+(a) Qwen3.5-4B
+(b) Qwen3.5-9B
+(c) Qwen3.5-35B-A3B
+Figure 3. Comparisons of final-answer accuracy and real tool-call counts on BrowseComp-200 across agents. The vertical axis (Performance)
+reports accuracy (%). Seer achieves the highest accuracy while keeping tool-call counts close to those of Base Agent.
+Table 1. Preliminary comparison of RAP@4 and Seer (k = 4)
+using average accuracy across benchmarks (%). RAP@4 is omitted
+from later tables as it barely improves on the Base Agent.
+Model
+Base
+RAP@4
+Seer
+Qwen3.5-4B
+8.3
+8.0
+18.8
+Qwen3.5-9B
+14.2
+13.9
+25.2
+5. Experiments
+5.1. Experimental Setup
+Training Setup. Frozen agents collect real trajectories by
+sampling questions round-robin from DeepDive [35], Miro-
+Verse [40], Nemotron RL [42], OpenSeeker [15], and RED-
+Searcher [10], excluding evaluation questions. This yields
+0.7M call–response pairs for the simulator and 1M training
+samples for the estimator. All methods share two exter-
+nal tools: search returns titles, links, and snippets, while
+visit retrieves pages and extracts goal-relevant evidence.
+Extraction in visit is performed by a shared Qwen3.5-
+397B-A17B service, so its cost applies equally to all com-
+pared methods. Both models are initialized from Qwen3.5-
+9B [45] and use LoRA [25] at a learning rate of 10−4, with
+simulator/estimator ranks of 64/32 and context limits of
+16k/128k tokens. The estimator learns discounted terminal
+correctness (γ = 0.95) through a fully trainable HL-Gauss
+head [16] with 201 bins over [−1, 1] and a Gaussian standard
+deviation of 0.75 bin widths. Both checkpoints are reused
+unchanged across agents.
+Evaluation Setup. We report final-answer accuracy on
+GAIA [39], BrowseComp-200 (BC-200) [58], BrowseComp-
+ZH (BC-ZH) [67], SEAL-0 [44], and XBench-DeepSearch
+(XBench-DS) [7], following each benchmark’s evaluation
+protocol. The main comparison covers Qwen3.5-4B/9B/35B-
+A3B [45], Qwen3.6-35B-A3B [46], and Gemma-4-e2b-
+it/e4b-it [19]. For each model, all methods share the frozen
+agent and tools and use the model’s recommended sam-
+pling settings.
+Base Agent runs one ReAct-style trajec-
+tory [62], whereas BoN@4 and AV@4 run four and select
+by normalized-answer majority voting [57] and prompted
+outcome verification [63], respectively, without gold-answer
+access. We also implement RAP@4 [24], but omit it from
+the main table after prompted simulation and self-evaluation
+yield little benefit on 4B/9B agents, as illustrated in Table 1.
+Each trajectory is limited to 100 committed agent rounds,
+128k input tokens, and 9000 s, with a direct-answer attempt
+upon reaching a limit. Speculative proposals do not count
+toward the round limit. Seer uses depth-one imagined search
+with candidate width k ∈{4, 8, 16, 32}, reporting k = 4
+and k = 32 as low-width and scaled settings in the main
+comparison. These widths are not compute-matched to four
+full trajectories, whose real tool calls are all incurred, while
+Seer executes only selected actions. In tables, Base, BoN,
+and AV abbreviate Base Agent, BoN@4, and AV@4, re-
+spectively; Sk denotes Seer with candidate width k, labeled
+Seer@k in figures. In all result tables, bold and underlined
+values indicate the best and second-best results within each
+comparison group, respectively, including ties.
+5.2. Analysis
+Main Results Across Agent Models: Table 2 shows that
+Seer supports Qwen and Gemma agents, reusing the same
+simulator and estimator without model-specific retraining.
+With four candidates per decision (S4), Seer outperforms
+both four-trajectory baselines on all five benchmarks with
+Qwen3.5-4B and reaches 47.0% on XBench-DeepSearch
+with 9B, versus 38.0% for both baselines. Expanding to S32
+raises GAIA accuracy to 41.7% and 50.5% for 4B and 9B,
+respectively, and surpasses both baselines on every bench-
+mark with 9B. Gains extend to Gemma-4, with S32 raising
+GAIA accuracy from 20.4% to 31.1% for e2b-it and from
+21.4% to 36.9% for e4b-it. Across all six models, S32 im-
+6
+
+
+Table 2. Comparisons of final-answer accuracy (%) across Qwen and Gemma agents using Base Agent, BoN@4, AV@4, and Seer (Sk,
+candidate width k). Seer improves over Base Agent in 26 of 30 settings at k = 32, reusing the simulator and estimator across agents.
+Qwen3.5-4B
+Qwen3.5-9B
+Qwen3.5-35B-A3B
+Benchmark
+Base
+BoN
+AV
+S4
+S32
+Base
+BoN
+AV
+S4
+S32
+Base
+BoN
+AV
+S4
+S32
+GAIA
+13.6
+21.4
+26.2
+29.1
+41.7
+22.3
+35.9
+35.0
+35.9
+50.5
+57.3
+53.4
+47.6
+62.1
+57.3
+BC-200
+1.0
+4.5
+3.5
+5.0
+7.0
+2.5
+5.5
+6.5
+5.5
+9.5
+22.0
+24.0
+24.0
+24.5
+22.0
+SEAL-0
+4.5
+9.9
+8.1
+10.8
+16.2
+10.8
+23.4
+18.9
+22.5
+26.1
+27.0
+28.8
+33.3
+31.5
+34.2
+XBench-DS
+20.0
+36.0
+35.0
+41.0
+43.0
+28.0
+38.0
+38.0
+47.0
+60.0
+64.0
+67.0
+64.0
+66.0
+69.0
+BC-ZH
+2.4
+7.6
+5.2
+8.0
+9.7
+7.6
+11.4
+13.5
+15.2
+16.3
+36.3
+37.7
+34.9
+36.0
+43.3
+Qwen3.6-35B-A3B
+Gemma-4-e2b-it
+Gemma-4-e4b-it
+Benchmark
+Base
+BoN
+AV
+S4
+S32
+Base
+BoN
+AV
+S4
+S32
+Base
+BoN
+AV
+S4
+S32
+GAIA
+64.1
+75.7
+73.8
+78.6
+79.6
+20.4
+23.3
+25.2
+30.1
+31.1
+21.4
+25.2
+30.1
+24.3
+36.9
+BC-200
+20.5
+35.0
+35.0
+36.0
+37.5
+1.5
+1.0
+1.0
+2.5
+1.0
+0.5
+1.5
+1.5
+1.0
+1.5
+SEAL-0
+29.7
+20.7
+28.8
+24.3
+27.0
+1.8
+5.4
+4.5
+4.5
+6.3
+6.3
+9.0
+8.1
+5.4
+7.2
+XBench-DS
+61.0
+76.0
+70.0
+73.0
+74.0
+21.0
+21.0
+29.0
+28.0
+31.0
+23.0
+28.0
+39.0
+27.0
+40.0
+BC-ZH
+27.0
+35.3
+36.0
+35.3
+38.8
+2.1
+1.0
+2.8
+1.7
+3.8
+1.4
+1.0
+4.2
+3.8
+3.5
+Table 3. Comparisons of final-answer accuracy (%) on larger agents. Seer transfers to 122B and 397B agents without retraining, with S32
+outperforming Base Agent in all cases.
+Qwen3.5-122B-A10B
+Qwen3.5-397B-A17B
+Benchmark
+Base
+BoN
+AV
+S4
+S32
+Base
+BoN
+AV
+S4
+S32
+GAIA
+67.0
+64.1
+61.2
+68.0
+71.8
+68.9
+74.8
+69.9
+76.7
+72.8
+BC-200
+31.5
+32.5
+35.0
+35.0
+39.0
+34.5
+37.5
+37.5
+37.0
+42.5
+SEAL-0
+32.4
+28.8
+31.5
+34.2
+36.9
+31.5
+36.9
+36.0
+37.8
+40.5
+XBench-DS
+66.0
+70.0
+61.0
+71.0
+72.0
+75.0
+73.0
+75.0
+79.0
+80.0
+BC-ZH
+39.4
+38.1
+36.3
+40.5
+43.6
+50.2
+49.8
+49.8
+55.7
+55.4
+proves over Base Agent in 26 of 30 comparisons and reaches
+79.6% on GAIA with Qwen3.6-35B-A3B without retraining
+either shared component. Unlike trajectory-level selection,
+both Seer settings evaluate alternatives without real tool calls
+for discarded candidates, trading extra inference computa-
+tion for broader search rather than paying to execute every
+alternative.
+Scaling to Larger Agent Models: Although designed
+for small agents, Seer also benefits substantially larger mod-
+els (Table 3). Reusing the same simulator and estimator
+without retraining, S32 improves over Base Agent on all five
+benchmarks for both Qwen3.5-122B-A10B and Qwen3.5-
+397B-A17B and outperforms both four-trajectory baselines
+in nine of ten comparisons. For 397B, it raises BrowseComp-
+200 accuracy from 34.5% to 42.5% and SEAL-0 from 31.5%
+to 40.5%. These gains show that Seer’s shared guidance
+transfers across model scales rather than benefiting only
+small agents, without implying these larger models are suit-
+able for on-device deployment.
+Contributions of Prediction and Evaluation: Table 4
+cumulatively builds Seer from the frozen Base Agent with
+four candidates per decision, all executed and ranked by
+prompted scoring. Replacing prompted scoring with the
+estimator improves accuracy by 0.9–22.3 points on seven
+of eight models, except Qwen3.5-397B-A17B. Retaining
+the estimator and adding simulator predictions lowers ac-
+curacy on six models at k = 4 but eliminates real calls for
+discarded candidates. Increasing Seer to k = 32 matches
+or exceeds real-response selection at k = 4 on six of eight
+models (Tables 2, 3, and 4), showing that broader search can
+compensate for prediction-related losses through additional
+inference rather than execution of discarded candidates. Di-
+rect scoring without outcome simulation trails Seer on seven
+of eight models with one tie, echoing WebDreamer [21]: an
+action’s value hinges on content invisible at decision time,
+such as the page behind a search result, which only simulated
+responses can reveal before selection.
+Accuracy versus Real Tool Use:
+Figure 3 shows
+that Seer improves the accuracy–tool-cost trade-off on
+BrowseComp-200 across all agents. Its tool-call costs re-
+7
+
+
+Table 4. Comparisons of cumulative component additions on GAIA across agents (accuracy %, k = 4). Adding the estimator improves over
+prompted scoring, while subsequently adding the simulator avoids real calls for discarded candidates at an accuracy cost.
+Qwen3.5
+Qwen3.6
+Gemma-4
+Variant
+4B
+9B
+35B-A3B
+122B-A10B
+397B-A17B
+35B-A3B
+e2b-it
+e4b-it
+Base + search (k = 4)
+16.5
+44.7
+62.1
+71.8
+73.8
+74.8
+26.2
+19.4
++ estimator
+38.8
+45.6
+66.0
+72.8
+71.8
+75.7
+31.1
+29.1
++ simulator (Seer)
+29.1
+35.9
+62.1
+68.0
+76.7
+78.6
+30.1
+24.3
+Direct scoring
+23.3
+31.1
+61.2
+68.0
+72.8
+76.7
+28.2
+21.4
+Table 5. Comparisons of Seer accuracy (%) across candidate widths k on all five benchmarks, with the best and second-best results within
+each model and benchmark shown in bold and underlined, respectively, including ties. Larger k does not consistently improve performance,
+highlighting the need to select a width for each agent and task.
+Qwen3.5-4B
+Qwen3.5-9B
+Qwen3.5-35B-A3B
+Qwen3.5-122B-A10B
+Benchmark
+k=4
+k=8
+k=16
+k=32
+k=4
+k=8
+k=16
+k=32
+k=4
+k=8
+k=16
+k=32
+k=4
+k=8
+k=16
+k=32
+GAIA
+29.1
+35.9
+39.8
+41.7
+35.9
+38.8
+42.7
+50.5
+62.1
+64.1
+59.2
+57.3
+68.0
+68.9
+72.8
+71.8
+BC-200
+5.0
+5.5
+6.0
+7.0
+5.5
+7.0
+9.0
+9.5
+24.5
+27.5
+27.0
+22.0
+35.0
+34.0
+36.5
+39.0
+SEAL-0
+10.8
+10.8
+15.3
+16.2
+22.5
+24.3
+23.4
+26.1
+31.5
+29.7
+31.5
+34.2
+34.2
+35.1
+36.0
+36.9
+XBench-DS
+41.0
+39.0
+43.0
+43.0
+47.0
+50.0
+51.0
+60.0
+66.0
+69.0
+71.0
+69.0
+71.0
+68.0
+71.0
+72.0
+BC-ZH
+8.0
+9.3
+9.0
+9.7
+15.2
+15.9
+15.9
+16.3
+36.0
+41.5
+41.0
+43.3
+40.5
+39.8
+41.9
+43.6
+Qwen3.5-397B-A17B
+Qwen3.6-35B-A3B
+Gemma-4-e2b-it
+Gemma-4-e4b-it
+Benchmark
+k=4
+k=8
+k=16
+k=32
+k=4
+k=8
+k=16
+k=32
+k=4
+k=8
+k=16
+k=32
+k=4
+k=8
+k=16
+k=32
+GAIA
+76.7
+76.7
+71.8
+72.8
+78.6
+79.6
+80.6
+79.6
+30.1
+27.2
+28.2
+31.1
+24.3
+30.1
+34.0
+36.9
+BC-200
+37.0
+38.0
+42.0
+42.5
+36.0
+41.5
+38.0
+37.5
+2.5
+0.5
+1.0
+1.0
+1.0
+2.5
+1.5
+1.5
+SEAL-0
+37.8
+36.0
+37.8
+40.5
+24.3
+28.8
+28.8
+27.0
+4.5
+9.0
+4.5
+6.3
+5.4
+7.2
+5.4
+7.2
+XBench-DS
+79.0
+77.0
+79.0
+80.0
+73.0
+74.0
+74.0
+74.0
+28.0
+30.0
+28.0
+31.0
+27.0
+26.0
+32.0
+40.0
+BC-ZH
+55.7
+55.4
+57.1
+55.4
+35.3
+39.8
+41.5
+38.8
+1.7
+2.4
+3.5
+3.8
+3.8
+2.8
+4.5
+3.5
+Table 6. Estimator–oracle agreement (%): how often both select
+the same candidate action. Agents are Qwen3.5 variants.
+Model
+Dataset
+k=4
+k=8
+k=16
+k=32
+397B
+GAIA
+25.0
+21.1
+11.8
+10.0
+122B
+BC-200
+40.9
+21.4
+17.6
+22.5
+397B
+XBench-DS
+30.8
+7.9
+0.0
+0.0
+main close to those of Base Agent across the tested widths,
+whereas BoN@4 and AV@4 incur substantially more real
+calls by executing four complete trajectories. These results
+illustrate the benefit of evaluating alternatives through sim-
+ulation and executing only selected actions: additional in-
+ference computation enables more effective search without
+paying the real tool costs of discarded candidates.
+Scaling Candidate Width: Across all agents and bench-
+marks (Table 5), k = 32 falls below the best tested width
+in 14 of 40 settings, although it achieves the highest accu-
+racy, including ties, on all five benchmarks for Qwen3.5-
+4B/9B. Optimal widths depend on both agent and task:
+Qwen3.6-35B-A3B peaks at k = 16 on GAIA and k = 8 on
+BrowseComp-200, whereas Gemma-4-e2b-it favors k = 32
+and k = 4, respectively. Table 6 further probes ranking reli-
+ability by comparing the estimator’s action choice with that
+of a GPT-5.5 oracle given the ground-truth answer for this di-
+agnostic. Agreement generally decreases with k, though not
+monotonically on BC-200, consistent with greater sensitivity
+to estimator noise when selecting among more candidates.
+Together, these results suggest a trade-off between candidate
+coverage under simulator noise and ranking reliability under
+estimator noise. Wider search offers more opportunities to
+find useful actions despite imperfect predictions, without
+reducing per-call simulator noise, but also increases the risk
+of selecting overvalued branches, potentially compounded
+by such errors. This trade-off motivates selecting a specific
+candidate width rather than simply maximizing k.
+6. Conclusion
+We presented Seer, an inference-time framework for local
+guidance in deep research that separates agent proposals
+8
+
+
+from learned tool-response prediction and value estimation.
+Trained with complementary supervision from a shared tra-
+jectory corpus, its simulator and estimator guide different
+agent models without retraining, using imagined search but
+only real responses as evidence. Experiments show sub-
+stantial small-agent gains and transfer across model families
+and scales, with tool-call costs close to those of Base Agent
+without search guidance in the measured comparisons. We
+believe Seer suggests a path toward capable, locally con-
+trolled research agents through reusable guidance rather than
+model-specific adaptation or costly external exploration.
+Acknowledgments
+This work was supported by the National Natural Science
+Foundation of China under Grant No. 625B2122 (Youth
+Student Basic Research Program for PhD Students) and
+Grant No. 62427820 (National Major Scientific Instrument
+and Equipment Development Project).
+LLM Usage Statement
+LLM assistance was used for language editing, consistency
+checks, and manuscript presentation. The authors retain full
+responsibility for reviewing the final manuscript and for all
+technical claims and conclusions.
+References
+[1] Rishabh Agarwal, Nino Vieillard, Yongchao Zhou, Piotr
+Stanczyk, Sabela Ramos Garea, Matthieu Geist, and Olivier
+Bachem. On-policy distillation of language models: Learning
+from self-generated mistakes. In ICLR, 2024. 2, 13
+[2] Apple. Introducing Apple’s on-device and server foundation
+models. https://machinelearning.apple.com/
+research / introducing - apple - foundation -
+models, 2024. 1
+[3] Lei Bai, Zongsheng Cao, Yang Chen, Zhiyao Cui, Shangheng
+Du, Yue Fan, Shiyang Feng, Zijie Guo, Haonan He, Liang
+He, et al. Scaling the horizon, not the parameters: Reach-
+ing trillion-parameter performance with a 35b agent. arXiv
+preprint arXiv:2606.30616, 2026. 14
+[4] Peter Belcak, Greg Heinrich, Shizhe Diao, Yonggan Fu, Xin
+Dong, Saurav Muralidharan, Yingyan Celine Lin, and Pavlo
+Molchanov. Small language models are the future of agentic
+AI. arXiv:2506.02153, 2025. 1
+[5] Hyungjoo Chae, Namyoung Kim, Kai Tzu-iunn Ong, Minju
+Gwak, Gwanwoo Song, Jihoon Kim, Sunghwan Kim, Dongha
+Lee, and Jinyoung Yeo. Web agents with world models:
+Learning and leveraging environment dynamics in web navi-
+gation. In ICLR, 2025. 1, 3, 15
+[6] Haotian Chen, Xin Cong, Shengda Fan, Yuyang Fu, Ziqin
+Gong, Yaxi Lu, Yishan Li, Boye Niu, Chengjun Pan, Zijun
+Song, Huadong Wang, Yesai Wu, Yueying Wu, Zihao Xie,
+Yukun Yan, Zhong Zhang, Yankai Lin, Zhiyuan Liu, and
+Maosong Sun. AgentCPM-Explore: Realizing long-horizon
+deep exploration for edge-scale agents. arXiv:2602.06485,
+2026. 2, 13
+[7] Kaiyuan Chen, Yixin Ren, Yang Liu, Xiaobo Hu, Haotong
+Tian, Tianbao Xie, Fangfu Liu, Haoye Zhang, Hongzhang
+Liu, Yuan Gong, et al. xbench: Tracking agents productiv-
+ity scaling with profession-aligned real-world evaluations.
+arXiv:2506.13651, 2025. 6
+[8] Zhaorun Chen, Zhuokai Zhao, Kai Zhang, Bo Liu, Qi Qi,
+Yifan Wu, Tarun Kalluri, Sara Cao, Yuanhao Xiong, Haibo
+Tong, Huaxiu Yao, Hengduo Li, Jiacheng Zhu, Xian Li, Dawn
+Song, Bo Li, Jason Weston, and Dat Huynh. Scaling agent
+learning via experience synthesis. arXiv:2511.03773, 2025.
+3, 15
+[9] Sanjiban Choudhury. Process reward models for LLM agents:
+Practical framework and directions. arXiv:2502.10325, 2025.
+3, 15
+[10] Zheng Chu, Xiao Wang, Jack Hong, Huiming Fan, Yuqi
+Huang, Yue Yang, Guohai Xu, Chenxiao Zhao, Cheng Xi-
+ang, Shengchao Hu, Dongdong Kuang, Ming Liu, Bing Qin,
+and Xing Yu. REDSearcher: A scalable and cost-efficient
+framework for long-horizon search agents. arXiv:2602.14234,
+2026. 6
+[11] Dave Citron. Try deep research and our new experimen-
+tal model in Gemini, your AI assistant. Google. https:
+/ / blog . google / products / gemini / google -
+gemini-deep-research/, 2024. 1
+[12] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark
+Chen, Heewoo Jun, Lukasz Kaiser, Matthias Plappert, Jerry
+Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse,
+and John Schulman. Training verifiers to solve math word
+problems. arXiv:2110.14168, 2021. 2, 15
+[13] Mingkai Deng, Jinyu Hou, Zhiting Hu, and Eric Xing. Gen-
+eral agentic planning through simulative reasoning with world
+models. arXiv:2507.23773v3, 2026. 3, 15
+[14] Hang Ding, Peidong Liu, Junqiao Wang, Ziwei Ji, Meng Cao,
+Rongzhao Zhang, Lynn Ai, Eric Yang, Tianyu Shi, and Lei
+Yu. DynaWeb: Model-based reinforcement learning of web
+agents. arXiv:2601.22149, 2026. 3, 15
+[15] Yuwen Du, Rui Ye, Shuo Tang, Xinyu Zhu, Yijun Lu,
+Yuzhu Cai, and Siheng Chen. OpenSeeker: Democratizing
+frontier search agents by fully open-sourcing training data.
+arXiv:2603.15594, 2026. 6
+[16] Jesse Farebrother, Jordi Orbay, Quan Vuong, Adrien Ali Taiga,
+Yevgen Chebotar, Ted Xiao, Alex Irpan, Sergey Levine,
+Pablo Samuel Castro, Aleksandra Faust, Aviral Kumar, and
+Rishabh Agarwal. Stop regressing: Training value functions
+via classification for scalable deep RL. In ICML, 2024. 5, 6,
+18
+[17] Shiyang Feng, Runmin Ma, Xiangchao Yan, Yue Fan, Yusong
+Hu, Songtao Huang, Shuaiyu Zhang, Zongsheng Cao, Tian-
+shuo Peng, Jiakang Yuan, et al. InternAgent-1.5: A unified
+agentic framework for long-horizon autonomous scientific
+discovery. arXiv preprint arXiv:2602.08990, 2026. 13
+[18] Giridhar Ganapavarapu and Dhaval Patel. MCP-Cosmos:
+World model-augmented agents for complex task execution
+in MCP environments. arXiv:2605.09131, 2026. 3, 15
+[19] Gemma Team. Gemma 4 technical report. arXiv:2607.02770,
+2026. 6
+9
+
+
+[20] Yuxian Gu, Li Dong, Furu Wei, and Minlie Huang. MiniLLM:
+Knowledge distillation of large language models. In ICLR,
+2024. 2, 13
+[21] Yu Gu, Kai Zhang, Yuting Ning, Boyuan Zheng, Boyu Gou,
+Tianci Xue, Cheng Chang, Sanjari Srivastava, Yanan Xie,
+Peng Qi, Huan Sun, and Yu Su. Is your LLM secretly a world
+model of the internet? model-based planning for web agents.
+Transactions on Machine Learning Research, 2025. 1, 3, 7,
+15
+[22] David Ha and J¨urgen Schmidhuber.
+World models.
+arXiv:1803.10122, 2018. 15
+[23] Danijar Hafner, Jurgis Pasukonis, Jimmy Ba, and Timothy
+Lillicrap. Mastering diverse domains through world models.
+arXiv:2301.04104, 2023. 3, 15
+[24] Shibo Hao, Yi Gu, Haodi Ma, Joshua Jiahua Hong,
+Zhen Wang, Daisy Zhe Wang, and Zhiting Hu.
+Reason-
+ing with language model is planning with world model.
+arXiv:2305.14992, 2023. 1, 3, 6, 15
+[25] Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-
+Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu
+Chen. LoRA: Low-rank adaptation of large language models.
+arXiv:2106.09685, 2021. 6
+[26] Michael Janner, Justin Fu, Marvin Zhang, and Sergey Levine.
+When to trust your model: Model-based policy optimization.
+In NeurIPS, 2019. 3, 15
+[27] Bowen Jin, Hansi Zeng, Zhenrui Yue, Jinsung Yoon, Sercan
+Arik, Dong Wang, Hamed Zamani, and Jiawei Han. Search-
+R1: Training LLMs to reason and leverage search engines
+with reinforcement learning. arXiv:2503.09516, 2025. 2, 13
+[28] Jing Yu Koh, Stephen McAleer, Daniel Fried, and Rus-
+lan Salakhutdinov. Tree search for language model agents.
+arXiv:2407.01476, 2024. 1, 3, 15
+[29] Nicholas Lee, Lutfi Eren Erdogan, Chris Joseph John, Surya
+Krishnapillai, Michael W. Mahoney, Kurt Keutzer, and
+Amir Gholami. Agentic test-time scaling for WebAgents.
+arXiv:2602.12276, 2026. 23
+[30] Yishan Li, Wentong Chen, Yukun Yan, Mingwei Li, Sen Mei,
+Xiaorong Wang, Kunpeng Liu, Xin Cong, Shuo Wang, Zhong
+Zhang, Yaxi Lu, Zhenghao Liu, Yankai Lin, Zhiyuan Liu, and
+Maosong Sun. AgentCPM-Report: Interleaving drafting and
+deepening for open-ended deep research. arXiv:2602.06540,
+2026. 2
+[31] Hunter Lightman, Vineet Kosaraju, Yura Burda, Harri Ed-
+wards, Bowen Baker, Teddy Lee, Jan Leike, John Schulman,
+Ilya Sutskever, and Karl Cobbe. Let’s verify step by step. In
+The Twelfth International Conference on Learning Represen-
+tations, 2024. 3, 15
+[32] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-
+Ming Chen, Wei-Chen Wang, Guangxuan Xiao, Xingyu
+Dang, Chuang Gan, and Song Han. AWQ: Activation-aware
+weight quantization for LLM compression and acceleration.
+arXiv:2306.00978, 2023. 2, 13
+[33] Jessy Lin, Yuqing Du, Olivia Watkins, Danijar Hafner, Pieter
+Abbeel, Dan Klein, and Anca Dragan. Learning to model the
+world with language. In Proceedings of the 41st International
+Conference on Machine Learning, pages 29992–30017, 2024.
+15
+[34] Tengxiao Liu, Zifeng Wang, Jin Miao, I-Hung Hsu, Jun Yan,
+Jiefeng Chen, Rujun Han, Fangyuan Xu, Yanfei Chen, Ke
+Jiang, Samira Daruki, Yi Liang, William Yang Wang, Tomas
+Pfister, and Chen-Yu Lee. Budget-aware tool-use enables
+effective agent scaling, 2026. 1, 2, 23
+[35] Rui Lu, Zhenyu Hou, Zihan Wang, Hanchen Zhang, Xiao Liu,
+Yujiang Li, Shi Feng, Jie Tang, and Yuxiao Dong. DeepDive:
+Advancing deep search agents with knowledge graphs and
+multi-turn RL. arXiv:2509.10446, 2025. 6
+[36] Liangchen Luo, Yinxiao Liu, Rosanne Liu, Samrat Phatale,
+Meiqi Guo, Harsh Lara, Yunxuan Li, Lei Shu, Yun Zhu, Lei
+Meng, Jiao Sun, and Abhinav Rastogi. Improve mathematical
+reasoning in language models by automated process supervi-
+sion. arXiv:2406.06592, 2024. 3, 4, 15
+[37] Jindi Lv, Aoyu Li, Yuhao Zhou, Zheng Zhu, Xiaofeng
+Wang, Qing Ye, Yueqi Duan, Wentao Feng, and Jiancheng
+Lv. Spatial-aware reduction framework: Towards efficient
+and faithful visual state space models.
+arXiv preprint
+arXiv:2606.19932, 2026. 13
+[38] Aman Madaan, Niket Tandon, Prakhar Gupta, Skyler
+Hallinan, Luyu Gao, Sarah Wiegreffe, Uri Alon, Nouha
+Dziri, Shrimai Prabhumoye, Yiming Yang, Shashank Gupta,
+Bodhisattwa Prasad Majumder, Katherine Hermann, Sean
+Welleck, Amir Yazdanbakhsh, and Peter Clark. Self-Refine:
+Iterative refinement with self-feedback. arXiv:2303.17651,
+2023. 2, 15
+[39] Gr´egoire Mialon, Cl´ementine Fourrier, Craig Swift, Thomas
+Wolf, Yann LeCun, and Thomas Scialom. GAIA: A bench-
+mark for general AI assistants. arXiv:2311.12983, 2023. 1,
+6
+[40] MiroMind Team, Song Bai, Lidong Bing, Carson Chen,
+Guanzheng Chen, Yuntao Chen, Zhe Chen, Ziyi Chen, Jifeng
+Dai, Xuan Dong, et al. MiroThinker: Pushing the perfor-
+mance boundaries of open-source research agents via model,
+context, and interactive scaling. arXiv:2511.11793, 2025. 6
+[41] Reiichiro Nakano, Jacob Hilton, Suchir Balaji, Jeff Wu,
+Long Ouyang, Christina Kim, Christopher Hesse, Shantanu
+Jain, Vineet Kosaraju, William Saunders, et al. WebGPT:
+Browser-assisted question-answering with human feedback.
+arXiv:2112.09332, 2021. 2, 13
+[42] NVIDIA Corporation. Nemotron-RL-knowledge-web search-
+mcqa. Hugging Face dataset, 2025. 6
+[43] OpenAI. Introducing deep research. https://openai.
+com / index / introducing - deep - research/,
+2025. 1
+[44] Thinh Pham, Nguyen Nguyen, Pratibha Zunjare, Weiyuan
+Chen, Yu-Min Tseng, and Tu Vu.
+SealQA: Raising the
+bar for reasoning in search-augmented language models.
+arXiv:2506.01062, 2025. 6
+[45] Qwen Team. Qwen3.5: Towards native multimodal agents,
+2026. 6
+[46] Qwen Team. Qwen3.6-35B-A3B: Agentic coding power, now
+open to all, 2026. 6
+[47] Christopher D. Rosin. Multi-armed bandits with episode
+context. Annals of Mathematics and Artificial Intelligence, 61
+(3):203–230, 2011. 5
+[48] Timo Schick, Jane Dwivedi-Yu, Roberto Dess`ı, Roberta
+Raileanu, Maria Lomeli, Luke Zettlemoyer, Nicola Cancedda,
+10
+
+
+and Thomas Scialom. Toolformer: Language models can
+teach themselves to use tools. arXiv:2302.04761, 2023. 2, 13
+[49] Julian Schrittwieser, Ioannis Antonoglou, Thomas Hubert,
+Karen Simonyan, Laurent Sifre, Simon Schmitt, Arthur Guez,
+Edward Lockhart, Demis Hassabis, Thore Graepel, Timothy
+Lillicrap, and David Silver. Mastering atari, go, chess and
+shogi by planning with a learned model. Nature, 588:604–
+609, 2020. 3, 15
+[50] Noah Shinn, Federico Cassano, Edward Berman, Ashwin
+Gopinath, Karthik Narasimhan, and Shunyu Yao. Reflex-
+ion: Language agents with verbal reinforcement learning.
+arXiv:2303.11366, 2023. 3, 15
+[51] David Silver, Thomas Hubert, Julian Schrittwieser, Ioannis
+Antonoglou, Matthew Lai, Arthur Guez, Marc Lanctot, Lau-
+rent Sifre, Dharshan Kumaran, Thore Graepel, et al. A general
+reinforcement learning algorithm that masters chess, shogi,
+and go through self-play. Science, 362(6419):1140–1144,
+2018. 5
+[52] Richard S. Sutton. Dyna, an integrated architecture for learn-
+ing, planning, and reacting. ACM SIGART Bulletin, 2(4):
+160–163, 1991. 3, 15
+[53] Tongyi DeepResearch Team. Tongyi DeepResearch technical
+report. arXiv:2510.24701, 2025. 1
+[54] Venus Team, Sunhao Dai, Yong Deng, Jinzhen Lin, Yusheng
+Song, Guoqing Wang, Xiaofeng Wu, Yuqi Zhou, Shuo
+Yang, Zhenzhe Ying, Zhanwei Zhang, Changhua Meng, and
+Weiqiang Wang. DR-Venus: Towards frontier edge-scale deep
+research agents with only 10K open data. arXiv:2604.19859,
+2026. 2
+[55] Sanidhya Vijayvargiya and Rahul Lokesh. Efficient on-device
+agents via adaptive context management. arXiv:2511.03728,
+2025. 1, 2, 23
+[56] Yuxuan Wan, Tianqing Fang, Zaitang Li, Yintong Huo,
+Wenxuan Wang, Haitao Mi, Dong Yu, and Michael R.
+Lyu. Inference-time scaling of verification: Self-evolving
+deep research agents via test-time rubric-guided verification.
+arXiv:2601.15808, 2026. 1, 15
+[57] Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc Le, Ed
+Chi, Sharan Narang, Aakanksha Chowdhery, and Denny Zhou.
+Self-consistency improves chain of thought reasoning in lan-
+guage models. In ICLR, 2023. 1, 2, 6, 15
+[58] Jason Wei, Zhiqing Sun, Spencer Papay, Scott McKinney,
+Jeffrey Han, Isa Fulford, Hyung Won Chung, Alex Tachard
+Passos, William Fedus, and Amelia Glaese. BrowseComp:
+A simple yet challenging benchmark for browsing agents.
+arXiv:2504.12516, 2025. 1, 6
+[59] Yu Xia, Jingru Fan, Weize Chen, Siyu Yan, Xin Cong, Zhong
+Zhang, Yaxi Lu, Yankai Lin, Zhiyuan Liu, and Maosong
+Sun. AgentRM: Enhancing agent generalization with reward
+modeling. In Proceedings of the 63rd Annual Meeting of the
+Association for Computational Linguistics (Volume 1: Long
+Papers), pages 19277–19290, 2025. 1, 3, 15
+[60] Guangzhi Xiong, Qiao Jin, Xiao Wang, Yin Fang, Haolin Liu,
+Yifan Yang, Fangyuan Chen, Zhixing Song, Dengyu Wang,
+Minjia Zhang, Zhiyong Lu, and Aidong Zhang. Supervis-
+ing the search process produces reliable and generalizable
+information-seeking agents. arXiv:2502.13957v3, 2026. 1, 3,
+15
+[61] Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Thomas L.
+Griffiths, Yuan Cao, and Karthik Narasimhan.
+Tree of
+thoughts: Deliberate problem solving with large language
+models. arXiv:2305.10601, 2023. 3, 15
+[62] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran,
+Karthik R Narasimhan, and Yuan Cao. React: Synergizing
+reasoning and acting in language models. In The Eleventh
+International Conference on Learning Representations, 2023.
+2, 6, 13
+[63] Weihao Zeng, Keqing He, Chuqiao Kuang, Xiaoguang Li,
+and Junxian He. Pushing test-time scaling limits of deep
+search with asymmetric verification. arXiv:2510.06135, 2025.
+1, 2, 6, 15
+[64] Wenlin Zhang, Xiaopeng Li, Yingyi Zhang, Pengyue Jia,
+Yichao Wang, Huifeng Guo, Yong Liu, and Xiangyu Zhao.
+Deep research: A survey of autonomous research agents.
+arXiv:2508.12752, 2025. 1, 3
+[65] Yuxiang Zheng, Dayuan Fu, Xiangkun Hu, Xiaojie Cai, Lyu-
+manshan Ye, Pengrui Lu, and Pengfei Liu. DeepResearcher:
+Scaling deep research via reinforcement learning in real-world
+environments. arXiv:2504.03160, 2025. 1, 2, 13
+[66] Andy Zhou, Kai Yan, Michal Shlapentokh-Rothman, Haohan
+Wang, and Yu-Xiong Wang. Language agent tree search
+unifies reasoning, acting, and planning in language models.
+In ICML, 2024. 1, 3, 15
+[67] Peilin Zhou, Bruce Leon, Xiang Ying, Can Zhang, Yifan
+Shao, Qichen Ye, Dading Chong, Zhiling Jin, Chenxuan Xie,
+Meng Cao, Yuxin Gu, Sixin Hong, Jing Ren, Jian Chen,
+Chao Liu, and Yining Hua. BrowseComp-ZH: Benchmarking
+web browsing ability of large language models in chinese.
+arXiv:2504.19314, 2025. 6
+[68] Shuyan Zhou, Frank F. Xu, Hao Zhu, Xuhui Zhou, Robert Lo,
+Abishek Sridhar, Xianyi Cheng, Tianyue Ou, Yonatan Bisk,
+Daniel Fried, Uri Alon, and Graham Neubig. WebArena: A
+realistic web environment for building autonomous agents.
+arXiv:2307.13854, 2023. 13
+[69] Yuhao Zhou, Yuxin Tian, Jindi Lv, Mingjia Shi, Yuanxi Li,
+Qing Ye, Shuhao Zhang, and Jiancheng Lv. Ferret: An ef-
+ficient online continual learning framework under varying
+memory constraints. In 2025 IEEE/CVF Conference on Com-
+puter Vision and Pattern Recognition (CVPR), pages 4850–
+4861. IEEE, 2025. 13
+[70] Yuhao Zhou, Jindi Lv, Yuxin Tian, Dan Si, Qing Ye, and
+Jiancheng Lv. Deploying models to non-participating clients
+in federated learning without fine-tuning: A hypernetwork-
+based approach. In International Conference on Learning
+Representations, pages 63600–63621, 2026. 14
+[71] Yuhao Zhou, Yunpeng Zhu, Yang Zhou, Jindi Lyu, Jian
+Lan, Zhangyuan Wang, Dan Si, Thomas Seidl, Qing Ye,
+and Jiancheng Lyu. ForgeVLA: Federated vision-language-
+action learning without language annotations. arXiv preprint
+arXiv:2605.07474, 2026. 14
+[72] Yuxin Zuo, Zikai Xiao, Li Sheng, Fei Huang, Jianhong Tu,
+Yuxuan Liu, Tianyi Tang, Xiaomeng Hu, Yang Su, Qingfeng
+Lan, Yantao Liu, Qin Zhu, Yinger Zhang, Bowen Yu, Haiquan
+Zhao, Haiyang Xu, Jianxin Yang, Jiayang Cheng, Junyang
+Wang, Lianghao Deng, Mingfeng Xue, Tianyi Bai, Yang
+11
+
+
+Fan, Yubo Ma, Yucheng Li, Zeyu Cui, Zhihai Wang, Zhihui
+Xie, Zhuorui Ye, An Yang, Dayiheng Liu, Jingren Zhou, and
+Ning Ding. Qwen-AgentWorld: Language world models for
+general agents. arXiv:2606.24597, 2026. 15
+12
+
+
+Appendix Contents
+Section
+Page
+A . Notation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+13
+B . Extended Background and Related Work . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+13
+C . Seer Search Algorithm
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+16
+D . Tool-Response Simulator Implementation Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+16
+E . Value Estimator Implementation Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+17
+F . Simulator Case Studies: Predicted and Real Tool Responses
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+18
+G . Case Studies: Action Selection and Real Tool Use . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+20
+H . Limitations and Future Work . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+23
+A. Notation
+Table 7 summarizes the notation used in this paper. Note that we distinguish the frozen model’s proposal distribution π from
+the agent’s search-guided action distribution πG, and real observations ot from predicted observations ˆo(i). Lowercase k
+denotes candidate width, whereas uppercase K denotes the number of value bins.
+B. Extended Background and Related Work
+We begin with the research-agent setting and its resource constraints, then expand the three directions reviewed in §2 with
+additional methods and details not covered in the main text. Efficient research agents address the cost and capability of the
+deployed model, while inference-time guidance improves how its proposals are selected. Within inference-time guidance,
+model-based lookahead addresses a further question: how to evaluate candidate consequences without executing every
+alternative. These directions are complementary, not mutually exclusive.
+B.1. Research Agents and Tool Use
+Research agents combine a language model’s parametric knowledge with information acquired through tools. WebGPT [41]
+combines browser-assisted question answering with human-feedback training, while ReAct [62] interleaves reasoning and
+actions so that subsequent decisions incorporate environmental observations. Toolformer [48] learns when and how to invoke
+APIs through self-supervised examples. Together, these approaches establish the interaction pattern underlying research agents:
+selecting tools, observing their outputs, and using the resulting information to guide subsequent reasoning. InternAgent-
+1.5 [17] extends this pattern to scientific discovery by coordinating generation, verification, and evolution across computational
+and empirical tasks.
+Within this setting, the task determines which observations are useful. WebArena [68] evaluates functional task completion
+in interactive websites, whereas the benchmarks used in this study assess answers assembled through search and page retrieval
+(§5.1). Research agents must therefore decide which query or goal-conditioned page visit is likely to reveal useful information.
+This creates two deployment concerns: the local resources needed to run the model and the external tool calls needed to gather
+evidence. The following subsections consider improving the deployed model first, then guiding its decisions without updating
+the deployed model.
+B.2. Efficient Research Agents
+One approach is to reduce the cost of the deployed model or improve its capabilities through training. AWQ [32] reduces
+weight storage and inference costs through activation-aware quantization. MiniLLM [20] distills larger language models into
+smaller ones, while generalized knowledge distillation [1] uses teacher feedback on student-generated sequences to address
+the mismatch between training and inference. These methods make model compression and capability transfer central to
+efficient deployment. Beyond language models, STORM [37] reduces visual tokens while preserving spatial structure in visual
+state space models, whereas Ferret [69] adapts model partitioning and pipeline execution to changing memory budgets during
+online continual learning. Both illustrate how efficiency also depends on the representation and execution of computation,
+complementing methods that improve an agent’s decisions.
+Reinforcement learning further targets the agent’s tool-use behavior. Search-R1 [27] trains models to interleave reasoning
+with retrieval using outcome-based rewards, and DeepResearcher [65] optimizes research agents through real web interactions.
+AgentCPM-Explore [6] extends this direction to long-horizon research with an edge-scale model. Alongside reinforcement
+13
+
+
+Table 7. Notation used in the paper.
+Symbol
+Meaning
+Research interactions and resource constraints
+q, D
+Research request and task distribution, with q ∼D.
+G, πG
+Research agent and its action distribution, including search guidance.
+π
+Action-proposal distribution of the frozen agent model.
+t, st
+Real-round index and committed history, initially containing q and agent instructions.
+at, ˆa
+Selected action (tool use or final submission) and submitted answer, respectively.
+ot, ∅
+Real tool responses and the empty response for final submission.
+E, ⊕
+Real execution and concatenation in st+1 = st ⊕(at, E(at)).
+calls(a), c
+Ordered calls in action a and one call (tool name and arguments).
+ξ, Rterm(ξ; q)
+Execution record and terminal quality score; binary correctness in the evaluated tasks, with zero for unanswered
+tasks.
+c(G, ξ)
+Resource vector (cparam(G), ctool(ξ))⊤.
+cparam(G)
+Total number of locally deployed model parameters, including those of the agent model and both decision
+models in Seer.
+ctool(ξ)
+All real calls in ξ, including those for discarded candidates if executed; batched calls count individually. Seer
+executes only selected actions.
+B, ⪯
+Resource-budget vector and componentwise inequality.
+Tool-response prediction
+Wϕ, ϕ
+Tool-response simulator and its trainable parameters.
+bE
+Local response approximation, collecting predictions in call order.
+ˆoc
+Predicted response to an individual call, sampled from Wϕ(· | c).
+DW , NW
+Dataset of retained call–response pairs and its size.
+ci, oi
+Tool call and observed response in simulator training pair i.
+ℓ, oℓ, o<ℓ, |o|
+Response-token index, current token, preceding tokens, and response length.
+LW (ϕ)
+Response-only negative log-likelihood used to train the simulator.
+Outcome-supervised value estimation
+Vθ, θ
+Value estimator over histories and its trainable parameters, including its head.
+DV
+Dataset of history prefixes and discounted terminal correctness targets.
+qξ, sξ,t, Tξ
+Question, prefix at position t, and terminal history index of ξ.
+γ, Gξ,t
+Discount factor and target γTξ−tRterm(ξ; qξ), discounted by remaining interaction steps, not tokens or
+individual tool calls.
+s, G
+Generic history and scalar target in a value-training pair.
+K, b
+Number of uniform value bins and bin index b ∈{1, . . . , K}.
+β0, . . . , βK
+Ordered bin boundaries delimiting the value-head support.
+zb
+Bin center (βb−1 + βb)/2.
+σ, Φ
+Smoothing standard deviation and standard normal cumulative distribution function.
+yb(G), pθ(b | s)
+Normalized Gaussian target mass and predicted probability for bin b.
+LV (θ)
+Soft-label cross-entropy; scores are decoded as Vθ(s) = P
+b zbpθ(b | s).
+Imagined search and commitment
+¯s, ˆs(i)
+Selected-node history and imagined history for candidate i.
+a(i), ˆo(i), v(i)
+Candidate action, predicted responses, and estimated history value.
+k, m
+Candidate width (maximum proposals per expansion) and actual number of valid proposals, with 1 ≤m ≤k.
+Nsim, n, dmax
+Search simulations per real round, search-simulation index, and depth cap.
+u, e, e(i)
+Parent node, outgoing edge, and edge corresponding to candidate i.
+P(e), cpuct
+Edge prior (1/m for new siblings) and PUCT exploration coefficient.
+N(u), N(e), Q(e)
+Node visits, edge visits, and mean value backed up through an edge.
+score(e), v
+PUCT selection score and simulation-endpoint value.
+e∗, action(e∗)
+Most-visited root edge selected for commitment and its action.
+learning, Agents-A1 [3] combines supervised fine-tuning with distillation from domain-specific teachers to strengthen long-
+horizon capabilities in a 35B model. Although such training can strengthen the proposal model, adapting another backbone
+requires additional optimization. This motivates the complementary approach considered next: guiding proposals at inference
+time while keeping the deployed agent frozen. Such guidance requires no retraining of the deployed agent, and reusing the
+same guidance components across agents avoids repeated model-specific adaptation.
+Reuse across deployments is also studied in federated learning, although the objects being transferred differ. Hyper-
+FedZero [70] generates models for previously non-participating clients without client-side fine-tuning, while ForgeVLA [71]
+learns vision-language-action models from distributed robot experience without centralizing raw data or requiring manual
+14
+
+
+language annotations. These approaches address model deployment and collaborative training across clients, whereas Seer
+reuses prediction and evaluation models to guide frozen agents at inference time.
+B.3. Inference-Time Guidance
+Inference-time guidance can act on completed outputs or intervene at intermediate decisions. This distinction matters for
+research agents because generating a candidate answer may already require substantial tool use.
+Output-level refinement. Learned verifiers [12] score candidate solutions, self-consistency [57] aggregates independently
+sampled reasoning paths, and Self-Refine [38] alternates generation with feedback and revision. For deep research, asymmetric
+verification [63] allocates a relatively modest verification budget to selecting among expensive search trajectories, while
+DeepVerifier [56] uses test-time rubric-guided verification in an iterative refinement loop. These methods can select an existing
+answer or inform a subsequent revision, but cannot recover tool calls already spent producing the candidates. For example, the
+BoN@4 and AV@4 baselines used in our experiments execute all four trajectories before selecting an answer (§5.1). This cost
+motivates guidance before the next real action, rather than only after a trajectory has been completed.
+Decision-level evaluation. Tree of Thoughts [61] explores intermediate reasoning states through search and self-evaluation,
+while Reflexion [50] uses verbal feedback from earlier attempts to guide later behavior. For interactive agents, LATS [66]
+combines tree search, value estimation, and reflection with environmental feedback, and Koh et al. [28] perform search in the
+actual web environment.
+Learning reusable evaluators. Search determines which alternatives to explore, while evaluation determines which appear
+promising. Rather than relying only on prompted self-evaluation, a separately trained evaluator can provide this ranking signal.
+Step-level process supervision [31] trains evaluators from intermediate feedback, and OmegaPRM [36] automates process-
+supervision collection through Monte Carlo search for mathematical reasoning. AgentPRM [9] uses Monte Carlo reward
+targets in an actor–critic framework to train agent policies, rather than restricting guidance to inference time. AgentRM [59]
+learns a reward model for test-time guidance that transfers across tasks and policy models, while RAG-Gym [60] studies
+transferable search critics for information seeking.
+These methods separate the model that proposes actions from the component that evaluates them. However, changing the
+evaluator does not by itself remove the cost of obtaining candidate observations. Branches explored through real interaction
+still incur tool calls even when discarded. This remaining cost motivates model-based lookahead, which supplies predicted
+observations for evaluation before execution.
+B.4. Model-Based Lookahead
+Model-based lookahead addresses how candidate consequences are obtained. Instead of executing every alternative, an agent
+can use a learned or prompted world model to predict aspects of the resulting observation or state. The distinction between
+using such predictions for policy learning and for inference-time planning clarifies Seer’s relationship to this literature.
+Foundations of world modeling. Dyna [52] integrates real experience with model-based planning, while Ha and
+Schmidhuber [22] learn compact representations of environment dynamics and train a controller within a learned model.
+MuZero [49] learns latent dynamics together with planning-relevant reward, policy, and value predictions. DreamerV3 [23]
+learns behavior from imagined trajectories, and Model-Based Policy Optimization [26] uses short model-generated rollouts
+branched from real data to limit the effects of model bias. These approaches establish the use of internal simulation, with
+different choices of predictive representation and learning objective.
+World models for agent training. Language-based and synthetic environments extend this idea to learning interactive
+policies. Dynalang [33] learns a multimodal world model that predicts future text and image representations and trains a
+policy from imagined rollouts. DreamGym [8] generates transitions and feedback for agent reinforcement learning, and
+DynaWeb [14] combines rollouts in a learned web environment with real expert trajectories. Qwen-AgentWorld [72] learns
+language world models across multiple agent environments and studies their use both as simulators for reinforcement learning
+and as a foundation for agent training. In these settings, predicted experience supports learning the agent itself.
+Language world models for inference-time planning. Predictions can also guide a fixed agent without updating its policy.
+RAP [24] repurposes an LLM as both a reasoning agent and a world model, combining predicted transitions with Monte Carlo
+tree search and task-dependent rewards. For web navigation, WMA [5] learns transition-focused natural-language descriptions
+of changes between observations rather than reproducing full HTML states. WebDreamer [21] combines simulated action
+outcomes with value-based selection and trains specialized world models using synthesized interaction data. SiRA [13] uses
+natural-language belief states for goal-oriented simulative planning, while MCP-Cosmos [18] integrates world models with
+MCP tools to support planning before execution. These methods bring language-based prediction into candidate comparison
+rather than requiring real interaction for every alternative.
+15
+
+
+Relation to Seer. Seer combines model-based lookahead with a reusable evaluator for frozen research agents. Its simulator
+can be viewed as a specialized language world model that predicts tool responses from individual calls, rather than modeling
+the full external environment. The estimator separately scores the resulting histories using discounted terminal correctness
+from real continuations. These targets reflect observed outcomes and remaining interaction steps, not direct judgments of each
+action’s correctness. Both components are trained offline on real trajectories and reused across agents, rather than updating the
+agent through imagined experience. This combines call-level prediction with history-level evaluation while keeping action
+proposal separate. Only selected actions are executed, and only their real responses enter the next committed history. Seer
+therefore complements model compression and policy training while moving candidate comparison before real tool execution.
+Algorithm 1 Seer: imagined search and real execution in one round
+Require: nonterminal committed history st; frozen proposal distribution π; models Wϕ, Vθ; Nsim, k, dmax ≥1; cpuct ≥0
+1: Initialize root st at depth zero; new nodes have N = 0 and new edges have N = Q = 0
+2: for n = 1 to Nsim do
+3:
+Select a path to a terminal, unexpanded, or depth-capped node with history ¯s using Eq. (12)
+4:
+if the node is nonterminal, unexpanded, and below dmax then
+5:
+Independently sample m valid actions {a(i)}m
+i=1 from π(· | ¯s), with 1 ≤m ≤k
+6:
+Batch their tool calls through Wϕ to obtain ˆo(i) in call order; use ∅for final-answer candidates
+7:
+Add children ˆs(i) = ¯s ⊕(a(i), ˆo(i)) with edge priors P(e(i)) = 1/m; mark final-answer children terminal
+8:
+Extend the path through the first new edge
+9:
+end if
+10:
+v ←Vθ(history at path endpoint), including terminal histories
+11:
+For each path edge: N(e) ←N(e) + 1, Q(e) ←Q(e) + (v −Q(e))/N(e)
+12:
+Increment visit counts of all path nodes, including the root
+13: end for
+14: Select at by Eq. (13)
+15: if at is a final-answer submission then
+16:
+Return the answer and terminate
+17: else
+18:
+Execute only at’s tool calls to obtain ot = E(at)
+19:
+Discard the imagined tree; return the real history st+1 = st ⊕(at, ot) for the next round
+20: end if
+C. Seer Search Algorithm
+Algorithm 1 describes one round of imagined search followed by real execution, as introduced in §4.3. Search begins at
+the committed history and explores branches with separate imagined continuations, up to a depth cap dmax. During each
+simulation, selection follows Eq. (12), and the estimator scores the endpoint to assess its potential for task completion. This
+value is then backed up along the traversed path, updating the mean value of each edge. After search, the action on the most
+visited edge from the root is selected for real execution according to Eq. (13).
+Note that no gold-answer judgment is queried during search, including for terminal candidates. After a tool-using action is
+selected, its actual responses replace the predicted continuation rather than being appended to it. Thus, each subsequent round
+starts from a history containing only committed actions and real tool observations.
+D. Tool-Response Simulator Implementation Details
+The simulator Wϕ approximates the information returned by the shared tools, rather than the full state of the web. Its modeling
+unit is an individual call c: a tool name together with its arguments. As in Eq. (6), predictions for a multi-call action are
+assembled in the original call order. This factorization makes response prediction independent of the agent architecture while
+preserving the format expected by the value estimator.
+D.1. Supervision from Observed Tool Responses
+The real trajectories collected in §4.2 provide call–response supervision for both search and visit. Search outputs contain
+titles, links, and snippets; visit outputs contain page content extracted for the specified retrieval goal. We normalize equivalent
+call representations, remove infrastructure exceptions, and deduplicate repeated call–response pairs. Empty results and
+inaccessible pages are represented consistently, while substantive returned content is retained. These steps reduce variation
+16
+
+
+caused by the collection infrastructure without filtering examples according to whether the final answer was correct. An
+unsuccessful research trajectory can still supply a valid observation of what a tool returns.
+The resulting simulator corpus contains 0.7M pairs, as reported in §5.1. Validation is separated by normalized call identity
+so that repeated observations of the same call do not appear on both sides of the split. This differs from the estimator’s
+question-disjoint split: the simulator learns a call-level conditional distribution, whereas the estimator learns to assess
+question-dependent histories.
+D.2. Tool-Conditioned Prediction
+The simulator uses the same tool-specific input templates during training and inference. The boxed templates below make the
+conditioning information explicit. The query, URL, and goal are supplied by the proposed tool call; the enclosing conversation
+and the identity of the proposing model are not additional inputs. For a page visit, conditioning on the goal lets the simulator
+predict a focused extraction rather than an undirected reconstruction of the page.
+Search simulator prompt
+Act as a web search engine simulator.
+Return the top search results for the query
+below.
+Query:
+{query}
+Page-visit simulator prompt
+Act as a webpage extraction tool simulator.
+Extract content from the URL that is
+relevant to the goal.
+URL: {url}
+Goal:
+{goal}
+Training minimizes the response-only negative log-likelihood in §4.2. The instruction and call arguments supply context
+but do not contribute target tokens to the loss. This objective learns the conditional form and content of tool responses, rather
+than training the simulator to choose actions or judge whether a research question has been solved.
+D.3. Configuration and Use in Search
+Following §5.1, we initialize the simulator from Qwen3.5-9B and train it with LoRA rank 64, a learning rate of 10−4, and
+a context limit of 16k tokens. Each training example must retain response tokens within this limit, so examples that leave
+no tokens for response supervision are excluded. After training, the same checkpoint is reused across agent models without
+further updates.
+At inference, candidate calls are grouped for simulation, and each predicted response is attached only to its corresponding
+imagined branch. Proposals that submit a final answer contain no tool calls and therefore require no simulator output. These
+predictions support candidate comparison but do not serve as evidence. Once an action is selected, its tool calls are executed in
+the real environment, and only the resulting observations enter the next root history. This procedure allows comparison before
+execution while keeping subsequent reasoning grounded in real tool responses.
+E. Value Estimator Implementation Details
+The estimator Vθ complements call-level prediction by assessing a history in the context of its research question. Its
+supervision associates intermediate histories with observed task outcomes and their distance from completion. It provides an
+outcome-supervised scalar ranking signal for candidate histories, rather than predicting tool responses or generating critiques.
+E.1. History-Level Targets
+We retain deduplicated trajectories with submitted answers and exclude unanswered runs that end in errors or timeouts, as in
+§4.2. A judge compares each submitted answer with its gold answer to assign binary terminal correctness. The gold answer
+and judge output are used only to construct labels; neither is appended to the estimator’s input history. For a retained trajectory
+ξ, each labeled prefix receives
+Gξ,t = γTξ−tRterm(ξ; qξ),
+γ = 0.95.
+(15)
+17
+
+
+The distance Tξ −t counts remaining interaction steps, not tokens or individual calls within an action. Correct trajectories
+have positive targets that approach one at completion, whereas incorrect submitted answers induce zero targets throughout
+their trajectories. Excluding unfinished runs from this training set does not change the evaluation convention that unanswered
+questions receive a terminal quality score of zero.
+Discounting distinguishes prefixes associated with successful completion at different remaining distances without requiring
+manual step-by-step annotation. However, each target describes an observed continuation from the shared collection corpus; it
+does not assert that the immediately preceding action was individually correct. Since the corpus contains continuations from
+different frozen models, the learned score reflects this supervision rather than representing a calibrated success probability for
+a particular deployment policy. These semantics are preserved when the estimator ranks imagined histories at inference.
+E.2. Gaussian-Smoothed Value Classification
+We replace the language-modeling head with a fully trainable HL-Gauss classification head [16]. As specified in §5.1, the
+head has K = 201 uniform bins over [−1, 1]. Their width is βb −βb−1 = 2/201, and the smoothing standard deviation is
+σ = 0.75(2/201). Although the supervision targets lie in [0, 1], the classification support is the wider interval [−1, 1]; the
+support should not be confused with the range of observed labels.
+For each target, Eq. (10) integrates a Gaussian over the bins and normalizes its mass over the bounded support. This
+gives neighboring bins similar supervision for nearby target values, rather than treating two targets on opposite sides of a bin
+boundary as unrelated classes. Training minimizes soft-label cross-entropy, and inference returns the expectation of bin centers
+under the predicted distribution, as in §4.2. The scalar expectation is the value used for search and backup; no text-generation
+prompt or gold-answer comparison is required to obtain it.
+E.3. Causal Prefix Training and Shared Deployment
+The estimator corpus contains 1M training samples derived from the real trajectories (§5.1). We split training and validation by
+question, keeping every trajectory and labeled prefix for the same question together. This prevents closely related continuations
+from leaking across the split. Each trajectory is processed in one causal forward pass, with supervision read at the endpoints of
+its labeled prefixes. An endpoint representation can attend only to its own history, so later actions and the final submission are
+unavailable when scoring an earlier prefix.
+Shared-prefix training requires each shorter history to have exactly the same tokens as the corresponding prefix of the full
+trajectory. We exclude trajectories beyond the context limit rather than changing the evidence available to earlier prefixes
+through truncation. These conditions preserve the intended history–target pairing while avoiding the repeated encoding of
+shared context.
+The estimator is initialized from Qwen3.5-9B and uses LoRA rank 32, a learning rate of 10−4, and a 128k-token context
+limit, together with the fully trainable classification head. Its checkpoint is reused unchanged across agents. At deployment, it
+scores the history formed by appending a candidate action and its predicted responses; final-answer candidates are scored
+with an empty response. The experiments use depth-one imagined search, so each candidate extends a real root by only one
+imagined action before evaluation.
+F. Simulator Case Studies: Predicted and Real Tool Responses
+We compare predictions from the tool-response simulator Wϕ with the corresponding real tool responses. Unlike the trajectory
+comparisons in Appendix G, these cases examine the content supplied to the value estimator, not final-answer accuracy or
+realized tool savings. The shared interface has two tools: search returns result lists, and visit retrieves pages and extracts
+goal-relevant content (§5.1). Page reading is therefore covered by visit, not a separate read tool, for which no examples
+are available here.
+The boxes distinguish call arguments, predicted responses, and real responses. Queries and outputs are condensed where
+indicated, and descriptive summaries are not verbatim tool logs. Any research context is provided for the reader: Wϕ receives
+only the call and its tool-specific instruction, not the enclosing conversation (Appendix D). We examine agreement and
+discrepancies in response content rather than treating textual similarity as a measure of factual correctness. These comparisons
+provide a qualitative analysis rather than an estimate of average prediction accuracy.
+18
+
+
+F.1. Predicting Search Results
+Simulator Case A: A specific historical search result
+Call. search, with query: hatpin "If Men Use Their Bare Fists to Fight Life’s Battles" 1919
+advertisement. The investigation seeks the wording of an advertisement for the 1919 film Bare Fists.
+Predicted response. The result list contains The Hat-Pin: Fashionably Dangerous, with URL
+https://femmefashionforward.wordpress.com/2020/09/28/the-hat-pin-fashionably-dangerous/.
+Its snippet connects the film advertisement to the phrase “If Men Use Their Bare Fists to Fight Life’s Battles”.
+Real response. The returned hit has the same title, URL, and answer-relevant snippet linking the phrase to the 1919 advertisement.
+Interpretation. The match preserves a concrete retrieval target and the relation among the film, date, and wording, rather than merely
+predicting a historical topic. This is the information an imagined continuation can expose to Vθ when comparing candidate actions. It
+does not itself verify the phrase in the committed history: a selected search must be executed, and its real response supplies
+the actual evidence.
+Simulator Case B: Preserving useful results for noisy queries
+Call (abbreviated). search, with a long query combining "Different Tempo" rooster hamster animation
+distinct song versions composer and additional terms. The research goal is to connect animated song performances to
+their musical source. The displayed query preserves the main terms, not the full original search argument.
+Predicted response (summary). A relevant hit links the hamster performance to The Hampsterdance Song and the melody
+Whistle-Stop from Disney’s 1973 Robin Hood.
+Real response (summary). The corresponding hit supports the same musical connection rather than redirecting the investigation to a
+different dominant topic.
+Interpretation. The supplied response pair preserves a useful association despite distracting query terms. Unlike Case A, the available
+excerpt does not reproduce an exact result title or URL, so the visible comparison supports agreement on the research direction rather
+than an independently checkable, character-level match. It does not show that the simulator corrected the query or recovered the final
+composer answer in this case.
+Simulator Case C: Matched timeout, not invented content
+Call (summary). search, with an oversized query about the 2024 price range of Shanghai Gold Exchange Au(T+D), expanded with
+financial and unrelated technical terms.
+Predicted response (summary). A Google search timeout for the expanded query, rather than a list of market results.
+Real response (summary). The actual request also returns a Google search timeout.
+Interpretation. Both responses indicate an absence of retrieved evidence, not a fact about gold prices. Such a prediction could inform
+candidate-history evaluation, but this pair neither establishes that query length caused the timeout nor demonstrates reliable prediction
+of transient tool failures. The training pipeline excludes infrastructure failures (§4.2), so this diagnostic example should not be read as
+evidence that timeout messages were retained as training targets. No downstream reformulation or avoided call is established by the
+response pair alone.
+F.2. Predicting Goal-Conditioned Page Extractions
+Simulator Case D: Preserving a biographical fact
+Call. visit, with URL https://www.dailymail.com/news/article-9925789/Elon-Musks-secret-sister-
+tells-Errol-Musk-turned-asked-DNA-test.html. Goal: Find how old Riette Nel’s mother was when she gave birth
+to her.
+Predicted response (condensed). Riette Nel was born as Mariette van Deventer in Ladysmith, South Africa, on August 8, 1975. Her
+birth certificate did not name a father, and her mother was 21 at her birth. The predicted summary answers the goal with 21 years old.
+19
+
+
+Real response (condensed). The extraction reports the same birth name, date, place, and birth-certificate detail, and states that her
+mother was 21.
+Interpretation. The response pair agrees on both the requested age and the context identifying whose mother and birth are being
+discussed. This illustrates goal-conditioned prediction of an answer-relevant passage, not reconstruction of the entire article or
+independent validation of every claim it contains. The predicted extraction remains part of an imagined history until the selected call
+obtains a real response.
+Simulator Case E: Retaining an exact scientific award identifier
+Call. visit, with URL https://iopscience.iop.org/article/10.3847/2041-8213/acd54b. Goal: Find the
+NASA award number supporting work by R. G. Arendt.
+Predicted response (condensed). Work by R.G.A. was supported by NASA under award number 80GSFC21M0002. The
+surrounding acknowledgement also identifies the South African Radio Astronomy Observatory as the operator of MeerKAT and a
+facility of the National Research Foundation. The summary repeats 80GSFC21M0002 as the requested award number.
+Real response (condensed). The extraction contains the identical award string and the same surrounding acknowledgement context.
+Interpretation. Here, usefulness depends on preserving an exact alphanumeric identifier and its association with the author, not merely
+recognizing that the paper acknowledges NASA support. The agreement shows that the predicted extraction retains the requested field
+despite nearby institutional information.
+Simulator Case F: Textual agreement does not guarantee layout fidelity
+Call. visit, with URL https://lindas-literary-home.com/my-literary-home/essays-poems-with-
+commentaries/audre-lordes-father-son-and-holy-ghost/. Goal: Retrieve the text of Audre Lorde’s Father Son
+and Holy Ghost, including indentation, to identify which stanza has indented lines.
+Predicted response (summary). The extraction reproduces the poem’s line sequence and includes leading spaces before lines such as
+“Not that his judgment eyes” and “have been forgotten”. The summary claims the text preserves the poem’s structure and line breaks.
+Real response (summary). The extraction contains the same line sequence but normalizes away the leading spaces, while describing
+the stanza and line structure as preserved.
+Interpretation. The pair agrees closely on textual content but differs on the field required by this particular goal: indentation. A
+statement that structure is preserved cannot substitute for an actual layout check. Neither high textual similarity nor leading spaces in a
+prediction establish the original page’s typography. Layout-sensitive questions therefore require verification against a real source
+representation that retains formatting, rather than relying on the imagined extraction or on a whitespace-normalized response alone.
+G. Case Studies: Action Selection and Real Tool Use
+We examine six cases of Seer’s search guidance and the resulting committed research trajectories. The first four contrast a
+correct Seer answer with unsuccessful Base Agent, BoN@4, and AV@4 runs; the final two compare successful runs with
+different real tool costs. All Seer runs use candidate width k = 32 and depth cap dmax = 1. Questions and trajectory excerpts
+are condensed for readability, rather than reproduced as verbatim tool logs. These qualitative comparisons complement the
+aggregate results in §5.2.
+Table 8 summarizes the outcomes and resource use. We count ctool(ξ) as in §3: every real search or visit call counts,
+including calls in discarded BoN@4 and AV@4 trajectories, and calls batched in one action count individually. Final-answer
+submissions contribute no tool calls. For Seer, Wϕ predicts candidate tool responses and Vθ scores the resulting imagined
+histories before search selects an action for real execution. These local computations are not real tool calls, but they are not
+free computation either.
+20
+
+
+Table 8. Case outcomes and real tool-call counts. C denotes a correct answer; I denotes an incorrect or unanswered result; — indicates a
+comparison not included in the case report. Base, BoN, AV, and S32 follow the notation in §5.1.
+Case
+Base
+BoN
+AV
+S32
+1. OpenCV contributor
+11 (I)
+39 (I)
+50 (I)
+3 (C)
+2. Hiking location
+54 (I)
+178 (I)
+124 (I)
+17 (C)
+3. UN parliamentary seats
+40 (I)
+135 (I)
+104 (I)
+16 (C)
+4. NBA final-game margin
+14 (I)
+62 (I)
+47 (I)
+8 (C)
+5. Encoder-layer comparison
+11 (C)
+—
+—
+2 (C)
+6. Elevator-accident article
+—
+21 (C)
+—
+2 (C)
+G.1. Correct Answers from Focused Trajectories
+Case 1: Turning a retrieved source into an identity check
+Setting. GAIA; Qwen3.5-9B.
+Question. Which contributor to the OpenCV version that added Mask-RCNN support shares a Latin-transliterated name with a former
+Chinese head of government? Labeled answer: Li Peng.
+Seer’s committed trajectory: 3 calls (2 searches, 1 visit). A search for OpenCV’s addition of Mask-RCNN support returns the
+ChangeLog. A visit identifies the relevant version, 4.0.0, and a contributor list containing Li Peng. One targeted search for Li Peng as a
+former Chinese premier checks the identity match, after which Seer submits Li Peng.
+Comparison. Base Agent reaches the same ChangeLog, but subsequent queries accumulate contributor names and loosely related
+keywords rather than checking a specific candidate. It uses 9 searches and 2 visits without a correct submission. BoN@4 and AV@4
+also fail (39 and 50 real calls), with similar query deterioration in their four trajectories.
+Interpretation. The useful source is available to both Seer and Base Agent; the difference appears in what they do next. Seer’s
+trajectory preserves the link between the release, its contributors, and the identity clue. This illustrates the role of next-action guidance
+after retrieval, rather than an advantage attributable only to finding a better initial source. The excerpts do not reveal which unexecuted
+candidates received lower estimator scores.
+Case 2: Revising a location as constraints accumulate
+Setting. BrowseComp-200; Qwen3.5-397B-A17B.
+Question. Identify a scenic hiking location formed during the last ice age, with a body-part-related name, a fall from its viewpoint
+between 2000 and 2021, and a 2014 search-and-rescue count related to the Grand Canyon’s 2022 count by a factor of 84.5. Labeled
+answer: Trolltunga.
+Seer’s committed trajectory: 17 searches. Early searches consider directions including Angels Landing, the Grand Canyon, and
+Finger Lakes without establishing a joint match. A subsequent search connects Trolltunga with the tongue-related name and glacial
+formation clues. Further searches check a 2015 fatal fall and the rescue-statistics clue, leading to the answer Trolltunga.
+Comparison. Base Agent spends 54 calls exploring partially matching locations and repeatedly searching the rescue-count ratio, then
+submits Half Dome. BoN@4 and AV@4 use 178 and 124 calls, respectively, without reaching a correct answer.
+Interpretation. Seer’s visible trajectory changes direction when another location better fits multiple constraints, whereas Base Agent
+ultimately settles on a partial match. This behavior is consistent with comparing alternative next actions before commitment. It does
+not imply that Seer retains a persistent tree of location hypotheses: at depth one, each real round starts a new imagined search from the
+committed history. The example shows that a large frozen agent can also benefit from guidance over its proposals.
+Case 3: Refining a lookup rather than rejecting its premise
+Setting. SEAL-0; Qwen3.5-397B-A17B.
+Question. According to United Nations data from 2015, what percentage of national parliamentary seats in Northern America were
+held by women? Labeled answer: 21.8%.
+Seer’s committed trajectory: 16 calls (9 searches, 7 visits). Initial searches locate UN, IPU, and UNSD material. Seer moves from
+21
+
+
+broader regional presentations, including The World’s Women 2015, to a UNdata table containing the Northern America row. A
+secondary data presentation supplies a cross-check of the 2015 value, and Seer submits 21.8%.
+Comparison. Base Agent encounters the same source ecosystem but questions whether Northern America is reported separately,
+eventually giving an approximate 22–23% range after 40 calls. BoN@4 uses 135 calls and returns approximately 27–28% with a
+premise objection; AV@4 uses 104 calls without supplying the exact labeled figure. Their searches repeatedly return to broader
+regional groupings rather than resolving the requested row.
+Interpretation. Failing to locate a row in an initial document is not evidence that the requested statistic is unavailable. Seer’s
+committed actions continue refining the lookup within the relevant data sources instead of substituting an approximate answer or a
+premise objection. The contrast concerns action selection under incomplete retrieval, not access to the labeled answer during search.
+Case 4: Preserving the two-hop structure of a sports lookup
+Setting. XBench-DeepSearch; Qwen3.5-9B.
+Question. For the team of the player ranked second in total fouls in the 2023–24 NBA regular season, what was the score difference in
+its final game that season, including the play-in and playoffs? Labeled answer: 7 points.
+Seer’s committed trajectory: 8 calls (6 searches, 2 visits). Seer searches the regular-season total-foul leaderboard and visits
+Basketball-Reference to identify Domantas Sabonis and the Sacramento Kings. It then searches the Kings’ final game and visits a game
+or season page to resolve the relevant score difference. The submitted answer is 7 points.
+Comparison. Base Agent initially finds the relevant basketball source, but later queries mix unrelated names and malformed keyword
+sequences; timeouts also occur. It ends without an answer after 14 calls. BoN@4 spends 62 calls and recovers part of the chain without
+a correct final difference, while AV@4 spends 47 calls and submits −10.
+Interpretation. Seer’s trajectory keeps the player-to-team and team-to-game links explicit rather than repeatedly reopening
+inconsistent combinations. Together with Case 1, this provides a small-agent example of more focused committed queries. Because the
+unsuccessful run also contains tool failures, the difference cannot be attributed exclusively to query drift or to any single
+decision-model component.
+G.2. Fewer Real Calls at the Same Answer Quality
+Case 5: Submitting once the comparison is supported
+Setting. GAIA; Qwen3.5-4B.
+Question. How many more encoder blocks or layers does BERT-base have than the encoder in Attention Is All You Need? Labeled
+answer: 6.
+Seer’s committed trajectory: 2 searches, 3 rounds. One search establishes that BERT-base has 12 encoder layers, and another
+establishes that the original Transformer encoder has 6. Seer then submits 12 −6 = 6; the submission is a committed round but not a
+real tool call.
+Comparison. Base Agent also obtains the two layer counts early, but continues checking arXiv, Wikipedia, Hugging Face, and course
+material before returning the same answer. It uses 5 searches and 6 visits over 12 rounds, for 11 real calls in total. Thus, its real-call
+count is 5.5× Seer’s despite identical final correctness.
+Interpretation. The visible difference is the timing of final submission, not the arithmetic. In Seer, a final-answer action is evaluated
+by Vθ with an empty tool response and competes with further tool-using actions (§4.1). This supplies a mechanism for selecting
+submission once the history supports an answer, without a separate stopping threshold. The example is consistent with this mechanism,
+but does not establish that the estimator is calibrated to evidence sufficiency.
+Case 6: Reaching the same evidence without executing four trajectories
+Setting. BrowseComp-200; Qwen3.5-397B-A17B.
+Question. A machine used beneath the Colosseum later developed into steam-powered and electric passenger versions. In a 2010s
+article about accidents involving this machine, who is the sibling of a person catastrophically injured on Thanksgiving? Labeled
+answer: Josh / Josh Nelson.
+Seer’s committed trajectory: 2 calls (1 search, 1 visit). A search combining the historical-machine and Thanksgiving-injury clues
+returns a CBS News article about in-home elevator accidents. A visit identifies the injured person as Jordan Nelson and the sibling as
+22
+
+
+Josh Nelson. Seer submits the answer Josh.
+Comparison. BoN@4 also selects the correct answer through the same essential evidence chain, but its four real trajectories incur 11
+searches and 10 visits in aggregate. Its 21 real calls are 10.5× Seer’s count.
+Interpretation. Here the successful evidence chain is short for both methods; the accounting difference includes the real execution of
+alternative BoN@4 trajectories. Seer instead uses the simulator and estimator to guide depth-one imagined search, executing only the
+selected action at each round. Candidate width k = 32 is a maximum number of next-action proposals per expansion, not 32 complete
+simulated research trajectories. The comparison establishes lower real tool use, not matched local computation or a 10.5×
+latency speedup.
+H. Limitations and Future Work
+Seer’s scope is cost reduction on the tool-call axis, not context management: it reduces how often external services must be
+called, while the interaction histories it reads still grow with every round. This section reports the limitations that follow from
+the design and evaluation choices, states why the current work does not cover each of them, and outlines the corresponding
+follow-up studies, grouped into five directions: the relation to context compression, model coverage, the question-answering
+focus, fixed search computation, and deployment cost accounting.
+Relation to context compression. Seer is not a context-management method and does not compete with context
+compression or summarization. The two operate on different cost axes: context compression [55] shrinks what the model reads,
+whereas Seer reduces how often external services must be called. Seer keeps full committed histories by design, because the
+estimator is trained on complete real histories and retaining real responses is what preserves the separation between predicted
+content and citable evidence. For the same reason, we did not include a context-compression or summarization baseline in
+this work: such a method changes the input distribution that the frozen agent sees, so a controlled comparison would require
+either retraining the agent for compressed histories or verifying that a compression module preserves decision quality on every
+benchmark, either of which is a study on its own. Combining Seer with context compression on the same tool interface is a
+natural direction, as the two would reduce both cost axes at once.
+Model coverage. Our evaluation covers Qwen and Gemma, currently among the most widely used open-source model
+families, with both decision models initialized from Qwen3.5-9B. The restriction is deliberate rather than incidental: both
+decision models are trained once on real trajectories and then shared by every evaluated agent, so extending the study to an
+independent family such as DeepSeek or GLM means collecting new training trajectories and retraining both decision models
+on that family, a training-scale effort that would break the controlled setup in which every agent is guided by the same decision
+models. The Gemma agents already provide first evidence that the guidance itself transfers across families; whether the shared
+9B decision models become a bottleneck for stronger agents, and whether the gains persist when the agent is stronger than the
+models guiding it, are left to future work.
+From question answering to research reports. We focus on question answering because terminal correctness provides a
+clear, verifiable training signal and a consistent basis for comparing agents. Correctness alone does not capture the quality
+of a full research report, where coverage, citation support, and synthesis also matter. We did not evaluate report-style tasks
+in this work because their supervision requires rubrics whose construction is itself an open measurement problem; adopting
+one would tie both the estimator’s training signal and the evaluation to a contested metric. Extending Seer with rubric-based
+supervision would preserve the separation between proposal, prediction, and evaluation while broadening what the estimator
+learns to assess.
+Search depth and adaptive allocation of computation. We use fixed candidate widths and a search depth of one to
+compare the effect of candidate coverage under a common search procedure; deeper search couples width and depth effects
+and would confound this comparison. This controlled setting leaves open how much computation each decision needs, and
+the estimator’s discount factor is likewise fixed at γ = 0.95 throughout, with its sensitivity left uncharacterized. We did
+not run an adaptive-computation study because such a policy must commit its budget before observing the outcome, which
+requires a calibrated uncertainty signal that the current estimator does not provide. Future work could vary candidate width
+and simulation effort according to decision uncertainty and the remaining budget, building on adaptive agent scaling [29, 34].
+The aim would be to spend more computation where additional candidates are useful and less where they add little, evaluated
+under the same resource constraints as the fixed settings studied here.
+Deployment cost accounting on local devices. By accounting for model parameters and real tool calls separately, we
+study the cost of guidance without tying the comparison to a particular device. These measures do not, however, establish
+peak memory use, energy consumption, or latency on actual hardware. We did not take hardware measurements, because
+they depend on a specific device profile, and single-device numbers would not transfer across the heterogeneous edge devices
+23
+
+
+this work targets. We instead report a device-independent analytical estimate: each decision proposes k candidates and runs
+the simulator and estimator once per candidate, so local inference time scales roughly with k. Quantizing the agent and both
+decision models, sharing representations between prediction and evaluation, and tailoring batching to the device could reduce
+the added local cost. Evaluating these changes on a fixed device profile would show whether the savings preserve decision
+quality and translate into practical deployment benefits. This design exchanges local computation for performance without
+agent-side training, and the two decision models share the same 9B base weights with separate LoRA adapters, so the added
+memory is dominated by the shared base rather than by the adapters.
+Progress along these directions could make reusable guidance practical for a wider range of research tasks and devices,
+accelerating access to research assistance while preserving users’ control over their agents’ reasoning and decisions.
+24

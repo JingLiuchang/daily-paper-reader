@@ -1,0 +1,836 @@
+Self-Evolving Beyond Human-Crafted Experience
+for EDA Scripting
+Yang Liu1,∗,†, Shengbo Tong1,2,∗, Xiyuan Chen1,3, Shiwei Hou1, Sen Yuan1,
+Hao Wang1, Yanfeng Li1,†, Hongwen Li1,†, Yiming Zhu1, Zhuolun He2,†
+, Wenjian Yu2,†
+1CXMT, 2Tsinghua University, 3USTC
+paul.liu@cxmt.com, tsb23@mails.tsinghua.edu.cn
+∗These authors contributed equally to this work.
+†Corresponding authors.
+Abstract—The growing complexity of electronic systems de-
+mands efficient design flows, yet EDA scripting remains a bot-
+tleneck: proprietary APIs are sparsely documented, and errors
+often appear as silent failures or cryptic exceptions. Hand-
+crafted knowledge helps but is difficult to maintain as toolchains
+evolve. We present ZhuLong-SE (Self-Evolution), an execution-
+grounded LLM agent that learns reusable knowledge from prior
+task traces. Building on ZhuLong [1], it enhances the task-level
+harness with API retrieval, documentation responses, isolated
+sandbox execution, and static checking, then adds governed cross-
+task self-evolution. Beyond solving individual tasks, ZhuLong-
+SE distills past execution traces into a three-tier memory store
+governed by ground-truth anchoring, disconfirmation filtering,
+held-out rollback, and anti-leakage retrieval. On the 158-task
+EDA-Eval-PyAether benchmark, the full task-level harness, with
+self-evolution disabled, achieves 92.4% pass@1 and outperforms
+ZhuLong on all five tested LLM backbones. On a harder
+instance-disjoint test set, self-evolution from the bare config-
+uration surpasses a human-crafted-experience baseline by 2.5
+percentage points (80.0% vs. 77.5% pass@1).
+Index
+Terms—System-level
+design
+methodologies,
+design
+knowledge reuse, LLM agents, EDA scripting, continual learning,
+self-evolution, memory reliability, PyAether.
+I. INTRODUCTION
+EDA scripting is challenging because tool APIs are tool-
+specific, sparsely documented, and exposed through SWIG
+bindings whose type rules differ from native Python. Zhu-
+Long [1] is the first work that established an execution-
+grounded LLM agent for EDA scripting that combines
+API retrieval, documentation inspection, and sandbox ex-
+ecution via unified MCP tools, augmented by an offline
+API self-exploration mechanism that infers undocumented
+API behaviors through counterfactual experimentation. On the
+EDA-Eval-PyAether benchmark, the system achieved 78.5%
+pass@1, substantially outperforming a pure LLM baseline
+of 23.6%. However, a critical limitation remained: the agent
+solved each task independently and did not learn from past
+execution traces, so its performance on new tasks did not
+improve over time.
+Building on this task-level substrate, we introduce self-
+evolution: an offline system that distills execution traces
+into reusable knowledge and re-injects it into future tasks,
+with reliability gates that prevent unverified experience from
+misleading the agent. To provide reliable signals for self-
+evolution, we introduce a precision-optimized static checker
+for deterministic API misuse. It raises no error flags on
+the 158 benchmark ground-truth solutions, a sanity check
+limited to this reference-code set. Applying self-evolution
+to EDA scripting introduces two challenges. First, feedback
+is very sparse: the agent receives only a binary pass/fail
+from the hidden verifier. This is different from methods like
+SkillOpt [2], which assume dense per-step rewards. Without
+careful verification, distilled experience can mislead. Second,
+instance-disjoint evaluation risks cross-split answer copying: a
+held-out task may copy a training sibling’s verbatim solution
+rather than transferring the underlying method, a problem
+recently observed in EvolveMem [3].
+We present ZhuLong-SE (Self-Evolution), which extends
+the ZhuLong task-level substrate with enhanced API retrieval
+and documentation responses, improved sandbox isolation,
+and precision-optimized static checking, and then adds a self-
+evolution layer with reliability gating. To handle sparse feed-
+back, we introduce ground-truth anchoring, scope-boundary
+reflection, disconfirmation-based filtering, and a held-out val-
+idation loop that rejects degrading rounds. Beyond post-hoc
+evaluation gating, we design structural anti-leakage retrieval
+via names-only injection and deterministic docstring general-
+ization to reduce the risk of cross-split answer copying. These
+mechanisms are designed to provide methodological signals
+without injecting full call sequences, while an evolution round
+is retained only when held-out validation does not degrade
+beyond the acceptance threshold. On the held-out test set,
+this design achieves a higher mean pass@1 than the human-
+crafted-experience baseline.
+Our contributions are as follows.
+• Self-evolution as a design methodology for EDA au-
+tomation. We establish self-evolution—distilling execution
+traces into reusable knowledge and re-injecting them into
+future tasks—as a systematic methodology for system-level
+EDA scripting. To make it deployable under EDA’s sparse
+feedback and opaque commercial APIs, we introduce three
+governance rules: ground-truth anchoring, on-demand pitfall
+retrieval, and validation-gated rollback.
+• A rigorous evaluation protocol against cross-split leak-
+arXiv:2611.26912v1  [cs.AI]  19 Nov 2026
+
+
+age. We expose cross-split answer copying as a threat
+to trustworthy self-evolution evaluation, and propose a
+retrieval-time defense (names-only injection + docstring
+generalization) that removes full call sequences and task-
+specific details while preserving methodological transfer—
+establishing a protocol for future work on self-evolving
+design agents.
+• Counterintuitive design insights from controlled abla-
+tion. Controlled ablations on the 158-task EDA benchmark
+yield three observations: ground-truth anchoring prevents
+12 of 24 failed-task traces from producing falsely verified
+entries; pitfall pre-injection reduces validation pass@1 by
+8.0 pp in our ablation; and names-only retrieval improves
+over full-sequence injection by 4.7 pp. On the 40-task held-
+out test set, self-evolution from the Bare configuration
+reaches 80.0% mean pass@1, compared with 77.5% for the
+human-crafted-experience baseline, grounding these obser-
+vations for future system-level design automation.
+II. RELATED WORK
+A. LLM for EDA Scripting
+LLMs for chip design have largely targeted RTL genera-
+tion: ChipNeMo, RTLCoder, AutoChip, and CodeV-R1 [4]–
+[7] domain-adapt or fine-tune models for Verilog, relying
+on human-constructed testbenches, which is orthogonal to
+operating an EDA tool’s API surface. The procedural-scripting
+strand has grown quickly: ChatEDA, ChaTCL, EDA-Copilot,
+iScript, FluxEDA, JARVIS, and AutoEDA [8]–[14] span
+flow planning, Tcl/Q&A assistance, multi-agent collaboration,
+single-turn generation, and execution infrastructure. Within
+this strand, ZhuLong [1] is the direct precursor to our work:
+it combines API retrieval, documentation inspection, sandbox
+execution, and offline API self-exploration, but solves tasks
+independently without reusing execution traces across tasks.
+Another closely related system is OpenROAD Agent [15],
+which adds execution-feedback self-correction on an open
+physical-design tool, but fine-tunes the model and does not
+externalize cross-task experience. Our scenario shares its
+generate-execute-revise shape yet keeps the model frozen and
+judges pass/fail by real sandbox execution with hidden tests—
+addressing cross-task reuse through self-evolution rather than
+fine-tuning. The Agentic EDA survey [16] situates this line at
+L3 autonomy. Two gaps recur for a frozen-agent, hidden-test
+setting: none externalizes cross-task experience into a reliable,
+leakage-controlled store, and none carries a domain-level static
+check beyond the tool’s own schema—both of which our
+system addresses.
+B. Self-Evolving Agents with Governed Memory
+A broad family of works equips agents with reusable exter-
+nal memory: skill libraries, cross-task insight distillation, hier-
+archical memory, and cognitive architectures [17]–[20], with
+CodeAct [21] unifying the action space as executable Python.
+The survey by Zhang et al. [22] provides a comprehensive tax-
+onomy of memory mechanisms for LLM agents. These works,
+however, generally assume an open world or a train/test-
+disjoint split, which sidesteps the same-task regression signal
+that our fixed-set setting must surface. DemoEvolve [23] ex-
+plicitly studies sparse terminal feedback in harness evolution,
+but addresses it through human demonstrations—whereas our
+setting assumes no such external guidance.
+Treating the skill store as an optimization target, Skil-
+lOpt [2] edits a single skill document under a held-out gate
+and observes that “plausible textual diagnoses can still hurt,”
+echoing our concern that unverified experience can mislead.
+SkillOS [24] learns curation via RL with a four-dimensional
+judge, and Trace2Skill has been explored in two complemen-
+tary forms: Ni et al. [25] propose a general framework that dis-
+tills execution trajectories into reusable skills through parallel
+trajectory analysis and inductive pattern consolidation, using
+a verifier primarily for quality filtering of the extracted skills;
+Du and Pinckney [26] present a test-time scaling framework
+for hardware agents where dense verifier feedback actively
+drives the oracle-mutator-selector evolution loop. These works
+optimize on disjoint splits with relatively dense signal, whereas
+our sparse-pass/fail, fixed-set setting makes which-experience-
+to-trust more pressing than how to edit a document.
+Verifier-guided evolution brings the reward signal closer to
+our hidden-test setting. ReVeal [27] self-generates test cases
+for dense rewards, but self-generated tests can be gamed and
+do not substitute for a hidden verifier. Du and Pinckney [26]
+share our hidden-verifier, no-answer framing but run online per
+task with physical isolation and task-wise skills; their finding
+that cross-task transfer is unreliable for heterogeneous RTL
+cautions how far logical-error knowledge should travel—a
+concern we address through governed memory and anti-
+leakage retrieval. EvoAgentBench [28], the most comparable
+benchmark, formalizes this tension with an ability-supported
+yet instance-disjoint split, finding that an Anchor Skill oracle
+helps while no automatic method sustains the gain.
+Several works inform the governance machinery underly-
+ing our approach: MUSE-Autoskill [29] on refinement and
+reflection, Externalization [30] and Reflexion [31] on memory
+artifacts and same-task iteration, and Governing Evolving
+Memory [32] on System-2 verification. LastingBench [33]
+proposes counterfactual rewriting to safeguard benchmarks
+against knowledge leakage, underscoring the importance of
+our anti-leakage retrieval design. The central lesson is that
+evolving memory requires an external gate grounded in ground
+truth to remain reliable. Our method addresses this challenge
+under sparse pass/fail supervision and strict anti-leakage con-
+straints.
+III. METHOD
+Building on the origin ZhuLong execution harness [1],
+ZhuLong-SE retains its retrieval–documentation–execution
+loop and introduces the blue-highlighted extensions in Fig-
+ure 1: enhanced API retrieval and documentation, isolated
+parallel sandbox management, a precision-optimized static
+checker, human-crafted rules and skills, and an offline cross-
+task self-evolution system. We describe the task-level harness
+
+
+API Retrieval
+Vector Database
+Token Overlap
+BM25
+Cross Family Synonym
+Preprocessing
+Sandbox Environment
+Reset Workdir
+Execute Code
+Static Checking
+Error & Print Log
+Detailed Document
+Parameters, Examples, Constraints
+Property and Constructor Tables
+Distill
+Self-Evolution System
+L0 (Raw): per task trace and feedback
+L1 (Patterns): aggregate pattern items
+L2 (Evolution): memory version control
+Solution Layer
+Pitfall Layer
+Meta Layer
+Strategy Layer
+User Instruction
+Write
+Verification & Evaluation
+ZhuLong-SE Agent
+MCP Tools
+Search
+API
+Read
+Document
+Execute
+Code
+Rules
+Tools
+Recall
+Memory
+Skills
+Read
+Fig. 1. Architecture of ZhuLong-SE, adapted from the ZhuLong execution framework [1]. Blue-highlighted blocks denote components added or enhanced in
+this work. Unhighlighted blocks show the shared execution workflow.
+extensions in Sections III-A–III-E, followed by self-evolution
+in Section IV.
+A. API Retrieval
+ZhuLong provides a single search_apis MCP tool that
+uses semantic retrieval [1]. ZhuLong-SE retains its embedding-
+based semantic path, adds a dedicated keyword-oriented tool
+(search_apis_by_keyword), and supplements matches
+missed by the summary with a BM25 pass over the full
+description text. The keyword path targets queries that the
+semantic index handles poorly, such as abbreviations and
+camel-case fragments. The index tokenizes each API name
+by splitting on camel-case boundaries and stripping family
+prefixes. The query is bidirectionally expanded for abbrevia-
+tions (e.g., CV↔CellView, crt↔create), enabling matches on
+abbreviated tokens inside API names. Depending on query
+type, a router expands abbreviations, returns direct-match hints
+for API-name fragments, or appends semantic results for
+natural-language queries. Finally, a cross-family synonym map
+links four functionally equivalent API families (db*, emy*,
+goa*, ae*), so a hit in one family surfaces equivalents in the
+others, addressing the failure mode where an agent recalls the
+correct operation but selects the wrong interface family.
+B. Documentation Enrichment
+ZhuLong’s get_api_details returns parameter types,
+return values, examples, and inferred constraints [1], but
+its per-API pages do not expose class instance properties.
+ZhuLong-SE therefore parses the raw documentation into
+a property table and appends it to each detailed response,
+so a queried class exposes its instance attributes alongside
+its methods. Constructor notes also disambiguate ambiguous
+calls: for example, emyPointArray accepts a plain list of
+points, a fact the per-signature page does not state.
+C. Sandbox Execution
+We run multiple isolated sandbox endpoints, each with an
+independent working directory, and dispatch requests through
+a queue pool. A routine clears working directories before each
+run and resets library files to minimal content, so prior runs do
+not bias subsequent ones. This isolation ensures that execution
+feedback reflects the current code under test, not residual
+state from earlier tasks. The queue pool enables concurrent
+evaluation without changing ZhuLong’s per-task interaction
+protocol [1].
+D. Static Checking
+Because PyAether’s SWIG bindings expose all symbols at
+import time regardless of whether the underlying function
+exists at runtime, an agent may call a fabricated API or pass a
+native Python value where a SWIG-wrapped type is required
+without triggering any runtime error during self-test—yet the
+submission fails the hidden test that exercises that path. To
+catch such failures before submission, we introduce a static
+checker that runs after the agent’s self-test and before final
+submission.
+The checker parses submitted code into an abstract syntax
+tree, extracts API calls, and checks four documented misuse
+patterns: (i) fabricated APIs, (ii) incorrect keyword argu-
+ments, (iii) native Python values passed where explicit SWIG-
+wrapped construction is required, and (iv) silently swallowed
+exceptions. Actionable findings are returned to the agent for
+repair before final submission. The rules are derived from
+the API documentation and refined on real submissions. As
+a reference-code sanity check, the checker raises no flags on
+any of the 158 ground-truth solutions. This result is limited to
+that set and is not a general zero-false-positive guarantee.
+E. Human-Crafted Experience
+ZhuLong-SE additionally injects four skills and one rule
+file authored from PyAether development experience rather
+
+
+than specific benchmark solutions. The skills cover API search,
+command-family selection, interpretation of silent or ambigu-
+ous sandbox feedback, and explicit SWIG type construction.
+The rule file requires API-detail checks before use, post-
+creation verification, and bounded search, providing a stable
+prior that complements knowledge learned from the execution
+traces.
+IV. SELF-EVOLUTION
+Unlike ZhuLong’s offline API self-exploration, which aug-
+ments per-API documentation through counterfactual sandbox-
+ing [1], ZhuLong-SE adds a cross-task offline self-evolution
+system (the blue-highlighted block at right in Figure 1). It
+distills task execution traces into reusable knowledge and re-
+injects it into later tasks. Knowledge is organized in three tiers,
+following the episodic-semantic-procedural memory distinc-
+tion [20]: L0 holds raw traces, L1 stores aggregated patterns,
+and L2 archives distilled skill versions. Within L1, patterns
+are partitioned into four layers: solution (verified API routes),
+pitfall (negative warnings), meta (effective query patterns), and
+strategy (decision records). The write side runs offline after
+each training batch, and the read side injects knowledge at
+task formatting and on demand when the agent hits an error.
+The write, promotion, and round-acceptance stages apply reli-
+ability gates, as unvalidated experience can mislead [2], [18].
+Distillation and state updates run offline. During inference,
+the accepted memory is queried locally, without additional
+evolution or distillation.
+A. Distillation and Reflection
+The write side routes each task to the appropriate reflection
+path. We override the agent’s self-reported success with the
+evaluator’s binary verdict before any reflection begins, follow-
+ing Reflexion’s observation that reliable feedback is necessary
+for reflection to help rather than harm [31]. Tasks that still
+error on their final attempt take the error path; tasks whose
+self-test passed but the evaluator failed take the contradiction
+path instead. This distinction is critical because a self-test-
+passed task’s error log contains only stale errors; mining
+pitfalls from these would record already-solved bugs rather
+than genuine gaps in the agent’s knowledge. Each L1 entry
+carries a reliability tier: verified, unverified, or pitfall.
+B. Knowledge Lifecycle with Reliability Gating
+Extracted L1 patterns undergo aggregation, gating, aging,
+and promotion to rules and skills. A verified entry is discon-
+firmed only when a failed task is an API misuse precisely
+attributed to that entry; at a count of two or more, the entry
+is filtered out. Unverified traces cannot downgrade verified
+entries, and entries not re-confirmed for five rounds drop
+to unverified. Promotion is guarded by a four-dimensional
+judge (abstraction, reusability, actionability, faithfulness) fol-
+lowing SkillOS [24], and a MUSE-style create-evaluate-refine
+loop [29] for low-scoring candidates. We add a zero-exception
+generality gate that rejects rules whose always/never state-
+ments do not hold across the entire API surface, ensuring that
+distilled rules remain broadly applicable rather than overfitting
+to specific task patterns.
+C. Anti-Leakage Retrieval
+Under an instance-disjoint split, naive retrieval risks cross-
+split answer copying. We prevent this through three mech-
+anisms. Names-only pre-injection reduces a solution entry
+to API names only, dropping call order and parameters. De-
+terministic docstring generalization strips task-identifying
+specifics from both distillation and query sides. Problem-side
+embedding matches on problem similarity while returning
+solution metadata only at read time. Pitfalls are not pre-
+injected; they enter through on-demand runtime queries keyed
+to the agent’s actual error.
+D. Held-Out Gated Evolution
+After each training round, the agent generates on valida-
+tion tasks (which never carry distillation). The round’s full
+evolved state is accepted only if the validation pass rate does
+not regress by more than 5 pp against the previous round.
+Otherwise, it is rolled back. This extends SkillOpt’s held-out
+criterion [2] from a single document to the entire evolved
+state.
+V. EXPERIMENTS
+We evaluate ZhuLong-SE on EDA-Eval-PyAether, the 158-
+task real-world PyAether scripting benchmark introduced by
+ZhuLong [1]1. Each task is a natural-language docstring plus
+a function signature, and a submission passes only if real
+sandbox execution satisfies a hidden test (the black-box ver-
+ifier). The primary model is DeepSeek-V4-Pro-Preview. The
+human-crafted experience consists of four skills and one rule
+authored by a senior EDA engineer with extensive experience
+in PyAether development.
+The experiments have two parts. First, on all 158 tasks, we
+ask whether the enhanced ZhuLong-SE harness outperforms
+the original ZhuLong across matched LLM backbones and
+which measured harness components contribute to the gain.
+Second, after removing human-crafted experience, we ask
+whether governed self-evolution can match or surpass the
+human-crafted-experience baseline.
+A. Harness Evaluation
+We first evaluate the enhanced task-level harness, with self-
+evolution disabled throughout this subsection. The complete
+ZhuLong-SE configuration enables all harness enhancements
+described in Section III, including full retrieval, documentation
+enrichment, sandbox isolation, the static checker, and human-
+crafted experience. We first compare this configuration with
+the published ZhuLong baseline and then decompose the
+measured components under the primary backbone. No self-
+evolved knowledge is injected into any result reported in this
+subsection. For each comparison, the backbone version and
+settings other than the harness components under study are
+1We obtained the benchmark by contacting its authors.
+
+
+aligned with ZhuLong [1]. Table I uses the reported ZhuLong
+results where available.
+Table I compares ZhuLong-SE with ZhuLong on the
+same backbone versions. Across all the five comparisons,
+ZhuLong-SE improves by 11.4 pp on DeepSeek-V4-Pro-
+Preview, 16.4 pp on GLM-5.2, 5.7 pp on Kimi-K2.6, 6.9 pp on
+DeepSeek-V4-Flash-Preview, and 15.8 pp on Doubao-Seed-
+2.0-pro. Because self-evolution is disabled, these gains reflect
+the combined task-level enhancements in Section III. The
+comparisons indicate transfer across the tested model families,
+although absolute performance still depends on backbone
+capability.
+TABLE I
+HARNESS-ONLY PASS@1 COMPARISON WITH ZHULONG ON ALIGNED
+BACKBONE VERSIONS (158 TASKS, ONE ZHULONG-SE RUN PER MODEL,
+NO SELF-EVOLUTION).
+Model
+ZhuLong ZhuLong-SE
+∆
+DeepSeek-V4-Pro-Preview
+81.0%
+92.4%
++11.4 pp
+GLM-5.2
+74.7%
+91.1%
++16.4 pp
+Kimi-K2.6
+83.5%
+89.2%
++5.7 pp
+DeepSeek-V4-Flash-Preview
+78.5%
+85.4%
++6.9 pp
+Doubao-Seed-2.0-pro
+55.7%
+71.5%
++15.8 pp
+Each harness configuration is evaluated once because a full
+158-task run is costly, and the broad task coverage reduces sen-
+sitivity to any single task outcome. Repeated runs are reserved
+for the smaller validation and challenge-test evaluations.
+We next perform an ablation study on ZhuLong-SE. Be-
+cause ZhuLong-SE is inherited from ZhuLong, we use pro-
+gressive rather than leave-one-out ablation to attribute that
+advantage to the newly added components. Checker ON en-
+ables the static checker, whereas OFF bypasses it. Semantic-
+Only retains search_apis but disables the keyword tool
+and BM25 supplement, whereas Full enables both tools. Bare
+uses no human-crafted knowledge, whereas Human adds four
+skills and one rule derived from human PyAether development
+experience rather than the benchmark tasks. DeepSeek-V4-
+Pro-Preview serves as the fixed inference backbone. Table II
+shows that successive additions raise Pass@1 from 81.0% to
+87.3% with the checker (+6.3 pp), to 88.6% with Full retrieval
+(+1.3 pp), and to 92.4% with Human experience (+3.8 pp).
+Each component therefore contributes, with the checker pro-
+viding the largest stepwise gain. Documentation enrichment
+and sandbox isolation remain fixed and are evaluated only in
+the overall harness comparison.
+TABLE II
+PROGRESSIVE HARNESS ABLATION ON THE 158-TASK BENCHMARK
+(SINGLE RUN, DEEPSEEK-V4-PRO-PREVIEW).
+Experience
+Retrieval
+Checker
+Pass@1
+Bare
+Semantic-Only
+OFF
+81.0%
+Bare
+Semantic-Only
+ON
+87.3%
+Bare
+Full
+ON
+88.6%
+Human
+Full
+ON
+92.4%
+Task 132 illustrates why the keyword path complements
+semantic retrieval. The task connects two orthogonal routing
+paths by placing a via at their intersection and requires
+constructing several SWIG-wrapped types. With Semantic-
+Only retrieval, the agent issued natural-language queries but
+did not retrieve the required type definitions, eventually pass-
+ing a native tuple where a wrapped object was required.
+With Full retrieval, the agent queried ViaDef, emyPoint,
+and emyString through the keyword path, retrieved their
+construction signatures, and completed the task successfully.
+This case reflects the intended role of camel-case splitting and
+exact-fragment matching: they make abbreviation-dense API
+and type names directly addressable when natural-language
+similarity is insufficient.
+Finally, we characterize the residual failures of the enhanced
+harness. Figure 2 aggregates the 111 failed tasks across the five
+ZhuLong-SE backbone runs in Table I. AssertionError
+accounts for 54.1% of these failures: the generated program
+reaches the hidden verifier without an uncaught API or type
+error, but its result violates a tested property. Such semantic
+or result-level errors lie outside the static checker’s declared
+scope, which targets deterministic API misuse rather than
+hidden functional correctness. This analysis therefore charac-
+terizes the remaining failure frontier rather than directly mea-
+suring checker recall. Since the task-level harness still solves
+each task independently, these residual errors motivate the
+next subsection’s evaluation of whether validated knowledge
+distilled from prior traces can improve later tasks.
+54.1%
+17.1%
+9.0%
+8.1%
+6.3%
+5.4%
+AssertionError
+TypeError
+AttributeError
+RuntimeError
+Generation timeout
+SystemError
+Fig. 2. Residual failure types of ZhuLong-SE across five LLM backbones on
+the 158-task benchmark (111 failures aggregated).
+B. Self-Evolution
+To evaluate self-evolution without ceiling effects—the Bare
+agent already passes 87% of the 158 tasks—and to support
+held-out gating, we adopt an instance-disjoint challenge split
+(train 98 / val 20 / test 40), in the spirit of EvoAgentBench’s
+ability-supported yet instance-disjoint split [28]. The split is
+stratified so that the test set concentrates more discriminative
+tasks, identified by testbench code length and the number
+of unique APIs used. Because the validation and test sets
+are small, every self-evolution evaluation is the mean of five
+independent runs with its standard deviation.
+
+
+Table III reports test Pass@1 across rounds, against the
+Bare baseline (no evolved knowledge) and the Human base-
+line. Self-evolution clears the Bare baseline by +14.0 pp
+(66.0%→80.0%) and surpasses the Human baseline (80.0%
+vs. 77.5%) at Round 2, after which Round 3 regresses to
+75.5%. The validation trend is consistent: validation peaks
+at Round 2 (88.0%) and drops at Round 3 (80.0%), so the
+gate accepts Rounds 1 and 2 but rejects Round 3, rolling
+back its 52 new entries and freezing the knowledge base
+at Round 2 (334 entries, 20 skills). Crucially, the test trend
+agrees with validation—Round 3 regresses on both (75.5%
+vs. 80.0%)—confirming the gate’s rejection reflects genuine
+overfitting, not a validation-specific artifact. Round 2 also has
+the smallest observed run-to-run spread (±3.1), below the
+Human baseline’s ±5.3.
+TABLE III
+SELF-EVOLUTION ON THE CHALLENGE TEST SET (40 TASKS, 5 RUNS
+EACH, DEEPSEEK-V4-PRO-PREVIEW). “PATTERNS” IS THE L1 ENTRY
+COUNT, “SKILLS” ARE AUTO-DISTILLED. THE HELD-OUT GATE ACCEPTED
+ROUNDS 1 AND 2, AND REJECTED ROUND 3.
+Knowledge
+Patterns Skills Pass@1 (test) Pass@1 (val)
+Bare
+0
+0
+66.0%±7.2
+—
+Round 1
+256
+16
+78.0%±9.9
+81.0%±8.2
+Round 2
+334
+20
+80.0%±3.1
+88.0%±2.7
+Round 3
+386
+25
+75.5%±6.7
+80.0%±3.5
+Human Baseline
+—
+4
+77.5%±5.3
+—
+To examine the write-side gates under a fixed input, we
+freeze the 24 distinct failed-task traces accumulated across
+post-split batches and re-run the offline reflection chain with
+each gate toggled. This avoids the cost and sparse signal
+of full end-to-end ablation (13 hours per round), follow-
+ing Trace2Skill’s shared-trace-pool design [25]. Test failure
+traces serve only as offline-reflection inputs, and knowledge
+produced from them is never injected into test evaluation.
+Table IV reports the resulting L1 entry counts. Because
+reflection is not fully deterministic, we interpret only gate-
+shaped changes rather than one-entry differences.
+TABLE IV
+WRITE-SIDE GATE ABLATION ON THE FROZEN 24-TASK FAILURE TRACE
+POOL. “ON” AND “OFF” REPORT L1 ENTRY COUNTS.
+Gate
+ON
+OFF
+Ground-Truth Anchoring
+37
+48
+Contradiction Path
+37
+54
+Routing
+36
+37
+Scope Boundary
+36
+36∗
+Disconfirmation Filter
+37
+37†
+∗Affects entry content rather than count. † Inactive because the threshold
+requires disconfirmation across at least two batches.
+Ground-truth anchoring has the clearest observed effect:
+without it, 12 of 24 tasks yield at least one falsely verified
+entry because the trace’s self-reported success is trusted. The
+net count rises by 11 rather than 12 because one such task
+produces no entry under correct anchoring. Disabling the
+contradiction path produces 17 additional entries by mining
+stale, already-repaired errors, while disabling routing sends
+failed tasks to the success branch and produces no pitfalls.
+These entry-count results characterize how the three gates alter
+reflection output. They do not constitute an end-to-end quality
+comparison.
+The remaining two write-side gates cannot be evaluated by
+this design. Scope-boundary reflection changes the precon-
+ditions and constraints recorded within an entry rather than
+the entry count, so the reported metric cannot identify its
+effect. The disconfirmation filter removes an entry only after
+disconfirmation in at least two batches; no entry can reach
+that threshold in this single-round replay. Their value therefore
+remains unverified here and requires content-level assessment
+and multi-round accumulation, respectively.
+We also ablate each of the four read-side mechanisms
+from Section IV-C (names-only pre-injection, docstring gen-
+eralization, problem-side embedding, and the decision not
+to pre-inject pitfalls) by freezing the Round 2 knowledge
+and varying the injection configuration, then re-running the
+agent on validation (baseline 88.0%±2.7). Table V isolates
+each. Pre-injecting pitfalls is the most harmful (−8.0 pp):
+a task’s description does not predict which API it will mis-
+use, so a recalled pitfall is usually off-target, confirming the
+choice to route pitfalls through the runtime query instead.
+Docstring generalization (−6.3 pp when disabled) and names-
+only injection (−4.7 pp when full-sequence injection is used)
+each contribute—the former because disabling it breaks the
+query-embedding symmetry, the latter because a full call
+sequence over-specifies and misleads. The embedding strategy
+(embedding the problem summary vs. the solution text) shows
+no measurable effect here, which we attribute to names-only
+injection: under this reduction, the retrieved content is the
+same regardless of embedding, so the embedding choice is
+dominated by the names-only reduction. The problem-side
+embedding is therefore justified by its anti-leakage role rather
+than by a measurable Pass@1 gain in this configuration.
+TABLE V
+READ-SIDE INJECTION ABLATION, FROZEN ROUND 2 KNOWLEDGE,
+VALIDATION (20 TASKS, 5 RUNS). EACH ROW VARIES ONE MECHANISM
+AWAY FROM THE FULL SYSTEM (BASELINE 88.0%±2.7).
+Configuration
+Pass@1 (val)
+∆
+Full System (Baseline)
+88.0%±2.7
+—
+Pitfall Pre-Injection
+80.0%±5.0
+−8.0 pp
+Docstring Generalization Off
+81.7%±5.8
+−6.3 pp
+Full-Sequence Injection
+83.3%±5.8
+−4.7 pp
+Embed Solution (Not Problem)
+88.0%±2.7
+0 pp
+VI. CONCLUSION AND FUTURE WORK
+We presented ZhuLong-SE (Self-Evolution), which aug-
+ments ZhuLong [1] with task-level harness enhancements and
+governed cross-task evolution while keeping the backbone
+frozen. On the 158-task EDA-Eval-PyAether benchmark, the
+full task-level harness achieves 92.4% pass@1 in a single
+
+
+full run and outperforms ZhuLong on all five backbone
+comparisons. On the 40-task instance-disjoint challenge test,
+self-evolution from the Bare configuration achieves 80.0%
+mean pass@1, compared with 77.5% for the human-crafted-
+experience baseline. The frozen-trace ablation identifies the
+effects of ground-truth anchoring, contradiction handling, and
+routing on reflection output, while leaving scope-boundary
+reflection and multi-batch disconfirmation unverified under
+its entry-count, single-round design. Future work will extend
+the evaluation to additional EDA tool flows and languages,
+including SKILL-based automation, and to larger task sets,
+while investigating adaptive gating thresholds that adjust to
+task difficulty.
+REFERENCES
+[1] Y. Liu, S. Hou, X. Chen, Y. Wang, S. Yuan, Q. Gan, S. You, F. Chen,
+W. Li, S. Hu, Y. Liu, E. Xia, X. Lu, H. Wang, F. Xu, and Y. Li, “Zhulong:
+Execution-grounded llm agent for eda scripting with offline api self-
+exploration,” 2026.
+[2] Y. Yang, Z. Gong, W. Huang, Q. Yang, Z. Zhou, Z. Huang, Y. Li, X. Gao,
+Q. Dai, B. Liu et al., “Skillopt: Executive strategy for self-evolving agent
+skills,” arXiv preprint arXiv:2605.23904, 2026.
+[3] J. Liu, X. Ye, P. Xia, Z. Zheng, C. Xie, M. Ding, and H. Yao,
+“Evolvemem: Self-evolving memory architecture via autoresearch for
+llm agents,” 2026.
+[4] M. Liu, T.-D. Ene, R. Kirby, C. Cheng, N. Pinckney, R. Liang, J. Alben,
+H. Anand, S. Banerjee, I. Bayraktaroglu et al., “Chipnemo: Domain-
+adapted llms for chip design,” arXiv preprint arXiv:2311.00176, 2023.
+[5] S. Liu, W. Fang, Y. Lu, Q. Zhang, H. Zhang, and Z. Xie, “Rtlcoder:
+Outperforming gpt-3.5 in design rtl generation with our open-source
+dataset and lightweight solution,” in 2024 IEEE LLM Aided Design
+Workshop (LAD).
+IEEE, 2024, pp. 1–5.
+[6] S. Thakur, J. Blocklove, H. Pearce, B. Tan, S. Garg, and R. Karri, “Au-
+tochip: Automating hdl generation using llm feedback,” arXiv preprint
+arXiv:2311.04887, 2023.
+[7] Y. Zhu, D. Huang, H. Lyu, X. Zhang, C. Li, W. Shi, Y. Wu, J. Mu,
+J. Wang, P. Jin et al., “Qimeng-codev-r1: Reasoning-enhanced ver-
+ilog generation,” Advances in Neural Information Processing Systems
+(NeurIPS), vol. 38, pp. 154 266–154 300, 2026.
+[8] H. Wu, Z. He, X. Zhang, X. Yao, S. Zheng, H. Zheng, and B. Yu,
+“Chateda: A large language model powered autonomous agent for eda,”
+IEEE Transactions on Computer-Aided Design of Integrated Circuits
+and Systems, vol. 43, no. 10, pp. 3184–3197, 2024.
+[9] Y. Rui, Y. Li, R. Wang, R. Chen, Y. Zhu, Z. Di, X. Wang, and M. Ling,
+“Chatcl: Llm-based multi-agent rag framework for tcl script generation,”
+in 2025 International Symposium of Electronics Design Automation
+(ISEDA).
+IEEE, 2025, pp. 736–742.
+[10] Z. Xiao, X. He, H. Wu, B. Yu, and Y. Guo, “Eda-copilot: A rag-
+powered intelligent assistant for eda tools,” ACM Transactions on Design
+Automation of Electronic Systems, vol. 30, no. 6, pp. 1–24, 2025.
+[11] N. Xu, Z. Zhang, S. Shu, L. Qi, J. Lv, W. Wang, T. Zhao, C. Zhang,
+Z. Yang, X. Li et al., “iscript: A domain-adapted large language model
+and benchmark for physical design tcl script generation,” arXiv preprint
+arXiv:2603.04476, 2026.
+[12] Z. Chen, Z. Song, Y. Li, Q. Sun, and C. Zhuo, “Fluxeda: A uni-
+fied execution infrastructure for stateful agentic eda,” arXiv preprint
+arXiv:2603.25243, 2026.
+[13] Y. Lu, H. I. Au, J. Zhang, J. Pan, G. Zhou, Y. Wang, J. Sun, A. Li,
+J. Zhang, H. Li et al., “Autoeda: Enabling eda flow automation through
+microservice-based llm agents,” arXiv preprint arXiv:2508.01012, 2025.
+[14] Zhang et al., “Jarvis: A collaborative multi-agent system for eda,” 2025.
+[15] B.-Y. Wu, U. Sharma, A. Rovinski, and V. A. Chhabria, “Openroad
+agent: An intelligent self-correcting script generator for openroad,” in
+2025 IEEE LLM-Aided Design Workshop (LAD).
+IEEE, 2025, pp. 16–
+22.
+[16] Z. Zang, Y. Song, A. Wang, B. W.-K. Ling, Q. Sun, Z. Lei, F. Yang,
+C. Zhuo, and J. Luo, “The dawn of agentic eda: A survey of autonomous
+digital chip design,” arXiv preprint arXiv:2512.23189, 2025.
+[17] G. Wang, Y. Xie, Y. Jiang, A. Mandlekar, C. Xiao, Y. Zhu, L. Fan, and
+A. Anandkumar, “Voyager: An open-ended embodied agent with large
+language models,” arXiv preprint arXiv:2305.16291, 2023.
+[18] A. Zhao, D. Huang, Q. Xu, M. Lin, Y.-J. Liu, and G. Huang, “Expel: Llm
+agents are experiential learners,” in Proceedings of the AAAI Conference
+on Artificial Intelligence, vol. 38, no. 17, 2024, pp. 19 632–19 642.
+[19] C. Packer, S. Wooders, K. Lin, V. Fang, S. G. Patil, I. Stoica, and J. E.
+Gonzalez, “Memgpt: Towards llms as operating systems,” 2024.
+[20] T. R. Sumers, S. Yao, K. Narasimhan, and T. L. Griffiths, “Cognitive
+architectures for language agents,” arXiv preprint arXiv:2309.02427,
+2023.
+[21] X. Wang, Y. Chen, L. Yuan, Y. Zhang, Y. Li, H. Peng, and H. Ji, “Exe-
+cutable code actions elicit better llm agents,” in Forty-first International
+Conference on Machine Learning, 2024.
+[22] Zhang et al., “Memory mechanisms for llm agents: A survey,” arXiv,
+2024.
+[23] Anonymous, “Demoevolve: Overcoming sparse feedback in agentic
+harness evolution with demonstrations,” 2026.
+[24] S. Ouyang, J. Yan, Y. Chen, R. Han, Z. Wang, B. D. Mishra, R. Meng,
+C.-L. Li, Y. Jiao, K. Zha et al., “Skillos: Learning skill curation for
+self-evolving agents,” arXiv preprint arXiv:2605.06614, 2026.
+[25] J. Ni, Y. Liu, X. Liu, Y. Sun, M. Zhou, P. Cheng, D. Wang, E. Zhao,
+X. Jiang, and G. Jiang, “Trace2skill: Distill trajectory-local lessons into
+transferable agent skills,” arXiv preprint arXiv:2603.25158, 2026.
+[26] Z. Du and N. Pinckney, “Trace2skill: Verifier-guided skill evolution for
+long-context eda agents,” arXiv preprint arXiv:2605.21810, 2026.
+[27] Y. Jin, K. Xu, H. Li, X. Han, Y. Zhou, C. Li, and J. Bai, “Reveal:
+Self-evolving code agents via reliable self-verification,” arXiv preprint
+arXiv:2506.11442, 2025.
+[28] X. Gao, C. Hu, H. Chen, P. Yao, Z. Wang, Y. Bai, Z. Wu, Y. Han,
+X. Cong, J. Gui et al., “Evoagentbench: Benchmarking agent self-
+evolution via ability transfer,” arXiv preprint arXiv:2607.05202, 2026.
+[29] H. Lin, P. Li, J. Song, F. Jiang, and T. Zhang, “Muse-autoskill: Self-
+evolving agents via skill creation, memory, management, and evalua-
+tion,” arXiv preprint arXiv:2605.27366, 2026.
+[30] C. Zhou, H. Chai, W. Chen, Z. Guo, R. Shan, Y. Song, T. Xu, Y. Yang,
+A. Yu, W. Zhang et al., “Externalization in llm agents: A unified review
+of memory, skills, protocols and harness engineering,” arXiv preprint
+arXiv:2604.08224, 2026.
+[31] N. Shinn, F. Cassano, A. Gopinath, K. Narasimhan, and S. Yao, “Re-
+flexion: Language agents with verbal reinforcement learning,” Advances
+in Neural Information Processing Systems (NeurIPS), vol. 36, pp. 8634–
+8652, 2023.
+[32] C. Lam, J. Li, L. Zhang, and K. Zhao, “Governing evolving memory
+in llm agents: Risks, mechanisms, and the stability and safety governed
+memory (ssgm) framework,” arXiv preprint arXiv:2603.11768, 2026.
+[33] Fang et al., “Lastingbench: Safeguarding llm benchmarks against knowl-
+edge leakage,” 2025.

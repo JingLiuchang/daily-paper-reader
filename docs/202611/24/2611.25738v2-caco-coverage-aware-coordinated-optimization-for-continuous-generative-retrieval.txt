@@ -1,0 +1,4031 @@
+CACO: Coverage-Aware Coordinated Optimization for
+Continuous Generative Retrieval
+Pan Zhang
+Hunan University
+Changsha, China
+hnuzhangpan@hnu.edu.cn
+Nan Zhuang
+Beijing, China
+zhuangn53@pku.edu.cn
+Yongkang Zhang
+Huazhong Agricultural University
+Hubei, China
+calmee4@webmail.hzau.edu.cn
+Kun Xú
+Beijing, China
+xukunxkxk@gmail.com
+Zhongtao Jiang
+Beijing, China
+ji4ngxiaoming@gmail.com
+Zhiwei Wang
+Beijing, China
+zhiwei.wang1991@gmail.com
+Kun Xˇu∗
+Beijing, China
+syxu828@gmail.com
+Youhuan Li∗
+Hunan University
+Changsha, China
+liyouhuan@hnu.edu.cn
+Abstract
+Continuous generative retrievers powered by flow matching and
+diffusion sample multiple queries in item embedding space for
+approximate nearest-neighbor (ANN) search under fixed budgets.
+However, existing generative retrievers can suffer from retrieval
+overlap under uncoordinated sampling, whereas explicit diversity
+guidance to broaden the candidate set may induce relevance drift
+as it lacks direct feedback on the value of additional items. We
+introduce CACO (Coverage-Aware Coordinated Optimization), a
+self-supervised post-training framework coordinating queries from
+frozen flow-matching and diffusion retrievers toward complemen-
+tary item coverage with negligible latency overhead. Using empiri-
+cal retrieval frequencies across sampled reference queries as a rele-
+vance proxy, CACO formulates a label-free coverage objective that
+improves recall across all 30 backbone–dataset settings in offline ex-
+periments. To avoid the overhead of sampling reference queries at
+inference, CACO employs a coordinated query adjustment net-
+work combining inter-query bidirectional attention with gated
+relative directions, updating queries via bounded tangent-space
+projection and spherical retraction. During training, CACO applies
+tangential antithetic perturbations and counterfactual single-query
+replacement to measure each query’s marginal gain, yielding an
+unbiased gradient estimator of smoothed set coverage across non-
+differentiable ANN search. On eight public benchmarks and an
+in-house 24-partition streaming industrial dataset, CACO improves
+Recall@100 and Recall@400 by up to 23.7% and 23.9% over the
+strongest baseline, cuts inter-query overlap by 53.3%–64.9%, and
+adds only 0.5%–3.0% inference latency.
+CCS Concepts
+• Information systems →Recommender systems.
+Keywords
+continuous generative retrieval, self-supervised post-training, cov-
+erage optimization, recommender systems
+Same user, same retrieval budget: 3 queries × 2 videos
+Likes guitar practice videos
+I. Retrieval overlap
+II. Relevance drift
+III. CACO (ours)
+Each query is unaware of
+what the others retrieve
+Only 2 distinct videos
+Retrieval
+overlap
+q1
+q2
+q3
+6 distinct videos (4 relevant)
+Shared
+user 
+context
+Coordinate queries before retrieval
+Joint query adjustment
+Per-query 
+marginal gains
+in weighted 
+coverage
+Training signal:
+q3
+q1
+q2
+Query states 
+and relative
+directions
+6 distinct videos (all relevant)
+q1
+q2
+q3
+q1
+q3
+V1
+V2
+C chord
+G chord
+C chord
+Chords
+Strumming
+Practice 
+routines
+V7
+V8
+Off-topic
+...
+V1
+V2
+V3
+V4
+V5
+V6
+q2
+Chosen
+Both pairs add
+new videos. But no 
+direct feedback 
+shows the value of 
+each additive 
+videos.
+V5
+V6
+Not chosen
+V3
+V4
+V1
+V2
+Figure 1: Illustrative retrieval for a user interested in guitar
+practice, with 𝐿= 3 queries and 𝐾= 2 videos per query. (I)
+Overlapping results yield only two distinct videos. (II) Six
+distinct videos are retrieved, but only four are relevant to
+guitar practice. (III) CACO coordinates the queries to retrieve
+six distinct, relevant videos.
+1
+Introduction
+Large-scale recommender systems in e-commerce, short-video
+feeds, and online news have to retrieve a limited set of rele-
+vant candidates from massive corpora under strict latency bud-
+gets [6, 11, 15, 24, 52]. Recent continuous generative retrievers
+powered by diffusion [26, 55] and flow matching [10, 22, 31, 44, 56]
+model user-conditioned query distributions in item embedding
+space and retrieve candidates via approximate nearest-neighbor
+(ANN) search [34]. This generative process allows the system to
+sample multiple queries under the same user context and merge
+their retrieval results into a final candidate set, thereby better
+capturing diverse user interests [5, 26].
+However, generating multiple queries alone does not automati-
+cally guarantee capturing diverse interests: maximizing recall re-
+quires set-level complementarity, where a query adds value only
+∗Corresponding authors.
+1
+arXiv:2611.25738v2  [cs.IR]  22 Nov 2026
+
+
+Pan Zhang et al.
+when it retrieves relevant items missed by the others [2]. Stan-
+dard generative retrievers enrich the query distribution across
+user preferences, yet still sample queries independently at infer-
+ence [26, 28, 31, 32, 37, 55]. Because independent samples remain
+blind to one another’s results, even a diverse distribution can map
+onto overlapping top-𝐾ANN neighborhoods, causing retrieval over-
+lap that wastes limited slots on duplicates. To break this overlap,
+recent methods go further by applying explicit diversity guidance—
+steering queries apart via interest priors, semantic anchors, or re-
+pulsive signals [5, 36, 44]. Although such guidance broadens the
+candidate set, it lacks direct feedback from retrieval results on the
+value of newly added items, risking relevance drift that trades du-
+plicate items for off-topic candidates.
+Figure 1 illustrates both failure modes for a user interested in
+guitar practice under a budget of 𝐿= 3 queries and 𝐾= 2 videos
+per query. Uncoordinated queries in Panel I cluster around chords
+and repeatedly retrieve the same two videos, returning only two
+distinct items across six slots. In contrast, in Panel II, explicit guid-
+ance pushes the third query beyond chords and strumming toward
+generic practice routines. Without direct feedback on the value of
+new results, it picks off-topic fitness videos over guitar tuning, leav-
+ing only four of the six videos relevant. Rather than steering queries
+directly, an alternative workaround for overlap is to increase the
+retrieval depth 𝐾and deduplicate the results. Nevertheless, such a
+compensatory strategy trades extra retrieval overhead for broader
+coverage, leaving query generation unchanged without optimizing
+each query’s contribution to the merged candidate set. Achieving
+the complementary, fully relevant set in Panel III motivates our
+central question: under a fixed retrieval budget, how can we coor-
+dinate queries so that each retrieves relevant items missed by the
+others?
+In practice, learning to coordinate queries toward this goal
+presents two challenges. First, user interaction data provide only
+partial supervision: indiscriminately expanding coverage may
+introduce irrelevant items, while fitting a single observed target
+cannot capture the full range of interests that the query set should
+cover. We therefore need a coverage objective that approximates
+item relevance beyond the single observed target and rewards
+queries for covering complementary candidates. Second, even
+with a suitable coverage objective that can identify high-quality
+query sets, using it to train query generation remains challenging.
+On the one hand, coverage depends on the discrete candidate
+sets returned by approximate nearest-neighbor search, which
+prevents direct optimization of query generation through standard
+backpropagation [41, 53]. On the other hand, direct distillation
+of these high-quality query sets does not necessarily preserve
+their broader coverage of relevant items, because matching query
+representations and optimizing set-level retrieval coverage are
+different objectives. Preserving this coverage advantage during
+learning therefore requires training signals derived from actual
+retrieval results.
+To address these challenges, we propose CACO (Coverage-
+Aware Coordinated Optimization), a lightweight self-supervised
+post-training framework that coordinates queries from frozen flow-
+matching and diffusion retrievers. CACO constructs a label-free,
+frequency-weighted coverage objective using item retrieval counts
+across reference queries sampled from the frozen base model as
+a relevance proxy. Each covered item contributes its weight only
+once, so retrieving duplicates yields zero additional gain. Applying
+offline greedy selection over a large reference pool confirms that
+this objective consistently guides query selection toward higher
+recall without ground-truth target labels. To avoid generating a
+large query pool at inference, CACO employs a coordinated query
+adjustment network that integrates context cross-attention, inter-
+query bidirectional attention, and gated relative directions, updat-
+ing queries by bounded tangent-space projection and spherical
+retraction. During training, CACO applies tangential antithetic
+perturbations and holds the other queries fixed via counterfactual
+single-query replacement to measure each query’s marginal cover-
+age gain. This formulation yields an unbiased gradient estimator
+of Gaussian-smoothed set coverage across non-differentiable ANN
+search, improving complementary coverage while keeping the base
+generator, query count, and retrieval depth unchanged.
+Our main contributions are as follows:
+• Label-Free Coverage Objective. We formulate a frequen-
+cy-weighted set-coverage objective that uses empirical re-
+trieval counts across sampled reference queries as a rele-
+vance proxy, and verify via offline greedy selection that it
+improves recall across all 30 backbone–dataset settings.
+• Self-Supervised Post-Training Coordination. We pro-
+pose CACO, a lightweight self-supervised post-training
+framework that coordinates queries sampled from a frozen
+base generator under a fixed retrieval budget, deriving an
+unbiased smoothed-coverage gradient estimator from tan-
+gential antithetic perturbations and counterfactual single-
+query replacement.
+• Public and Industrial Validation. Across eight public
+benchmarks, an in-house 24-partition streaming industrial
+dataset, and six frozen flow-matching and diffusion back-
+bones, CACO improves Recall@100 and Recall@400 by up
+to 23.7% and 23.9%, cuts query overlap by 53.3%–64.9%, and
+adds only 0.5%–3.0% inference latency.
+2
+Related Work
+2.1
+Generative Retrieval
+Generative retrieval in recommender systems follows discrete or
+continuous paradigms. Discrete methods generate semantic item
+IDs [17] constructed through vector quantization [18, 42] or hierar-
+chical clustering [46]. Later work incorporates collaborative signals
+into tokenization and generation [30, 51, 58] or aligns recommen-
+dations with user preferences [12]. Alternative generation schemes
+include parallel decoding [21], latent-token-conditioned multi-tree
+decoding in LATTE [19], and masked diffusion in LLaDARec [45].
+Continuous methods generate query embeddings conditioned
+on user context for nearest-neighbor search. Diffusion-based meth-
+ods model target representations via iterative denoising [28, 55]
+or incorporate multi-interest and quantized guidance for diver-
+sity [5, 26, 36]. ADRec [9] combines autoregressive modeling with
+item-level diffusion and multi-stage alignment, while PreferDiff [32]
+formulates Bayesian personalized ranking using generation prob-
+abilities. For efficient generation, TA-Rec [37] uses consistency
+regularization for single-step generation, FMRec [31] adopts
+straight-path flow matching—further extended with contrastive
+2
+
+
+CACO: Coverage-Aware Coordinated Optimization for Continuous Generative Retrieval
+alignment [22] and popularity debiasing [56]—and X-Rec [44]
+combines anchor conditioning with Riemannian flow matching [10]
+on the unit sphere. Order-agnostic continuous item identifiers also
+enable parallel generation [29]. Building on continuous generative
+retrieval, CACO introduces a self-supervised post-training layer
+that coordinates queries from frozen flow-matching and diffusion
+backbones for complementary set-level coverage.
+2.2
+Multi-Interest Retrieval
+Multi-interest retrieval represents each user with multiple vectors
+to capture diverse preference facets for parallel nearest-neighbor
+search. Early approaches extract interests from behavior sequences
+through dynamic capsule routing [24] or self-attentive aggrega-
+tion [6]. SINE [47] infers a sparse set of active concepts, while
+behavior clustering provides another way to construct multiple
+user representations [40]. Subsequent work enriches interest mod-
+eling with temporal patterns and user profiles [7, 8].
+Beyond interest extraction, disagreement and backward-flow
+regularization promote more informative and diverse representa-
+tions [25, 57], while graph-based item partitioning supports interest
+disentanglement [14]. REMI [54] further improves interest learning
+through interest-aware hard negative mining and routing regular-
+ization. At the supervision level, TiMiRec [50] introduces target-
+interest distillation to guide multi-interest learning. Moving beyond
+single-positive supervision, MIMA [38] groups concurrent posi-
+tives within a request, models interest dependencies via a causally
+masked decoder, and applies Hungarian matching to exclusively
+assign distinct positive items to different interests.
+Similarly, continuous generative retrievers capture diverse
+preferences through multi-query sampling and explicit diversity
+guidance [5, 26, 36, 44]. However, differentiating representations
+or guiding queries in isolation from merged retrieval results leaves
+a coverage gap: independent queries can still retrieve overlapping
+nearest-neighbor sets, whereas ungrounded query separation risks
+relevance drift toward off-topic items. Instead of relying solely on
+query- or target-level differentiation, CACO coordinates queries
+directly through marginal gains in frequency-weighted candidate
+coverage.
+3
+Problem Formulation
+This section formalizes multi-query continuous generative retrieval
+under a fixed retrieval budget. A request is described by context
+ℎ= (𝑆ℎ,𝐴ℎ,𝑐), where 𝑆ℎ= (𝑣1, . . . , 𝑣𝑇) is a sequence of historical
+items ordered by interaction time, 𝐴ℎ= (𝑎1, . . . ,𝑎𝑇) contains the
+corresponding actions, and 𝑐denotes additional conditioning in-
+formation, such as the expected action on the target item [33, 44].
+Let I be the item corpus and 𝑒𝑣∈R𝑑the fixed embedding of item
+𝑣∈I. Given ℎ, a model generates a collection of 𝐿query vectors:
+𝑄= (𝑞1, . . . ,𝑞𝐿) ∼𝜋𝜃(· | ℎ),
+𝑞𝑖∈R𝑑.
+(1)
+Independent conditional sampling is a special case, with 𝜋𝜃(𝑄|
+ℎ) = Î𝐿
+𝑖=1 𝑝𝜃(𝑞𝑖| ℎ). Although we use the term query set for
+convenience, 𝑄is an indexed collection and may contain repeated
+or similar vectors.
+Let A𝐾(𝑞) ⊆I denote the top-𝐾candidate set returned for
+query 𝑞via approximate nearest-neighbor search over {𝑒𝑣}𝑣∈I.
+෤𝑞𝑞1
+෤𝑞𝑞2
+𝑞𝑞1
+𝑞𝑞2
+𝑞𝑞3
+ANN
+෤𝑞𝑞3
+ANN
+ANN
+ANN
+retrieved item
+item
+query set
+reference query set 𝑄𝑄ℎ
+𝑄𝑄
+1. Reference query statistics
+2. Items retrieved by 𝑄𝑄
+Weighted coverage 𝐹𝐹ℎ(𝑄𝑄)
+Sum each 
+retrieved item’s 
+weight once !
+Retrieval example
+Item:𝑣𝑣
+Count:𝑐𝑐ℎ(𝑣𝑣)
+𝑤𝑤ℎ𝑣𝑣= 𝑐𝑐ℎ(𝑣𝑣)𝛼𝛼
+√2
+√3
+1
+1
+1
+1
+1
+1
+1
+1
+2
+3
+1
+1
+√2
+1
++
++
++
+≈4.41
+Figure 2: Constructing frequency-weighted coverage. Item
+weights are derived from retrieval frequencies across the
+reference queries in 𝑄ℎ. Each unique item retrieved by 𝑄
+(phone, perfume, shoes, and gloves) contributes once; the
+illustrated set has total weight 3 +
+√
+2 ≈4.41 (𝛼= 0.5).
+The final candidate set is the union
+U𝐾(𝑄) =
+𝐿
+Ø
+𝑖=1
+A𝐾(𝑞𝑖),
+|U𝐾(𝑄)| ≤𝐿𝐾.
+(2)
+The budget 𝐵= 𝐿𝐾counts retrieval slots before filtering and dedu-
+plication; repeated items do not increase the final candidate count.
+Our goal is to learn queries that jointly cover the user’s relevant
+items while keeping 𝐿and 𝐾fixed. We evaluate this goal using the
+next observed positive-interaction item as a sample of the user’s
+latent interests.
+4
+Method
+This section presents CACO, our self-supervised post-training
+framework for multi-query coordination. We first formulate the
+label-free coverage objective and verify it via offline greedy selec-
+tion, and then detail the coordinated query adjustment network
+and its marginal-coverage training objective.
+4.1
+Frequency-Weighted Coverage Objective
+An ideal query set covers items in proportion to their relevance to
+the user. Let 𝑝∗(𝑣| ℎ) be the unknown probability that item 𝑣is the
+user’s next positive interaction under context ℎ. The probability
+mass covered by 𝑄is
+𝐽ℎ(𝑄) =
+∑︁
+𝑣∈U𝐾(𝑄)
+𝑝∗(𝑣| ℎ).
+(3)
+Since observed interactions do not reveal the full distribution 𝑝∗(𝑣|
+ℎ), we use item retrieval frequencies from the base generator as an
+empirical relevance proxy under context ℎ(see Appendix C for its
+probability-mass interpretation).
+For each user context, we independently sample a reference
+query set 𝑄ℎ= ( ˜𝑞1, . . . , ˜𝑞𝑀) from the frozen generator 𝑝𝜃0 (· | ℎ)
+and collect reference query statistics by computing the retrieval
+3
+
+
+Pan Zhang et al.
+…
+𝑣𝑣1
+𝑣𝑣2
+𝑣𝑣𝑡𝑡
+𝑎𝑎1
+𝑎𝑎2
+𝑎𝑎𝑡𝑡
+Embedding Lookup
+𝑐𝑐
+𝑒𝑒1
+𝑒𝑒2
+…
+𝑒𝑒𝑡𝑡
+Frozen Generative 
+Retrieval Model
+Hidden 
+States
+FFN
+x N
+Get Final-Layer 
+Attention Weight 
+Final-Layer 
+Attention Score 
+Relative Directions
+Gate
+Tangent Projection 
+& Norm
+෍
+𝑗𝑗
+𝛽𝛽𝑖𝑖𝑖𝑖(̇𝑞𝑞𝑗𝑗−̇ 𝑞𝑞𝑖𝑖)
+…̇
+𝑞𝑞𝑖𝑖
+𝑞𝑞𝑖𝑖
+𝑟𝑟𝑖𝑖
+𝜇𝜇𝑖𝑖
+𝑞𝑞𝑖𝑖
+= 1
+𝛽𝛽𝑖𝑖𝑖𝑖
+𝑎𝑎𝑖𝑖𝐿
+𝑎𝑎𝑖𝑖𝑖
+𝑎𝑎𝑖𝑖𝑖
+𝑎𝑎𝑖𝑖𝑖
+…
+…
+𝛽𝛽𝑖𝑖𝑖
+𝛽𝛽𝑖𝑖𝑖
+𝛽𝛽𝑖𝑖𝐿̇
+𝑞𝑞𝑖𝑖̇
+𝑞𝑞2̇
+𝑞𝑞1̇
+𝑞𝑞𝑗𝑗̇
+𝑞𝑞𝐿𝐿
+𝑟𝑟𝑖𝑖
+(a) The model framework of CACO
+exploration 
+area
+𝒒𝒒𝒊𝒊
+𝒒𝒒𝒊𝒊
++
+𝒒𝒒𝒊𝒊
+−
+better 
+direction
+worse 
+direction
+Item weight
+high
+low
+𝑸𝑸(𝒊𝒊)
+𝒒𝒒𝟏𝟏
++
+𝒒𝒒𝒊𝒊
+−
+𝒒𝒒𝑳
++
+…
+…
+ℒ𝑡𝑡𝑡𝑡𝑡𝑡𝑡𝑡𝑡𝑡= −෍
+𝑖𝑖=1
+𝐿𝐿(𝐹𝐹ℎ𝑄𝑄+ −𝐹𝐹ℎ(𝑄𝑄(𝑖𝑖))) 𝜇𝜇𝑖𝑖, 𝜀𝜀𝑖𝑖
+2𝜎𝜎∑𝑣𝑣𝑤𝑤ℎ(𝑣𝑣)
+(b)  The training process of CACO
+𝐻𝐻ℎ
+1
+𝐻𝐻ℎ
+2
+𝐻𝐻ℎ
+𝑡𝑡
+…
+…
+…
+Cross
+Attention
+Self 
+Attention
+𝑊𝑊𝑟𝑟
+single-query 
+replacement
+𝑸𝑸+
+𝒒𝒒𝟏𝟏
++
+𝒒𝒒𝒊𝒊
++
+𝒒𝒒𝑳
++
+…
+…
+Attn mask
+0
+1
+Adjustment
+Projection
+Q
+K
+Bidirectional Attention
+Figure 3: Overview of CACO. (a) The adjustment network uses user history and interactions among queries to predict an
+adjustment for each query from the frozen generator. It combines this prediction with a learned weighted sum of relative query
+directions, whose weights are computed from the final query states and the last-layer self-attention weights. The combined
+adjustment is then projected onto the tangent space, and the final updated query is normalized onto the unit hypersphere. (b)
+With other queries fixed, training compares opposite perturbations 𝑞+
+𝑖and 𝑞−
+𝑖. The weighted coverage difference guides updates
+toward high-weight items not already covered by other queries.
+count of each item 𝑣:
+𝑐ℎ(𝑣) =
+𝑀
+∑︁
+𝑚=1
+1{𝑣∈A𝐾( ˜𝑞𝑚)}.
+(4)
+We use this context-specific count as a relevance proxy and assign
+item weights
+𝑤ℎ(𝑣) = 𝑐ℎ(𝑣)𝛼,
+𝛼∈(0, 1],
+(5)
+with 𝑤ℎ(𝑣) = 1{𝑐ℎ(𝑣) > 0} when 𝛼= 0. Notably, setting 𝛼= 0
+gives equal weight to all items retrieved by 𝑄ℎ, whereas 𝛼= 1 uses
+their retrieval counts directly. Intermediate values (e.g., 𝛼= 0.5 in
+Figure 2) retain frequency differences while reducing the dominance
+of high-frequency items.
+The resulting frequency-weighted coverage objective is
+𝐹ℎ(𝑄) =
+∑︁
+𝑣∈U𝐾(𝑄)
+𝑤ℎ(𝑣).
+(6)
+Figure 2 illustrates how this objective evaluates a generated query
+set 𝑄using the item weights derived from the reference query set
+𝑄ℎ. Once an item is covered, retrieving it with another query con-
+tributes no additional gain. A query is therefore valuable when it
+retrieves high-weight items absent from the other queries’ results.
+The reference query statistics and weights are computed without
+ground-truth target item information and remain fixed when com-
+paring query sets. Items never retrieved by 𝑄ℎhave 𝑤ℎ(𝑣) = 0 and
+contribute zero to 𝐹ℎ, but remain eligible for recall evaluation.
+To verify whether optimizing 𝐹ℎ(𝑄) improves retrieval recall
+before training a new model, we first apply an offline greedy selec-
+tion algorithm over the 𝑀-query reference query set 𝑄ℎ. Starting
+with an empty collection 𝑄= ∅, the algorithm iteratively selects 𝐿
+queries from 𝑄ℎ. At each step, it chooses the remaining query with
+the largest marginal coverage gain:
+Δℎ(𝑞| 𝑄) =
+∑︁
+𝑣∈A𝐾(𝑞)\U𝐾(𝑄)
+𝑤ℎ(𝑣).
+(7)
+After each selection, the covered-item set U𝐾(𝑄) is updated and
+the marginal gains of the remaining queries are recomputed.
+Section 5.7 shows that, for all tested positive values of 𝛼, greedy
+optimization of 𝐹ℎ(𝑄) improves recall across all 30 backbone–
+dataset settings. However, greedy selection requires generating
+a large query pool (𝑀≫𝐿) and executing nearest-neighbor search
+for all 𝑀queries at inference time, incurring substantial overhead.
+To avoid this cost, CACO instead learns to directly adjust a fixed-
+size collection of 𝐿queries.
+4.2
+Coordinated Query Adjustment
+To adjust queries toward complementary coverage, each query
+needs access to both the user context and the other queries to ac-
+count for the items they may retrieve. Therefore, CACO employs a
+coordinated query adjustment network to jointly refine the queries,
+as illustrated in Figure 3(a). Specifically, the frozen base model
+provides unit-normalized initial queries 𝑄(0) = ( ¤𝑞1, . . . , ¤𝑞𝐿) sam-
+pled independently from the generator, along with hidden states
+4
+
+
+CACO: Coverage-Aware Coordinated Optimization for Continuous Generative Retrieval
+𝐻ℎ= (𝐻1
+ℎ, . . . , 𝐻𝑇
+ℎ) from its history encoder. Given these inputs, the
+adjustment network outputs the refined queries 𝑄= (𝑞1, . . . ,𝑞𝐿),
+allowing each adjusted query to depend on the entire initial collec-
+tion. Each of the 𝑁adjustment layers grounds the queries in the
+user’s history via cross-attention [49] while enabling inter-query
+coordination via bidirectional self-attention [13]:
+𝑆(ℓ) = 𝑋(ℓ−1) + CrossAttn(𝑋
+(ℓ−1), 𝐻ℎ, 𝐻ℎ),
+𝑈(ℓ) = 𝑆(ℓ) + SelfAttn(𝑆
+(ℓ)),
+𝑋(ℓ) = 𝑈(ℓ) + FFN(𝑈
+(ℓ)),
+(8)
+where 𝑋(0) denotes the projected initial queries, ℓ= 1, . . . , 𝑁, and
+the overbar denotes layer normalization. In addition to predicting
+each query’s adjustment from its final hidden state, we use a relative
+directions gate to add a weighted sum of directions toward the other
+queries:
+𝑟𝑖=𝑊𝑟𝑋
+(𝑁)
+𝑖
++
+𝐿
+∑︁
+𝑗=1
+𝛽𝑖𝑗( ¤𝑞𝑗−¤𝑞𝑖).
+(9)
+The gating weights 𝛽𝑖𝑗are computed from the final query states
+and the last-layer self-attention weights 𝑎(𝑎)
+𝑖𝑗
+across 𝐴attention
+heads:
+𝛽𝑖𝑗=
+1
+√
+𝐴
+𝐴
+∑︁
+𝑎=1
+ 𝑤⊤
+𝑎𝑋
+(𝑁)
+𝑖
+𝑎(𝑎)
+𝑖𝑗,
+(10)
+where 𝑤𝑎is a learnable vector shared across queries in the same
+attention head. Allowing 𝛽𝑖𝑗to take either sign lets each query move
+toward or away from the others, paralleling signed gates that learn
+context-dependent directions from paired counterfactuals [27].
+Following prior work on spherical retraction [1, 3, 4], we project
+𝑟𝑖onto the tangent space at ¤𝑞𝑖via 𝑃𝑖(𝑣) = 𝑣−⟨𝑣, ¤𝑞𝑖⟩¤𝑞𝑖and apply a
+bounded update:
+𝑡𝑖= 𝑃𝑖(𝑟𝑖),
+𝜇𝑖=
+𝑡𝑖
+√︁
+1 + ∥𝑡𝑖∥2/𝜌2 ,
+𝑞𝑖=
+¤𝑞𝑖+ 𝜇𝑖
+√︁
+1 + ∥𝜇𝑖∥2 ,
+(11)
+where 𝜌> 0 is a hyperparameter that bounds the step size. Since
+𝜇𝑖⊥¤𝑞𝑖and ∥𝜇𝑖∥< 𝜌, the updated query 𝑞𝑖preserves unit norm
+while restricting its deterministic angular displacement to at most
+arctan 𝜌. Zero-initializing the residual and gating output layers en-
+sures that the adjustment network starts from an identity mapping
+(𝑞𝑖= ¤𝑞𝑖), preserving the initial queries at the beginning of training
+while keeping the query count 𝐿and retrieval depth 𝐾unchanged.
+4.3
+Training via Marginal Coverage Gains
+Training the adjustment network to maximize 𝐹ℎ(𝑄) is non-trivial
+because the discrete nearest-neighbor retrieval sets in 𝐹ℎ(𝑄) pre-
+vent direct backpropagation. To overcome this, CACO constructs
+a surrogate training signal by comparing positive and negative
+perturbations of each query while holding the other queries’ re-
+trieval results fixed, as illustrated in Figure 3(b). Specifically, given
+an initial query collection 𝑄(0) sampled independently of the refer-
+ence query set 𝑄ℎ, the adjustment network produces the bounded
+tangential step 𝜇𝑖for each query 𝑖as in Eq. (11). To explore the local
+neighborhood around the predicted direction, we independently
+sample Gaussian noise 𝜖𝑖∼N (0, 𝐼) for each query and perturb 𝜇𝑖
+in the tangent space to form an antithetic query pair [35, 43]:
+𝑞±
+𝑖=
+¤𝑞𝑖+ 𝜇±
+𝑖
+√︁
+1 + ∥𝜇±
+𝑖∥2 ,
+𝜇±
+𝑖= 𝜇𝑖± 𝜎𝑃𝑖(𝜖𝑖),
+(12)
+where 𝜎> 0 is the perturbation scale controlling the local explo-
+ration area around 𝑞𝑖.
+Let 𝑄+ = (𝑞+
+1 , . . . ,𝑞+
+𝐿) denote the positively perturbed collection.
+For each query 𝑖, we construct a counterfactual collection 𝑄(𝑖) via
+single-query replacement, substituting only 𝑞+
+𝑖in 𝑄+ with 𝑞−
+𝑖. We
+then measure the normalized coverage difference:
+Δ𝑖= 𝐹ℎ(𝑄+) −𝐹ℎ(𝑄(𝑖))
+Í
+𝑣∈I 𝑤ℎ(𝑣)
+.
+(13)
+Since all other queries remain unchanged, Δ𝑖directly compares
+the marginal coverage gains of the two perturbations. Changes
+that affect only items already covered by the other queries yield
+zero gain, whereas newly covered items contribute their frequency
+weights, making the signal sensitive to both estimated relevance
+and what the other queries retrieve.
+Finally, we optimize the adjustment network by aligning the
+tangential update 𝜇𝑖with the coverage-improving perturbation
+direction:
+Ltrain = −
+𝐿
+∑︁
+𝑖=1
+Δ𝑖⟨𝜇𝑖,𝜖𝑖⟩
+2𝜎
+,
+(14)
+where ⟨·, ·⟩denotes the inner product. A positive Δ𝑖pulls 𝜇𝑖to-
+ward +𝜖𝑖(the better direction in Figure 3(b)), whereas a negative Δ𝑖
+pushes it toward −𝜖𝑖. We prove in Appendix C (Theorem C.2) that,
+with fixed reference weights, the negative gradient of Ltrain is an
+unbiased estimator of the gradient of the Gaussian-smoothed nor-
+malized coverage objective. During training, only the adjustment
+network is updated while the base generator and item embeddings
+remain frozen. Because the positive and negative retrieval sets can
+be reused across the per-query comparisons, each training step
+requires only two retrievals per query (i.e., 2𝐿per query collection)
+rather than re-running retrieval for every perturbed collection.
+Furthermore, because the quality of the training signal Δ𝑖de-
+pends on the reference query set 𝑄ℎ, we can refresh 𝑄ℎand the item
+weights 𝑤ℎ(𝑣) during training using the adjusted queries produced
+by CACO—which are more dispersed and may uncover potentially
+relevant items missed by the base generator—to provide stronger
+supervision for subsequent training.
+5
+Experiments
+We evaluate CACO across eight public benchmarks, an in-house
+24-partition streaming industrial dataset, and six frozen generative
+backbones, examining overall recall, cross-backbone generalization,
+overlap reduction and inference efficiency, component ablations,
+and our frequency-weighted coverage objective.
+5.1
+Experimental Setup
+Datasets. We evaluate on eight public benchmarks and an in-
+house industrial dataset. The public benchmarks include Beauty,
+Sports, and Toys from Amazon Reviews 2014 [39]; Musical In-
+struments (Instruments), Video Games (Games), and Movies and
+TV (Movies) from Amazon Reviews 2023 [20]; KuaiRec [15]; and
+MovieLens-25M (ML-25M) [16] (user and item counts are listed in
+5
+
+
+Pan Zhang et al.
+Table 1: Overall retrieval performance on eight public datasets (Recall on a 0–1 scale; higher is better).
+Method
+Beauty
+Sports
+Toys
+KuaiRec
+ML-25M
+Instruments
+Games
+Movies
+Users / Items
+22.4K / 12.1K
+35.6K / 18.4K
+19.4K / 11.9K
+7.2K / 10.7K
+161K / 40.9K
+57.4K / 24.6K
+94.8K / 25.6K
+657K / 198K
+R@100 R@400
+R@100 R@400
+R@100 R@400
+R@100 R@400
+R@100 R@400
+R@100 R@400
+R@100 R@400
+R@100 R@400
+Multi-Interest
+Retrieval
+ComiRec
+0.078 0.125
+0.045 0.076
+0.091 0.138
+0.071 0.197
+0.120 0.232
+0.030 0.051
+0.050 0.082
+0.058 0.088
+REMI
+0.067 0.096
+0.039 0.058
+0.063 0.086
+0.289 0.500
+0.304 0.361
+0.050 0.075
+0.073 0.111
+0.044 0.062
+MIMA
+0.099 0.157
+0.050 0.083
+0.096 0.150
+0.163 0.316
+0.235 0.435
+0.064 0.101
+0.115 0.177
+0.049 0.073
+Discrete
+Generative
+Retrieval
+TIGER
+0.102 0.180
+0.059 0.118
+0.094 0.179
+0.242 0.421
+0.308 0.486
+0.095 0.162
+0.140 0.245
+0.082 0.142
+LATTE
+0.106 0.184
+0.058 0.121
+0.093 0.178
+0.247 0.433
+0.310 0.487
+0.096 0.164
+0.140 0.245
+0.083 0.142
+LLaDARec
+0.053 0.092
+0.037 0.063
+0.045 0.085
+0.248 0.434
+0.327 0.517
+0.069 0.102
+0.099 0.168
+0.083 0.139
+Continuous
+Generative
+Retrieval
+DreamRec
+0.055 0.082
+0.024 0.043
+0.050 0.080
+0.065 0.120
+0.124 0.187
+0.046 0.073
+0.063 0.099
+0.040 0.064
+DimeRec
+0.035 0.061
+0.020 0.037
+0.069 0.103
+0.130 0.238
+0.212 0.370
+0.041 0.066
+0.089 0.142
+0.064 0.119
+PreferDiff
+0.050 0.077
+0.022 0.037
+0.053 0.081
+0.030 0.059
+0.065 0.105
+0.033 0.052
+0.032 0.053
+0.017 0.034
+TA-Rec
+0.064 0.096
+0.029 0.049
+0.061 0.092
+0.030 0.060
+0.036 0.064
+0.030 0.049
+0.048 0.080
+0.012 0.022
+ADRec
+0.065 0.095
+0.037 0.058
+0.063 0.091
+0.145 0.198
+0.176 0.255
+0.053 0.078
+0.082 0.122
+0.045 0.067
+X-Rec
+0.115 0.206
+0.055 0.127
+0.117 0.207
+0.246 0.475
+0.273 0.501
+0.058 0.138
+0.096 0.217
+0.058 0.119
+Base
+0.113 0.185
+0.074 0.141
+0.117 0.192
+0.261 0.426
+0.285 0.462
+0.088 0.159
+0.146 0.243
+0.093 0.154
+CACO
+0.142 0.236
+0.084 0.175
+0.141 0.244
+0.301 0.500
+0.305 0.518
+0.103 0.194
+0.167 0.301
+0.104 0.180
+Improve
+23.72% 14.78%
+13.61% 23.94%
+20.59% 17.92%
+4.10%
+0.01%
+—
+0.25%
+7.98% 18.28%
+13.73% 22.85%
+11.27% 16.51%
+Bold/dashed underline: best/second-best unrounded mean.
+R@100/R@400 use 10 × 10/20 × 20 queries–neighbors.
+For CACO, R@100 is evaluated at 10 × 10 using the adjustment network trained with 20 queries.
+Improve: positive relative gain over the best other method (including Base). —: no gain.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+Partition
+0.000
+0.050
+0.100
+0.150
+0.200
+0.250
+Recall@400
+ComiRec
+TIGER
+LATTE
+DreamRec
+DimeRec
+XRec
+Base
+CACO
+Shading: pointwise 95% user-bootstrap CIs.
+Figure 4: Recall@400 trajectories across 24 consecutive partitions on the in-house industrial dataset under the 20 × 20 retrieval
+budget. Each point evaluates 10,240 requests. Shaded regions show pointwise 95% confidence intervals estimated by cluster
+bootstrap for Recall@400.
+Table 1). We use the official 5-core subsets for all Amazon datasets
+and treat reviews as positive implicit feedback [23]; for ML-25M and
+the KuaiRec big matrix, positive interactions are defined by ratings
+of at least 4 and watch ratios of at least 1, respectively. Moreover,
+for these two datasets, we retain the earliest positive interaction
+per user–item pair and discard users with fewer than five distinct
+positives to ensure sufficient non-redundant history. Following the
+standard leave-one-out protocol [23], each user’s interactions are
+ordered by time (with a maximum sequence length of 200), holding
+out the final item for testing, the penultimate item for validation,
+and earlier items for training. For industrial evaluation, we con-
+struct an in-house dataset from chronological user–item interaction
+logs across 24 sequential partitions. Each partition contains ≈2.6M
+training and 10,240 test instances pairing historical positive and re-
+cent interaction sequences, whose target items form that partition’s
+ANN candidate pool. Due to data security and commercial confi-
+dentiality requirements, we keep this in-house dataset proprietary
+and omit platform-specific details.
+6
+
+
+CACO: Coverage-Aware Coordinated Optimization for Continuous Generative Retrieval
+X-Rec
+DreamRec
+DimeRec
+PreferDiﬀ
+TA-Rec
+Base
+0
+5
+10
+15
+20
+25
+30
+Recall@400 (%)
+Beauty
+Sports
+Toys
+Backbone
++ CACO gain
+Figure 5: Recall@400 across six frozen generative backbones
+on Amazon2014 (20 × 20 budget). Each group shows Beauty,
+Sports, and Toys from left to right; solid bars show backbone
+recall and hatched increments show the CACO gain. Error
+bars show one standard deviation across three training seeds,
+each averaged over two inference seeds.
+Baselines. We compare CACO against three categories of repre-
+sentative retrieval methods: (1) Multi-interest retrieval meth-
+ods, which learn multiple user interest vectors for parallel nearest-
+neighbor search, including ComiRec [6], REMI [54], and MIMA [38];
+(2) Discrete generative retrieval methods, which tokenize items
+into semantic IDs and generate target identifiers via sequence de-
+coding or discrete diffusion, including TIGER [42], LATTE [19],
+and LLaDARec [45]; and (3) Continuous generative retrieval
+methods, which generate query embeddings in the continuous
+item space via diffusion or flow matching for nearest-neighbor re-
+trieval, including DreamRec [55], DimeRec [26], PreferDiff [32], TA-
+Rec [37], ADRec [9], and X-Rec [44]. In addition, we include Base,
+our backbone continuous generator that adopts the sequence archi-
+tecture of X-Rec [44] without anchor conditioning and learns query
+embeddings via Riemannian flow matching on the unit sphere [10].
+As shown in Figure 3(a), Base constructs each historical interaction
+token representation by summing its item embedding and action
+embedding. Applying CACO on top of the frozen Base model pro-
+vides a direct comparison to isolate the gain of coordinated query
+adjustment.
+Training. Across all compared methods, we use a shared set of
+fixed, unit-normalized 128-dimensional item embeddings on each
+dataset. For public datasets, the item embeddings are pretrained
+on training sequences using a 2-layer causal Transformer with a
+next-item prediction objective; for the industrial dataset, each item
+is represented by a 128-dimensional unit-normalized multimodal
+embedding. The public Base generator uses 8 Transformer layers
+with hidden dimension 256 (∼8M parameters), 30 Euler integration
+steps, and a classifier-free guidance scale of 3.0, while the adjust-
+ment network of CACO sets the number of layers 𝑁= 2, hidden
+dimension 128, and the number of attention heads 𝐴= 4 (∼0.6M
+parameters); overall, CACO and all baselines maintain a compa-
+rable parameter scale. On public datasets, all retrieval models are
+trained for two epochs using AdamW (learning rate 10−4, batch
+size 512). For CACO, we train the adjustment network for the first
+epoch using the reference query set and item weights from Base,
+and refresh them using queries adjusted by the first-epoch network
+before training for the second epoch. We set 𝑀= 200, 𝛼= 0.5, step
+bound 𝜌= tan 32◦, and perturbation scale 𝜎= tan 8◦/
+√
+127.
+For the industrial dataset, we pretrain each method for 100,000
+steps with a batch size of 2,048 on an independent historical corpus,
+followed by sequential supervised fine-tuning and evaluation over
+24 consecutive partitions.
+Evaluation protocol and metrics. We report Recall @𝐵, the frac-
+tion of test targets contained in the merged candidate set U𝐾(𝑄)
+(Eq. (2)), under budgets 𝐿× 𝐾= 10 × 10 (𝐵= 100) and 20 × 20
+(𝐵= 400). To quantify inter-query redundancy, we define the mean
+pairwise Jaccard overlap of a query set 𝑄as
+MPJ(𝑄) =
+2
+𝐿(𝐿−1)
+∑︁
+1≤𝑖<𝑗≤𝐿
+|A𝐾(𝑞𝑖) ∩A𝐾(𝑞𝑗)|
+|A𝐾(𝑞𝑖) ∪A𝐾(𝑞𝑗)| .
+(15)
+We average MPJ(𝑄) over test contexts; lower values indicate less
+redundant retrieval. For all methods, we filter out items that have
+already appeared in the user’s interaction history and deduplicate
+retrieved candidates. All experiments train each method with three
+random seeds and evaluate each checkpoint across two inference
+seeds, reporting the mean over all six runs.
+5.2
+Overall Retrieval Performance
+Table 1 compares all methods on eight public datasets under 10×10
+(Recall @100) and 20 × 20 (Recall @400) retrieval budgets. Multi-
+interest and continuous generative methods retrieve 𝐾nearest
+neighbors for each of 𝐿generated vectors, while discrete generative
+methods decode 𝐿semantic IDs and retrieve 𝐾nearest neighbors
+per decoded representation in the shared embedding space, ensur-
+ing the same 𝐿× 𝐾retrieval budget.
+CACO achieves the best performance on nearly all datasets
+and budgets, with relative gains of up to 23.72% in Recall @100
+and 23.94% in Recall @400 over the strongest competing method.
+The only exception is ML-25M at Recall @100, where LLaDARec
+achieves 0.327 versus CACO’s 0.305; at Recall @400, CACO slightly
+surpasses it (0.518 vs. 0.517). Compared with the frozen Base model
+sharing the same generator and item embeddings, CACO improves
+Recall @100 by 1.01–3.99 percentage points and Recall @400 by
+2.55–7.36 percentage points without increasing 𝐿or 𝐾. Absolute
+gains over Base grow under 20 × 20 where coordination matters
+more, while training once at 𝐿= 20 transfers directly to 𝐿= 10 at
+inference.
+5.3
+Performance on Industrial Dataset
+Figure 4 reports Recall @400 under the 20 × 20 retrieval budget.
+CACO achieves the highest overall recall across the streaming par-
+titions, maintaining a 2–3 percentage-point lead over Base through-
+out evaluation. It matches X-Rec on early partitions and pulls ahead
+on later ones, showing that coordinated query adjustment remains
+effective as user preferences and candidate pools evolve. More
+broadly, the flow-matching retrievers CACO, X-Rec, and Base con-
+sistently form the strongest group, followed by the discrete gener-
+ative methods LATTE and TIGER, while ComiRec and multi-step
+7
+
+
+Pan Zhang et al.
+Table 2: Retrieval overlap and end-to-end inference cost.
+Method
+Beauty
+Sports
+Toys
+Industrial
+MPJ ↓Time ↓
+MPJ ↓Time ↓
+MPJ ↓Time ↓
+MPJ ↓Time ↓
+Base
+0.237 4.322
+0.185 4.297
+0.196 4.318
+0.125 6.454
+CACO
+0.106 4.406
+0.065 4.425
+0.081 4.426
+0.058 6.487
+Overhead
++1.95%
++2.97%
++2.51%
++0.51%
+MPJ: mean pairwise Jaccard. Time: end-to-end inference time (ms/sample).
+Industrial reports partition averages.
+Overhead: percentage increase in end-to-end inference time relative to Base.
+diffusion retrievers remain lower. CACO thus sustains its gains
+beyond static public benchmarks on temporally evolving industrial
+streams.
+5.4
+Generalization Across Generative
+Backbones
+To test whether CACO serves as a general post-training module
+beyond Base, we attach it to five additional frozen continuous gen-
+erative retrievers—flow-matching X-Rec [44] and diffusion-based
+DreamRec [55], DimeRec [26], PreferDiff [32], and TA-Rec [37]—on
+Beauty, Sports, and Toys under the 20 × 20 budget. Each pretrained
+backbone and the item embeddings remain frozen; the adjustment
+network takes the backbone’s own history features and trains for
+two epochs with 𝑀= 200 reference queries refreshed after the first
+epoch.
+Figure 5 compares paired Recall @400 before and after CACO
+adjustment from identical initial queries. CACO improves mean
+Recall @400 for all six backbones across all three datasets (all 18
+settings), delivering gains of 0.89–8.72 percentage points. DimeRec
+achieves the largest gain on Toys, jumping from 10.38% to 19.10%
+(+8.72 pp), while TA-Rec gains 4.49–5.12 pp across datasets. Even
+on the strongest baseline X-Rec, CACO raises Recall @400 from
+20.57% to 23.36% on Beauty and from 20.66% to 24.55% on Toys,
+confirming plug-and-play compatibility across flow-matching and
+diffusion architectures.
+5.5
+Overlap Reduction and Inference Efficiency
+Table 2 reports test-set mean pairwise Jaccard overlap (MPJ) and
+end-to-end inference time (query generation plus ANN retrieval
+at batch size 32 on an NVIDIA H100 GPU) under the 20 × 20 bud-
+get, using identical retrieval indices for Base and CACO. CACO
+cuts test-set MPJ by 53.3%–64.9% across Beauty, Sports, Toys, and
+Industrial while adding only 0.51%–2.97% end-to-end latency (0.03–
+0.13 ms/sample). Grouping test users into validation-tertile Base
+MPJ strata on Beauty, Sports, and Toys further shows positive recall
+gains in every stratum, peaking at +6.86 to +13.23 percentage points
+in the high-overlap group where uncoordinated queries waste the
+most budget. Moreover, expanding retrieval depth 𝐾∈[20, 400]
+on the industrial dataset under a 400-item candidate cap confirms
+that post-hoc deduplication cannot replace coordination: CACO
+reaches 20% recall at 𝐾= 32 (0.58 ms CPU ANN time), whereas Base
+requires 𝐾= 200 (1.37 ms) to match it. Holding the budget fixed
+at 𝐵= 400 across (𝐿, 𝐾) ∈{(10, 40), (20, 20), (40, 10)} on Beauty,
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+Base
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+CACO
+1
+2
+5
+10
+20
+Retrieval count
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Jaccard overlap
+Base
+CACO
+Item
+Figure 6: An example case on Sports. Base (top) and CACO
+(bottom) share the same t-SNE projection of queries and
+items (left). Right: pairwise Jaccard overlap between the re-
+trieval sets of queries 𝑞𝑖and 𝑞𝑗, 𝐽𝑖𝑗= |A𝐾(𝑞𝑖)∩A𝐾(𝑞𝑗)|
+|A𝐾(𝑞𝑗)∪A𝐾(𝑞𝑖)| , with
+self-overlap masked white. Full-test averages appear in Ta-
+ble 2.
+Sports, and Toys without retraining further improves Recall @400
+in all nine settings by 2.87–6.40 pp (peaking at 40 × 10 and raising
+distinct items by 35.7%–66.2%) (Table 10), while CACO tops the
+14-method recall–latency frontier (Figure 15).
+Figure 6 visualizes a Sports test instance via a shared t-SNE [48]
+projection (left) and pairwise Jaccard matrix (right). Under Base,
+sampled queries cluster tightly and over 10 queries retrieve iden-
+tical items (MPJ = 0.306, 104 distinct items), missing the target.
+CACO spreads queries across complementary neighborhoods, low-
+ering MPJ to 0.048, expanding coverage to 232 distinct items, and
+recovering the target item.
+5.6
+Ablation Study
+Figure 7 compares CACO against the unadjusted Base model and
+three ablated variants on Beauty, Sports, KuaiRec, and ML-25M
+under the 20×20 (Recall @400) budget. Across all four datasets, the
+full CACO model achieves the best performance, with a consistent
+progression of Base < w/o QI < w/o RG < CACO:
+Effect of Query Interaction (w/o QI). Masking off-diagonal self-
+attention also zeroes relative-direction terms from other queries in
+Eq. (10), causing a 10.21%–14.04% relative recall drop across datasets
+(e.g., 0.2297 to 0.1974 on Beauty and 0.4920 to 0.4297 on KuaiRec)
+and confirming the necessity of inter-query coordination.
+Effect of Relative Directions Gate (w/o RG). Removing the
+relative directions gate in Eq. (9) while keeping cross-attention,
+self-attention, and the FFN lowers recall by 5.81%–10.93%, yet w/o
+8
+
+
+CACO: Coverage-Aware Coordinated Optimization for Continuous Generative Retrieval
+Table 3: Offline query selection across five backbones and six datasets: Recall@400 (↑) and MPJ (↓, parentheses; Eq. (15)).
+Backbone
+Selection
+Beauty
+Sports
+Toys
+KuaiRec
+ML-25M
+Industrial
+LATTE
+Random
+0.176
+(0.0332)
+0.110
+(0.0192)
+0.131
+(0.0115)
+0.464
+(0.0693)
+0.468
+(0.0675)
+0.098
+(0.0333)
+Greedy (𝛼= 0)
+0.118
+(0.0001)
+0.072
+(0.0000)
+0.091
+(0.0000)
+0.378
+(0.0005)
+0.400
+(0.0063)
+0.091
+(0.0064)
+Greedy (𝛼= 0.5)
+0.200
+(0.0042)
+0.131
+(0.0042)
+0.165
+(0.0033)
+0.555
+(0.0065)
+0.544
+(0.0117)
+0.142
+(0.0075)
+Greedy (𝛼= 1)
+0.218
+(0.0125) 0.142
+(0.0108) 0.179
+(0.0087) 0.572
+(0.0142) 0.566
+(0.0195) 0.144
+(0.0087)
+X-Rec
+Random
+0.205
+(0.1119)
+0.127
+(0.0371)
+0.204
+(0.1316)
+0.472
+(0.0486)
+0.504
+(0.0527)
+0.197
+(0.0042)
+Greedy (𝛼= 0)
+0.224
+(0.0419)
+0.105
+(0.0043)
+0.234
+(0.0644)
+0.369
+(0.0000)
+0.398
+(0.0018)
+0.187
+(0.0095)
+Greedy (𝛼= 0.5)
+0.240
+(0.0503)
+0.150
+(0.0114) 0.239
+(0.0745)
+0.570
+(0.0044)
+0.598
+(0.0071)
+0.217
+(0.0128)
+Greedy (𝛼= 1)
+0.239
+(0.0614) 0.155
+(0.0194)
+0.237
+(0.0860) 0.595
+(0.0089) 0.618
+(0.0133) 0.218
+(0.0191)
+DimeRec
+Random
+0.061
+(0.6220)
+0.034
+(0.6675)
+0.107
+(0.6535)
+0.251
+(0.2658)
+0.370
+(0.1569)
+0.014
+(0.0257)
+Greedy (𝛼= 0)
+0.079
+(0.5393)
+0.042
+(0.5998) 0.126
+(0.5813) 0.349
+(0.1059)
+0.457
+(0.0449)
+0.015
+(0.0024)
+Greedy (𝛼= 0.5)
+0.078
+(0.5405) 0.042
+(0.5986)
+0.125
+(0.5801)
+0.342
+(0.1127) 0.463
+(0.0514) 0.018
+(0.0085)
+Greedy (𝛼= 1)
+0.078
+(0.5419)
+0.042
+(0.5987)
+0.125
+(0.5802)
+0.334
+(0.1228)
+0.458
+(0.0623)
+0.018
+(0.0161)
+Base
+Random
+0.183
+(0.2373)
+0.136
+(0.1844)
+0.192
+(0.1967)
+0.421
+(0.3098)
+0.462
+(0.1722)
+0.181
+(0.1250)
+Greedy (𝛼= 0)
+0.214
+(0.1402)
+0.167
+(0.0616)
+0.225
+(0.1191)
+0.561
+(0.1036)
+0.573
+(0.0462)
+0.200
+(0.0339)
+Greedy (𝛼= 0.5)
+0.216
+(0.1489) 0.170
+(0.0721) 0.227
+(0.1296) 0.564
+(0.1063) 0.591
+(0.0516) 0.222
+(0.0392)
+Greedy (𝛼= 1)
+0.213
+(0.1601)
+0.167
+(0.0866)
+0.224
+(0.1414)
+0.554
+(0.1119)
+0.582
+(0.0605)
+0.221
+(0.0493)
+CACO
+Random
+0.224
+(0.1108)
+0.165
+(0.0715)
+0.231
+(0.0864)
+0.472
+(0.1852)
+0.496
+(0.0903)
+0.194
+(0.0635)
+Greedy (𝛼= 0)
+0.255
+(0.0527)
+0.183
+(0.0253)
+0.258
+(0.0387)
+0.582
+(0.0522)
+0.574
+(0.0198)
+0.217
+(0.0130)
+Greedy (𝛼= 0.5)
+0.258
+(0.0627) 0.190
+(0.0355) 0.265
+(0.0494) 0.594
+(0.0564) 0.606
+(0.0258) 0.229
+(0.0206)
+Greedy (𝛼= 1)
+0.255
+(0.0732)
+0.188
+(0.0461)
+0.263
+(0.0603)
+0.587
+(0.0629)
+0.596
+(0.0335)
+0.225
+(0.0301)
+Random selects 20 queries from the 200-query reference pool; Greedy selects 20 of 200 queries (𝐾= 20 neighbors/query; Industrial reports partition averages).
+Parentheses show mean pairwise Jaccard overlap (green: Random; red: Greedy). Bold and dashed underlines indicate the best and second-best unrounded Recall
+among the four strategies per backbone and dataset; CACO training uses 𝛼= 0.5 (shaded).
+Base w/o
+QI
+w/o
+RG
+GD
+CACO
+0.14
+0.18
+0.22
+Recall@400
+0.187
+0.197
+0.205
+0.148
+0.230
+Beauty14
+Base w/o
+QI
+w/o
+RG
+GD
+CACO
+0.10
+0.12
+0.14
+0.16
+0.18
+0.141
+0.151
+0.156
+0.103
+0.175
+Sports14
+Base w/o
+QI
+w/o
+RG
+GD
+CACO
+0.40
+0.44
+0.48
+Recall@400
+0.424
+0.430
+0.449
+0.409
+0.492
+KuaiRec
+Base w/o
+QI
+w/o
+RG
+GD
+CACO
+0.45
+0.49
+0.53
+0.463
+0.465
+0.487
+0.471
+0.517
+ML-25M
+Figure 7: Ablation of CACO: removing query interaction (QI)
+or the relative directions gate (RG), or replacing marginal
+coverage learning with greedy distillation (GD). Values are
+mean Recall@400 over three training seeds; dashed lines
+denote CACO. Vertical axes are truncated.
+RG consistently outperforms w/o QI, showing complementary
+gains from attention interaction and direction aggregation.
+Marginal Coverage Learning vs. Greedy Distillation (GD). GD
+selects 20 teacher queries from the 200-query reference set via of-
+fline greedy selection (𝛼= 0.5), pairs predicted and teacher queries
+via Hungarian matching, and minimizes their cosine distance. GD
+trails CACO by 8.96%–40.93% in relative recall and falls below Base
+on Beauty, Sports, and KuaiRec: small embedding errors shift dis-
+crete ANN memberships and alter inter-query overlap, confirming
+the advantage of learning directly from marginal coverage gains.
+Effect of Reference-Pool Refresh. Comparing one-epoch, two-
+epoch fixed-pool, and two-epoch refreshed schedules across five
+public datasets shows that refreshing 𝑄ℎafter epoch 1 improves
+Recall @400 over the fixed-pool control by 0.12–0.89 pp across every
+training seed (Tables 6–7). This isolates updated supervision gains
+from extra optimization, whereas additional refresh rounds plateau
+(Appendix A).
+5.7
+Coverage Objective Analysis
+Table 3 evaluates offline greedy selection under 𝐹ℎ(𝑄) across five
+retrieval backbones and six datasets, comparing random selection
+against unweighted (𝛼= 0), sublinear (𝛼= 0.5), and linear (𝛼=
+1) frequency-weighted coverage. At 𝛼= 0.5 and 𝛼= 1, greedy
+selection improves Recall @400 over random sampling in all 30
+backbone–dataset settings while substantially lowering MPJ (e.g.,
+𝛼= 0.5 boosts Base by 3.25–14.25 pp on public benchmarks and
+from 0.181 to 0.222 on the industrial dataset, with MPJ dropping
+from 0.1250 to 0.0392); intermediate exponents 𝛼∈{0.25, 0.75}
+likewise achieve 30-out-of-30 recall gains (Appendix D.2).
+9
+
+
+Pan Zhang et al.
+Comparing 𝛼∈{0, 0.5, 1} directly confirms the risk of relevance
+drift when broadening coverage without feedback on the value
+of additional items. For instance, unweighted selection (𝛼= 0)
+drives X-Rec’s MPJ on KuaiRec to 0.0000 yet lowers recall from
+0.472 to 0.369 (and drops LATTE on Industrial from 0.098 to 0.091),
+whereas 𝛼= 0.5 and 𝛼= 1 raise X-Rec’s recall to 0.570 and 0.595.
+Optimal exponents track intrinsic query redundancy: highly over-
+lapping DimeRec (random MPJ of 0.622–0.668 on Amazon) peaks at
+𝛼∈[0, 0.5] where dispersing collapsed neighborhoods dominates,
+whereas low-overlap LATTE (MPJ of 0.012–0.069) and X-Rec favor
+𝛼= 1 to prioritize high-confidence items. Moderately redundant
+Base and CACO peak at 𝛼= 0.5, supporting our default setting.
+Finally, varying the training reference-pool size 𝑀∈[20, 800] on
+Beauty, Sports, and Toys shows rapid saturation, with 𝑀= 20
+already retaining 89%–91% of the Recall @400 gain achieved at
+𝑀= 800.
+6
+Conclusion
+We proposed CACO, a lightweight self-supervised post-training
+framework that coordinates queries from frozen flow-matching
+and diffusion retrievers toward complementary coverage under a
+fixed retrieval budget. Using empirical reference-query retrieval
+counts as a relevance proxy, CACO learns coordinated query ad-
+justment from unbiased marginal-coverage gradients without con-
+structing a large query pool at inference. Experiments across eight
+public benchmarks, an in-house streaming industrial dataset, and
+six generative backbones show that CACO effectively improves re-
+call while substantially cutting inter-query overlap with negligible
+latency overhead.
+References
+[1] P.-A. Absil and Jérôme Malick. 2012. Projection-like Retractions on Matrix
+Manifolds. SIAM Journal on Optimization 22, 1 (2012), 135–158. doi:10.1137/
+100802529
+[2] Rakesh Agrawal, Sreenivas Gollapudi, Alan Halverson, and Samuel Ieong. 2009.
+Diversifying Search Results. In Proceedings of the Second ACM International Con-
+ference on Web Search and Data Mining (WSDM ’09). Association for Computing
+Machinery, New York, NY, USA, 5–14. doi:10.1145/1498759.1498766
+[3] Silvere Bonnabel. 2013. Stochastic Gradient Descent on Riemannian Mani-
+folds. IEEE Trans. Automat. Control 58, 9 (2013), 2217–2229. doi:10.1109/tac.2013.
+2254619
+[4] Nicolas Boumal. 2023. An Introduction to Optimization on Smooth Manifolds.
+Cambridge University Press. https://www.nicolasboumal.net/book
+[5] Zhuo Cai, Shoujin Wang, Victor W. Chu, Usman Naseem, Yang Wang, and Fang
+Chen. 2025. Unleashing the Potential of Diffusion Models Towards Diversified
+Sequential Recommendations. In Proceedings of the 48th International ACM SIGIR
+Conference on Research and Development in Information Retrieval (SIGIR ’25).
+Association for Computing Machinery, New York, NY, USA, 1476–1486. doi:10.
+1145/3726302.3730109
+[6] Yukuo Cen, Jianwei Zhang, Xu Zou, Chang Zhou, Hongxia Yang, and Jie Tang.
+2020. Controllable Multi-Interest Framework for Recommendation. In Proceedings
+of the 26th ACM SIGKDD International Conference on Knowledge Discovery &
+Data Mining (KDD ’20). Association for Computing Machinery, New York, NY,
+USA, 2942–2951. doi:10.1145/3394486.3403344
+[7] Zheng Chai, Zhihong Chen, Chenliang Li, Rong Xiao, Houyi Li, Jiawei Wu,
+Jingxu Chen, and Haihong Tang. 2022. User-Aware Multi-Interest Learning for
+Candidate Matching in Recommenders. In Proceedings of the 45th International
+ACM SIGIR Conference on Research and Development in Information Retrieval.
+ACM, 1326–1335. doi:10.1145/3477495.3532073
+[8] Gaode Chen, Xinghua Zhang, Yanyan Zhao, Cong Xue, and Ji Xiang. 2021. Explor-
+ing Periodicity and Interactivity in Multi-Interest Framework for Sequential Rec-
+ommendation. In Proceedings of the Thirtieth International Joint Conference on Ar-
+tificial Intelligence, IJCAI-21, Zhi-Hua Zhou (Ed.). International Joint Conferences
+on Artificial Intelligence Organization, 1426–1433. doi:10.24963/ijcai.2021/197
+Main Track.
+[9] Jialei Chen, Yuanbo Xu, and Yiheng Jiang. 2025. Unlocking the Power of Diffusion
+Models in Sequential Recommendation: A Simple and Effective Approach. In
+Proceedings of the 31st ACM SIGKDD Conference on Knowledge Discovery and
+Data Mining V.2. ACM, 155–166. doi:10.1145/3711896.3737172
+[10] Ricky T. Q. Chen and Yaron Lipman. 2024.
+Flow Matching on
+General Geometries. In International Conference on Learning Representa-
+tions. 47922–47945.
+https://proceedings.iclr.cc/paper_files/paper/2024/hash/
+d1f9936d3be6997ffffab692977eebe6-Abstract-Conference.html
+[11] Paul Covington, Jay Adams, and Emre Sargin. 2016. Deep Neural Networks
+for YouTube Recommendations. In Proceedings of the 10th ACM Conference on
+Recommender Systems (RecSys ’16). Association for Computing Machinery, New
+York, NY, USA, 191–198. doi:10.1145/2959100.2959190
+[12] Jiaxin Deng, Shiyao Wang, Kuo Cai, Lejian Ren, Qigen Hu, Weifeng Ding, Qiang
+Luo, and Guorui Zhou. 2025. OneRec: Unifying Retrieve and Rank with Genera-
+tive Recommender and Iterative Preference Alignment. arXiv:2502.18965 [cs.IR]
+https://arxiv.org/abs/2502.18965
+[13] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2019. BERT:
+Pre-training of Deep Bidirectional Transformers for Language Understanding. In
+Proceedings of the 2019 Conference of the North American Chapter of the Association
+for Computational Linguistics: Human Language Technologies, Volume 1 (Long and
+Short Papers), Jill Burstein, Christy Doran, and Thamar Solorio (Eds.). Association
+for Computational Linguistics, Minneapolis, Minnesota, 4171–4186. doi:10.18653/
+v1/N19-1423
+[14] Yingpeng Du, Ziyan Wang, Zhu Sun, Yining Ma, Hongzhi Liu, and Jie Zhang.
+2024. Disentangled Multi-interest Representation Learning for Sequential Rec-
+ommendation. In Proceedings of the 30th ACM SIGKDD Conference on Knowledge
+Discovery and Data Mining. ACM, 677–688. doi:10.1145/3637528.3671800
+[15] Chongming Gao, Shijun Li, Wenqiang Lei, Jiawei Chen, Biao Li, Peng Jiang,
+Xiangnan He, Jiaxin Mao, and Tat-Seng Chua. 2022. KuaiRec: A Fully-Observed
+Dataset and Insights for Evaluating Recommender Systems. In Proceedings of
+the 31st ACM International Conference on Information & Knowledge Management
+(CIKM ’22). Association for Computing Machinery, New York, NY, USA, 540–550.
+doi:10.1145/3511808.3557220
+[16] F. Maxwell Harper and Joseph A. Konstan. 2015. The MovieLens Datasets:
+History and Context. ACM Transactions on Interactive Intelligent Systems 5, 4,
+Article 19 (2015), 19 pages. doi:10.1145/2827872
+[17] Min Hou, Le Wu, Yuxin Liao, Yonghui Yang, Zhen Zhang, Yu Wang, Changlong
+Zheng, Han Wu, and Richang Hong. 2026. A Survey on Generative Recommen-
+dation: Data, Model, and Tasks. AI Open 7 (2026), 169–193. doi:10.1016/j.aiopen.
+2026.05.002
+[18] Yupeng Hou, Zhankui He, Julian McAuley, and Wayne Xin Zhao. 2023. Learn-
+ing Vector-Quantized Item Representation for Transferable Sequential Recom-
+menders. In Proceedings of the ACM Web Conference 2023. ACM, 1162–1171.
+doi:10.1145/3543507.3583434
+[19] Yupeng Hou, Haven Kim, Clark Mingxuan Ju, Eduardo Escoto, Neil Shah, and
+Julian McAuley. 2026. Expressiveness Limits of Autoregressive Semantic ID
+Generation in Generative Recommendation. arXiv:2605.06331 [cs.IR] https:
+//arxiv.org/abs/2605.06331
+[20] Yupeng Hou, Jiacheng Li, Xiangjun Fu, Zhankui He, An Yan, Xiusi Chen, and
+Julian McAuley. 2026. Bridging Language and Items for Retrieval and Recom-
+mendation: Benchmarking LLMs as Semantic Encoders. In Proceedings of the
+64th Annual Meeting of the Association for Computational Linguistics (Volume 1:
+Long Papers), Maria Liakata, Viviane P. Moreira, Jiajun Zhang, and David Jurgens
+(Eds.). Association for Computational Linguistics, San Diego, California, United
+States, 3251–3265. doi:10.18653/v1/2026.acl-long.147
+[21] Yupeng Hou, Jiacheng Li, Ashley Shin, Jinsung Jeon, Abhishek Santhanam, Wei
+Shao, Kaveh Hassani, Ning Yao, and Julian McAuley. 2025. Generating Long
+Semantic IDs in Parallel for Recommendation. In Proceedings of the 31st ACM
+SIGKDD Conference on Knowledge Discovery and Data Mining V.2. ACM, 956–966.
+doi:10.1145/3711896.3736979
+[22] Wangyu Jin, Yang Xue, Wenwen Xia, Hongliang He, Guanfeng Liu, and Peng-
+peng Zhao. 2026. Contrastive Flow Matching for Sequential Recommendation.
+In Proceedings of the Thirty-Fifth International Joint Conference on Artificial Intel-
+ligence. International Joint Conferences on Artificial Intelligence Organization,
+2744–2752. doi:10.24963/ijcai.2026/305
+[23] Wang-Cheng Kang and Julian McAuley. 2018. Self-Attentive Sequential Recom-
+mendation. In 2018 IEEE International Conference on Data Mining (ICDM). IEEE,
+197–206. doi:10.1109/ICDM.2018.00035
+[24] Chao Li, Zhiyuan Liu, Mengmeng Wu, Yuchi Xu, Huan Zhao, Pipei Huang,
+Guoliang Kang, Qiwei Chen, Wei Li, and Dik Lun Lee. 2019. Multi-Interest
+Network with Dynamic Routing for Recommendation at Tmall. In Proceedings of
+the 28th ACM International Conference on Information and Knowledge Management
+(CIKM ’19). Association for Computing Machinery, New York, NY, USA, 2615–
+2623. doi:10.1145/3357384.3357814
+[25] Jian Li, Jieming Zhu, Qiwei Bi, Guohao Cai, Lifeng Shang, Zhenhua Dong, Xin
+Jiang, and Qun Liu. 2022. MINER: Multi-Interest Matching Network for News
+Recommendation. In Findings of the Association for Computational Linguistics:
+ACL 2022, Smaranda Muresan, Preslav Nakov, and Aline Villavicencio (Eds.).
+10
+
+
+CACO: Coverage-Aware Coordinated Optimization for Continuous Generative Retrieval
+Association for Computational Linguistics, Dublin, Ireland, 343–352. doi:10.
+18653/v1/2022.findings-acl.29
+[26] Wuchao Li, Rui Huang, Haijun Zhao, Chi Liu, Kai Zheng, Qi Liu, Na Mou, Guorui
+Zhou, Defu Lian, Yang Song, Wentian Bao, Enyun Yu, and Wenwu Ou. 2025.
+DimeRec: A Unified Framework for Enhanced Sequential Recommendation via
+Generative Diffusion Models. In Proceedings of the Eighteenth ACM International
+Conference on Web Search and Data Mining (WSDM ’25). Association for Com-
+puting Machinery, New York, NY, USA, 726–734. doi:10.1145/3701551.3703555
+[27] Ziming Li, Jiatan Huang, Xiaoguang Guo, Guiling Wang, and Chuxu Zhang. 2026.
+Same Signal, Opposite Meaning: Direction-Informed Adaptive Learning for LLM
+Agents. arXiv preprint arXiv:2605.06908 (2026). https://arxiv.org/abs/2605.06908
+[28] Zihao Li, Aixin Sun, and Chenliang Li. 2024. DiffuRec: A Diffusion Model for
+Sequential Recommendation. ACM Transactions on Information Systems 42, 3
+(2024), 1–28. doi:10.1145/3631116
+[29] Xinyu Lin, Haihan Shi, Wenjie Wang, Fuli Feng, Qifan Wang, See-Kiong Ng,
+and Tat-Seng Chua. 2025. Order-agnostic Identifier for Large Language Model-
+based Generative Recommendation. In Proceedings of the 48th International ACM
+SIGIR Conference on Research and Development in Information Retrieval. ACM,
+1923–1933. doi:10.1145/3726302.3730053
+[30] Enze Liu, Bowen Zheng, Cheng Ling, Lantao Hu, Han Li, and Wayne Xin Zhao.
+2025. Generative Recommender with End-to-End Learnable Item Tokenization.
+In Proceedings of the 48th International ACM SIGIR Conference on Research and De-
+velopment in Information Retrieval. ACM, 729–739. doi:10.1145/3726302.3729989
+[31] Feng Liu, Lixin Zou, Xiangyu Zhao, Min Tang, Liming Dong, Dan Luo, Xiangyang
+Luo, and Chenliang Li. 2025. Flow Matching Based Sequential Recommender
+Model. In Proceedings of the Thirty-Fourth International Joint Conference on Arti-
+ficial Intelligence, IJCAI-25. International Joint Conferences on Artificial Intelli-
+gence Organization, 3108–3116. doi:10.24963/ijcai.2025/346
+[32] Shuo Liu, An Zhang, Guoqing Hu, Hong Qian, and Tat-Seng Chua. 2025. Pref-
+erence Diffusion for Recommendation. In International Conference on Learning
+Representations. 79844–79881. https://proceedings.iclr.cc/paper_files/paper/2025/
+hash/c6989f4c36acb6f0e0fdd60f1c12e8a0-Abstract-Conference.html
+[33] Zihan Liu, Yupeng Hou, and Julian McAuley. 2024. Multi-Behavior Generative
+Recommendation. In Proceedings of the 33rd ACM International Conference on
+Information and Knowledge Management (CIKM ’24). Association for Computing
+Machinery, New York, NY, USA, 1575–1585. doi:10.1145/3627673.3679730
+[34] Yu. A. Malkov and D. A. Yashunin. 2020. Efficient and Robust Approximate
+Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs.
+IEEE Transactions on Pattern Analysis and Machine Intelligence 42, 4 (2020), 824–
+836. doi:10.1109/TPAMI.2018.2889473
+[35] Horia Mania, Aurelia Guy, and Benjamin Recht. 2018.
+Simple ran-
+dom
+search
+of
+static
+linear
+policies
+is
+competitive
+for
+reinforce-
+ment learning. In Advances in Neural Information Processing Systems,
+Vol.
+31.
+https://proceedings.neurips.cc/paper_files/paper/2018/hash/
+7634ea65a4e6d9041cfd3f7de18e334a-Abstract.html
+[36] Wenyu Mao, Shuchang Liu, Haoyang Liu, Haozhe Liu, Xiang Li, and Lantao
+Hu. 2025. Distinguished Quantized Guidance for Diffusion-based Sequence
+Recommendation. In Proceedings of the ACM on Web Conference 2025. ACM,
+425–435. doi:10.1145/3696410.3714955
+[37] Wenyu Mao, Jiancan Wu, Guoqing Hu, Zhengyi Yang, Wei Ji, and Xiang Wang.
+2025. On Efficiency-Effectiveness Trade-off of Diffusion-based Recommenders.
+In Advances in Neural Information Processing Systems, Vol. 38. Neural Information
+Processing Systems Foundation, Inc. (NeurIPS), 102765–102791. doi:10.52202/
+085713-3098
+[38] Xingyuan Mao, Alin Fan, Shichao Nie, Junfeng Zhang, Yan Xiao, Tao Luo, and
+Xiaoyi Zeng. 2026. MIMA: Multi-Interest Recommendation via Multi-Positive
+Exclusive Assignment. arXiv:2609.12842 [cs.IR] https://arxiv.org/abs/2609.12842
+[39] Julian McAuley, Christopher Targett, Qinfeng Shi, and Anton van den Hengel.
+2015. Image-Based Recommendations on Styles and Substitutes. In Proceedings
+of the 38th International ACM SIGIR Conference on Research and Development in
+Information Retrieval (SIGIR ’15). Association for Computing Machinery, New
+York, NY, USA, 43–52. doi:10.1145/2766462.2767755
+[40] Aditya Pal, Chantat Eksombatchai, Yitong Zhou, Bo Zhao, Charles Rosenberg,
+and Jure Leskovec. 2020. PinnerSage: Multi-Modal User Embedding Framework
+for Recommendations at Pinterest. In Proceedings of the 26th ACM SIGKDD
+International Conference on Knowledge Discovery & Data Mining. ACM, 2311–
+2320. doi:10.1145/3394486.3403280
+[41] Tobias Plötz and Stefan Roth. 2018.
+Neural Nearest Neighbors Networks.
+In Advances in Neural Information Processing Systems, Vol. 31. Curran As-
+sociates, Inc.
+https://proceedings.neurips.cc/paper_files/paper/2018/hash/
+f0e52b27a7a5d6a1a87373dffa53dbe5-Abstract.html
+[42] Shashank Rajput, Nikhil Mehta, Anima Singh, Raghunandan Hulikal Keshavan,
+Trung Vu, Lukasz Heldt, Lichan Hong, Yi Tay, Vinh Tran, Jonah Samost, Maciej
+Kula, Ed Chi, and Maheswaran Sathiamoorthy. 2023. Recommender Systems
+with Generative Retrieval. In Advances in Neural Information Processing Systems,
+Vol. 36. Curran Associates, Inc., 10299–10315. doi:10.52202/075280-0452
+[43] Tim Salimans, Jonathan Ho, Xi Chen, Szymon Sidor, and Ilya Sutskever. 2017.
+Evolution Strategies as a Scalable Alternative to Reinforcement Learning. arXiv
+preprint arXiv:1703.03864 (2017). https://arxiv.org/abs/1703.03864
+[44] Chenglei Shen, Chenzhe Huang, Dong Jiang, Hongjie Gao, Jue Zhang, Kun Xú,
+Lincan Cai, Nan Zhuang, Pan Zhang, Shi Chen, Shunchi Zhang, Xiaoyu Ye, Yang
+Jin, Yu Zhang, Zhenwei An, Zhongtao Jiang, Zhiwei Wang, and Kun Xˇu. 2026. X-
+Rec Technical Report. arXiv:2609.29180 [cs.IR] https://arxiv.org/abs/2609.29180
+[45] Teng Shi, Chenglei Shen, Weijie Yu, Shen Nie, Chongxuan Li, Xiao Zhang, Ming
+He, Jianping Fan, and Jun Xu. 2026. LLaDA-Rec: Discrete Diffusion for Parallel
+Semantic ID Generation in Generative Recommendation. In Proceedings of the
+2026 Conference on Empirical Methods in Natural Language Processing. Association
+for Computational Linguistics, 14152–14165. doi:10.18653/2026.emnlp-main.616
+[46] Zihua Si, Zhongxiang Sun, Jiale Chen, Guozhang Chen, Xiaoxue Zang, Kai Zheng,
+Yang Song, Xiao Zhang, Jun Xu, and Kun Gai. 2024. Generative Retrieval with
+Semantic Tree-Structured Identifiers and Contrastive Learning. In Proceedings of
+the 2024 Annual International ACM SIGIR Conference on Research and Development
+in Information Retrieval in the Asia Pacific Region. ACM, 154–163. doi:10.1145/
+3673791.3698408
+[47] Qiaoyu Tan, Jianwei Zhang, Jiangchao Yao, Ninghao Liu, Jingren Zhou, Hongxia
+Yang, and Xia Hu. 2021. Sparse-Interest Network for Sequential Recommendation.
+In Proceedings of the 14th ACM International Conference on Web Search and Data
+Mining. ACM, 598–606. doi:10.1145/3437963.3441811
+[48] Laurens van der Maaten and Geoffrey Hinton. 2008. Visualizing Data using
+t-SNE. Journal of Machine Learning Research 9, 86 (2008), 2579–2605.
+https:
+//jmlr.org/papers/v9/vandermaaten08a.html
+[49] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+Aidan N Gomez, Ł ukasz Kaiser, and Illia Polosukhin. 2017. Attention is All you
+Need. In Advances in Neural Information Processing Systems, I. Guyon, U. Von
+Luxburg, S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett
+(Eds.), Vol. 30. Curran Associates, Inc. https://proceedings.neurips.cc/paper_
+files/paper/2017/file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf
+[50] Chenyang Wang, Zhefan Wang, Yankai Liu, Yang Ge, Weizhi Ma, Min Zhang,
+Yiqun Liu, Junlan Feng, Chao Deng, and Shaoping Ma. 2022. Target Interest
+Distillation for Multi-Interest Recommendation. In Proceedings of the 31st ACM
+International Conference on Information & Knowledge Management. ACM, 2007–
+2016. doi:10.1145/3511808.3557464
+[51] Wenjie Wang, Honghui Bao, Xinyu Lin, Jizhi Zhang, Yongqi Li, Fuli Feng, See-
+Kiong Ng, and Tat-Seng Chua. 2024. Learnable Item Tokenization for Generative
+Recommendation. In Proceedings of the 33rd ACM International Conference on
+Information and Knowledge Management. ACM, 2400–2409. doi:10.1145/3627673.
+3679569
+[52] Chuhan Wu, Fangzhao Wu, Suyu Ge, Tao Qi, Yongfeng Huang, and Xing Xie. 2019.
+Neural News Recommendation with Multi-Head Self-Attention. In Proceedings
+of the 2019 Conference on Empirical Methods in Natural Language Processing and
+the 9th International Joint Conference on Natural Language Processing (EMNLP-
+IJCNLP). Association for Computational Linguistics, Hong Kong, China, 6389–
+6394. doi:10.18653/v1/D19-1671
+[53] Yujia Xie, Hanjun Dai, Minshuo Chen, Bo Dai, Tuo Zhao, Hongyuan Zha, Wei
+Wei, and Tomas Pfister. 2020. Differentiable Top-k with Optimal Transport. In
+Advances in Neural Information Processing Systems, Vol. 33. Curran Associates,
+Inc., 20520–20531. https://proceedings.neurips.cc/paper_files/paper/2020/hash/
+ec24a54d62ce57ba93a531b460fa8d18-Abstract.html
+[54] Yueqi Xie, Jingqi Gao, Peilin Zhou, Qichen Ye, Yining Hua, Jae Boum Kim,
+Fangzhao Wu, and Sunghun Kim. 2023. Rethinking Multi-Interest Learning for
+Candidate Matching in Recommender Systems. In Proceedings of the 17th ACM
+Conference on Recommender Systems (RecSys ’23). Association for Computing
+Machinery, New York, NY, USA, 283–293. doi:10.1145/3604915.3608766
+[55] Zhengyi Yang, Jiancan Wu, Zhicai Wang, Xiang Wang, Yancheng Yuan, and
+Xiangnan He. 2023. Generate What You Prefer: Reshaping Sequential Recom-
+mendation via Guided Diffusion. In Advances in Neural Information Processing
+Systems, A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine
+(Eds.), Vol. 36. Curran Associates, Inc., 24247–24261. doi:10.52202/075280-1054
+[56] Zican Yang, Zeyu Li, Cong He, Xiaotao Wu, Guanfeng Liu, and Pengpeng Zhao.
+2026. PDFlow: Popularity-Debiased Flow Matching for Sequential Recommenda-
+tion. In Proceedings of the Thirty-Fifth International Joint Conference on Artificial
+Intelligence. International Joint Conferences on Artificial Intelligence Organiza-
+tion, 3178–3186. doi:10.24963/ijcai.2026/353
+[57] Shengyu Zhang, Lingxiao Yang, Dong Yao, Yujie Lu, Fuli Feng, Zhou Zhao,
+Tat-Seng Chua, and Fei Wu. 2022. Re4: Learning to Re-contrast, Re-attend, Re-
+construct for Multi-interest Recommendation. In Proceedings of the ACM Web
+Conference 2022 (WWW ’22). Association for Computing Machinery, New York,
+NY, USA, 2216–2226. doi:10.1145/3485447.3512094
+[58] Bowen Zheng, Yupeng Hou, Hongyu Lu, Yu Chen, Wayne Xin Zhao, Ming
+Chen, and Ji-Rong Wen. 2024. Adapting Large Language Models by Integrating
+Collaborative Semantics for Recommendation. In 2024 IEEE 40th International
+Conference on Data Engineering (ICDE). IEEE, 1435–1448. doi:10.1109/icde60146.
+2024.00118
+11
+
+
+Pan Zhang et al.
+A
+Iterative Reference-Pool Updates
+We examine whether repeated reference-pool updates yield further
+gains. Starting from Base’s 𝑀= 200 reference queries per context,
+we update the pool using the preceding adjustment network. Each
+stage trains a new network for two epochs from the same initial-
+ization within each seed, holding its pool fixed. Base and the initial
+queries 𝑄(0) remain unchanged; inference uses only the current
+adjustment network at 20 × 20.
+Figure 8 shows that the first update improves Recall@400 by
+0.37, 0.45, and 0.27 percentage points on Sports, Instruments, and
+Movies, respectively. Further updates yield diminishing returns:
+Sports declines, while Instruments and Movies nearly plateau be-
+fore decreasing slightly, despite additional rounds of training and
+reference generation.
+B
+Reference-Query Pool Size
+We vary the reference-query pool size 𝑀from 20 to 800 on Sports,
+Toys, and Beauty. Each setting uses the same 𝑀in both training
+epochs: we train for one epoch, refresh the pool with the resulting
+adjustment network, and continue training that network for one
+more epoch. All other training settings remain fixed, and inference
+uses one adjustment network at 20 × 20.
+Figure 9 shows diminishing returns as 𝑀increases. Sports nearly
+plateaus beyond 𝑀= 100, while Toys and Beauty continue to
+improve modestly. Even 𝑀= 20 retains 89–91% of the Recall@400
+gain over Base achieved with 𝑀= 800 across the three datasets.
+One possible explanation is that the adjustment network learns
+from many user contexts within each dataset, reducing its reliance
+on large reference pools for individual contexts.
+C
+Theoretical Analysis
+We first express the marginal coverage signal as a difference in
+probability mass under an item distribution estimated from ref-
+erence queries. We then show that the negative gradient of the
+CACO training loss is an unbiased estimator of the gradient of the
+corresponding Gaussian-smoothed coverage objective.
+C.1
+Probability-Mass Interpretation of
+Coverage Gains
+The base generator induces an item-level retrieval probability
+𝑟ℎ(𝑣) =
+Pr
+𝑞∼𝑝𝜃0 (·|ℎ)
+ 𝑣∈A𝐾(𝑞),
+b𝑟ℎ(𝑣) = 𝑐ℎ(𝑣)
+𝑀
+,
+E𝑄ℎ[b𝑟ℎ(𝑣) | ℎ] = 𝑟ℎ(𝑣).
+(C.1)
+The equality follows by taking the expectation of each retrieval
+indicator in Eq. (4). Thus, normalized retrieval counts are unbiased
+estimates of these probabilities.
+For 𝛼> 0 and 𝑍ℎ= Í
+𝑣∈I 𝑤ℎ(𝑣) > 0, the frequency weights
+define the empirical item distribution
+b𝑝ℎ,𝛼(𝑣) =
+b𝑟ℎ(𝑣)𝛼
+Í
+𝑢∈I b𝑟ℎ(𝑢)𝛼= 𝑤ℎ(𝑣)
+𝑍ℎ
+.
+(C.2)
+For 𝛼= 0, this distribution is uniform over items retrieved by
+the reference pool. The common factor 𝑀−𝛼cancels, so replacing
+counts by frequencies preserves the normalized coverage objective
+0
+1
+2
+3
+Reference-pool updates
+17
+18
+19
+20
+Recall@400 (%)
+Sports
+Instruments
+Movies
+Figure 8: Recall with successive reference-pool updates, start-
+ing from Base’s pool. Each point averages three training seeds
+and two inference seeds; error bars show the standard devia-
+tion across training-seed means.
+and training signal. In particular,
+𝐹ℎ(𝑄)
+𝑍ℎ
+=
+∑︁
+𝑣∈U𝐾(𝑄)
+b𝑝ℎ,𝛼(𝑣).
+(C.3)
+Let 𝑈−𝑖= Ð
+𝑗≠𝑖A𝐾(𝑞+
+𝑗) be the items covered by the other queries.
+Their contribution cancels in Eq. (13), giving
+Δ𝑖=
+∑︁
+𝑣∈A𝐾(𝑞+
+𝑖)\𝑈−𝑖
+b𝑝ℎ,𝛼(𝑣) −
+∑︁
+𝑣∈A𝐾(𝑞−
+𝑖)\𝑈−𝑖
+b𝑝ℎ,𝛼(𝑣).
+(C.4)
+Hence, Δ𝑖compares the probability mass newly covered by the
+positive and negative perturbations under the estimated item dis-
+tribution.
+Proposition C.1 (Unbiased coverage difference with lin-
+ear weights). For 𝛼= 1 and retrieval sets of size 𝐾, define 𝑝ret
+ℎ(𝑣) =
+𝑟ℎ(𝑣)/𝐾. For any fixed pair 𝑄+,𝑄(𝑖) evaluated with an independently
+sampled reference pool,
+E𝑄ℎ[Δ𝑖| ℎ,𝑄+,𝑄(𝑖)] =
+∑︁
+𝑣∈U𝐾(𝑄+)
+𝑝ret
+ℎ(𝑣)
+−
+∑︁
+𝑣∈U𝐾(𝑄(𝑖) )
+𝑝ret
+ℎ(𝑣).
+(C.5)
+Proof. Each reference query retrieves 𝐾items, so Í
+𝑣𝑟ℎ(𝑣) = 𝐾
+and 𝑍ℎ= 𝑀𝐾. Consequently, b𝑝ℎ,1(𝑣) = 𝑐ℎ(𝑣)/(𝑀𝐾) has expecta-
+tion 𝑝ret
+ℎ(𝑣) by Eq. (C.1). Applying linearity of expectation to the
+difference of the two covered masses proves the result.
+□
+For a refreshed pool, the same frequency construction uses the
+current reference-query distribution. The following analysis estab-
+lishes the training-gradient result conditional on the resulting item
+weights, for every supported value of 𝛼.
+C.2
+Gaussian-Smoothed Coverage Objective
+Let C denote the fixed context ℎ, frozen base outputs (𝑄(0), 𝐻ℎ),
+reference set 𝑄ℎ, nonnegative item weights 𝑤ℎ, and a measurable
+12
+
+
+CACO: Coverage-Aware Coordinated Optimization for Continuous Generative Retrieval
+20
+40
+100
+200
+400
+800
+17.0
+17.2
+17.4
+17.6
+Recall@400 (%)
+(a) Sports
+20
+40
+100
+200
+400
+800
+23.8
+24.0
+24.2
+24.4
+(b) Toys
+20
+40
+100
+200
+400
+800
+23.0
+23.5
+24.0
+(c) Beauty
+Reference-query pool size M (log scale)
+Figure 9: Recall@400 versus the reference-query pool size used in both training epochs. Points average three training seeds,
+each evaluated with two inference seeds; error bars show the standard deviation across training-seed means. Vertical scales
+differ across panels.
+retrieval rule, including its index, filtering, and tie-breaking rules.
+We condition on C throughout the derivation. Assume 0 < 𝑍ℎ=
+Í
+𝑣∈I 𝑤ℎ(𝑣) < ∞and 𝜎> 0. The perturbations are independent of
+C and independent across queries.
+For each unit initial query ¤𝑞𝑖, let T𝑖= {𝑢∈R𝑑: ⟨𝑢, ¤𝑞𝑖⟩= 0}
+and T = T1 × · · · × T𝐿. Write 𝑃𝑖= 𝐼𝑑−¤𝑞𝑖¤𝑞⊤
+𝑖for the matrix of the
+projection defined in Section 4.2, and let 𝑃apply these projections
+blockwise. For 𝑢= (𝑢1, . . . ,𝑢𝐿) ∈T, define
+R𝑖(𝑢𝑖) =
+¤𝑞𝑖+ 𝑢𝑖
+√︁
+1 + ∥𝑢𝑖∥2 ,
+𝑓C(𝑢) = 𝐹ℎ
+ (R𝑖(𝑢𝑖))𝐿
+𝑖=1
+
+𝑍ℎ
+.
+(C.6)
+Because coverage counts each item at most once, 0 ≤𝑓C(𝑢) ≤1.
+Gaussian smoothing gives the objective
+𝐽𝜎(𝜇| C) = E𝜖[𝑓C(𝜇+ 𝜎𝑃𝜖) | C],
+𝜇∈T .
+(C.7)
+As in Eq. (12), smoothing acts on tangent coordinates before query
+normalization, with Gaussian noise added after bounding the de-
+terministic update in Eq. (11). Throughout this appendix, ∇𝜇𝑖𝐽𝜎
+denotes the gradient within T𝑖, represented as a vector in R𝑑.
+C.3
+Unbiasedness of the Antithetic Gradient
+Estimator
+Theorem C.2 (Conditional unbiasedness). For 𝜖𝑖∼N (0, 𝐼𝑑)
+independent across queries and of C, and Δ𝑖from Eq. (13),
+b𝑔𝑖= Δ𝑖
+2𝜎𝑃𝑖(𝜖𝑖),
+E[b𝑔𝑖| C] = ∇𝜇𝑖𝐽𝜎(𝜇| C),
+where the gradient is taken in the fixed tangent space at ¤𝑞𝑖. Moreover,
+for differentiable adjustment-network outputs 𝜇(𝜙), treating Δ𝑖as
+constant during backpropagation gives
+E[−∇𝜙Ltrain | C] = ∇𝜙𝐽𝜎(𝜇(𝜙) | C).
+The proof uses Gaussian smoothing in tangent coordinates and
+symmetry of the paired perturbations; discrete retrieval need only
+be measurable.
+Choose an orthonormal basis 𝐵𝑖∈R𝑑×(𝑑−1) for T𝑖, so that 𝐵𝑖𝐵⊤
+𝑖=
+𝑃𝑖and 𝐵⊤
+𝑖𝐵𝑖= 𝐼𝑑−1. Let 𝐵= diag(𝐵1, . . . , 𝐵𝐿), 𝜇= 𝐵𝑥, and 𝜉=
+𝐵⊤𝜖∼N (0, 𝐼𝑚), where 𝑚= 𝐿(𝑑−1). Then 𝐵𝜉= 𝑃𝜖and Eq. (C.7)
+is an ordinary Gaussian convolution on R𝑚. Writing 𝜑𝜎,𝑚for the
+density of N (0, 𝜎2𝐼𝑚) yields
+𝐽𝜎(𝑥) =
+∫
+R𝑚𝑓C(𝐵𝑧)𝜑𝜎,𝑚(𝑧−𝑥) d𝑧,
+∇𝑥𝑖𝐽𝜎(𝑥) = 1
+𝜎E𝜉[𝑓C(𝐵𝑥+ 𝜎𝐵𝜉)𝜉𝑖| C].
+(C.8)
+Here 𝐽𝜎(𝑥) = 𝐽𝜎(𝐵𝑥| C), and the gradient identity follows from
+∇𝑥𝑖𝜑𝜎,𝑚(𝑧−𝑥) = (𝑧𝑖−𝑥𝑖)𝜑𝜎,𝑚(𝑧−𝑥)/𝜎2 and the substitution 𝑧=
+𝑥+𝜎𝜉. The boundedness of 𝑓C and integrability of Gaussian density
+derivatives justify differentiation under the integral. This Gaussian
+score identity underlies evolution strategies [43] and applies even
+when the retrieval sets change discontinuously. Multiplying the
+second line by 𝐵𝑖gives
+∇𝜇𝑖𝐽𝜎(𝜇| C) =
+1
+𝜎𝑍ℎ
+E𝜖[𝐹ℎ(𝑄+)𝑃𝑖𝜖𝑖| C].
+(C.9)
+Next, let𝜖(𝑖) equal𝜖with only block𝑖negated. Independence and
+Gaussian symmetry imply that 𝜖(𝑖) and 𝜖have the same conditional
+distribution. Moreover, the single-query replacement in Eq. (13)
+satisfies 𝑄(𝑖) (𝜇,𝜖) = 𝑄+(𝜇,𝜖(𝑖)). Changing variables from 𝜖to 𝜖(𝑖)
+therefore gives
+E[𝐹ℎ(𝑄(𝑖))𝑃𝑖𝜖𝑖| C] = −E[𝐹ℎ(𝑄+)𝑃𝑖𝜖𝑖| C].
+(C.10)
+Combining this equality with Eqs. (13) and (C.9) proves
+E[b𝑔𝑖| C] =
+1
+2𝜎𝑍ℎ
+E
+ 𝐹ℎ(𝑄+) −𝐹ℎ(𝑄(𝑖))𝑃𝑖𝜖𝑖
+ C
+
+= ∇𝜇𝑖𝐽𝜎(𝜇| C).
+(C.11)
+The other queries retain their positive perturbations in both collec-
+tions and are averaged over in 𝐽𝜎. Thus each estimate corresponds
+to a partial gradient of the jointly smoothed objective; sharing 𝑄+
+may correlate the estimates but preserves their unbiasedness.
+C.4
+CACO Parameter Gradient
+Let 𝜙denote the adjustment-network parameters and 𝐷𝜙𝜇𝑖its Jaco-
+bian at a differentiable point. Conditional on C, the initial queries
+and projections 𝑃𝑖are independent of 𝜙. For the bounded update in
+13
+
+
+Pan Zhang et al.
+Eq. (11), set 𝑎𝑖= (1 + ∥𝑡𝑖∥2/𝜌2)−1/2. Since 𝑡𝑖= 𝑃𝑖𝑟𝑖(𝜙) and 𝜇𝑖= 𝑎𝑖𝑡𝑖,
+the chain rule gives
+𝐷𝜙𝜇𝑖=
+
+𝑎𝑖𝐼𝑑−𝑎3
+𝑖
+𝜌2 𝑡𝑖𝑡⊤
+𝑖
+
+𝑃𝑖𝐷𝜙𝑟𝑖.
+(C.12)
+Its columns lie in T𝑖, so (𝐷𝜙𝜇𝑖)⊤𝑃𝑖= (𝐷𝜙𝜇𝑖)⊤. Treating the sampled
+noise and coverage differences as constants during backpropagation,
+as in Eq. (14), yields
+−∇𝜙Ltrain =
+𝐿
+∑︁
+𝑖=1
+(𝐷𝜙𝜇𝑖)⊤Δ𝑖𝜖𝑖
+2𝜎
+=
+𝐿
+∑︁
+𝑖=1
+(𝐷𝜙𝜇𝑖)⊤b𝑔𝑖.
+(C.13)
+The Jacobian removes the radial component of 𝜖𝑖, which explains
+why Eq. (14) can use the unprojected noise. Since network outputs
+are computed before sampling perturbations, their Jacobians can
+be taken outside the conditional expectation. Using Eq. (C.11) and
+the chain rule once more gives
+E[−∇𝜙Ltrain | C] =
+𝐿
+∑︁
+𝑖=1
+(𝐷𝜙𝜇𝑖)⊤∇𝜇𝑖𝐽𝜎(𝜇| C)
+= ∇𝜙𝐽𝜎(𝜇(𝜙) | C),
+(C.14)
+which completes the proof of Theorem C.2. Inter-query depen-
+dencies are captured by 𝐷𝜙𝜇𝑖; the network outputs need not be
+independent.
+Effect of reference refresh. At training step 𝑡, let C𝑡contain the
+current reference set and weights, including any refresh completed
+before the new perturbations are sampled. The reference queries
+and item weights are fixed during differentiation, and the new per-
+turbations are sampled independently of C𝑡. Theorem C.2 therefore
+gives an unbiased gradient estimate for the Gaussian-smoothed cov-
+erage objective defined by the current empirical item distribution,
+before and after reference refresh.
+D
+Offline Greedy Selection and Sensitivity to 𝛼
+D.1
+Greedy Selection Procedure
+Algorithm 1 selects 𝐿queries from a reference pool of size 𝑀
+(1 ≤𝐿≤𝑀) to maximize the frequency-weighted coverage objec-
+tive 𝐹ℎ(𝑄) defined in Section 4.1. With candidate sets 𝐶𝑗= A𝐾( ˜𝑞𝑗)
+and item weights 𝑤ℎfixed, each iteration adds the remaining query
+with the largest marginal weight of newly covered items and up-
+dates the covered union 𝑈. The procedure requires no ground-truth
+target labels and preserves retrieval depth 𝐾; its inference cost
+stems from generating all 𝑀reference queries and executing 𝑀
+nearest-neighbor searches, motivating CACO’s amortized single-
+pass adjustment of 𝐿queries.
+D.2
+Sensitivity to the Relevance-Weighting
+Exponent 𝛼
+Table 4 reports the full sensitivity sweep over 𝛼∈{0, 0.25, 0.5, 0.75,
+1} across five retrieval backbones and six datasets, complementing
+the condensed summary in Table 3.
+Robustness across positive exponents. Every tested positive
+value 𝛼∈{0.25, 0.5, 0.75, 1} improves Recall @400 over random
+Algorithm 1 Offline Greedy Query Selection
+Input: Reference queries ˜𝑞1, . . . , ˜𝑞𝑀; retrieval sets 𝐶𝑗= A𝐾( ˜𝑞𝑗);
+item weights 𝑤ℎ; number of selected queries 𝐿.
+Output: Selected query collection 𝑄.
+1: 𝑄←[ ];
+2: 𝑈←∅; // Covered items
+3: 𝑅←{1, . . . , 𝑀}; // Unselected query indices
+4: for 𝑡= 1, . . . , 𝐿do
+5:
+For each 𝑗∈𝑅, compute:
+6:
+gain(𝑗) ←
+∑︁
+𝑣∈𝐶𝑗\𝑈
+𝑤ℎ(𝑣);
+7:
+𝑗∗←arg max𝑗∈𝑅gain(𝑗);
+8:
+𝑄←Append(𝑄, ˜𝑞𝑗∗);
+9:
+𝑈←𝑈∪𝐶𝑗∗;
+10:
+𝑅←𝑅\ {𝑗∗};
+11: end for
+12: return 𝑄;
+reference-pool selection across all 30 backbone–dataset pairs while
+reducing MPJ. This consistency confirms that frequency-weighted
+coverage reliably identifies higher-recall query subsets across a
+wide range of relevance-weighting strengths.
+Coverage–relevance trade-off trajectory. Increasing 𝛼from 0 to
+1 monotonically permits higher pairwise overlap (MPJ) in exchange
+for stronger concentration on frequently retrieved candidates. Pure
+unweighted coverage (𝛼= 0) assigns equal weight to every item
+in the reference pool without distinguishing item value, inducing
+relevance drift toward peripheral candidates on backbones whose
+queries are already dispersed (e.g., reducing LATTE from 0.464
+to 0.378 on KuaiRec and X-Rec from 0.504 to 0.398 on ML-25M).
+Introducing even mild frequency weighting (𝛼= 0.25) immedi-
+ately reverses these drops, raising Recall @400 to 0.516 and 0.561,
+respectively.
+Link between preferred 𝛼and intrinsic query redundancy.
+Comparing optimal exponents across backbones reveals a clear
+relationship with initial retrieval overlap. Highly redundant gen-
+erators such as DimeRec (random-pool MPJ of 0.6220–0.6675 on
+Amazon benchmarks) peak at smaller exponents (𝛼∈[0, 0.5]),
+where dispersing collapsed neighborhoods is the primary bottle-
+neck. Conversely, backbones whose sampled queries already exhibit
+low overlap—such as multi-tree LATTE (MPJ of 0.0115–0.0693) and
+anchor-conditioned X-Rec (MPJ of 0.0042–0.1316)—attain peak re-
+call at larger exponents (𝛼∈[0.75, 1]), benefiting from stronger
+emphasis on high-confidence items. Base and CACO exhibit mod-
+erate redundancy and achieve optimal or near-optimal recall at
+𝛼= 0.5 across datasets, supporting our default choice.
+E
+Additional Qualitative Cases
+The five cases in Table 5 illustrate how coordinated query adjust-
+ment can reduce retrieval overlap and recover relevant items missed
+by Base. They are selected successes from Amazon Reviews 2014
+Beauty, Sports, and Toys: CACO retrieves the target under both
+inference seeds 42 and 43 and returns more distinct items. These
+examples complement the aggregate results and Figure 6.
+14
+
+
+CACO: Coverage-Aware Coordinated Optimization for Continuous Generative Retrieval
+Table 4: Full sensitivity of offline greedy query selection to the relevance-weighting exponent 𝛼: Recall@400 (↑) and MPJ (↓,
+parentheses; Eq. (15)).
+Backbone
+Selection
+Beauty
+Sports
+Toys
+KuaiRec
+ML-25M
+Industrial
+LATTE
+Random
+0.176
+(0.0332)
+0.110
+(0.0192)
+0.131
+(0.0115)
+0.464
+(0.0693)
+0.468
+(0.0675)
+0.098
+(0.0333)
+Greedy (𝛼= 0)
+0.118
+(0.0001)
+0.072
+(0.0000)
+0.091
+(0.0000)
+0.378
+(0.0005)
+0.400
+(0.0063)
+0.091
+(0.0064)
+Greedy (𝛼= 0.25)
+0.177
+(0.0012)
+0.117
+(0.0013)
+0.146
+(0.0010)
+0.516
+(0.0026)
+0.509
+(0.0081)
+0.139
+(0.0068)
+Greedy (𝛼= 0.5)
+0.200
+(0.0042)
+0.131
+(0.0042)
+0.165
+(0.0033)
+0.555
+(0.0065)
+0.544
+(0.0117)
+0.142
+(0.0075)
+Greedy (𝛼= 0.75)
+0.212
+(0.0082)
+0.137
+(0.0075)
+0.175
+(0.0060)
+0.570
+(0.0105)
+0.559
+(0.0157)
+0.144
+(0.0082)
+Greedy (𝛼= 1)
+0.218
+(0.0125) 0.142
+(0.0108) 0.179
+(0.0087) 0.572
+(0.0142) 0.566
+(0.0195) 0.144
+(0.0087)
+X-Rec
+Random
+0.205
+(0.1119)
+0.127
+(0.0371)
+0.204
+(0.1316)
+0.472
+(0.0486)
+0.504
+(0.0527)
+0.197
+(0.0042)
+Greedy (𝛼= 0)
+0.224
+(0.0419)
+0.105
+(0.0043)
+0.234
+(0.0644)
+0.369
+(0.0000)
+0.398
+(0.0018)
+0.187
+(0.0095)
+Greedy (𝛼= 0.25)
+0.237
+(0.0452)
+0.139
+(0.0070) 0.240
+(0.0689)
+0.535
+(0.0020)
+0.561
+(0.0039)
+0.213
+(0.0105)
+Greedy (𝛼= 0.5)
+0.240
+(0.0503)
+0.150
+(0.0114)
+0.239
+(0.0745)
+0.570
+(0.0044)
+0.598
+(0.0071)
+0.217
+(0.0128)
+Greedy (𝛼= 0.75)
+0.240
+(0.0561)
+0.154
+(0.0157)
+0.239
+(0.0805)
+0.587
+(0.0067)
+0.611
+(0.0103)
+0.218
+(0.0159)
+Greedy (𝛼= 1)
+0.239
+(0.0614) 0.155
+(0.0194)
+0.237
+(0.0860) 0.595
+(0.0089) 0.618
+(0.0133) 0.218
+(0.0191)
+DimeRec
+Random
+0.061
+(0.6220)
+0.034
+(0.6675)
+0.107
+(0.6535)
+0.251
+(0.2658)
+0.370
+(0.1569)
+0.014
+(0.0257)
+Greedy (𝛼= 0)
+0.079
+(0.5393)
+0.042
+(0.5998) 0.126
+(0.5813) 0.349
+(0.1059)
+0.457
+(0.0449)
+0.015
+(0.0024)
+Greedy (𝛼= 0.25)
+0.078
+(0.5407)
+0.042
+(0.5993)
+0.126
+(0.5810)
+0.346
+(0.1092)
+0.461
+(0.0477)
+0.017
+(0.0046)
+Greedy (𝛼= 0.5)
+0.078
+(0.5405) 0.042
+(0.5986)
+0.125
+(0.5801)
+0.342
+(0.1127) 0.463
+(0.0514) 0.018
+(0.0085)
+Greedy (𝛼= 0.75)
+0.078
+(0.5411)
+0.042
+(0.5986)
+0.125
+(0.5801)
+0.337
+(0.1174)
+0.462
+(0.0566)
+0.018
+(0.0125)
+Greedy (𝛼= 1)
+0.078
+(0.5419)
+0.042
+(0.5987)
+0.125
+(0.5802)
+0.334
+(0.1228)
+0.458
+(0.0623)
+0.018
+(0.0161)
+Base
+Random
+0.183
+(0.2373)
+0.136
+(0.1844)
+0.192
+(0.1967)
+0.421
+(0.3098)
+0.462
+(0.1722)
+0.181
+(0.1250)
+Greedy (𝛼= 0)
+0.214
+(0.1402)
+0.167
+(0.0616)
+0.225
+(0.1191)
+0.561
+(0.1036)
+0.573
+(0.0462)
+0.200
+(0.0339)
+Greedy (𝛼= 0.25)
+0.215
+(0.1441)
+0.169
+(0.0660)
+0.227
+(0.1240) 0.566
+(0.1044)
+0.588
+(0.0482)
+0.220
+(0.0355)
+Greedy (𝛼= 0.5)
+0.216
+(0.1489) 0.170
+(0.0721) 0.227
+(0.1296)
+0.564
+(0.1063) 0.591
+(0.0516) 0.222
+(0.0392)
+Greedy (𝛼= 0.75)
+0.215
+(0.1547)
+0.169
+(0.0794)
+0.226
+(0.1357)
+0.559
+(0.1089)
+0.587
+(0.0559)
+0.222
+(0.0441)
+Greedy (𝛼= 1)
+0.213
+(0.1601)
+0.167
+(0.0866)
+0.224
+(0.1414)
+0.554
+(0.1119)
+0.582
+(0.0605)
+0.221
+(0.0493)
+CACO
+Random
+0.224
+(0.1108)
+0.165
+(0.0715)
+0.231
+(0.0864)
+0.472
+(0.1852)
+0.496
+(0.0903)
+0.194
+(0.0635)
+Greedy (𝛼= 0)
+0.255
+(0.0527)
+0.183
+(0.0253)
+0.258
+(0.0387)
+0.582
+(0.0522)
+0.574
+(0.0198)
+0.217
+(0.0130)
+Greedy (𝛼= 0.25)
+0.258
+(0.0574)
+0.187
+(0.0298)
+0.262
+(0.0436)
+0.594
+(0.0539)
+0.603
+(0.0222)
+0.228
+(0.0159)
+Greedy (𝛼= 0.5)
+0.258
+(0.0627) 0.190
+(0.0355) 0.265
+(0.0494) 0.594
+(0.0564) 0.606
+(0.0258) 0.229
+(0.0206)
+Greedy (𝛼= 0.75)
+0.256
+(0.0683)
+0.189
+(0.0412)
+0.264
+(0.0553)
+0.593
+(0.0596)
+0.602
+(0.0298)
+0.227
+(0.0255)
+Greedy (𝛼= 1)
+0.255
+(0.0732)
+0.188
+(0.0461)
+0.263
+(0.0603)
+0.587
+(0.0629)
+0.596
+(0.0335)
+0.225
+(0.0301)
+Random selects 20 queries at random from the reference query pool; Greedy selects 20 of 200 queries (𝐾= 20 neighbors/query; Industrial reports partition
+averages).
+Parentheses: Jaccard overlap averaged over 190 query pairs, then test contexts. Green: baseline; red: Greedy.
+Bold and dashed underlines indicate the best and second-best Recall per backbone and dataset. For CACO training, we set 𝛼= 0.5 (shaded).
+Table 5: Selected success cases under 20 × 20 retrieval, shown with inference seed 42. Arrows denote Base →CACO. Best target
+rank is the minimum rank across queries; ranks at most 20 indicate a hit.
+Example
+Dataset
+Target item
+Distinct items
+MPJ
+Best target rank
+Example 1
+Beauty
+Nail-art transfer foil
+66 →201
+0.353 →0.077
+88 →3
+Example 2
+Beauty
+Concealer
+116 →232
+0.296 →0.057
+28 →3
+Example 3
+Sports
+Cycling computer
+112 →241
+0.243 →0.047
+27 →3
+Example 4
+Toys
+Cards Against Humanity
+161 →311
+0.106 →0.020
+49 →2
+Example 5
+Toys
+The Castles of Burgundy
+89 →222
+0.292 →0.054
+22 →3
+15
+
+
+Pan Zhang et al.
+Across all five cases, the target moves from outside every query’s
+top-20 results to rank 2 or 3 for at least one query. The improvement
+also appears in the Toys case with relatively low initial overlap,
+where MPJ decreases from 0.106 to 0.020. CACO can replace some
+items retrieved by Base, so the broader candidate set need not
+contain the original set.
+The examples use 8M Base and CACO models trained with seed
+42, with 𝐿= 20 queries and retrieval depth 𝐾= 20. Previously
+interacted items are filtered, and the merged candidate sets are not
+refilled. Table 5 reports inference seed 42; item counts, MPJ, and
+target ranks are computed in the original embedding space.
+Figures 10–14 use a shared t-SNE projection within each case,
+containing both query collections, their retrieved-item union, recent
+history, the target, and 500 background items. The projection uses
+cosine distance, perplexity 35, and seed 42. Base appears above
+CACO, with query distributions on the left and Jaccard matrices on
+the right. All panels preserve query order and share color scales:
+logarithmic retrieval counts from 1 to 20 and Jaccard overlap from
+0 to 1. The heatmap diagonal is masked and excluded from MPJ;
+projected distances serve only to illustrate the retrieval geometry.
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+Base
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+CACO
+1
+2
+5
+10
+20
+Retrieval count
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Jaccard overlap
+Base
+CACO
+Item
+Figure 10: Example 1 (Beauty): nail-art transfer foil. CACO
+broadens coverage and reduces query overlap, bringing the
+target into the retrieved set.
+F
+Additional Experiments
+F.1
+Effect of Reference-Pool Refresh
+Refreshing the reference pool updates coverage supervision using
+the queries produced by CACO. To separate this benefit from ad-
+ditional optimization, we compare three training schedules from
+the same frozen Base model: one epoch, two epochs with a fixed
+reference pool, and two epochs with a refresh after the first epoch.
+All schedules use the same data splits and training seeds (42, 44,
+and 45), and inference applies a single adjustment network. We re-
+port the mean and sample standard deviation across training seeds,
+averaging inference seeds 42 and 43 within each model.
+Under the 20×20 retrieval setting used during training, refreshing
+the pool improves Recall@400 over the fixed-pool two-epoch con-
+trol on all five datasets by 0.121–0.893 percentage points (Table 6).
+The gains hold for every training seed on every dataset (Table 7),
+showing that the improvement comes from updated supervision
+rather than additional training alone.
+The benefit is less consistent when transferring directly to 10×10
+retrieval. Mean Recall@100 improves on Beauty, Toys, and KuaiRec
+but decreases on Sports and ML-25M. Reference refresh therefore
+strengthens coverage learning under this retrieval setting, while its
+benefit under a different query count and retrieval depth depends
+on the dataset.
+F.2
+Initial Overlap and Failure Cases
+We examine how CACO’s gains vary with the overlap among Base
+queries. Test examples are assigned to low, middle, and high overlap
+groups using tertile boundaries estimated from Base MPJ on the
+validation set. The lower and upper boundaries are (0.0806, 0.2642)
+for Beauty, (0.1125, 0.2167) for Sports, and (0.0738, 0.2240) for Toys.
+Base and CACO are compared on the same examples with paired
+inference seeds.
+Table 8 shows positive recall gains in every group, with the
+largest absolute improvements in the high-overlap group on all
+three datasets. This pattern is consistent with query coordination
+being most beneficial when the initial retrieval sets are redundant,
+although the grouping alone does not establish causality. The gained
+targets outnumber the lost targets in every group, explaining the
+overall recall improvement.
+Broader coverage does not guarantee that every target is retained.
+In Table 9, CACO returns more distinct items and lowers MPJ but
+loses a target retrieved by Base under both inference seeds. For
+each dataset, we select the first such example in test-set order, using
+a loss under either seed only if no example fails under both. These
+cases complement the successes in Appendix E and illustrate the
+distinction between improving aggregate coverage and preserving
+each individual prediction.
+F.3
+Retrieval Efficiency and Budget Allocation
+We examine the quality–speed trade-off at the common 𝐿= 𝐾= 20
+setting, comparing Recall@400 with end-to-end inference time per
+sample.
+All methods use a checkpoint trained with seed 42, with Recall
+averaged over inference seeds 42 and 43 and time over five full
+test-set evaluations. Measurements use H100 GPUs, batch size 32,
+four CPU threads per worker, disjoint CPU affinity, and passive
+OpenMP waiting. End-to-end time includes host-to-device transfer,
+query generation, history-filtered exact cosine retrieval, device-
+to-host transfer, and deduplication; loading, warmup, and offline
+preparation are excluded. Discrete generators use the same SID-to-
+vector retrieval protocol as the other shared-space comparisons.
+Figure 15 shows that lightweight methods are faster, while CACO
+achieves the highest Recall on all three datasets in this comparison.
+Relative to Base, CACO raises Recall by 3.73–5.36 percentage points
+16
+
+
+CACO: Coverage-Aware Coordinated Optimization for Continuous Generative Retrieval
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+Base
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+CACO
+1
+2
+5
+10
+20
+Retrieval count
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Jaccard overlap
+Base
+CACO
+Item
+Figure 11: Example 2 (Beauty): concealer. Query adjustment
+reduces overlap and recovers the target missed by Base.
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+Base
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+CACO
+1
+2
+5
+10
+20
+Retrieval count
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Jaccard overlap
+Base
+CACO
+Item
+Figure 12: Example 3 (Sports): cycling computer. CACO re-
+trieves the target while covering more distinct items.
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+Base
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+CACO
+1
+2
+5
+10
+20
+Retrieval count
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Jaccard overlap
+Base
+CACO
+Item
+Figure 13: Example 4 (Toys): Cards Against Humanity. CACO
+further reduces the relatively low initial overlap and retrieves
+the target.
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+Base
+-20
+0
+20
+t-SNE 1
+-20
+0
+20
+t-SNE 2
+1
+10
+20
+Query
+1
+10
+20
+Query
+CACO
+1
+2
+5
+10
+20
+Retrieval count
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Jaccard overlap
+Base
+CACO
+Item
+Figure 14: Example 5 (Toys): The Castles of Burgundy. Re-
+duced overlap accompanies broader coverage and successful
+target retrieval.
+with an additional 0.03–0.10 ms per sample (0.7–2.3%), preserving
+nearly the same inference cost.
+Table 10 holds the retrieval budget at 𝐵= 400 and compares
+(𝐿, 𝐾) = (10, 40), (20, 20), (40, 10) without retraining CACO. CACO
+improves recall, increases the number of distinct retrieved items,
+and reduces MPJ in all nine comparisons. Both methods attain their
+highest recall with 10 × 40 among these allocations, showing that
+query count and retrieval depth remain consequential even under
+a fixed budget. Table 11 reports model sizes, including the frozen
+backbone in CACO; increasing the number of Base queries changes
+computation but adds no parameters.
+F.4
+Retrieval-Depth Expansion on the
+Industrial Dataset
+To distinguish broader query coverage from a larger output set, we
+compare depth expansion with and without a 400-item candidate
+cap (Figure 16). On the first partition of the industrial dataset, we
+keep each model’s 20 queries fixed and vary CPU ANN depth from
+17
+
+
+Pan Zhang et al.
+Table 6: Effect of reference-pool refresh on recall (%). Values are mean ± sample standard deviation over three training seeds,
+each averaged over two inference seeds. ΔRecall is the paired gain from refreshing after the first epoch rather than keeping the
+pool fixed for two epochs, in percentage points. Training uses 20 × 20; 10 × 10 results are obtained without retraining.
+Dataset
+𝐿× 𝐾
+1 epoch
+2 epochs, fixed pool
+2 epochs, refreshed pool
+ΔRecall (pp)
+Beauty
+20 × 20
+22.498 ± 0.332
+22.896 ± 0.340
+23.606 ± 0.217
++0.710 ± 0.131
+Sports
+20 × 20
+16.835 ± 0.116
+17.100 ± 0.192
+17.455 ± 0.076
++0.354 ± 0.136
+Toys
+20 × 20
+23.190 ± 0.054
+23.472 ± 0.083
+24.365 ± 0.050
++0.893 ± 0.116
+KuaiRec
+20 × 20
+47.517 ± 0.280
+49.410 ± 0.078
+49.991 ± 0.160
++0.581 ± 0.083
+ML-25M
+20 × 20
+50.462 ± 0.323
+51.691 ± 0.245
+51.812 ± 0.230
++0.121 ± 0.017
+Beauty
+10 × 10
+13.654 ± 0.219
+13.952 ± 0.205
+14.247 ± 0.134
++0.296 ± 0.072
+Sports
+10 × 10
+8.433 ± 0.051
+8.543 ± 0.061
+8.431 ± 0.058
+−0.112 ± 0.015
+Toys
+10 × 10
+13.606 ± 0.073
+13.868 ± 0.097
+14.115 ± 0.087
++0.247 ± 0.082
+KuaiRec
+10 × 10
+28.628 ± 0.679
+29.919 ± 0.695
+30.126 ± 0.620
++0.207 ± 0.238
+ML-25M
+10 × 10
+30.295 ± 0.323
+31.029 ± 0.275
+30.478 ± 0.295
+−0.551 ± 0.027
+Table 7: Test recall (%) for each training seed, averaged over inference seeds 42 and 43. Both schedules train for two epochs;
+Refreshed updates the reference pool after the first epoch, while Fixed retains the original pool.
+Recall@100
+Recall@400
+Dataset
+Training seed
+Fixed
+Refreshed
+Fixed
+Refreshed
+Beauty
+42
+13.791
+14.130
+22.694
+23.441
+44
+13.882
+14.218
+22.707
+23.525
+45
+14.182
+14.394
+23.288
+23.852
+Sports
+42
+8.582
+8.453
+16.886
+17.372
+44
+8.575
+8.475
+17.160
+17.522
+45
+8.472
+8.366
+17.255
+17.470
+Toys
+42
+13.757
+14.066
+23.452
+24.420
+44
+13.909
+14.063
+23.563
+24.323
+45
+13.937
+14.215
+23.400
+24.351
+KuaiRec
+42
+30.017
+30.449
+49.352
+49.882
+44
+29.181
+29.411
+49.380
+49.916
+45
+30.560
+30.518
+49.498
+50.174
+ML-25M
+42
+30.719
+30.151
+51.408
+51.548
+44
+31.245
+30.725
+51.813
+51.919
+45
+31.123
+30.557
+51.851
+51.969
+20 to 400, using the same retrieval index and full test set. Recall
+averages two inference seeds for one trained model per method;
+CPU ANN time averages five passes at batch size 32 and excludes
+query generation. ComiRec uses its pretrained model, while TIGER
+retrieves through semantic-ID vectors in the shared embedding
+space.
+Deeper retrieval improves every method when all distinct candi-
+dates are retained, but the gains largely saturate once the output
+is capped at 400 items. CACO achieves the highest recall at every
+measured depth in both settings. Under the cap, it first reaches 20%
+recall at depth 32, compared with 200 for Base, with CPU ANN costs
+of 0.58 and 1.37 ms per example, respectively. Thus, coordinating
+queries improves coverage under the same output limit, beyond
+the benefit of simply returning more candidates.
+G
+Dataset Statistics
+Table 12 summarizes the eight public datasets and the in-house
+industrial dataset. Public statistics are reported after the preprocess-
+ing described in Section 5.1. The public datasets span 7,176–657,203
+users and 10,719–197,943 items. Interactions count retained positive
+events before histories are truncated to 200 items, and items refer to
+the full retrieval catalog. Each user contributes one validation target
+and one test target; earlier prefixes provide training examples.
+The in-house industrial dataset consists of 24 sequential parti-
+tions, each with approximately 2.6 million training instances and
+10,240 test instances. These counts refer to prediction instances and
+may include repeated users.
+18
+
+
+CACO: Coverage-Aware Coordinated Optimization for Continuous Generative Retrieval
+Table 8: Recall and coverage by initial Base overlap under 20 × 20 retrieval. Models use training seed 42 and inference seeds
+42 and 43. Groups use validation-set Base MPJ averaged over inference seeds; 𝑛is the number of test examples. Gained and
+Lost count targets newly retrieved or missed by CACO relative to Base, averaged over inference seeds. Δ is the recall gain in
+percentage points.
+Dataset
+Overlap group
+𝑛
+Recall@400 (%)
+Δ (pp)
+Target changes
+MPJ
+Base
+CACO
+Gained
+Lost
+Base
+CACO
+Beauty
+All
+22363
+18.307
+23.666
++5.359
+1417.5
+219.0
+0.238
+0.082
+Beauty
+Low
+8193
+8.861
+9.752
++0.891
+149.5
+76.5
+0.048
+0.029
+Beauty
+Middle
+7146
+14.281
+17.024
++2.743
+309.0
+113.0
+0.148
+0.038
+Beauty
+High
+7024
+33.421
+46.654
++13.233
+959.0
+29.5
+0.550
+0.189
+Sports
+All
+35598
+13.707
+17.434
++3.726
+1760.0
+433.5
+0.184
+0.050
+Sports
+Low
+13289
+11.020
+12.435
++1.415
+363.5
+175.5
+0.072
+0.029
+Sports
+Middle
+11751
+13.726
+17.254
++3.527
+575.0
+160.5
+0.159
+0.037
+Sports
+High
+10558
+17.068
+23.925
++6.857
+821.5
+97.5
+0.355
+0.090
+Toys
+All
+19412
+19.176
+24.400
++5.224
+1157.5
+143.5
+0.197
+0.062
+Toys
+Low
+7059
+10.200
+11.262
++1.062
+128.0
+53.0
+0.045
+0.026
+Toys
+Middle
+6131
+16.792
+19.499
++2.708
+240.0
+74.0
+0.131
+0.040
+Toys
+High
+6222
+31.710
+44.134
++12.424
+789.5
+16.5
+0.433
+0.124
+Table 9: Selected failure cases under 20 × 20 retrieval, shown for both inference seeds. CACO retrieves more distinct items with
+lower MPJ but misses the target retrieved by Base. Target hit is 1 for a hit and 0 for a miss.
+Example
+Dataset
+Inference seed
+Target hit
+Distinct items
+MPJ
+Base
+CACO
+Base
+CACO
+Base
+CACO
+Example 1
+Beauty
+42
+1
+0
+210
+273
+0.093
+0.030
+Example 1
+Beauty
+43
+1
+0
+215
+289
+0.108
+0.028
+Example 2
+Sports
+42
+1
+0
+175
+214
+0.211
+0.077
+Example 2
+Sports
+43
+1
+0
+179
+223
+0.186
+0.070
+Example 3
+Toys
+42
+1
+0
+264
+289
+0.038
+0.027
+Example 3
+Toys
+43
+1
+0
+272
+299
+0.030
+0.022
+Table 10: Query-count and depth allocation under a fixed retrieval budget of 𝐵= 400. Each method uses a model trained with
+seed 42; results average inference seeds 42 and 43 on the full test set. CACO is trained with 20 queries and applied to all
+allocations without retraining. Δ is the Recall@400 gain in percentage points.
+Dataset
+𝐿× 𝐾
+Recall@400 (%)
+Δ (pp)
+Distinct items
+MPJ
+Base
+CACO
+Base
+CACO
+Base
+CACO
+Beauty
+10 × 40
+21.171
+25.231
++4.060
+197.2
+267.6
+0.260
+0.101
+Beauty
+20 × 20
+18.307
+23.666
++5.359
+164.7
+236.9
+0.238
+0.082
+Beauty
+40 × 10
+15.682
+22.086
++6.403
+140.2
+211.0
+0.213
+0.066
+Sports
+10 × 40
+15.630
+18.498
++2.868
+199.1
+286.4
+0.206
+0.063
+Sports
+20 × 20
+13.707
+17.434
++3.726
+163.9
+255.2
+0.184
+0.050
+Sports
+40 × 10
+11.908
+16.175
++4.267
+137.4
+228.3
+0.166
+0.039
+Toys
+10 × 40
+21.940
+25.811
++3.871
+200.9
+276.7
+0.226
+0.081
+Toys
+20 × 20
+19.176
+24.400
++5.224
+169.1
+248.4
+0.197
+0.062
+Toys
+40 × 10
+16.971
+23.120
++6.148
+144.4
+224.5
+0.171
+0.047
+19
+
+
+Pan Zhang et al.
+0.05 0.1 0.2
+0.5
+1
+2
+5
+10
+End-to-end time (ms/sample)
+0
+5
+10
+15
+20
+25
+Recall@400 (%)
+Base
+CACO
+ComiRec
+REMI
+MIMA
+TIGER
+LATTE
+LLaDARec
+DreamRec
+DimeRec
+PreferDiﬀ
+TA-Rec
+ADRec
+XRec
+0.05 0.1 0.2
+0.5
+1
+2
+5
+10
+End-to-end time (ms/sample)
+0
+5
+10
+15
+20
+25
+Recall@400 (%)
+Base
+CACO
+ComiRec
+REMI
+MIMA
+TIGER
+LATTE
+LLaDARec
+DreamRec
+DimeRec
+PreferDiﬀ
+TA-Rec
+ADRec
+XRec
+0.05 0.1 0.2
+0.5
+1
+2
+5
+10
+End-to-end time (ms/sample)
+0
+5
+10
+15
+20
+25
+Recall@400 (%)
+Base
+CACO
+ComiRec
+REMI
+MIMA
+TIGER
+LATTE
+LLaDARec
+DreamRec
+DimeRec
+PreferDiﬀ
+TA-Rec
+ADRec
+XRec
+(a) Beauty
+(b) Sports
+(c) Toys
+Figure 15: Quality–speed trade-off under the shared 20 × 20 budget. Each point is one method; higher and further left is better.
+Each panel has its own logarithmic time axis and linear Recall axis, with identical limits across datasets. Rose diamonds
+highlight CACO, and gray squares denote Base. Horizontal bars show one timing standard deviation across five full test-set
+evaluations, generally smaller than the markers.
+Table 11: Model parameters (millions) on eight public datasets and the in-house industrial dataset. CACO includes the frozen
+backbone and one adjustment module. Frozen model components are counted; shared item embeddings and retrieval workspace
+are excluded. A dash denotes a method not included in the industrial comparison.
+Method
+Beauty
+Sports
+Toys
+KuaiRec
+ML-25M
+Instruments
+Games
+Movies
+Industrial
+Base
+8.465
+8.465
+8.465
+8.465
+8.465
+8.465
+8.465
+8.465
+448.350
+CACO
+9.094
+9.094
+9.094
+9.094
+9.094
+9.094
+9.094
+9.094
+449.375
+ComiRec
+7.970
+7.970
+7.970
+7.970
+7.970
+7.970
+7.970
+7.970
+451.905
+REMI
+7.970
+7.970
+7.970
+7.970
+7.970
+7.970
+7.970
+7.970
+—
+MIMA
+8.074
+8.074
+8.074
+8.074
+8.074
+8.074
+8.074
+8.074
+—
+TIGER
+8.083
+8.094
+8.088
+8.089
+8.233
+8.081
+8.098
+8.221
+450.827
+LATTE
+8.085
+8.097
+8.090
+8.091
+8.235
+8.083
+8.100
+8.223
+450.836
+LLaDARec
+8.708
+8.708
+8.708
+8.708
+8.708
+8.708
+8.708
+8.708
+—
+DreamRec
+8.049
+8.049
+8.049
+8.049
+8.049
+8.049
+8.049
+8.049
+453.869
+DimeRec
+7.959
+7.959
+7.959
+7.959
+7.959
+7.959
+7.959
+7.959
+450.186
+PreferDiff
+8.049
+8.049
+8.049
+8.049
+8.049
+8.049
+8.049
+8.049
+—
+TA-Rec
+8.164
+8.164
+8.164
+8.164
+8.164
+8.164
+8.164
+8.164
+—
+ADRec
+8.031
+8.031
+8.031
+8.031
+8.031
+8.031
+8.031
+8.031
+—
+X-Rec
+8.597
+8.597
+8.597
+8.597
+8.597
+8.597
+8.597
+8.597
+456.743
+20
+
+
+CACO: Coverage-Aware Coordinated Optimization for Continuous Generative Retrieval
+0
+10
+20
+30
+Recall (%)
+20
+64
+128
+200
+400
+Retrieval depth K (log scale)
+0
+5
+10
+15
+20
+Recall (%)
+20
+64
+128
+200
+400
+0.55
+0.93
+1.38
+2.56
+Reference CPU ANN time (ms)
+0.55
+0.93
+1.38
+2.56
+Reference CPU ANN time (ms)
+(a) Variable candidates
+(b) At most 400 candidates
+Base
+CACO
+ComiRec
+TIGER
+DimeRec
+Figure 16: Retrieval-depth expansion on the first partition of the industrial dataset with 20 queries. (a) All distinct candidates
+are retained. (b) Results are merged rank by rank and capped at 400 distinct items without refilling. Markers show measured
+depths. The right axes provide a shared reference time from the mean CPU ANN cost of Base and CACO at each depth; it does
+not represent individual methods’ latency.
+Table 12: Dataset sizes after preprocessing.
+Dataset
+Users
+Items
+Interactions
+Beauty
+22,363
+12,101
+198,502
+Sports
+35,598
+18,357
+296,337
+Toys
+19,412
+11,924
+167,597
+KuaiRec
+7,176
+10,719
+3,731,826
+ML-25M
+160,776
+40,857
+12,448,242
+Instruments
+57,439
+24,587
+511,836
+Games
+94,762
+25,612
+814,586
+Movies
+657,203
+197,943
+7,441,129
+Dataset
+Partitions
+Train/part.
+Test/part.
+Industrial
+24
+≈2.6M
+10,240
+21

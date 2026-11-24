@@ -1,0 +1,1839 @@
+SJG: A Skyline Joint Graph for Multi-Component
+Approximate Nearest Neighbor Search
+Linyun Ma
+College of Computer Science and Software Engineering
+Shenzhen University
+Shenzhen, China
+0009-0006-0597-2775
+Rui Mao
+College of Computer Science and Software Engineering
+Shenzhen University
+Shenzhen, China
+0000-0002-3645-5520
+Abstract—Graph-based indexes enable efficient approximate
+nearest neighbor search at scale by linking similar objects.
+In applications such as product retrieval and rental listing
+search, similarity depends on several components whose relative
+importance varies across queries. The challenge is that the index
+must select neighbors during construction, but the query weights
+that determine which objects are closest are not yet known. A
+straightforward approach is to index each component separately.
+However, merging the results of these searches can miss the
+nearest neighbor under the weighted distance. A joint graph
+allows a search to follow links across components, helping to
+avoid such misses, but selecting neighbors separately within each
+component can leave redundant edges, and keeping component
+hierarchies synchronized limits parallel construction. To address
+these limitations, we propose the Skyline Joint Graph (SJG).
+Although query weights can change the ranking of candidate
+neighbors, the dominance relation among them is independent
+of those weights. SJG exploits this property by pooling candidates
+across components and retaining the Skyline for each node,
+thereby enabling efficient approximate nearest neighbor search
+under different query weights while supporting parallel graph
+construction. Extensive experiments on six real-world datasets
+demonstrate that SJG achieves up to 27.9× the query throughput
+of baseline methods at 90% Recall@10, while accelerating single-
+threaded index construction by up to 201×. Its index requires at
+least 36% less space than the smallest baseline index.
+I. INTRODUCTION
+Similarity search is a fundamental operation in modern
+data systems. Recommendation engines, retrieval systems,
+and vector databases all need to retrieve objects that rank
+highly in similarity to a given query object. Over the past
+decade, approximate nearest neighbor search (ANNS) has
+made this task tractable at scale, and graph-based indexes such
+as HNSW [1], NSG [2], and Vamana [3] are widely used
+in large-scale ANNS [4], [5]. By organizing objects into a
+proximity graph, they achieve high recall while visiting only
+a small fraction of the collection [6]. During construction, each
+object first gathers a set of candidate neighbors and then retains
+a compact, well-connected subset. Most graph-based ANNS
+indexes construct and traverse the graph using the same fixed
+distance function.
+As data becomes increasingly diverse, however, objects are
+no longer well described by a single vector. For example,
+a rental listing carries a location, a name, a price, a guest
+capacity, and a set of amenities; a product carries an image, a
+Rental listings
+Queries and their component weights
+Top-1 results
+Query 1
+0.55
+0.05
+0.15
+0.10
+0.15
+Query 1
+→
+X
+Query 2
+0.10
+0.05
+0.15
+0.10
+0.60
+Query 2
+→
+Y
+Location priority
+Amenities priority
+X
+Y
+Z
+location
+(40.72, −73.99)
+L2
+name
+“Sunny loft …”
+Edit
+price
+$120
+L1
+guests
+2
+L1
+amenities
+{WiFi, Kitchen, …}
+Word cosine distance
+…
+Type
+Data
+Distance metric
+Fig. 1. Rental listing retrieval under different query weights.
+description, and a price; a user profile carries demographics,
+behavior, and text. Each component is naturally compared
+by its own distance function, and different queries attach
+different importance to these components. As Fig. 1 shows,
+one user may prioritize location in rental listing search,
+while another may prioritize amenities. The same collection
+can return different nearest neighbors under different weight
+assignments. Vector databases already support this kind of
+retrieval. Milvus [7], for example, lets applications search
+across multiple vector fields and specify how much each field
+contributes to the ranking. For graph-based indexing, however,
+supporting such queries introduces a construction challenge.
+The graph must be built before the query weights are known,
+even though these weights can change the relative ranking of
+candidate neighbors.
+arXiv:2611.29399v1  [cs.DB]  22 Nov 2026
+
+
+0.2
+0.2
+0.4
+0.4
+0.6
+0.6
+q
+Location distance from query
+Amenities distance from query
+B
+E
+F
+G
+Nearest: A
+Weights: 90% on location distance,
+10% on amenities distance
+Nearest: C
+50% weight on each distance
+Nearest: D
+Weights: 10% on location distance,
+90% on amenities distance
+Location distance
+Top-2 results: A, B
+Amenities distance
+Top-2 results: D, E
+Single-component search
+Fig. 2. Component-wise top-2 results can miss the weighted nearest neighbor.
+Existing methods address this challenge in different ways.
+Composite methods build one graph per component and merge
+the results during query processing. Since each graph selects
+neighbors using only its own component distance, the query
+weights are not needed during construction. During search,
+the system queries the component indexes and combines the
+retrieved candidates according to the specified weights. Mil-
+vus [7], for example, supports this pattern for multiple vector
+fields. Uemura et al. [8] use intermediate search results to
+select a starting node for the next component graph, reducing
+redundant node visits.
+However, simply taking the top candidates from each com-
+ponent and merging them can miss the nearest neighbor under
+the requested weight combination. As illustrated in Fig. 2,
+object C lies outside the top two under both location distance
+and amenities distance, yet it becomes the nearest neighbor
+when the two components receive equal weight. Even if both
+component searches return their exact top two objects, their
+union excludes C, and weighted reranking cannot recover it.
+Cross-graph guidance can reduce such misses when compo-
+nents are correlated, but it does not eliminate them in general.
+Although longer candidate lists may include such objects,
+they also increase the cost of traversal and reranking. Joint
+graph indexing takes a different approach, allowing queries to
+explore neighbor relationships across components and discover
+objects that separate component searches may miss.
+The Hierarchical Joint Graph (HJG) [9] implements this
+approach by building a hierarchical graph for each component
+and synchronizing the levels of corresponding nodes across
+these graphs. However, this joint organization introduces two
+limitations. First, HJG selects edges separately within each
+component, which can leave redundant edges in the joint graph
+and increase both index size and search cost. Second, syn-
+chronizing the hierarchies creates dependencies among graph
+updates, making parallel construction difficult and increasing
+construction cost.
+Taken together, these limitations reveal two related but dis-
+tinct challenges in constructing a joint graph for queries with
+unknown weights. The first is how to select effective neighbors
+when the relative importance of different components is not
+known in advance. The second is how to facilitate parallel
+joint graph construction without the dependencies introduced
+by synchronized component hierarchies.
+Challenge I: How to select effective neighbors without
+knowing the query weights
+Directly combining neighbors selected within individual
+components introduces substantial redundancy, inflating graph
+size and search cost. Conventional graph indexes control graph
+density through neighbor selection, typically using a fixed
+distance function to determine which edges to retain. With
+per-query weights, however, the usefulness of a neighbor
+may change across different distance combinations. Select-
+ing neighbors according to any particular weight assignment
+may therefore compromise the graph’s effectiveness for other
+queries, while retaining all candidates leads to excessive
+redundancy. We thus need a strategy that neither depends on
+a fixed weight assignment nor requires maintaining weight-
+dependent edge information. To address this challenge, we
+propose the Skyline Joint Graph (SJG), which uses weight-
+independent Skyline pruning to remove dominated candidates
+while preserving promising neighbors across different query
+weights.
+Challenge II: How to facilitate parallel joint graph con-
+struction
+Effective neighbor selection is only half of the problem.
+The construction process must also avoid costly dependencies
+among graph updates. In HJG [9], each node must keep the
+same level across all component graphs. During insertion, a
+larger neighborhood may promote a node to a higher level,
+which in turn requires updates across the graphs. These up-
+dates can affect neighboring nodes and trigger further promo-
+tions, creating cascading dependencies. As a result, insertions
+cannot proceed independently, making parallel construction
+difficult and expensive. SJG avoids these dependencies by
+separating candidate acquisition from joint neighbor selection.
+The component graphs are built independently, and each node
+then selects its final neighbors without modifying the adja-
+cency of others. This separation enables parallel construction
+without hierarchical synchronization or cascading updates.
+The main contributions of this paper are summarized as
+follows.
+• Effective graph indexing with joint neighbor selec-
+tion. We propose the Skyline Joint Graph (SJG), which
+integrates candidates from multiple component-specific
+graphs and performs joint neighbor selection through
+Skyline-based pruning. This weight-independent selec-
+tion reduces redundant edges and yields a compact graph
+that supports efficient weighted ANNS. The resulting ad-
+jacency preserves the minimum weighted distance within
+each candidate set for every nonnegative weighting.
+• Efficient and parallel graph construction. We develop a
+two-stage construction strategy that separates component-
+specific candidate acquisition from joint neighbor selec-
+tion. Candidate graphs are built independently, and each
+node selects its final neighbors from its own candidate
+set. This design removes hierarchical synchronization and
+
+
+cascading updates, enabling efficient parallel construc-
+tion.
+• Extensive experimental evaluation. We evaluate SJG
+under seven weight settings on each of six real-world
+datasets and examine its scalability up to 7.75 million
+objects. SJG outperforms the fastest composite baseline
+in 36 of the 42 settings, with a median speedup of 2.05×
+and a maximum of 27.9×. It builds up to 201× faster than
+HJG and produces graph indexes at least 36% smaller
+than all evaluated baselines.
+The rest of this paper is organized as follows. Section II
+reviews related work. Section III defines multi-component
+similarity search. Section IV presents the SJG index and its
+construction and search algorithms. Section V reports the
+experimental results. Section VI concludes the paper.
+II. RELATED WORK
+This section reviews three areas of related work: graph-
+based ANNS on single-component data, multi-component ex-
+act retrieval, and multi-component approximate retrieval.
+A. Graph-Based ANNS on Single-Component Data
+Graph-based ANNS indexes represent objects as vertices
+and search for near neighbors by following edges toward the
+query [10]. A natural starting point is a k-nearest neighbor
+graph, in which each object is connected to its closest neigh-
+bors. NN-Descent [11] constructs an approximation to this
+graph by iteratively comparing objects that occur in one an-
+other’s neighborhoods. Such a graph captures local proximity,
+but several neighbors of a vertex may lead a search into much
+the same region. The choice of edges therefore matters even
+when good candidate neighbors are already available.
+HNSW [1] organizes its edges across multiple layers. Search
+uses the sparse upper layers to move toward the query and
+then descends to a denser neighborhood to refine the result.
+NSG [2] builds a single-layer graph from an approximate k-
+nearest neighbor graph. For each vertex, it gathers candidates
+through graph search, prunes redundant edges, and then checks
+that every vertex is reachable from the entry point. Vamana [3]
+also searches the graph to obtain candidates, but applies a
+tunable pruning rule that controls when a selected neighbor
+can rule out another candidate. Other work addresses the cost
+of building these indexes through candidate edge pruning [12],
+graph refinement [13], and merging existing indexes [14].
+Graph search can accommodate a variety of distance func-
+tions, as illustrated by NMSLIB [15]. In the methods above,
+however, the distance function used to select neighbors is
+fixed during construction. In multi-component retrieval, two
+candidates can exchange their order of proximity to the same
+vertex when the query weights change. An edge pruned under
+one weighting may therefore lead to a neighbor preferred
+under another.
+B. Multi-Component Exact Retrieval
+Exact retrieval over multi-component data primarily relies
+on distance bounds to exclude objects that cannot be query
+results. Since different queries may assign different weights
+to individual components, indexes must retain component-
+specific distance information from which bounds can be de-
+rived for the given query weights.
+Existing studies have explored different ways to organize
+this information. Unified indexes, such as M2-tree [16] and
+M3-tree [17], [18], organize multi-component information
+within a common structure, with M3-tree retaining component-
+specific covering information to support queries under varying
+weights. Another approach organizes distance information
+through component-specific indexes or reference objects, as
+explored by PM-Tree and RR*-Tree [19]. DESIRE [20] uses
+a cluster-based index that supports query filtering through clus-
+ters and their associated distance information. Beyond single-
+machine indexing, OneDB [21] investigates multi-metric sim-
+ilarity search in distributed environments.
+Unlike these exact methods, which rely on distance bounds
+for candidate pruning, graph-based approximate retrieval
+guides search through pre-established neighbor relationships.
+C. Multi-Component Approximate Retrieval
+Existing multi-component approximate methods differ in
+how component information is incorporated into candidate
+discovery, graph construction, and query traversal.
+One approach maintains separate indexes for individual
+components and combines their search results. Milvus [7]
+supports searching different vector fields independently, fol-
+lowed by weighted aggregation and reranking. Since reranking
+operates only on returned candidates, this approach may miss
+objects that rank poorly within individual components but
+are close under the weighted distance. To exploit information
+across component searches, Uemura et al. [8] investigate coor-
+dinated graph search, reusing previously retrieved candidates
+to select entry points for subsequent component searches and
+evaluating candidates using the weighted distance.
+Component information can also be fused during graph
+construction rather than coordinated only during search.
+MUST [22] learns modality weights to construct fused rep-
+resentations and builds a proximity graph using similarities
+between weighted concatenated representations for target-
+modality search. Because the graph is constructed using
+weighted fused representations, its neighbor selection depends
+on the fusion weights rather than being independent of arbi-
+trary query weights.
+DEG [23] combines greedy Pareto frontier search for can-
+didate acquisition with dynamic relative neighborhood graph
+(RNG) pruning to construct a weight-aware graph for two-
+component vector search. Its pruning mechanism assigns each
+edge an active weight interval, allowing queries to traverse
+edges according to their weights. However, this interval-based
+pruning mechanism relies on the one-dimensional weight
+space of two components and cannot be directly extended
+to an arbitrary number of components. Moreover, DEG ac-
+quires candidates by searching a partially constructed graph
+and updates its adjacency during incremental insertion, in-
+
+
+TABLE I
+SYMBOLS AND DESCRIPTION
+Notation
+Description
+q, o
+Query object, data object
+k, K
+Number of search results returned per query,
+neighbor-list size per component graph
+w
+Query weight vector
+di(·, ·), Dw(·, ·)
+Normalized distance on component i, weighted
+distance under w
+v, u
+Graph node, candidate neighbor of v
+Li(v), Ai(v)
+Out-neighbors of v, union of out- and
+in-neighbors of v in component i
+C(v)
+Candidate set pooled across components for v
+S(v)
+Nondominated candidates in C(v)
+ρi(u), Bv(u)
+Rank of u in component i, sum of u’s ranks
+across components
+N(v)
+Final outgoing neighbors of v
+τ
+Minimum out-degree
+troducing construction dependencies and additional candidate-
+maintenance and edge-pruning costs.
+A different approach organizes component-specific neighbor
+relationships into a joint graph, allowing queries to traverse
+connections from different components within a single search.
+HJG [9] constructs a hierarchical graph for each component
+and synchronizes the levels of corresponding nodes to support
+weighted search across component-specific neighbors. Subse-
+quent work [24] also studies normalization and weight learning
+within this framework. However, HJG selects neighbors sepa-
+rately within each component, potentially retaining redundant
+edges in the joint graph, while hierarchical synchronization
+introduces dependencies among graph updates. In contrast,
+SJG uses component graphs to acquire candidates and per-
+forms weight-independent Skyline-based neighbor selection
+after merging them, allowing final adjacency construction to
+proceed independently across nodes.
+Attribute-filtered
+ANNS
+[25]–[29]
+and
+vector-set
+re-
+trieval [30], [31] address related but distinct tasks. The former
+restricts search results through attribute predicates, while the
+latter evaluates similarities between sets of vectors. For exam-
+ple, MV-HNSW [32] indexes a set of token vectors as a single
+graph node. Our setting instead combines distances between
+corresponding components using per-query weights.
+III. PROBLEM FORMULATION
+This
+section
+introduces
+the
+representation
+of
+multi-
+component data and the weighted distance used to compare
+objects, followed by a formal definition of the approximate
+nearest neighbor search problem considered in this paper.
+Table I summarizes the main notation.
+Let O = {o1, o2, . . . , on} be a dataset of n objects, each
+consisting of m components. Different components may have
+different data representations, such as numerical values, vec-
+tors, text, or sets, while each component maintains a consistent
+representation across objects. An object o ∈O is represented
+as the tuple in Eq. (1).
+o = (o(1), o(2), . . . , o(m)).
+(1)
+Here, o(i) ∈Ui denotes the value of object o in component i,
+where Ui is the corresponding data domain. Each component is
+associated with a distance function di : Ui × Ui →R≥0 that
+measures dissimilarity between component values. Different
+components may use different distance functions, such as L1
+distance, L2 distance, edit distance, or Jaccard distance. Since
+component distances may have different numerical scales,
+we apply maximum-distance normalization by dividing each
+component distance by its corresponding maximum distance.
+We continue to use di to denote the normalized component
+distance.
+Given a query object q = (q(1), q(2), . . . , q(m)), a weight
+vector w
+=
+(w1, w2, . . . , wm) specifies the relative im-
+portance of the components for the current query. A zero
+weight indicates that the corresponding component is excluded
+from distance evaluation. When all weight is assigned to a
+single component, the neighbor ordering depends only on
+that component. When multiple components have positive
+weights, their distances jointly determine the ordering. Let
+Iw = {i | wi > 0} denote the set of active components.
+The weighted distance between q and an object o is defined
+in Eq. (2).
+Dw(q, o) =
+X
+i∈Iw
+wi di
+ q(i), o(i)
+.
+(2)
+Here, wi ≥0 for each component i, and the weights are
+normalized so that Pm
+i=1 wi = 1.
+Multi-Component Weighted kNN Search. Given a dataset
+O and a query (q, w, k), where q is the query object, w is the
+component weight vector, and k is the number of requested
+neighbors, the objective is to retrieve the k objects in O with
+the smallest weighted distances to q. Let R∗(q, w, k) denote
+the exact result set, where |R∗| = k and Dw(q, u) ≤Dw(q, v)
+for every u ∈R∗and v ∈O \ R∗.
+We study the approximate version of this problem. Given the
+same query, an approximate index returns a set R of k objects.
+Search quality is measured by Recall@k = |R ∩R∗|/k.
+Approximate search aims to achieve high recall with limited
+search costs by reducing distance computations and graph
+traversal overhead.
+IV. THE SJG INDEX
+A multi-component graph index must select the outgoing
+neighbors of every node before the query weights are known.
+A future query can use its weights to change how objects are
+evaluated and expanded, but it can discover further objects
+only through edges established during construction. Our design
+therefore pursues two related goals. Each node should have a
+neighbor list that serves queries with different weights, and
+final neighbor selection should proceed independently across
+nodes once candidate relationships have been established.
+
+
+Step 2: Candidate union
+Step 3: Skyline selection
+Step 4: Directed SJG
+d1
+a
+b
+c
+v
+d2
+f
+g
+h
+v
+Candidates of v
+Candidate
+Distance from v
+d1
+d2
+a
+0.21
+0.41
+b
+0.24
+0.50
+c
+0.35
+0.38
+f
+0.40
+0.19
+g
+0.37
+0.25
+h
+0.46
+0.30
+0.2
+0.2
+0.3
+0.3
+0.4
+0.4
+0.5
+0.5
+d1 distance from v
+d2 distance from v
+a
+b
+c
+f
+g
+h
+S(v) = {a, c, f, g}
+a
+b
+c
+f
+g
+h
+v
+N(v) =
+a
+c
+f
+g
+Neighbors of v: {a, b, c}
+Neighbors of v: {f, g, h}
+C(v) = {a, b, c, f, g, h}
+Skyline of C(v)
+Outgoing neighbors of v
+Step 1: Per-component K-NN
+K-NN graph under 
+K-NN graph under 
+Fig. 3. SJG construction framework.
+A. SJG Framework
+The Skyline Joint Graph (SJG) organizes neighbor rela-
+tionships from different components into a static, single-layer
+directed graph G = (O, E). Each object v ∈O is a node.
+The edge set E contains a directed edge (v, u) for each final
+outgoing neighbor u ∈N(v).
+Combining neighbor relationships from different compo-
+nents does not, by itself, require synchronized hierarchies. We
+therefore examine the effect of the hierarchy on search by flat-
+tening a fully constructed HJG [9] while retaining its original
+neighbor relationships. The effect on search cost varies across
+datasets. Flattening reduces the cost on some datasets and
+increases it on others (Section V-C), so the hierarchy does not
+provide a consistent search benefit. Maintaining synchronized
+levels, however, couples updates across component graphs and
+can trigger further updates to neighboring nodes. Taken to-
+gether, these observations motivate a single-layer organization
+that retains cross-component connections without the cost of
+maintaining synchronized hierarchies.
+With the single-layer structure in place, construction can
+be organized around two tasks. It must first obtain possible
+neighbor relationships and then decide which of them should
+become final outgoing edges. As illustrated in Fig. 3, can-
+didate acquisition obtains approximate neighbor relationships
+separately from each component and pools them into a joint
+candidate set C(v) for every node v. Joint neighbor selection
+then compares each candidate’s distances across all compo-
+nents and determines the final adjacency using the Skyline as
+its basis. The key is to exploit component-wise dominance,
+which allows candidates to be compared without committing
+to a predefined weighting. In this way, the component graphs
+serve as sources of candidates, whereas queries traverse the
+single joint graph formed from the selected neighbors.
+B. Candidate Acquisition
+The single-layer organization removes the need to synchro-
+nize hierarchical levels, but a separate issue remains, namely
+how to obtain candidates. A single-layer graph could still be
+built incrementally. If objects are inserted one at a time by
+searching a partially constructed joint graph, the candidates
+available to a new node depend on the adjacency produced
+by earlier insertions. For a static dataset, however, candidate
+neighbors can be obtained independently from individual
+components without relying on a partially constructed joint
+graph. This allows us to acquire candidate relationships in
+advance and determine each node’s final adjacency without
+depending on an evolving joint graph.
+The neighbors of individual components can serve queries
+with different weight preferences. When all the weight is
+assigned to component i, the weighted neighbor ordering
+is determined entirely by di. The neighbors under each
+component therefore provide candidate connections relevant
+to queries that emphasize that component. To obtain these
+relationships, SJG uses NN-Descent [11] to construct an
+approximate K-nearest-neighbor graph for each component,
+yielding a neighbor list Li(v) for object v. Here, K controls
+the component neighbor-list size and differs from the number
+k of results requested by a query. These component graphs
+can be constructed independently because each uses only its
+corresponding distance function di.
+These neighbor lists, however, do not necessarily capture
+every relationship involving v. The K-nearest-neighbor re-
+lation need not be symmetric, even when the neighbors are
+computed exactly. An object u may select v as a neighbor
+without appearing in v’s own list. If we used only Li(v), such a
+relationship would be lost before the joint selection stage. SJG
+therefore forms the component-specific candidate set Ai(v) in
+Eq. (3) from both the forward and reverse neighbors of v.
+Ai(v) = Li(v) ∪{u ∈O : v ∈Li(u)}.
+(3)
+SJG then takes the union across components. The resulting
+set C(v) in Eq. (4) contains each candidate only once, even
+if several components supply it.
+C(v) =
+m
+[
+i=1
+Ai(v).
+(4)
+For example, the two components in Fig. 3 contribute
+{a, b, c} and {f, g, h}, giving C(v) = {a, b, c, f, g, h}. This
+union provides possible outgoing edges for node v during
+construction. It serves a different role from merging the result
+
+
+0.2
+0.2
+0.4
+0.4
+0.6
+0.6
+Current node v
+d1(v, ·)
+d2(v, ·)
+a
+b
+c
+f
+g
+h
+w = (0.8, 0.2)   Nearest: a
+w = (0.2, 0.8)   Nearest: f
+Region dominated by the Skyline
+Dw(v, g) ≤ Dw(v, h), ∀w ≥ 0
+Candidate neighbors of node v
+C(v) = {a, b, c, f, g, h}
+S(v) = {a, c, g, f}
+g dominates h ⇒
+Fig. 4. Weight-dependent ordering and weight-independent dominance.
+lists of separate component searches. Once a query starts
+traversing the final graph, it can visit successive nodes and
+discover further objects through their neighborhoods.
+At this point, the component graphs have supplied a pool
+of possible connections for each node. Yet this pool is only a
+starting point. When a query combines multiple components,
+being close in one component alone does not establish that
+a candidate should be retained in the joint graph. We must
+therefore compare the candidates in C(v) across all compo-
+nents before determining the final adjacency.
+C. Skyline-Based Joint Neighbor Selection
+Given the joint candidate set C(v), the remaining task is to
+decide which candidates should become outgoing neighbors.
+Since the query weights are unknown, retaining every candi-
+date may seem like a straightforward way to avoid excluding
+neighbors preferred by future queries. However, this leaves
+more neighbors to examine whenever a node is expanded.
+At the other extreme, selecting edges under a predefined
+weighted distance would favor one particular combination of
+components. We therefore need a selection rule that reduces
+unnecessary neighbors without fixing the query’s weighting in
+advance.
+Although the weights prevent us from fixing a complete
+ordering of the candidates, they do not make every com-
+parison uncertain. Fig. 4 illustrates the distinction. Changing
+the weights switches the nearest candidate from a to f, so
+their relative preference cannot be determined in advance. By
+contrast, g is no farther from v than h in every component.
+Its weighted distance to v therefore cannot exceed that of h,
+regardless of how the nonnegative weights are assigned. Thus,
+while some comparisons vary with the weights, others remain
+valid for all admissible weightings. These weight-independent
+comparisons provide a basis for selecting neighbors before the
+query weights are known.
+To compare two candidates, SJG examines their distances
+from v in each component, writing di(v, u) for the distance
+between v(i) and u(i).
+Definition 1 (Dominance). For two candidates u, u′ ∈C(v),
+u dominates u′, denoted by u ≺v u′, if u is no farther from v
+in any component, as specified in Eq. (5), and is strictly closer
+in at least one component.
+di(v, u) ≤di(v, u′)
+for every i.
+(5)
+The definition captures exactly the weight-independent com-
+parison illustrated above. It depends only on the component
+distances, not on the weights of a future query. SJG can
+therefore use this relation to identify candidates that are not
+dominated by any other candidate. They form the Skyline [33]
+of v, denoted by S(v) in Eq. (6).
+S(v) = {u ∈C(v) : ∄u′ ∈C(v) such that u′ ≺v u}.
+(6)
+Among the candidates in Fig. 3, a dominates b, while f and
+g dominate h, giving S(v) = {a, c, f, g}. SJG uses this set as
+its initial neighbor set.
+The dominance relation gives us a principled way to elimi-
+nate candidates. However, we must ensure that removing dom-
+inated candidates does not increase the minimum weighted
+distance from v within C(v) under any nonnegative query
+weights. The following proposition establishes this property.
+Proposition 1 (Weighted Minimum Preservation). For any
+node v with a nonempty finite candidate set C(v) and any
+nonnegative weight vector w, restricting the candidates to
+S(v) preserves the minimum weighted distance from v.
+min
+u∈S(v) Dw(v, u) = min
+u∈C(v) Dw(v, u).
+(7)
+Proof. Consider a candidate u′ ∈C(v) \ S(v). Since u′
+is dominated, another candidate dominates it. Following the
+dominance relation in the finite set C(v) eventually reaches a
+nondominated candidate u ∈S(v). By transitivity, u ≺v u′.
+Since all weights are nonnegative, summing the component-
+wise inequalities preserves their direction, as shown in Eq. (8).
+Dw(v, u) =
+m
+X
+i=1
+widi(v, u)
+≤
+m
+X
+i=1
+widi(v, u′) = Dw(v, u′).
+(8)
+Thus, every excluded candidate has a Skyline candidate with
+no greater weighted distance to v. Since S(v) ⊆C(v), the two
+sets have the same minimum weighted distance.
+■
+SJG therefore need not decide during construction which
+candidate will minimize the weighted distance from v under
+a future weighting. Regardless of the nonnegative weighting
+eventually specified, the Skyline contains at least one candidate
+that attains the minimum weighted distance from v in the
+original candidate set.
+Minimum Out-Degree. Although the Skyline preserves the
+minimum weighted distance within the candidate set, it can
+contain very few neighbors. For example, if one candidate
+dominates all others, the Skyline contains only that candidate.
+To avoid excessively small outgoing neighborhoods, SJG re-
+tains all Skyline candidates and supplements them only when
+
+
+their number is below min(τ, |C(v)|), where τ is the minimum
+out-degree.
+When supplementation is needed, SJG determines the order
+of additional candidates using their ranks within each com-
+ponent. Let ρi(u) denote the rank of candidate u among the
+candidates in C(v) under component distance di(v, u), with
+smaller ranks assigned to closer candidates. The rank sum
+Bv(u) in Eq. (9) determines which candidates are added first.
+Bv(u) =
+m
+X
+i=1
+ρi(u).
+(9)
+When supplementation is needed, SJG adds candidates from
+C(v) \ S(v) in ascending order of Bv(u) until |N(v)| =
+min(τ, |C(v)|). The final neighbor set N(v) contains all
+Skyline neighbors and any candidates added during supple-
+mentation.
+Every final neighbor comes from C(v), and every Skyline
+neighbor is retained, as expressed in Eq. (10). The resulting
+out-degree in Eq. (11) equals the Skyline size unless additional
+candidates are needed and available to reach the minimum out-
+degree τ.
+S(v) ⊆N(v) ⊆C(v),
+(10)
+|N(v)| = max
+ |S(v)|, min(τ, |C(v)|)
+
+.
+(11)
+It follows from Proposition 1 and the inclusions in Eq. (10)
+that the final neighbor set attains the same minimum weighted
+distance as the full candidate set for every nonnegative weight-
+ing.
+Thus, the Skyline determines the core neighbors of each
+node, while minimum-degree supplementation adds extra con-
+nections only when necessary. Together, they determine the
+final adjacency.
+Scale Invariance. The construction steps described above,
+including candidate acquisition, dominance testing, and rank-
+based supplementation, rely only on distance orderings within
+individual components. A strictly increasing transformation
+of the distances in any component therefore preserves the
+comparisons used by these steps. Provided that the randomized
+choices, processing order, and tie-handling rules remain con-
+sistent, the constructed adjacency is unchanged. This invari-
+ance applies to graph construction rather than query rankings.
+During search, weighted distances are evaluated using the
+specified distance functions and weights, so the ranking under
+fixed weights may still change when the distance values
+change.
+D. Parallel Graph Construction and Complexity
+In the following, we discuss how SJG supports parallel
+graph construction and analyze its time and space complexity.
+Parallel Construction. Candidate acquisition can proceed
+independently across components because each uses only
+its own distance function. Once the forward and reverse
+relationships Ai(v) are established, final neighbor selection
+also becomes independent across nodes. Each node v reads
+the fixed candidate relationships and object data, computes its
+Algorithm 1 SJG Construction
+Input: O, distances d1, . . . , dm, K, minimum out-degree τ
+Output: Joint graph G and entry node v0
+1: for i = 1, . . . , m do
+2:
+Initialize Ai(v) ←∅for every v ∈O
+3:
+Li ←NNDescent(O, di, K)
+4:
+for each v ∈O do
+5:
+for each u ∈Li(v) do
+6:
+Add u to Ai(v); add v to Ai(u)
+7:
+end for
+8:
+end for
+9: end for
+10: for each v ∈O in parallel do
+11:
+C(v) ←deduplicated union of Ai(v)
+12:
+Compute and store di(v, u) for each u ∈C(v) and
+each component i
+13:
+S(v) ←nondominated candidates in C(v)
+14:
+N(v) ←S(v)
+15:
+if |N(v)| < min(τ, |C(v)|) then
+16:
+Compute Bv(u) from the component-wise ranks
+in C(v)
+17:
+Add u ∈C(v) \ S(v) to N(v) in ascending order
+of Bv(u) until |N(v)| = min(τ, |C(v)|)
+18:
+end if
+19:
+G[v] ←N(v)
+20: end for
+21: v0 ←o1
+22: return G, v0
+candidate-distance vectors, and writes only its own adjacency
+N(v), without reading or modifying the final adjacency of
+other nodes. Consequently, nodes can select their neighbors
+in parallel without searching an evolving joint graph or main-
+taining synchronized hierarchies.
+Algorithm 1 summarizes the two stages. Lines 1–9 establish
+component-specific candidate relationships, while lines 10–
+20 independently determine each node’s final adjacency. The
+algorithm then selects o1 as the fixed entry node v0.
+Time Complexity. Let n = |O|, and let Ti(n, K) denote
+the work required to construct the approximate K-nearest-
+neighbor graph for component i. Building all m component
+graphs therefore requires Pm
+i=1 Ti(n, K) total work.
+Each component contributes at most nK forward and nK
+reverse entries. Hash-based deduplication of these entries takes
+O(nmK) expected work. Let cv = |C(v)| denote the number
+of distinct candidates at node v. Deduplication can only reduce
+the number of entries, so the total candidate count satisfies
+P
+v∈O cv ≤2nmK.
+During joint neighbor selection, component distances are
+computed once and reused for dominance testing and rank-
+ing. For each node v, constructing candidate-distance vectors
+requires at most mcv component-distance evaluations, while
+pairwise Skyline selection requires O(mc2
+v) scalar compar-
+isons without additional distance evaluations. If supplemen-
+tation is needed, computing component-wise ranks costs
+
+
+Algorithm 2 SJG Search
+Input: G, entry node v0, query (q, w, k), ef ≥k
+Output: Approximate top-k objects
+1: H ←empty min-heap; W ←empty max-heap
+2: t ←Dw(q, v0)
+3: Insert (t, v0) into H and W; V ←{v0}
+4: while H is not empty do
+5:
+(tu, u) ←H.popMin()
+6:
+if |W| = ef and tu > maxDistance(W) then
+7:
+break
+8:
+end if
+9:
+for each x ∈G[u] do
+10:
+if x ∈V then continue
+11:
+Add x to V
+12:
+tx ←Dw(q, x)
+13:
+if |W| < ef or tx < maxDistance(W) then
+14:
+Insert (tx, x) into H and W
+15:
+Retain at most ef closest objects in W
+16:
+end if
+17:
+end for
+18: end while
+19: return the k closest objects in W
+O(mcv log cv), summing the ranks costs O(mcv), and sorting
+the remaining candidates costs O(cv log cv) comparisons.
+Across all nodes, candidate-distance vectors require at most
+m P
+v∈O cv component-distance evaluations. With unit-cost
+component-distance evaluations, the expected total construc-
+tion work is O(Pm
+i=1 Ti(n, K) + nmK + m P
+v∈O c2
+v).
+Space Complexity. Let ¯r denote the average final out-degree.
+The final graph stores one adjacency list per object, requiring
+O(n¯r) space. Forward and reverse candidate relationships
+require O(nmK) auxiliary space, while processing node v
+requires O(mcv) temporary space for candidate-distance vec-
+tors. This temporary storage can be released after processing
+each node, although concurrent workers require separate stor-
+age.
+Since SJG retains the entire Skyline and uses τ only
+for minimum-degree supplementation, the final out-degree
+depends on the candidate set and its Skyline rather than a
+fixed maximum-degree bound.
+E. Query Processing
+Once construction is complete, the graph adjacency remains
+fixed, while query weights determine how encountered objects
+are evaluated and prioritized for expansion. Given a query
+(q, w, k), SJG applies the weighted distance defined in Eq. (2)
+to each encountered object u. Only components with positive
+weights require a distance evaluation.
+SJG uses best-first search (Algorithm 2) to explore promis-
+ing neighbors while retaining alternative directions of expan-
+sion. A min-heap H manages candidates awaiting expansion,
+while a max-heap W retains at most ef potential results and
+determines the distance threshold for admitting new candi-
+dates. The parameter ef ≥k controls search breadth, and a
+visited set V avoids repeated evaluations. Search begins from
+the fixed entry node v0.
+During traversal, the closest candidate in H is expanded,
+and its unvisited neighbors are evaluated using Dw. A neigh-
+bor is admitted to both heaps if W is not full or its weighted
+distance is smaller than the farthest distance in W. Importantly,
+removing an object from W does not remove it from H, so it
+may still be expanded.
+Search terminates when H is empty or the closest candidate
+awaiting expansion is farther than the farthest object in a full
+W. The k closest objects in W are returned. Throughout this
+process, query weights affect candidate evaluation and expan-
+sion order, while the graph adjacency remains unchanged.
+V. EXPERIMENTS
+We first compare SJG with existing methods under different
+query weights. We then examine how the hierarchy, candidate
+sources, and neighbor selection affect search performance and
+how sensitive SJG is to its construction parameters and the
+number of requested results. Finally, we compare construc-
+tion time and index size across methods and evaluate query
+performance and construction cost on larger datasets.
+A. Experimental Setup
+Datasets. We evaluate SJG on six real-world datasets, with
+their statistics summarized in Table II. Corel [34] contains four
+visual features, including a 32-dimensional color histogram, a
+32-dimensional color layout histogram, 9-dimensional color
+moments, and 16-dimensional co-occurrence texture. NUS-
+WIDE [35] contains five visual features, including a 64-
+dimensional color histogram, a 144-dimensional color cor-
+relogram, a 73-dimensional edge direction histogram, 128-
+dimensional wavelet texture, and 225-dimensional block-wise
+color moments.
+For Tiny ImageNet [36], we use the training images and
+extract five features: a 256-dimensional HSV color histogram,
+9-dimensional color moments, 32-dimensional Gabor texture,
+324-dimensional HOG, and 2048-dimensional ResNet-50 [37]
+representations. For COCO [38], we use images and captions
+from the 2017 training set. Its eight components include four
+visual features, CLIP [39] and ResNet-50 image representa-
+tions, and MPNet [40] and CLIP text representations. Multiple
+captions of each image are encoded and aggregated into one
+text representation. The deep representations in Tiny ImageNet
+and COCO are L2-normalized.
+Food and Airbnb contain heterogeneous components beyond
+vectors. Food is derived from Open Food Facts [41] and
+contains 40,000 objects, each with five nutritional values per
+100 grams, a food category, and a 768-dimensional MPNet
+representation of its product name. Airbnb uses listing snap-
+shots from 119 locations in Inside Airbnb [42], dated between
+September 11, 2025, and June 19, 2026. Each listing contains
+its location, name, price, guest capacity, and a 64-dimensional
+multi-hot vector over the 64 most frequent amenities.
+
+
+TABLE II
+DATASET STATISTICS.
+Dataset
+n
+m Distance functions
+Corel
+65,615
+4
+L1: color histogram, color layout
+L2: color moments, co-occurrence
+texture
+NUS-
+WIDE
+268,648
+5
+L1: color histogram, color
+correlogram, edge
+L2: wavelet texture, block-wise color
+moments
+Tiny
+ImageNet
+100,000
+5
+L1: HSV color histogram
+L2: color moments, Gabor, HOG,
+ResNet-50
+COCO
+117,287
+8
+L1: HSV color histogram, LBP
+texture, edge
+L2: block-wise color moments,
+ResNet-50, CLIP image and text,
+MPNet text
+Food
+40,000
+7
+L1: energy, fat, sugar, salt, protein
+Edit distance: food category
+Word cosine distance: product name
+Airbnb
+1,135,146
+5
+L1: price, guest capacity
+L2: latitude and longitude
+Edit distance: listing name
+Word cosine distance: amenities
+We compute the distances between product-name vectors in
+Food and between amenity vectors in Airbnb using the word
+cosine distance (WCD), as defined in Eq. (12) [9].
+dWCD(x, y) = arccos
+
+x⊤y
+∥x∥2∥y∥2
+
+.
+(12)
+Baselines. We compare SJG with three composite meth-
+ods, C-HNSW, C-NSG, and C-Vamana, and the joint graph
+HJG [9], [43]. The composite methods build an HNSW,
+NSG, or Vamana index for each component using public
+implementations [44]–[46]. We implement the combination,
+which retrieves ef candidates from each component, merges
+and deduplicates them, and reranks them by weighted distance.
+Metrics. We measure result quality using Recall@k, with k =
+10 by default. Ground truth is computed by linear scan. We
+measure query efficiency by queries per second (QPS) or mean
+query latency. For the ablation study, we count each evaluation
+of a component distance function as one distance computation.
+Protocol. We use 1,000 queries per dataset. Section V-B eval-
+uates both uniform and random weights, while the remaining
+experiments use uniform weights. SJG’s search parameter ef
+and the number of candidates returned by each component
+index in the composite methods are both doubled from 16
+to 4096. In the parameter study, we test only search budgets
+with ef ≥k. For HJG, we evaluate the distance threshold
+factor ε at 0.75, 1.0, 1.1, 1.2, 1.3, 1.4, and 1.5. For Fig. 5, we
+show the best recall–QPS trade-offs across the tested search
+configurations. For comparisons across methods at Recall@10
+targets of 0.90 and 0.95, we report the highest QPS among
+configurations reaching each target. Methods that fail to reach
+a target are excluded from its comparison.
+All queries run on a single thread. Construction uses 12
+threads for SJG and the composite methods, while HJG runs
+on a single thread. We additionally report single-thread con-
+struction time for SJG in Section V-E. For index construction,
+SJG uses K = 15 and τ = 16 by default. We vary these
+parameters in Section V-D. C-HNSW uses M = 16 and
+efConstruction = 200; C-NSG uses 100 initial neighbors,
+R = 32, L = 40, and C = 500; and C-Vamana uses R = 32,
+L = 200, α = 1.2, and two construction passes. HJG uses
+NNnum = 15 and Maxn = 1500.
+All experiments run on a server with two Intel Xeon E5-
+2680 v3 processors (2.50 GHz, 24 physical cores) and 504 GiB
+of memory under Ubuntu 20.04. The source code for SJG is
+available at https://github.com/Ma-raca/SJG-code.
+B. Query Performance under Different Weights
+To evaluate how SJG performs under varying query weights,
+we consider both equal and randomly sampled weight assign-
+ments. Under equal weighting, each of the m components
+receives weight 1/m. We also sample three weight vectors
+per dataset from each of two symmetric Dirichlet distributions,
+giving seven weight settings per dataset and 42 settings across
+six datasets. All seven settings on each dataset use the same
+prebuilt index. With α = 1, sampling is uniform over all
+nonnegative weight vectors whose entries sum to one. With
+α = 0.2, sampled vectors are more likely to concentrate
+most of the weight on a few components. We denote the j-th
+sampled weight vector by Dir(α)-j. Due to space limitations,
+Fig. 5 presents five weight settings on four datasets.
+At a Recall@10 target of 0.90, SJG outperforms the fastest
+composite baseline in 36 of the 42 settings, achieving a median
+speedup of 2.05× and a maximum speedup of 27.9×. Against
+HJG, SJG is faster in all 42 settings, with a median speedup
+of 21.4×. Under equal weights, SJG is the fastest on all
+six datasets. It is 1.6–4.8× faster than the fastest composite
+method and 12–28× faster than HJG. The conclusion holds
+at a higher recall target. At Recall@10 = 0.95, SJG is faster
+in 34 of the 40 comparable settings. Under equal weights, the
+smallest gap is on COCO, where SJG and C-HNSW achieve
+89.0 and 83.9 QPS.
+Moreover, the gap to the composite methods is largest on
+the datasets with non-vector components. In the 14 settings of
+Food and Airbnb, the speedup of SJG is at least 4.5× in all but
+one, and it reaches 27.9×. On the four vector-only datasets, the
+median speedup is 1.59×. On Food, the composite methods
+require at least 256 returned candidates per component to reach
+Recall@10 = 0.90 under every weight setting, whereas SJG
+reaches the same target with a search breadth of 32–128. On
+Airbnb under uniform weights, C-HNSW needs ef = 2048
+and C-Vamana needs 4096, and C-NSG reaches a recall of
+only 0.58 at 4096. SJG needs only 1024.
+In contrast, the settings where SJG falls behind concentrate
+on weights dominated by a single component. Among the
+12 settings whose largest component weight is about 0.8 or
+
+
+SJG
+C-HNSW
+C-NSG
+C-Vamana
+HJG
+Uniform
+10
+1
+10
+2
+NUS-WIDE
+10
+1
+10
+2
+Tiny ImageNet
+10
+1
+10
+2
+10
+3
+Food
+10
+0
+10
+1
+10
+2
+Airbnb
+Dir(1)-1
+10
+1
+10
+2
+10
+1
+10
+2
+10
+1
+10
+2
+10
+3
+10
+0
+10
+1
+10
+2
+Dir(1)-3
+10
+1
+10
+2
+10
+1
+10
+2
+10
+1
+10
+2
+10
+3
+10
+0
+10
+1
+10
+2
+Dir(0.2)-1
+10
+1
+10
+2
+10
+3
+10
+1
+10
+2
+10
+1
+10
+2
+10
+3
+10
+0
+10
+1
+10
+2
+Dir(0.2)-2
+10
+1
+10
+2
+0.8
+0.9
+1.0
+10
+1
+10
+2
+10
+3
+0.8
+0.9
+1.0
+10
+1
+10
+2
+10
+3
+0.8
+0.9
+1.0
+10
+0
+10
+1
+10
+2
+0.8
+0.9
+1.0
+QPS
+Recall@10
+Fig. 5. Query performance under different weight settings.
+higher, SJG falls behind in 4. In the other 30 settings, the
+largest component weight is at most 0.71, and SJG falls behind
+in only 2. This effect is most pronounced on NUS-WIDE
+under Dir(0.2)-1, where the ranking is driven primarily by
+similarity in block-wise color moments. Candidates retrieved
+from that component alone can therefore be competitive under
+the weighted distance. At the target recall, C-Vamana achieves
+504.3 QPS, compared with 225.9 QPS for SJG.
+C. Ablation Study
+We conduct ablation studies to examine the effects of three
+key design choices: the hierarchy, candidate acquisition, and
+neighbor selection. We compare the minimum number of dis-
+tance computations required to reach Recall@10 = 0.90 under
+uniform weights (Fig. 6). HJG-Flat removes the hierarchy
+from HJG while preserving its original neighbor relationships.
+Union constructs a single-layer graph by combining the for-
+ward and reverse neighbors from the component-specific K-
+NN graphs, retaining all candidates as outgoing neighbors.
+SJG retains the Skyline of each candidate set and adds further
+candidates only when needed to meet the minimum out-degree.
+Corel
+NUS-WIDE
+Tiny
+ImageNet
+COCO
+Food
+0.0
+0.5
+1.0
+1.5
+Distance computations
+(relative to HJG)
+HJG = 1
+HJG-Flat
+Union
+Random
+SJG
+Fig. 6. Ablation study on distance computations.
+For each node, Random retains the same number of neighbors
+as SJG but selects them randomly from the Union candidates.
+Skyline selection reduces distance computations on the five
+datasets. Compared with Union, SJG reduces the number of
+distance computations by 41%–65%. HJG needs 1.7–7.4× as
+many distance computations as SJG.
+Notably, the effects of the hierarchy and the candidate
+
+
+10
+15
+20
+30
+40
+(a) Neighbor-list size K
+0.5
+1
+1.5
+Normalized query latency
+0
+8
+16
+32
+(b) Minimum out-degree τ
+0.75
+1
+1.25
+5
+10
+20
+50
+100
+(c) Result count k
+0.5
+1
+1.5
+2
+2.5
+3
+Corel
+NUS-WIDE
+Tiny ImageNet
+COCO
+Food
+Airbnb
+Fig. 7. Parameter sensitivity of SJG.
+source vary across datasets. Removing the hierarchy reduces
+the number of distance computations by 24% on COCO but
+increases it by 23% on NUS-WIDE. On Corel and Food, HJG
+has only one level, so HJG-Flat is identical to HJG. Com-
+pared with HJG-Flat, using the union of the per-component
+neighbors as candidates reduces the number of distance com-
+putations by 36%–71% on four datasets but increases it by
+72% on Food.
+In particular, the benefit of joint neighbor selection comes
+from which neighbors SJG keeps, not only from how many.
+Random keeps as many neighbors as SJG but does not guaran-
+tee the weighted-minimum preservation property of Proposi-
+tion 1. Except on COCO (1.09×), Random needs 1.60–2.75×
+as many distance computations as SJG. On NUS-WIDE, it
+needs even more than Union, which keeps all candidates.
+In summary, Skyline selection is what consistently reduces
+distance computations on the five datasets, while the effects of
+the hierarchy and the candidate source vary with the dataset.
+D. Parameter Sensitivity
+We examine the sensitivity of SJG to the per-component
+neighbor-list size K, minimum out-degree τ, and result count
+k on six datasets under uniform weights. We vary one pa-
+rameter at a time, keeping the others at their default values
+(K = 15, τ = 16, and k = 10). For each configuration,
+we report the minimum measured query latency achieving
+Recall@k ≥0.95 by varying the search parameter ef (Fig. 7).
+Latency is normalized to that of the default configuration on
+each dataset.
+Increasing K can substantially improve search efficiency.
+On Airbnb, increasing K from 10 to 40 reduces query latency
+from 68.4 to 19.7 ms, achieving a 3.47× speedup. Meanwhile,
+the default K = 15 uses 33.2%–47.9% fewer edges than
+K = 40 across the six datasets, providing a more compact
+graph. SJG is less sensitive to τ: the maximum latency
+variation across the tested values is below 9.4% on every
+dataset, while τ = 16 adds less than 2.9% more edges than
+τ = 0. Retrieving 100 rather than 10 results requires only
+1.64–2.83× the query time across all six datasets, without
+rebuilding the index.
+TABLE III
+CONSTRUCTION TIME (MINUTES).
+Dataset
+1 thread
+12 threads
+HJG
+SJG
+SJG
+C-HNSW
+C-NSG
+C-Vamana
+Corel
+2.81
+0.77
+0.18
+0.06
+0.56
+0.21
+NUS-WIDE
+141.08
+11.55
+2.54
+1.88
+18.54
+4.56
+Tiny ImageNet
+48.89
+10.65
+1.61
+1.31
+23.76
+7.33
+COCO
+62.68
+20.50
+3.31
+1.96
+33.71
+10.97
+Food
+5.25
+1.75
+0.35
+0.27
+6.87
+1.21
+Airbnb
+7,816.03
+38.91
+8.20
+22.77
+73.23
+105.90
+TABLE IV
+GRAPH INDEX SIZE (MiB).
+Dataset
+SJG
+HJG
+C-HNSW
+C-NSG
+C-Vamana
+Corel
+8.16
+34.26
+36.59
+13.62
+19.92
+NUS-WIDE
+62.61
+178.08
+189.54
+103.22
+131.33
+Tiny ImageNet
+21.46
+65.17
+69.37
+34.65
+46.48
+COCO
+48.30
+121.99
+131.71
+75.47
+99.34
+Food
+9.50
+21.55
+38.79
+25.87
+16.42
+Airbnb
+165.08
+732.79
+807.78
+490.25
+407.02
+E. Construction Cost and Index Size
+SJG builds faster than HJG, and the gap is largest on the
+two largest datasets. On a single thread, HJG takes 3.0–4.6×
+as long as SJG on Corel, Tiny ImageNet, COCO, and Food,
+and 12.2× as long on NUS-WIDE. On Airbnb, HJG takes
+about 130 hours, whereas SJG takes only 39 minutes, a 201×
+difference (Table III).
+Moreover, SJG construction can be parallelized. With 12
+threads, SJG builds 4.3–6.6× faster than on a single thread. On
+Airbnb, the construction time of SJG drops to 8.2 minutes, less
+than that of every composite method. On the smaller datasets,
+C-HNSW builds fastest.
+In addition, SJG has the smallest graph index. On the six
+datasets, the graph index of SJG is 36.0%–59.4% smaller than
+that of the smallest baseline. The graph index of HJG is 2.3–
+4.4× as large as that of SJG (Table IV). This agrees with
+the degrees of the methods. The average degree of SJG is
+
+
+1
+2
+3
+5
+n (millions)
+20
+50
+QPS
+1
+2
+5
+7.75
+n (millions)
+20
+50
+100
+SJG
+C-HNSW
+0.6
+0.7
+0.8
+0.9
+1.0
+Recall@10
+2
+5
+10
+20
+50
+100
+QPS
+0.6
+0.7
+0.8
+0.9
+1.0
+Recall@10
+10
+20
+50
+100
+200
+500
+(a) YFCC, Recall@10 = 0.90
+(b) Amazon, Recall@10 = 0.90
+0
+40
+80
+120
+1
+2
+5
+7.75
+Build time (min)
+0
+10
+20
+30
+40
+1
+2
+3
+5
+(c) YFCC, n = 5M
+(d) Amazon, n = 7.75M
+n (millions)
+(e) YFCC, construction
+n (millions)
+(f) Amazon, construction
+Fig. 8. Scalability on YFCC and Amazon.
+31.1–106.9 and is highest on COCO, which has the most
+components (m = 8). The sum of the average degrees of
+the per-component graphs is 51.3–215.9 for the composite
+methods and 113.9–240.0 for HJG. SJG stores only one single-
+layer graph, whereas the composite methods store one graph
+per component, and HJG also stores adjacency by level.
+F. Scalability
+We examine how SJG behaves on two larger datasets
+as their size grows. YFCC uses the LIRE [47] features of
+YFCC100M [48] images released in Multimedia Commons.
+It has four components, a 144-dimensional CEDD, a 120-
+dimensional color layout, an 80-dimensional edge histogram,
+and a 60-dimensional Gabor texture, compared by L1, L2,
+L1, and L2 distance, respectively. Amazon uses the product
+metadata of Amazon Reviews 2023 [49]. It has five compo-
+nents, the store name, the title, the category set, the price, and
+the rating. The store name is compared by edit distance, the
+384-dimensional MiniLM [50] representation of the title by
+WCD, the category set by Jaccard distance, and the price and
+the rating by L1 distance. On each dataset, we take nested
+prefix subsets, with 1M, 2M, 3M, and 5M objects for YFCC
+and 1M, 2M, 5M, and 7.75M objects for Amazon. A separate
+set of 1,000 objects serves as the queries. We compare SJG
+with C-HNSW under uniform weights. C-HNSW is the fastest
+composite method in 34 of the 42 settings in Section V-B.
+Construction uses 12 threads, and queries run on a single
+thread.
+Figs. 8(a) and 8(b) show that SJG has higher query through-
+put than C-HNSW at every scale, although its lead narrows as
+the datasets grow. At Recall@10 = 0.90, SJG is 2.3× faster
+than C-HNSW on YFCC at 1M–3M and 1.3× faster at 5M.
+On Amazon, the speedup decreases from 4.2× at 1M to 1.3×
+at 7.75M. At the largest scale, Figs. 8(c) and 8(d) show that
+SJG maintains higher QPS than C-HNSW for recall between
+0.6 and 0.9.
+Notably, on Amazon, the highest recall that SJG reaches
+decreases as the dataset grows. With ef = 4096, the recall of
+SJG decreases from 0.975 at 1M to 0.923 at 7.75M, and that
+of C-HNSW decreases from 0.960 to 0.945. At 5M and above,
+SJG does not reach Recall@10 = 0.95 within this budget. On
+YFCC, both methods reach a recall above 0.97 at every scale.
+Figs. 8(e) and 8(f) show how construction time grows with
+dataset size. On YFCC, C-HNSW builds faster at all four
+scales. As the dataset grows from 1M to 5M objects, its
+construction time rises from 5.2 to 32.2 minutes, while SJG’s
+rises from 6.8 to 40.5 minutes. On Amazon, SJG builds faster
+at every scale, and its lead grows from about 3 minutes at 1M
+objects to 28 minutes at 7.75M.
+VI. CONCLUSION
+In this paper, we present the Skyline Joint Graph (SJG), a
+graph index for multi-component approximate nearest neigh-
+bor search with per-query weights. To address the chal-
+lenge of selecting neighbors before query weights are known,
+SJG pools component-specific candidates and applies weight-
+independent Skyline pruning to construct a compact joint
+graph. By separating candidate acquisition from joint neighbor
+selection, SJG also enables parallel graph construction without
+hierarchical synchronization or cascading updates. Extensive
+experiments on six real-world datasets demonstrate the ef-
+fectiveness of SJG. At Recall@10 = 0.90, SJG outperforms
+the fastest composite baseline in 36 of 42 dataset–weight
+combinations, achieving a median speedup of 2.05×. Its graph
+index is at least 36% smaller than the smallest baseline
+index, while its single-threaded construction is up to 201×
+faster than HJG. In future work, we will investigate how to
+preserve efficient graph navigation while reducing the number
+of retained Skyline neighbors.
+ACKNOWLEDGMENT
+This work is partially supported by the NSFC project
+62532007.
+AI-GENERATED CONTENT ACKNOWLEDGMENT
+We used generative AI tools to edit selected sentences for
+grammar, clarity, and readability.
+
+
+REFERENCES
+[1] Y. A. Malkov and D. A. Yashunin, “Efficient and robust approxi-
+mate nearest neighbor search using hierarchical navigable small world
+graphs,” IEEE Trans. Pattern Anal. Mach. Intell., vol. 42, no. 4, pp.
+824–836, 2020.
+[2] C. Fu, C. Xiang, C. Wang, and D. Cai, “Fast approximate nearest
+neighbor search with the navigating spreading-out graph,” Proc. VLDB
+Endow., vol. 12, no. 5, pp. 461–474, 2019.
+[3] S. J. Subramanya, Devvrit, R. Kadekodi, R. Krishnaswamy, and
+H. Simhadri, “DiskANN: Fast accurate billion-point nearest neighbor
+search on a single node,” in NeurIPS, Nov. 2019.
+[4] I. Azizi, K. Echihabi, and T. Palpanas, “Graph-based vector search:
+An experimental evaluation of the state-of-the-art,” Proc. ACM Manag.
+Data, vol. 3, no. 1, pp. 43:1–43:31, 2025.
+[5] R. Qiu and J. Tang, “Efficient approximate nearest neighbor search via
+Hemi-Sphere Centroids Graph,” Proc. ACM Manag. Data, vol. 3, no. 6,
+pp. 321:1–321:26, 2025.
+[6] W. Jiang, H. Hu, T. Hoefler, and G. Alonso, “Fast graph vector search
+via hardware acceleration and delayed-synchronization traversal,” Proc.
+VLDB Endow., vol. 18, no. 11, pp. 3797–3811, 2025.
+[7] J. Wang et al., “Milvus: A purpose-built vector data management
+system,” in SIGMOD, 2021, pp. 2614–2627.
+[8] R. Uemura, D. Amagata, and T. Hara, “An efficient framework for
+approximate nearest neighbor search on high-dimensional multi-metric
+data,” in Similarity Search and Applications, ser. LNCS, vol. 15268,
+2025, pp. 3–17.
+[9] Y. Zhu, L. Chen, Y. Gao, R. Ma, B. Zheng, and J. Zhao, “HJG: An
+effective hierarchical joint graph for ANNS in multi-metric spaces,” in
+ICDE, 2024, pp. 4275–4287.
+[10] M. Wang, X. Xu, Q. Yue, and Y. Wang, “A comprehensive survey and
+experimental comparison of graph-based approximate nearest neighbor
+search,” Proc. VLDB Endow., vol. 14, no. 11, pp. 1964–1978, 2021.
+[11] W. Dong, M. Charikar, and K. Li, “Efficient k-nearest neighbor graph
+construction for generic similarity measures,” in WWW, 2011, pp. 577–
+586.
+[12] S. Yang et al., “Revisiting the index construction of proximity graph-
+based approximate nearest neighbor search,” Proc. VLDB Endow.,
+vol. 18, no. 6, pp. 1825–1838, 2025.
+[13] S. Voruganti and M. T. ¨Ozsu, “MIRAGE-ANNS: Mixed approach graph-
+based indexing for approximate nearest neighbor search,” Proc. ACM
+Manag. Data, vol. 3, no. 3, pp. 188:1–188:27, 2025.
+[14] Z. Wu et al., “FGIM: a fast graph-based indexes merging framework for
+approximate nearest neighbor search,” Proc. ACM Manag. Data, vol. 4,
+no. 1, pp. 37:1–37:27, 2026.
+[15] L. Boytsov and B. Naidan, “Engineering efficient and effective non-
+metric space library,” in SISAP, 2013, pp. 280–293.
+[16] P. Ciaccia and M. Patella, “The M2-tree: Processing complex multi-
+feature queries with just one index,” in First DELOS Network of
+Excellence Workshop on Information Seeking, Searching and Querying
+in Digital Libraries, 2000.
+[17] B. Bustos and T. Skopal, “Dynamic similarity search in multi-metric
+spaces,” in Proc. 8th ACM Int. Workshop Multimedia Information
+Retrieval (MIR), 2006, pp. 137–146.
+[18] B. Bustos, S. Kreft, and T. Skopal, “Adapting metric indexes for
+searching in multi-metric spaces,” Multimed. Tools Appl., vol. 58, no. 3,
+pp. 467–496, 2012.
+[19] M. Franzke, T. Emrich, A. Z¨ufle, and M. Renz, “Indexing multi-metric
+data,” in ICDE, 2016, pp. 1122–1133.
+[20] Y. Zhu, L. Chen, Y. Gao, B. Zheng, and P. Wang, “DESIRE: An efficient
+dynamic cluster-based forest indexing for similarity search in multi-
+metric spaces,” Proc. VLDB Endow., vol. 15, no. 10, pp. 2121–2133,
+2022.
+[21] T. Qian, Y. Zhu, L. Chen, X. Ke, T. Li, and C. Jensen, “OneDB: A
+distributed multi-metric data similarity search system,” in KDD, 2026,
+pp. 4024–4033.
+[22] M. Wang et al., “MUST: An effective and scalable framework for
+multimodal search of target modality,” in ICDE, 2024, pp. 4747–4759.
+[23] Z. Yin, J. Gao, P. Balsebre, G. Cong, and C. Long, “DEG: Efficient
+hybrid vector search using the dynamic edge navigation graph,” Proc.
+ACM Manag. Data, vol. 3, no. 1, Feb. 2025, Art. no. 29.
+[24] X. Yu, C. Cai, Z. Feng, H. Lin, S. Xu, and Y. Peng, “Efficient
+optimization of hierarchical joint graph for multi-metric approximate
+nearest neighbor search,” in ISADS, 2025, pp. 66–73.
+[25] S. Gollapudi et al., “Filtered-DiskANN: Graph algorithms for approx-
+imate nearest neighbor search with filters,” in WWW, 2023, pp. 3406–
+3416.
+[26] L. Patel, P. Kraft, C. Guestrin, and M. Zaharia, “ACORN: Performant
+and predicate-agnostic search over vector embeddings and structured
+data,” Proc. ACM Manag. Data, vol. 2, no. 3, pp. 120:1–120:27, 2024.
+[27] M. Wang, L. Lv, X. Xu, Y. Wang, Q. Yue, and J. Ni, “An efficient and
+robust framework for approximate nearest neighbor search with attribute
+constraint,” in NeurIPS, 2023, pp. 15 738–15 751.
+[28] X. Xu, C. Li, Y. Wang, and Y. Xia, “Multiattribute approximate nearest
+neighbor search based on navigable small world graph,” Concurr.
+Comput. Pract. Exp., vol. 32, no. 24, 2020, Art. no. e5970.
+[29] M. Jiang et al., “DIGRA: A dynamic graph indexing for approximate
+nearest neighbor search with range filter,” Proc. ACM Manag. Data,
+vol. 3, no. 3, pp. 148:1–148:26, 2025.
+[30] O. Khattab and M. Zaharia, “ColBERT: Efficient and effective passage
+search via contextualized late interaction over BERT,” in SIGIR, 2020,
+pp. 39–48.
+[31] J. Engels, B. Coleman, V. Lakshman, and A. Shrivastava, “DESSERT:
+An efficient algorithm for vector set search with vector set queries,” in
+NeurIPS, 2023, pp. 67 972–67 992.
+[32] B. Yang et al., “Unified and efficient approach for multi-vector similarity
+search,” arXiv preprint arXiv:2604.02815, 2026.
+[33] S. B¨orzs¨onyi, D. Kossmann, and K. Stocker, “The skyline operator,” in
+ICDE, 2001, pp. 421–430.
+[34] M. Ortega-Binderberger, “Corel image features,” UCI Machine Learning
+Repository, https://doi.org/10.24432/C5K599, 1998.
+[35] T.-S. Chua, J. Tang, R. Hong, H. Li, Z. Luo, and Y. Zheng, “NUS-
+WIDE: A real-world web image database from National University of
+Singapore,” in Proc. ACM Int. Conf. Image and Video Retrieval (CIVR),
+2009, Art. no. 48.
+[36] Y. Le and X. Yang, “Tiny ImageNet visual recognition challenge,”
+CS231n course report, Stanford University, https://cs231n.stanford.edu/
+reports/2015/pdfs/yle project.pdf, 2015.
+[37] K. He, X. Zhang, S. Ren, and J. Sun, “Deep residual learning for image
+recognition,” in CVPR, 2016, pp. 770–778.
+[38] T.-Y. Lin et al., “Microsoft COCO: Common objects in context,” in
+ECCV, 2014, pp. 740–755.
+[39] A. Radford et al., “Learning transferable visual models from natural
+language supervision,” in ICML, 2021, pp. 8748–8763.
+[40] K. Song, X. Tan, T. Qin, J. Lu, and T.-Y. Liu, “MPNet: Masked and
+permuted pre-training for language understanding,” in NeurIPS, 2020,
+pp. 16 857–16 867.
+[41] “Open Food Facts,” retrieved on Jun. 21, 2026. [Online]. Available:
+https://world.openfoodfacts.org/data
+[42] Inside Airbnb, “Airbnb listings data,” Housing Justice Data Lab,
+retrieved on Jul. 3, 2026. [Online]. Available: https://insideairbnb.com/
+get-the-data/
+[43] ZJU-DAILY, “Hierarchical Joint Graph (HJG),” accessed Jun. 12, 2026.
+[Online]. Available: https://github.com/ZJU-DAILY/HJG
+[44] nmslib,
+“hnswlib,”
+accessed
+Jun.
+12,
+2026.
+[Online].
+Available:
+https://github.com/nmslib/hnswlib
+[45] ZJULearning, “Navigating Spreading-out Graph (NSG),” accessed Jun.
+15, 2026. [Online]. Available: https://github.com/ZJULearning/nsg
+[46] cmuparlay, “ParlayANN,” accessed Jun. 15, 2026. [Online]. Available:
+https://github.com/cmuparlay/ParlayANN
+[47] M. Lux and S. A. Chatzichristofis, “LIRe: Lucene image retrieval – an
+extensible Java CBIR library,” in ACM Multimedia, 2008, pp. 1085–
+1088.
+[48] B. Thomee et al., “YFCC100M: The new data in multimedia research,”
+Communications of the ACM, vol. 59, no. 2, pp. 64–73, 2016.
+[49] Y. Hou et al., “Bridging language and items for retrieval and recom-
+mendation: Benchmarking LLMs as semantic encoders,” in ACL, 2026,
+pp. 3251–3265.
+[50] W. Wang, F. Wei, L. Dong, H. Bao, N. Yang, and M. Zhou, “MiniLM:
+Deep self-attention distillation for task-agnostic compression of pre-
+trained transformers,” in NeurIPS, 2020, pp. 5776–5788.

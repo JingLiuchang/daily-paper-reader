@@ -1,0 +1,2173 @@
+Rethinking ANNS on Commodity PIM: PIM-Native
+Vector Search with Cooperative Filtering
+Dawei Guo, Yizou Chen, Fan Yang, Hui Li, and Ming-Chang Yang
+The Chinese University of Hong Kong
+{dwguo25, chenyz, fyang24, hli, mcyang}@cse.cuhk.edu.hk
+Abstract—Approximate nearest neighbor search (ANNS) is a
+key primitive in modern data-intensive systems, and its memory-
+bound vector-scanning stage makes processing-in-memory (PIM)
+a promising acceleration platform. Existing PIM-based ANNS
+systems largely transplant CPU-oriented distance evaluation and
+top-k selection onto PIM, introducing arithmetic- and state-
+heavy operations that poorly match lightweight, isolated PIM
+cores. To address these mismatches, we present PIVOT, a PIM-
+native Vector search system with cOoperative filTering, which
+thoroughly rethinks how ANNS should be executed on commodity
+PIM. First, PIVOT recasts PIM-side distance evaluation around
+binary quantization to exploit PIM-native bitwise operations,
+enabling LUT-free evaluation with low arithmetic cost and a
+small local-memory footprint. Second, PIVOT redesigns PIM-side
+candidate selection around threshold-guided cooperative filtering,
+using a survivor-mass model to derive a conservative threshold
+for CPU-side cluster filtering and PIM-side lower-bound filtering,
+thereby reducing output traffic and eliminating per-core top-k
+state. PIVOT organizes these stages into a cooperative workflow
+that keeps query-global coordination and reranking on the
+CPU while assigning memory-intensive, data-parallel filtering
+to PIM. To efficiently realize this workflow and sustain high
+utilization across devices, PIVOT further generates configuration-
+specialized PIM kernels and pipelines CPU-side preparation
+and reranking with PIM-side filtering across query batches.
+Evaluations on real UPMEM hardware show that PIVOT filters
+out 99.3–99.7% of probed vectors and achieves up to 18.8× and
+10.2× the QPS of CPU and prior PIM baselines, respectively.
+PIVOT also achieves higher recall than existing PIM systems and
+remains effective on high-dimensional embeddings.
+I. INTRODUCTION
+Approximate nearest neighbor search (ANNS) has become
+a key primitive in modern data-intensive systems, including
+retrieval-augmented generation (RAG) [20], [28], [33], vector
+databases [18], [50], [59], recommendation systems [9], [55],
+and large-scale semantic retrieval [43], [45], [54]. Existing
+ANNS methods are commonly grouped into cluster-based,
+graph-based, and hashing-based families [1], [4], [51]. Among
+them, cluster-based methods are widely used in billion-scale
+and production systems, most commonly in the form of
+inverted-file (IVF) indexes, due to their compact index struc-
+tures, controllable search cost, and sequential, highly parallel
+scan patterns [24], [25], [50]. At large scale, however, cluster-
+based ANNS spends substantial time scanning IVF lists,
+placing heavy pressure on memory bandwidth and expos-
+ing the von Neumann bottleneck [6], [8], [36], [52], [53].
+Processing-in-memory (PIM) therefore offers a promising way
+to accelerate large-scale cluster-based ANNS by executing this
+scan close to data [17], [21], [40].
+TABLE I
+PIVOT AT A GLANCE.
+Existing PIM ANNS
+PIVOT
+Evaluation
+Kernel
+Mismatch
+– FP/MUL-heavy
+– LUT-dependent
++ Bitwise-dominated
++ LUT-free
+Search
+Paradigm
+Mismatch
+– Distributed top-k
+– Replicated state
+– Synchronization
++ Cooperative filtering
++ Ranking-state-free
++ Independent per-PU filtering
+Commodity PIM systems place many lightweight process-
+ing units (PUs) close to memory, reducing data movement
+and providing high aggregate memory bandwidth [10], [21],
+[29], [30]. Their architecture, however, differs substantially
+from that of CPUs. Because compute logic must coexist with
+dense memory arrays under stringent area, power, thermal,
+and timing constraints, commodity PIM typically integrates
+simple memory-side cores with modest arithmetic capability
+and limited local working memory for runtime state and
+buffering. PUs also operate independently, with no shared
+memory or direct inter-PU communication, making global
+synchronization and distributed state management costly [10],
+[21]. These characteristics limit the effectiveness of directly
+transplanting CPU-oriented workflows. Fully exploiting PIM
+therefore requires a PIM-native execution path that keeps
+query-global control on the CPU and maps arithmetic-light,
+state-light, and independently executable work to the PUs.
+Existing PIM-based ANNS systems have demonstrated the
+potential of memory-side acceleration for large-scale vector
+search [6], [8], [36], [52]. These systems adapt conventional
+IVF-based cluster-search pipelines to PIM through PIM-
+specific designs for data placement, query scheduling, and
+resource management. However, their vector-scanning and
+candidate-selection workflow still retains two CPU-oriented
+design choices that are poorly matched to commodity PIM
+architectures, as summarized in Table I and examined in
+Section III. First, distance evaluation often relies on floating-
+point or multiplication-intensive computation and, in PQ-based
+designs, query-dependent lookup tables, consuming substantial
+processing cycles and local-memory capacity. Second, candi-
+date selection retains a top-k ranking paradigm designed for
+shared-memory CPUs, where ranking state can be efficiently
+managed in shared memory. On PIM, however, distributing
+a query across isolated PUs decomposes the global ranking
+into replicated local top-k buffers with synchronized updates,
+causing ranking state and partial-result traffic to grow with the
+1
+arXiv:2611.27010v1  [cs.AR]  20 Nov 2026
+
+
+number of participating PUs.
+These observations lead us to rethink ANNS execution on
+commodity PIM. We argue that a PIM-native ANNS pipeline
+should follow two principles. First, the PIM-side distance-
+evaluation kernel should favor arithmetic-light, PIM-native
+operations and compact runtime state. Second, candidate se-
+lection should replace distributed top-k ranking with a query-
+specific threshold that enables stateless, independent filtering
+across PUs. Realizing these principles requires careful CPU–
+PIM work partitioning according to the strengths of each side.
+Based on these principles, we propose PIVOT, a PIM-
+native Vector search system with cOoperative filTering. For
+PIM-native distance evaluation, PIVOT builds on RaBitQ-
+style binary quantization and redesigns the corresponding
+distance-evaluation kernel with centered query quantization
+and reduced-precision FastFloat reconstruction, yielding a
+LUT-free calculation dominated by PIM-native bitwise and
+integer operations [13], [15], [16]. To eliminate distributed
+top-k ranking, PIVOT replaces ranking with threshold-guided
+cooperative filtering. Specifically, PIVOT introduces a query-
+aware threshold estimator that combines per-cluster residual
+statistics with query-to-centroid distances to derive a conserva-
+tive query-specific radius τ and estimate the expected survivor
+contribution of each probed cluster. Using these estimates, the
+CPU first suppresses low-yield clusters before dispatch. The
+PUs then stream PIM-resident compact codes, independently
+reject candidates whose squared-distance lower bounds exceed
+τ 2, and return only survivor identifiers for CPU reranking.
+PIVOT further pipelines consecutive query batches, overlap-
+ping CPU-side routing, threshold estimation, and reranking
+with PIM-side filtering. Together, these mechanisms address
+the two architectural mismatches while keeping the PIM-side
+hot path arithmetic-light, state-light, and streaming-oriented.
+This paper makes the following contributions:
+• We identify two architectural mismatches in exist-
+ing PIM-based cluster search: arithmetic-heavy, LUT-
+dependent distance evaluation, and distributed top-k rank-
+ing with synchronization, replicated state, and communi-
+cation overhead (Section III).
+• We propose PIVOT, a PIM-native ANNS system with
+cooperative filtering. It combines a PIM-native lower-
+bound evaluation kernel with a query-aware threshold
+estimator to enable cooperative CPU-side cluster filtering
+and independent PIM-side vector filtering (Section IV).
+• We implement PIVOT on UPMEM with configuration-
+specialized PIM kernels and pipelined CPU–PIM execu-
+tion (Section V).
+• We evaluate PIVOT on billion-scale datasets. Unlike
+prior PIM systems whose PQ and local top-k designs
+limit scalability toward practical high-recall operation,
+PIVOT consistently delivers a stronger throughput–recall
+tradeoff, with its throughput advantage widening as recall
+increases. It achieves up to 18.8× and 10.2× the QPS
+of the CPU and PIM baselines, respectively, making
+commodity PIM more practical for real-world ANNS
+workloads (Section VI).
+PIM DIMMs
+CPU
+PIM
+Module
+PIM
+Module
+PIM
+Module
+Main Memory
+(DDR)
+DPU
+DMA
+WRAM
+(64KB)
+IRAM
+(24KB)
+MRAM (DRAM)
+(64MB)
+Fig. 1. A representative commodity PIM architecture: UPMEM PIM.
+II. BACKGROUND
+A. Commodity PIM Architecture
+Commodity PIM systems integrate many lightweight pro-
+cessing units (PUs) close to DRAM banks to reduce off-
+chip data movement and provide high aggregate memory
+bandwidth [10], [29], [30]. UPMEM PIM [10], illustrated in
+Figure 1, is the first publicly available programmable com-
+modity DRAM-PIM system and the hardware substrate used
+by most prior real-hardware PIM-based ANNS systems [6],
+[8], [36], [52]. We therefore use UPMEM as a representative
+evaluation platform, while our design principles target broader
+commodity-PIM architectural tradeoffs and extend beyond this
+specific platform.
+A UPMEM-enabled system consists of a host CPU and
+multiple PIM DIMMs connected through standard memory
+channels. Each PIM DIMM integrates many DRAM Pro-
+cessing Units (DPUs), each operating on a private 64 MB
+DRAM bank referred to as MRAM. A DPU also contains a
+lightweight in-order processor, 64 KB of software-managed
+scratchpad memory (WRAM) for local state and buffering,
+and 24 KB of instruction memory (IRAM). Multiple tasklets
+share the DPU pipeline and WRAM, with their execution
+interleaved to improve pipeline utilization and hide memory-
+access latency [10], [21], [22].
+Because compute logic must coexist with dense memory
+arrays under tight area, power, thermal, and timing budgets,
+commodity PIM trades per-core complexity, fast local storage,
+and communication flexibility for large-scale memory-side
+parallelism [29], [30], [39]. These tradeoffs directly shape the
+PIM programming model:
+Modest arithmetic capability: Complex arithmetic units
+consume additional area and power, so memory-side cores
+favor relatively simple instruction sets. On UPMEM, inte-
+ger addition, bitwise operations, and shifts are efficiently
+supported, whereas floating-point operations are emulated in
+software and full-width multiplication and division require
+longer instruction sequences [21], [47]. Kernels dominated
+by floating-point or multiplication-intensive computation can
+therefore quickly exhaust DPU arithmetic throughput [44].
+Limited local runtime memory: SRAM is substantially
+less dense than DRAM and becomes costly when replicated
+across many memory-side cores. Commodity PIM therefore
+provides only a small amount of fast local memory, such
+as WRAM on UPMEM. Data processed by a DPU must be
+explicitly transferred between MRAM and WRAM through
+DMA operations [10], [22]. WRAM is shared by all tasklets
+2
+
+
+and must accommodate tasklet stacks, temporary buffers, and
+runtime state. Large lookup tables or replicated per-tasklet
+buffers can therefore exhaust WRAM, reducing tasklet con-
+currency and limiting supported workload configurations [8],
+[11], [21].
+Restricted communication and coordination: Providing
+coherent shared memory or direct communication among
+thousands of memory-side cores would incur substantial hard-
+ware overhead [41]. Consequently, different DPUs do not
+share memory or communicate directly. Global reductions,
+shared-state updates, and inter-DPU data exchange must be
+mediated by the host CPU through explicit transfers [26].
+Within a DPU, UPMEM supports synchronization among
+tasklets, although frequent synchronization can reduce tasklet-
+level parallelism [21], [47].
+These characteristics create a programming model substan-
+tially different from conventional CPU execution. Efficient
+commodity-PIM execution therefore requires rethinking appli-
+cation workflows and the CPU–PIM boundary, keeping global
+control and coordination on the CPU while structuring PIM-
+side execution around streaming, arithmetic-light, and low-
+state kernels [26].
+B. Cluster-Based ANNS
+Given a query vector q, top-k ANNS seeks to return
+the k database vectors closest to q. Cluster-based methods
+commonly organize the search using an IVF index [24],
+[25]. During indexing, database vectors are partitioned into
+nlist clusters, typically using k-means, and each cluster is
+represented by a centroid and an inverted list. The vectors
+are typically encoded into quantized representations to re-
+duce index size and distance-evaluation cost. At query time,
+search typically proceeds in three stages. First, coarse routing
+computes query-to-centroid distances and selects the nearest
+nprobe lists. Second, vector scanning and candidate selec-
+tion evaluates distances using the quantized representations in
+these lists and retains the closest candidates in a bounded pool.
+Third, because quantization introduces approximation error,
+reranking reevaluates this pool using a more accurate repre-
+sentation, such as a less compressed quantized representation
+or the original full-precision vectors, before returning the final
+results.
+Vector quantization and evaluation kernels: Direct L2
+evaluation over full-precision vectors performs floating-point
+subtraction, multiplication, and accumulation across every di-
+mension. Scalar quantization reduces storage and computation
+costs by mapping each coordinate to a low-precision value,
+such as INT8. To achieve higher compression and faster eval-
+uation, product quantization (PQ) divides each vector into M
+subvectors and encodes each with its nearest codeword [25].
+For each query, PQ constructs query-dependent lookup ta-
+bles and evaluates each vector through M lookups and ac-
+cumulations. Binary quantization methods such as RaBitQ
+further compress vectors into compact bit strings and estimate
+distances mainly through bitwise operations and population
+counts, together with limited auxiliary metadata [15], [16].
+RaBitQ also provides a probabilistic error bound at a specified
+confidence level, enabling a conservative lower bound on the
+true squared Euclidean distance to be derived.
+Top-k candidate selection: Conventional CPU-based IVF
+search follows a score-then-rank workflow. As vector distances
+are evaluated, the system maintains a bounded max-heap
+containing the closest candidates found so far. The heap is
+updated whenever a closer candidate is discovered. Bound-
+based methods such as RaBitQ can use the largest retained
+distance at the heap root as a dynamic pruning threshold.
+If a vector’s distance lower bound exceeds this threshold, it
+cannot enter the candidate pool, allowing further evaluation or
+reranking to be skipped [15], [16]. When reranking is used,
+the system retains more than k candidates, reevaluates them
+using a higher-fidelity representation, and selects the final top-
+k results according to the refined distances.
+C. Existing ANNS Systems on Commodity PIM
+The vector-scanning stage of cluster-based ANNS generates
+substantial memory traffic and exposes abundant parallelism
+across inverted lists and their vectors, making it a natural
+target for commodity PIM. Existing PIM-based ANNS sys-
+tems follow this approach by accelerating the scan stage of
+IVF-based pipelines on memory-side processors [6], [8], [36],
+[52], while retaining query-global operations such as coarse
+routing and final result aggregation on the CPU. These systems
+differ primarily in the representation and kernel used for vector
+evaluation and in how top-k candidate selection is organized.
+UPVSS performs floating-point L2 distance evaluation on
+the PIM side and returns all evaluated vector distances and
+identifiers to the CPU for global top-k selection [36]. Under
+this design, the DPUs serve as parallel distance-evaluation
+engines, while candidate selection remains entirely on the
+host. UpANNS and DRIM-ANN instead use PQ-based vector
+evaluation and perform partial top-k candidate selection within
+the DPUs [6], [8]. UpANNS maintains a private candidate
+heap for each tasklet and aggregates the tasklet-local heaps
+into a DPU-level result. DRIM-ANN maintains a shared DPU-
+level top-k priority queue that is cooperatively updated by
+multiple tasklets. In both systems, the partial candidate sets
+produced by different DPUs are subsequently merged by the
+CPU.
+Existing PIM-based ANNS systems retain the conventional
+score-then-rank workflow. They either return all evaluated
+vector distances for CPU-side top-k selection or maintain
+partial ranking state on the PIM side. Section III examines the
+resulting evaluation–kernel and search–paradigm mismatches
+under the arithmetic, WRAM, communication, and coordina-
+tion constraints of commodity PIM.
+III. INVESTIGATION
+Existing
+PIM-based
+ANNS
+systems
+demonstrate
+that
+cluster-based ANNS can benefit from memory-side execu-
+tion [6], [8], [36]. Their vector-scanning and candidate-
+selection paths, however, preserve the CPU-oriented score-
+3
+
+
+1/4
+1/2
+1
+2
+4
+Operational Intensity (Ops/byte)
+10
+1
+10
+2
+Performance (MOPS)
+INT ADD/BITWISE
+INT MUL
+FP ADD
+FP MUL
+MRAM Bandwidth
+L2
+L2-INT8
+PQ-DA
+PQ-LC
+PQ-INT-DA
+PQ-INT-LC
+RaBitQ
+(a)
+16
+32
+64
+128
+PQ-M
+0
+64
+128
+WRAM Usage (KB)
+Stacks
+Query
+LUT
+Top-k buffers
+Others
+64-KB WRAM
+OOM
+OOM
+OOM
+(b)
+Fig. 2.
+Evaluation–kernel mismatch on commodity PIM. (a) Empirical
+roofline of representative distance-evaluation kernels on PIM DPUs. L2: full-
+precision L2. L2-INT8: INT8 L2. PQ-LC/DA: PQ lookup-table construction
+and distance accumulation. PQ-INT-LC/DA: integer-quantized PQ variants.
+RaBitQ: RaBitQ-style XOR–population-count kernel. (b) WRAM usage of
+PQ execution as the number of subquantizers M increases. The dashed line
+marks the 64 KB WRAM capacity.
+then-rank workflow, exposing two mismatches on commodity
+PIM.
+A. Evaluation–Kernel Mismatch: CPU-Friendly Kernels Are
+Not PIM-Friendly
+The first mismatch arises from the quantization methods and
+corresponding distance-evaluation kernels used during vector
+scanning. CPU-oriented IVF systems typically select quantiza-
+tion methods based on storage efficiency and evaluation speed
+on cache-rich, arithmetic-capable processors. On commodity
+PIM, kernel efficiency also depends on whether its arithmetic
+operations match lightweight memory-side cores and whether
+its query-dependent state fits within limited local memory.
+Figure 2(a) presents an empirical roofline of representative
+distance-evaluation kernels on UPMEM. The x-axis reports
+effective operations per MRAM byte, while the y-axis reports
+effective throughput in millions of operations per second
+(MOPS). The diagonal MRAM-bandwidth roof and horizontal
+throughput ceilings for different DPU operation classes are
+measured on real UPMEM hardware.
+Conventional distance-evaluation kernels fall well below the
+PIM performance roof because their arithmetic requirements
+poorly match lightweight memory-side cores. Full-precision
+L2 performs poorly because floating-point operations are
+emulated in software. INT8 L2 removes floating point but
+remains multiplication-intensive. PQ reduces the bytes scanned
+per vector, but lookup-table construction (PQ-LC) resembles
+dimension-wise L2 evaluation, while floating-point distance
+accumulation (PQ-DA) remains expensive. Integer-quantized
+PQ improves throughput, but still requires multiplication-
+intensive LUT construction and introduces additional quan-
+tization error. In contrast, binary distance evaluation relies
+primarily on bitwise operations and population counts, moving
+execution closer to the performance roof.
+The mismatch also appears in WRAM usage. A PQ lookup
+table with M subquantizers and 2nbits entries per subquantizer
+requires M · 2nbits · sentry bytes, where sentry is the entry
+size. With the common setting nbits = 8 and 32-bit entries,
+the LUT alone occupies 1024M bytes. Figure 2(b) shows that
+8
+32
+128
+nprobe
+10
+3
+10
+4
+10
+5
+10
+6
+10
+7
+Candidates/query
+(a)
+CPU-topk
+Per-DPU-topk
+Per-tasklet-topk
+No-topk
+8x
+32x
+128x
+128x
+512x
+2048x
+488x
+1953x
+7813x
+100 500 1K 2K
+100 500 1K 2K
+k
+0
+100
+200
+300
+400
+WRAM Usage (KB)
+(b)
+Stacks
+Query
+LUT
+Top-k buffers
+Others
+64-KB WRAM
+OOM
+OOM OOM
+OOM
+OOM
+OOM
+Per-DPU
+Per-tasklet
+Fig. 3. Search–paradigm mismatch on commodity PIM. (a) Returned can-
+didates per query under different selection methods. Labels show amplification
+relative to CPU-global top-k. (b) WRAM usage of per-DPU and per-tasklet
+top-k as k increases. The dashed line marks the 64 KB WRAM capacity.
+LUTs dominate the WRAM footprint and grow linearly with
+M. Total WRAM usage approaches UPMEM’s 64 KB capacity
+at M = 16 and exceeds it from M = 32. Because larger
+M is often required for high-dimensional vectors and higher
+accuracy, PQ creates a direct tension between search accuracy
+and WRAM capacity.
+These results show that the vector representation and its
+complete distance-evaluation path must be designed jointly for
+commodity PIM. Binary quantization avoids query-dependent
+LUTs and enables a bitwise scan kernel that better matches
+DPU arithmetic and local-memory constraints.
+B. Search–Paradigm Mismatch: Distributed Top-k Selection
+Is Not PIM-Friendly
+The second mismatch stems from the stateful nature of top-
+k candidate selection. On CPUs, worker threads share memory
+and can efficiently manage ranking state for the current top-
+k candidates. On commodity PIM, exploiting thousands of
+isolated DPUs requires distributing each query’s scan across
+DPUs, with multiple tasklets processing vectors within each
+DPU. Because DPUs neither share memory nor communicate
+directly, PIM-side top-k selection must be decomposed into
+local rankings across DPUs or tasklets, followed by host-side
+aggregation. We refer to this paradigm as PIM-side distributed
+top-k.
+Per-DPU top-k, as used by DRIM-ANN [6], maintains one
+shared heap in each participating DPU. Across P DPUs, these
+heaps collectively retain up to P ·k candidates for CPU aggre-
+gation. As shown in Figure 3(a), this produces substantially
+more output than CPU-global top-k. Multiple tasklets within
+each DPU must also synchronize when updating the shared
+heap, introducing serialized accesses into the scan hot loop.
+Per-tasklet top-k, as used by UpANNS [8], assigns each
+tasklet a private heap to avoid shared-heap synchronization.
+With T tasklets per DPU, the retained capacity grows to P ·
+T · k, amplifying candidate output while increasing WRAM
+usage, PIM–CPU transfer, and CPU-side merge work.
+Figure 3(b) shows that both organizations quickly exhaust
+local memory as k increases. The per-DPU design exceeds
+UPMEM’s 64 KB WRAM capacity at k = 1000, while the
+per-tasklet design exceeds it at k = 100 because ranking state
+4
+
+
+is replicated across tasklets. This leaves insufficient space for
+lookup tables, stacks, DMA buffers, and other runtime data,
+limiting the supported k and workload configurations.
+An alternative is to omit PIM-side top-k selection and
+return the distance of every scanned vector to the CPU, as
+in UPVSS [36]. This eliminates PIM-side ranking state and
+synchronization but transfers excessive data. Figure 3(a) shows
+that the returned candidate count grows rapidly with nprobe,
+reaching up to 7813× that of CPU-global top-k. The resulting
+PIM–CPU transfer and CPU-side selection overhead can offset
+the benefits of memory-side scanning.
+Distributed top-k also loses the globally updated prun-
+ing threshold available in shared-memory CPU execution. In
+lower-bound methods such as RaBitQ, the largest distance
+in the current heap serves as a dynamic cutoff, allowing
+vectors whose lower bounds exceed it to be discarded early.
+Under PIM-side distributed top-k, each DPU observes only its
+local ranking state, while maintaining a global cutoff would
+require repeated host-mediated communication during scan-
+ning. When all distances are returned to the CPU, the global
+cutoff becomes available only after scanning and transfer are
+complete. Neither organization therefore provides a timely
+global cutoff for effective lower-bound pruning on PIM.
+PIM-side distributed top-k incurs synchronization, repli-
+cated ranking state, and candidate-output amplification, while
+host-side global top-k incurs excessive communication and
+CPU-side selection overhead. These limitations motivate inde-
+pendent threshold-guided filtering on PIM, with global ranking
+performed only over surviving candidates on the CPU.
+IV. PIVOT DESIGN
+A. Design Principles
+Section III identifies an evaluation–kernel mismatch and a
+search–paradigm mismatch when CPU-oriented ANNS work-
+flows are mapped onto commodity PIM. PIVOT follows three
+design principles to address these mismatches.
+PIM-native distance-evaluation kernel: The evaluation–
+kernel mismatch shows that PIM-side distance evaluation
+should be arithmetic-light and state-light. PIVOT recasts dis-
+tance evaluation around RaBitQ-style binary quantization,
+enabling LUT-free computation dominated by XOR and
+population-count operations [15], [16]. It further uses cen-
+tered query quantization to reduce binary-side arithmetic and
+introduces reduced-precision FastFloat to accelerate auxiliary
+floating-point reconstruction. Together, these choices yield a
+PIM-native lower-bound evaluation kernel whose per-vector
+path is dominated by PIM-native operations (Section IV-C).
+Cooperative filtering instead of distributed top-k: The
+search–paradigm mismatch shows that PIM-side distributed
+top-k incurs synchronization, replicated ranking state, and
+candidate-output amplification. PIVOT instead derives a
+query-specific radius τ(q) that enables independent, ranking-
+state-free filtering across DPUs. Through threshold-guided
+cooperative filtering, the CPU filters low-yield clusters before
+dispatch, while each DPU independently rejects vectors whose
+squared-distance lower bounds exceed τ 2(q) and returns only
+survivor identifiers to the CPU for reranking (Section IV-D).
+CPU–PIM work partitioning and pipelined execution:
+PIVOT partitions work according to each side’s strengths.
+Query-global control, threshold estimation, cluster filtering,
+scheduling, and final reranking remain on the CPU, while the
+DPUs perform bulk vector scanning and lower-bound filtering.
+Consecutive query batches are pipelined so that CPU-side
+preparation and reranking overlap with PIM-side filtering.
+B. End-to-End Workflow
+Figure 4 presents the end-to-end workflow of PIVOT.
+Offline indexing phase: PIVOT constructs an IVF index
+with multi-bit RaBitQ codes following the original indexing
+procedure [15], [16]. Each vector contains a 1-bit base code
+for PIM-side lower-bound filtering and refinement bits for
+CPU reranking. For each cluster, PIVOT builds a residual-
+norm histogram for survivor-mass estimation and calibrates
+the threshold estimator using a small held-out query set.
+Sampled database vectors can serve as surrogate calibration
+queries when query traces are unavailable. The 1-bit codes and
+auxiliary factors are placed in PIM, while the complete multi-
+bit codes remain in host memory. Configuration-specialized
+DPU kernels are generated according to the dataset and index
+configuration and loaded before online execution. Section V
+further describes the data layout and kernel specialization.
+Online search phase: Queries are processed in batches.
+❶The CPU performs IVF coarse routing and selects nprobe
+clusters. ❷The calibrated survivor-mass estimator derives a
+query-specific radius τ(q) and estimates the contribution of
+each selected cluster. ❸Clusters with negligible expected
+survivor mass are removed before dispatch. ❹The CPU
+packages the query metadata and squared threshold τ 2(q) and
+dispatches the remaining work to the resident DPUs. ❺Each
+DPU applies the PIM-native lower-bound calculation to its
+local 1-bit codes and filters vectors against τ 2(q). ❻The
+DPUs return survivor identifiers, which the CPU reranks using
+the complete multi-bit codes before selecting the final top-k
+results. Consecutive batches are pipelined to overlap CPU-
+side routing, threshold estimation, and reranking with PIM-
+side filtering.
+C. PIM-Native Distance-Evaluation Kernel
+RaBitQ-style binary quantization represents each database
+vector with a 1-bit code and derives a probabilistic squared-
+distance lower bound in two steps [15], [16]. It first computes
+an integer similarity term from the binary database code and
+quantized query, and then combines this term with per-vector
+and query–cluster auxiliary factors to reconstruct a squared-
+distance estimate and its probabilistic error bound. The binary
+calculation is well suited to PIM because it is LUT-free
+and dominated by bitwise operations. Directly mapping the
+complete distance path to a DPU, however, still requires a per-
+code population count and software-emulated floating-point
+reconstruction.
+5
+
+
+Dataset
+CPU
+PIM
+MRAM
+DPU Vector Filtering
+IDs
+Residual
+Statistics
+Threshold
+Calibration
+IVF Index
+Load
+Refine. Codes
+Coarse Routing
+1-bit Codes
+01
+1
+2
+3
+k
+Kernel Generation
+RaBitQ Codes
+Offline
+Online
+1 0 0 1 1 0
+1 0 0 1
+1 0 0 0 1 1
+1 0 0 1 1 0
+❶
+Estimate 
+❷
+Cluster Filtering
+❸
+❹
+❺
+Top-k Reranking
+❻
+Selected clusters
+Encoded
+POPCNT
+XOR
+MRAM
+IDs
+1 0 0 1
+POP
+Fig. 4. PIVOT end-to-end workflow.
+To
+reduce
+binary-side
+arithmetic,
+PIVOT
+adopts
+the
+centered-query formulation implemented in FAISS [13], which
+quantizes the query around zero. This formulation eliminates
+the separate population count over each database code and
+computes the integer similarity term using weighted XOR–
+population-count operations and integer accumulation. The
+resulting value I(q, x) is then used to reconstruct the squared-
+distance lower bound:
+LB2(q, x) = ax + ρ2
+j −bxI(q, x)sq,j −ρjex,
+where ax, bx, and ex are per-vector factors, ρj = ∥q−cj∥2, and
+sq,j is the centered-query scale. At the configured confidence
+level, LB2(q, x) lower-bounds ∥q −x∥2
+2.
+Evaluating this expression with UPMEM’s general-purpose
+software-emulated floating-point routines for every vector re-
+mains expensive [21], [47]. PIVOT therefore introduces a
+reduced-precision FastFloat path specialized to lower-bound
+reconstruction. FastFloat represents each operand using its
+sign, exponent, and a compile-time-configured reduced-width
+significand. It performs exponent alignment, significand arith-
+metic, and result normalization using integer and bitwise op-
+erations. It fuses bxI(q, x)sq,j into a single reduced-precision
+operation, avoiding intermediate conversion and normaliza-
+tion. The resulting kernel combines centered XOR–population-
+count calculation with specialized FastFloat reconstruction,
+removing general software floating point from the per-vector
+path. Section VI-D evaluates the performance and accuracy
+impact of FastFloat.
+D. Threshold-Guided Cooperative Filtering
+The PIM-native kernel produces per-vector lower bounds,
+but using them across isolated DPUs requires a query-specific
+threshold before scanning and a filtering workflow that avoids
+distributed ranking state. PIVOT solves these challenges
+through threshold-guided cooperative filtering. The following
+describes (1) how PIVOT generates the threshold and (2) how
+it uses the threshold for CPU–PIM cooperative filtering.
+(1) Query-specific threshold generation: PIVOT estimates
+the smallest radius expected to contain the final top-k vectors
+and calibrates it against modeling error.
+Per-cluster residual statistics: Let Cj denote an IVF cluster
+with centroid cj. For each vector x ∈Cj, define its residual
+as zx = x −cj and its residual norm as sx = ∥zx∥2. During
+indexing, PIVOT summarizes these norms using an Nh-bin
+histogram
+Hj = {(sj,b, wj,b)}Nh
+b=1 ,
+where sj,b is the mean residual norm in bin b and wj,b is the
+fraction of cluster vectors assigned to that bin. Because cluster
+populations and residual norms are already available from the
+IVF–RaBitQ index, the estimator adds only Nh entries per
+cluster and no per-vector metadata.
+Query-conditioned survivor mass: For query q and probed
+cluster Cj, define uj = q −cj and ρj = ∥uj∥2. A vector with
+residual norm s has squared query distance
+∥x −q∥2
+2 = s2 + ρ2
+j −2sρj cos θ,
+where θ is the angle between zx and uj. Thus, for fixed s and
+ρj, whether the vector lies within radius r depends on their
+angular alignment.
+PIVOT approximates residual directions within each his-
+togram bin as isotropic. Under this approximation, the
+high-dimensional angular term satisfies
+√
+D cos θ
+approx.
+∼
+N(0, 1) [46]. Let Φ(·) denote the upper-tail probability of
+the standard normal distribution. The estimated fraction and
+expected number of vectors in Cj within radius r are
+bGj(q, r) =
+Nh
+X
+b=1
+wj,b Φ
+ 
+√
+D
+s2
+j,b + ρ2
+j −r2
+2sj,bρj
+!
+,
+Mj(q, r) = |Cj| bGj(q, r).
+Raw threshold selection: Let P(q) denote the clusters
+selected by coarse routing. The expected total survivor mass
+within radius r is
+bΛ(q, r) =
+X
+Cj∈P(q)
+Mj(q, r).
+PIVOT selects the smallest radius expected to contain k
+vectors:
+τ0(q) = inf
+n
+r | bΛ(q, r) ≥k
+o
+.
+6
+
+
+Because bΛ(q, r) increases monotonically with r, τ0(q) can be
+found efficiently through binary search.
+Conservative threshold calibration: An overly large radius
+retains excess vectors, increasing PIM output and CPU rerank-
+ing work, while an insufficient radius may exclude vectors
+needed for the final top-k result. The isotropic approximation
+is intentionally lightweight and can introduce modeling error,
+so PIVOT calibrates τ0(q) using a small offline query set. For
+each calibration query qi, let Rk(qi) denote the exact distance
+to the kth closest vector among the same probed IVF lists.
+PIVOT selects a multiplicative correction factor βϵ such that
+Pr
+qi∈Qcal [Rk(qi) > βϵτ0(qi)] ≤ϵ,
+τ(q) = βϵτ0(q).
+A smaller ϵ produces a more conservative threshold and
+retains more survivors. A larger ϵ reduces PIM output while
+increasing the risk of excluding vectors needed for the final
+top-k result. Section VI-E evaluates this tradeoff.
+(2) CPU–PIM cooperative filtering: The calibrated thresh-
+old τ(q) enables independent per-vector filtering on the DPUs.
+The survivor-mass model additionally uses this threshold to
+identify low-yield clusters, allowing the CPU to suppress them
+before dispatch.
+CPU cluster-level filtering: For each cluster Cj selected by
+IVF coarse routing, the CPU evaluates Mj(q, τ(q)), the ex-
+pected number of vectors within the calibrated radius, and dis-
+patches the cluster only if Mj(q, τ(q)) ≥µmin. Because sur-
+vivor mass is estimated, µmin is calibrated for each supported
+nprobe range so that Recall@k(µmin) ≥Recall@k(0) −δ,
+where δ is the maximum allowed absolute recall loss from
+cluster filtering. Section VI-E evaluates the tradeoff controlled
+by δ. Compared with directly reducing nprobe, which en-
+forces a smaller fixed probe count and discards later-ranked
+clusters solely by query-to-centroid distance, PIVOT evaluates
+every probed cluster using query-conditioned survivor mass.
+It adaptively suppresses low-yield clusters while preserving
+those likely to contribute useful survivors.
+PIM vector-level filtering: The CPU dispatches each admit-
+ted list to its resident DPU together with the encoded query,
+squared threshold τ 2(q), and the factors required by the lower-
+bound calculation. Within each DPU, tasklets divide the local
+lists into disjoint portions and process them in parallel. For
+each vector x, the PIM-native kernel in Section IV-C computes
+LB2(q, x). The DPU emits the vector identifier only if
+LB2(q, x) ≤τ 2(q).
+These independent decisions require no query-dependent LUT,
+ranking buffer, or per-vector ranking synchronization.
+After filtering, the CPU gathers survivors from all DPUs and
+reevaluates them using full multi-bit RaBitQ codes. It inserts
+the refined candidates into a CPU top-k heap to obtain the
+final ordering.
+Algorithm 1 summarizes the online procedure. Across
+consecutive batches, CPU-side routing, threshold estimation,
+cluster filtering, and reranking overlap with PIM-side vector
+filtering. Section V describes this pipelined CPU–PIM execu-
+tion in detail.
+Algorithm 1 PIVOT cooperative query processing
+1: procedure SEARCHBATCH(Q, nprobe, k)
+▷CPU: threshold and cluster filtering
+2:
+{Jq}q∈Q ←COARSESEARCH(Q, nprobe)
+3:
+for all q ∈Q do
+4:
+τq ←CALIBRATEDTHRESHOLD(q, Jq, {Hj}, k)
+5:
+Aq ←∅
+6:
+for all j ∈Jq do
+7:
+mj ←SURVIVORMASS(q, Cj, Hj, τq)
+8:
+if mj ≥µmin then
+9:
+Aq ←Aq ∪{j}
+10:
+end if
+11:
+end for
+12:
+DISPATCH(q, Aq, τ 2
+q )
+13:
+end for
+▷PIM: independent vector filtering
+14:
+for all (q, j, τ 2
+q ) dispatched in parallel do
+15:
+for all xi ∈Cj do
+16:
+d2
+i ←RABITQLOWERBOUND(q, xi)
+17:
+if d2
+i ≤τ 2
+q then
+18:
+EMITSURVIVOR(q, i)
+19:
+end if
+20:
+end for
+21:
+end for
+▷CPU: survivor reranking
+22:
+for all q ∈Q do
+23:
+Sq ←GATHERSURVIVORS(q)
+24:
+Rq ←RERANK(q, Sq, k)
+25:
+end for
+26:
+return {Rq}q∈Q
+27: end procedure
+V. IMPLEMENTATION
+We implement PIVOT in C++ on top of FAISS’s IVF–
+RaBitQ index [12] and the UPMEM SDK [48]. We first
+describe the PIM data path and scheduling, followed by
+two execution optimizations: configuration-specialized DPU
+kernels and pipelined CPU–PIM execution.
+A. PIM Data Path and Work Scheduling
+PIVOT adopts the list-slicing and hot-list replication strate-
+gies used by prior PIM-based ANNS systems [6], [8], [52].
+Large IVF lists are divided into contiguous slices and dis-
+tributed across DPUs, while frequently accessed lists are
+replicated so that concurrent queries can use different replicas.
+The CPU retains the IVF–RaBitQ index, residual histograms,
+and placement metadata. Each PIM-resident record stores the
+vector identifier, 1-bit base code, and lower-bound factors
+contiguously in MRAM. For each query–cluster pair that
+survives cluster filtering, the CPU computes the query residual
+and encoded query once and packages them with τ 2(q) and
+the auxiliary query factors into DPU work records. Each
+work item is assigned to a DPU containing the corresponding
+slice. When multiple replicas are available, PIVOT selects the
+resident DPU with the lowest assigned scan volume in the
+current batch. Within each DPU, tasklets divide the scheduled
+slices into disjoint portions for parallel scanning.
+Each tasklet accumulates survivor identifiers in a private
+DMA-sized WRAM buffer. When the buffer fills, the tasklet
+briefly synchronizes to reserve space in a DPU-wide MRAM
+output region and flushes the identifiers in one DMA transfer.
+7
+
+
+CPU Prepare
+CPU Rerank
+PIM Filtering
+B1
+B3
+B4
+B1
+B2
+B2
+B3
+B4
+Batch 2
+Batch 3
+Batch 4
+Batch 1
+Fig. 5. Pipelined CPU–PIM execution.
+After filtering, the host retrieves only populated output regions
+through scatter–gather transfers [48] and groups the identifiers
+by query for CPU-side multi-bit reranking. This keeps syn-
+chronization outside the per-vector hot path and transfers only
+surviving candidates.
+B. Configuration-Specialized DPU Kernel
+A generic DPU kernel must support different vector di-
+mensions, qb values, tasklet counts, and buffer configurations
+at runtime. This introduces configuration-dependent branches
+and generic loops into the scan hot path. Runtime-sized buffers
+also require dynamic WRAM allocation on each kernel launch,
+while PIM-side dynamic allocation incurs substantial over-
+head and tasklet contention [31]. Conservative maximum-sized
+buffers avoid allocation but waste scarce WRAM and limit
+tasklet concurrency. Runtime-dependent loop bounds further
+prevent the compiler from fully optimizing and unrolling the
+distance-calculation path.
+Because these parameters are fixed once the index and
+configuration are known, PIVOT generates a specialized DPU
+binary during index preparation. The generator specializes the
+vector dimension, qb, tasklet count, DMA size, output-buffer
+size, and FastFloat significand width. It statically allocates
+tasklet-local buffers, providing a predictable WRAM foot-
+print and more effective WRAM utilization. It also removes
+configuration branches, fixes loop bounds, emits an unrolled
+XOR–population-count path, and inlines the fused FastFloat
+product into the lower-bound calculation. These choices reduce
+allocation and control-flow overhead while exposing a straight-
+line scan path that better sustains DPU pipeline utilization.
+Generated binaries are compiled once, cached, and reused for
+all searches with the same configuration.
+C. Pipelined CPU–PIM Execution
+A synchronous schedule serializes CPU preparation, PIM
+filtering, survivor retrieval, and CPU reranking, leaving either
+the CPU or DPUs idle. PIVOT instead pipelines consecutive
+query batches, as illustrated in Figure 5. While the DPUs
+filter batch i, the CPU prepares batch i + 1—including coarse
+routing, survivor-mass estimation, cluster filtering, scheduling,
+and query encoding—and reranks the survivors from batch
+i−1. Once filtering of batch i completes, the host retrieves its
+survivor identifiers and immediately launches batch i+1. The
+CPU then parses and reranks batch i while the DPUs filter
+batch i + 1, sustaining overlap across steady-state execution.
+VI. EVALUATION
+A. Experimental Setup
+a) Testbed: We conduct all experiments on a dual-socket
+server with two Intel Xeon Silver 4216 CPUs at 2.10 GHz,
+251 GiB of DDR4 memory, and 20 UPMEM DIMMs con-
+taining 2,543 operational DPUs at 400 MHz. The server runs
+TABLE II
+DATASET CHARACTERISTICS.
+Dataset
+Vectors
+Queries
+Dim.
+Type
+DEEP1B
+1B
+9,000
+96
+float32
+SIFT1B
+1B
+9,000
+128
+uint8
+MS MARCO10M
+10M
+1,000
+1,024
+float32
+Ubuntu 22.04.5 and UPMEM SDK 2025.1.0. Host and DPU
+code are compiled with GCC 11.4 and UPMEM Clang 12,
+respectively, using -O3. FAISS is built with AVX-512 and
+Intel MKL enabled.
+b) Datasets:
+Following prior PIM ANNS work [6],
+we evaluate PIVOT on the billion-scale SIFT1B [25] and
+DEEP1B [2] datasets. Each dataset provides 10,000 queries.
+We reserve 1,000 queries for calibration and use the remaining
+9,000 for evaluation. We additionally use MS MARCO10M,
+a subset of MS MARCO [3], to evaluate high-dimensional
+performance. Parameter sweeps and hardware-scaling experi-
+ments use a 100M subset of DEEP1B, denoted DEEP100M.
+c) Baselines:
+• FAISS-IVF-RaBitQ is a CPU implementation of IVF–
+RaBitQ by FAISS [12]. It uses the same index and multi-
+bit reranking path as PIVOT.
+• DRIM-ANN [6] is a prior PIM-based IVFPQ system. We
+adapt its open-source implementation and use its original
+PQ-M = 16 configuration with INT8 inputs.
+• DRIM-ANN-Rerank extends DRIM-ANN with CPU-
+side reranking for a fairer high-recall comparison. We
+set each DPU’s local top-k capacity to 500, the largest
+that fits within its 64 KB WRAM. The CPU reranks the
+retained candidates to produce the final top-k results, with
+this cost included in end-to-end latency.
+We compare against DRIM-ANN [6], the state-of-the-art
+commodity-PIM ANNS system. UPVSS [36] cannot execute
+at the 1B-vector scale because its 384–512 GB full-precision
+index exceeds PIM capacity. We exclude UpANNS [8] because
+it uses a similar IVFPQ design, is reported to underperform
+DRIM-ANN, and its per-tasklet top-k exceeds DPU WRAM
+at k = 500. PIMANN [52] focuses on optimizing per-core
+scheduling and is orthogonal to our work, as discussed in
+Section VII.
+d) Metrics and methodology: We report Recall@k and
+end-to-end throughput in queries per second (QPS). End-to-
+end time includes online CPU computation, PIM execution,
+and CPU–PIM transfers. Index construction, calibration, ker-
+nel compilation, and initial database loading are offline and
+excluded. Unless otherwise stated, PIVOT uses a batch size
+of 1,000, k = 100, query quantization width qb = 4, multi-
+bit code width nb = 8, ϵ = 0.01, δ = 0.002, Nh = 64,
+and seven FastFloat fraction bits. PIVOT and DRIM-ANN use
+comparable list-slicing and replication configurations.
+B. End-to-End Performance
+Figure 6 compares the end-to-end throughput–recall tradeoff
+of PIVOT with the CPU and PIM baselines. Across both
+datasets and all nlist settings, PIVOT consistently sustains
+8
+
+
+0.7
+0.8
+0.9
+1.0
+10
+1
+10
+2
+10
+3
+(a) DEEP1B, nlist=4096
+0.7
+0.8
+0.9
+1.0
+(b) DEEP1B, nlist=8192
+0.7
+0.8
+0.9
+1.0
+(c) DEEP1B, nlist=16384
+0.7
+0.8
+0.9
+1.0
+(d) SIFT1B, nlist=4096
+0.7
+0.8
+0.9
+1.0
+(e) SIFT1B, nlist=8192
+0.7
+0.8
+0.9
+1.0
+(f) SIFT1B, nlist=16384
+0.35
+0.40
+10
+2
+10
+3
+0.36
+0.42
+10
+2
+10
+3
+0.32
+0.40
+10
+2
+10
+3
+0.40
+0.48
+10
+2
+0.40
+0.48
+10
+2
+10
+3
+0.32
+0.40
+0.48
+10
+2
+10
+3
+Recall@100
+QPS
+PIVOT
+FAISS-IVF-RaBitQ
+DRIM-ANN
+DRIM-ANN-Rerank
+Fig. 6. End-to-end throughput–recall tradeoff. Recall@100 and QPS on DEEP1B and SIFT1B across three nlist settings. Each point varies nprobe.
+>0.80
+>0.85
+>0.90
+>0.95
+Minimum Recall@100
+0
+500
+1000
+1500
+Best QPS
+X
+X
+X
+X
+X
+X
+X
+(a) DEEP1B
+5.0x
+10.2x
+5.8x
+7.9x
+14.0x
+>0.80
+>0.85
+>0.90
+>0.95
+Minimum Recall@100
+0
+200
+400
+600
+800
+X
+X
+X
+X
+X
+X
+(b) SIFT1B
+5.1x
+1.9x
+6.1x
+4.8x
+7.5x
+18.8x
+PIVOT
+FAISS-IVF-RaBitQ
+DRIM-ANN-Rerank
+DRIM-ANN
+Fig. 7. Best QPS at minimum Recall@100 targets. Each bar reports the
+highest measured QPS across all nlist and nprobe settings. A cross indicates
+that no measured configuration reaches the target.
+higher QPS, with its advantage widening toward the high-
+recall region. Higher recall requires larger nprobe and exposes
+more vector-scanning work, allowing PIVOT to better exploit
+PIM bandwidth and parallelism. PIVOT and FAISS-IVF-
+RaBitQ reach nearly identical maximum recall, confirming
+that the PIM-native kernel and conservative filtering preserve
+search accuracy.
+DRIM-ANN remains in a substantially lower-recall region
+because its PQ-M
+= 16 configuration is constrained by
+WRAM capacity, leading to greater quantization error. This
+limitation is more pronounced on DEEP1B, where DRIM-
+ANN additionally quantizes the original float32 vectors to
+INT8 for PIM execution. DRIM-ANN-Rerank improves recall,
+but its fixed DPU-local top-500 pool may discard globally use-
+ful candidates before CPU reranking and cannot be enlarged
+due to the WRAM limit. These constraints prevent prior PIM
+systems from reaching practical high-recall operating points,
+whereas PIVOT improves throughput across the curve while
+preserving high recall, making commodity PIM more practical
+for real-world ANNS.
+Figure 7 makes this trend explicit. Compared with FAISS-
+IVF-RaBitQ, PIVOT provides 5.0–5.1× the QPS at Re-
+call@100 above 0.80, with the advantage widening to 14.0–
+18.8× above 0.95. At targets reached by DRIM-ANN-Rerank,
+PIVOT provides up to 10.2× and 4.8× the QPS on DEEP1B
+and SIFT1B, respectively. DRIM-ANN-Rerank does not reach
+targets above 0.85 on DEEP1B or above 0.90 on SIFT1B.
+These results show that combining the PIM-native distance-
+evaluation kernel with cooperative filtering accelerates scan-
+heavy settings while preserving high recall without distributed
+top-k state.
+0
+10M
+20M
+30M
+Vectors/query
+nlist=4096
+nlist=8192
+nlist=16384
+nlist=4096
+nlist=8192
+nlist=16384
+8
+32
+128
+8
+32
+128
+8
+32
+128
+8
+32
+128
+8
+32
+128
+8
+32
+128
+nprobe=
+(a) DEEP1B
+(b) SIFT1B
+−55.4%
+−48.7%
+−38.3%
+−99.7%
+−99.6%
+−99.4%
+−48.3%
+−41.9%
+−39.1%
+−99.6%
+−99.4%
+−99.3%
+All list
+After CPU Filtering
+After PIM Filtering
+Fig. 8.
+Cooperative filtering work reduction. Vectors per query from all
+probed lists, after CPU filtering, and after PIM filtering.
+>0.80
+>0.85
+>0.90
+>0.95
+Minimum Recall@100
+0
+500
+1000
+Best QPS
+X X
+(a) DEEP1B
+−68.9%
+−77.5%
+−16.7%
+>0.80
+>0.85
+>0.90
+>0.95
+Minimum Recall@100
+0
+200
+400
+600
+X
+X
+X
+X
+(b) SIFT1B
+−68.2%
+−79.3%
+−8.9%
+−18.5%
+PIVOT
+w/o CPU Filter
+w/o PIM Filter
+Local Top-k
+Fig. 9.
+Cooperative filtering ablation. “w/o CPU Filter” disables CPU
+cluster filtering. “w/o PIM Filter” replaces PIM vector filtering with fixed per-
+DPU top-500 selection followed by CPU reranking. “Local Top-k” disables
+both filtering stages and uses the same selection and reranking path. A cross
+indicates that the recall target is not reached.
+C. Effectiveness of Cooperative Filtering
+Figure 8 reports the number of vectors remaining after
+each filtering stage. At nprobe = 128, CPU cluster filtering
+removes 38.3–55.4% of probed DEEP1B vectors and 39.1–
+48.3% of probed SIFT1B vectors before dispatch. PIM vector
+filtering then reduces the admitted vectors to a small survivor
+set. Together, the two stages eliminate 99.3–99.7% of the
+initially probed vectors. Cluster filtering reduces DPU scan
+work, while vector filtering reduces PIM–CPU transfer and
+CPU reranking. CPU cluster filtering is more effective at larger
+nprobe and smaller nlist. Larger nprobe introduces more
+marginal clusters, while larger nlist produces finer and shorter
+lists with less low-yield work.
+Figure 9 shows how these work reductions translate into
+end-to-end QPS. At the highest recall target reached by all
+variants, replacing PIM vector filtering with DPU-local top-
+500 lowers QPS by 68.9% on DEEP1B and 68.2% on SIFT1B.
+Disabling both filtering stages lowers QPS by 77.5% and
+79.3%, respectively. CPU cluster filtering contributes more
+as nprobe grows and low-yield clusters enter the probed set.
+9
+
+
+8
+32
+128
+nprobe
+0
+500
+1000
+QPS
+(a) QPS
+0
+20
+40
+Time (s)
+(b)
+−29.8%
+8
+32
+128
+nprobe
+0
+200
+400
+600
+(c) QPS
+0
+20
+40
+60
+(d)
+−37.2%
+DEEP1B, nlist=8192
+SIFT1B, nlist=8192
+PIVOT
+w/o pipeline
+w/o special. kernel
+w/o FastFloat
+CPU Prep
+PIM
+Xfer
+CPU Rerank
+Fig. 10.
+Kernel and execution ablation. QPS at nprobe ∈{8, 32, 128}
+and time breakdowns at nprobe = 128. “w/o pipeline” disables pipelined
+CPU–PIM execution. “w/o special. kernel” uses a generic DPU kernel. “w/o
+FastFloat” uses UPMEM’s software-emulated floating-point routines.
+0
+1e-4
+5e-4
+1e-3
+2e-3
+5e-3
+1e-2
+0.985
+0.990
+Recall@100
+(a) Recall
+0
+1e-4
+5e-4
+1e-3
+2e-3
+5e-3
+1e-2
+0
+10M
+20M
+Vectors/query
+(b) Filtering and QPS
+1.0
+1.2
+1.4
+Normalized QPS
+DEEP100M, nlist=8192, nprobe=2048
+δ
+Recall@100
+Vectors/query
+Recall Target
+Normalized QPS
+Fig. 11.
+CPU cluster-filtering sensitivity. Recall@100, vectors per query,
+and normalized QPS as the recall-loss budget δ increases. The dashed line
+shows the recall target. Setting δ = 0 disables CPU cluster filtering.
+The local top-500 variants fail to reach higher recall because
+WRAM capacity limits each DPU’s candidate pool, restricting
+the candidates available for CPU reranking. These results show
+that both filtering stages are necessary for the throughput and
+recall benefits of cooperative filtering.
+D. Kernel and Execution Optimizations
+Figure 10 evaluates FastFloat, kernel specialization, and
+pipelined CPU–PIM execution. FastFloat accelerates lower-
+bound reconstruction in the PIM-native kernel, improving
+QPS by 2.57–2.75× over general software-emulated floating
+point. Across both datasets and all evaluated nprobe settings,
+it changes Recall@100 by at most 0.07 percentage points,
+indicating negligible impact on search accuracy. The gain is
+slightly larger on 96-dimensional DEEP1B because recon-
+struction accounts for a larger fraction of scan time. Pipelining
+reduces end-to-end time by 29.8% on DEEP1B and 37.2% on
+SIFT1B by overlapping CPU preparation and reranking with
+PIM filtering. Kernel specialization improves QPS by 1.49–
+1.50× by eliminating runtime control flow, generic loops, and
+variable buffer management. Together, these results validate
+FastFloat for the PIM-native kernel and demonstrate the end-
+to-end benefits of specialization and pipelining.
+E. Sensitivity Analysis
+We use DEEP100M with nlist = 8192 and nprobe = 2048
+for parameter sweeps. The smaller database keeps experiments
+tractable, while the large nprobe creates a scan-heavy regime
+representative of billion-scale search. These experiments char-
+acterize trends rather than absolute performance.
+Figure 11 evaluates the recall-loss budget δ. Increasing
+δ permits a more aggressive µmin, filtering more low-yield
+clusters, reducing vectors scheduled for PIM, and increasing
+w/o cal.
+2e-3
+5e-3
+1e-2
+2e-2
+5e-2
+0.986
+0.988
+0.990
+0.992
+Recall@100
+(a) Recall
+w/o cal.
+2e-3
+5e-3
+1e-2
+2e-2
+5e-2
+20K
+30K
+40K
+Vectors/query
+(b) Filtering and QPS
+1.00
+1.02
+1.04
+1.06
+Normalized QPS
+DEEP100M, nlist=8192, nprobe=2048
+ε
+qb=2
+qb=4
+qb=8
+Vectors/query
+Normalized QPS
+Fig. 12. Threshold-calibration sensitivity. Recall@100, survivors per query,
+and normalized QPS under different calibration risks ϵ and query quantization
+widths qb. The leftmost point, “w/o cal.,” uses the uncalibrated threshold.
+>0.70
+>0.80
+>0.90
+>0.70
+>0.80
+>0.90
+>0.70
+>0.80
+>0.90
+Minimum Recall
+0
+1000
+2000
+Best QPS
+X
+X
+k=1
+k=10
+k=100
+4.1x
+2.6x
+5.4x
+2.9x
+7.7x
+4.9x
+4.3x
+2.9x
+5.8x
+3.4x
+9.5x
+4.6x
+4.9x
+2.7x
+7.9x
+10.7x
+DEEP1B, nlist=8192
+PIVOT
+FAISS-IVF-RaBitQ
+DRIM-ANN-Rerank
+Fig. 13. Sensitivity to the top-k setting. Best QPS at minimum Recall@k
+targets for k ∈{1, 10, 100}.
+QPS. Measured recall remains above the configured target
+throughout the sweep, showing that survivor-mass filtering
+provides a predictable accuracy–throughput tradeoff.
+Figure 12 evaluates the calibration risk ϵ and query quan-
+tization width qb. Increasing ϵ produces a less conservative
+threshold, reducing survivors and increasing QPS while grad-
+ually lowering recall. This confirms that ϵ controls the recall–
+reranking-work tradeoff of PIM vector filtering. The qb = 4
+and qb = 8 curves remain close, while qb = 2 is more sensitive
+to threshold calibration. Consistent with RaBitQ’s observation
+that 4-bit query quantization introduces negligible error [16],
+we use qb = 4 by default.
+Figure 13 evaluates different top-k settings. PIVOT con-
+sistently provides the highest QPS across different k, out-
+performing FAISS-IVF-RaBitQ by 4.1–10.7× and DRIM-
+ANN-Rerank by 2.6–4.9× at targets reached by both sys-
+tems. DRIM-ANN-Rerank’s recall degrades as k increases.
+At k = 100, it reaches only the 0.70 recall target because its
+fixed 500-entry DPU-local pool provides limited oversampling
+headroom and cannot be enlarged due to the WRAM limit. In
+contrast, PIVOT maintains high recall without PIM-side top-k
+state that grows with k.
+F. Hardware and Dimensional Scalability
+Figure
+14
+evaluates
+DPU-
+and
+tasklet-level
+scaling.
+Throughput increases steadily with DPU count, showing that
+the PIM-native distance-evaluation kernel scales across dis-
+tributed memory-side processors. Scaling remains sublinear
+because CPU-side stages do not scale with DPU count and
+uneven IVF-list sizes limit load balance. Tasklet throughput
+rises rapidly up to approximately 11 tasklets and then plateaus.
+Since instructions from the same tasklet are dispatched 11 cy-
+cles apart on UPMEM, approximately 11 tasklets are sufficient
+to fill the DPU pipeline [21]. Additional tasklets provide little
+benefit while increasing WRAM pressure.
+10
+
+
+256 512
+1K
+1.5K
+2K
+2.5K
+#DPU
+0
+2
+4
+Normalized QPS
+(a) DPU Scaling
+1 2 3 4 5 6 7 8 9 10111213141516
+#Tasklet
+0.0
+2.5
+5.0
+7.5
+Normalized QPS
+(b) Tasklet Scaling
+DEEP100M, nlist=8192, nprobe=2048
+Fig. 14. Hardware scalability. DPU and tasklet scaling on DEEP100M.
+0.4
+0.6
+0.8
+1.0
+Recall@100
+10
+2
+10
+3
+QPS
+MSMARCO10M, nlist=4096
+PIVOT
+FAISS-IVF-RaBitQ
+DRIM-ANN-Rerank
+DRIM-ANN
+Fig. 15.
+High-dimensional performance. End-to-end throughput–recall
+tradeoff on the 1,024-dimensional MS MARCO10M dataset.
+Figure 15 evaluates PIVOT on high-dimensional embed-
+dings. At low recall, the smaller database and low nprobe
+expose little vector-scanning work, so fixed CPU–PIM prepa-
+ration and transfer costs are not fully amortized, making
+PIVOT slightly slower than FAISS-IVF-RaBitQ. We include
+this region for completeness, while practical deployments
+primarily target higher recall. As recall and nprobe increase,
+vector scanning becomes dominant and PIVOT progressively
+outperforms the CPU baseline, reaching 4.38× the QPS at
+Recall@100 above 0.95. The DRIM-ANN variants remain
+below 0.66 Recall@100 because PQ-M = 16 provides in-
+sufficient quantization granularity for D = 1024. Increasing
+M could improve accuracy, but would enlarge the query-
+dependent LUT and further compete with local top-k state
+for WRAM. These results show that PIVOT remains effective
+as vector dimensionality increases.
+Overall, the results validate PIVOT’s design. The PIM-
+native distance-evaluation kernel and threshold-guided coop-
+erative filtering preserve high recall while avoiding distributed
+top-k state. Configuration-specialized kernels and pipelined
+CPU–PIM execution provide scalable end-to-end performance.
+VII. RELATED WORK
+ANNS on PIM and near-data accelerators: UpANNS [8]
+and DRIM-ANN [6] map IVFPQ search to commercial UP-
+MEM hardware through PIM-aware data placement, schedul-
+ing, and resource management. UpANNS maintains per-tasklet
+candidate heaps, while DRIM-ANN uses a shared DPU-
+local top-k queue. Both retain distributed ranking state and
+query-dependent PQ lookup tables. UPVSS [36] performs
+floating-point distance evaluation on DPUs and returns all
+distances and identifiers for CPU-side selection, avoiding
+PIM-side ranking but incurring substantial output traffic. PI-
+MANN [52] improves utilization through persistent kernels
+and fine-grained per-core scheduling. Its scheduling mecha-
+nisms are orthogonal to PIVOT and could complement our de-
+sign. Other work uses customized near-memory, near-storage,
+or in-memory hardware [34], [35], [61], [62]. These designs
+require specialized distance units, filtering logic, or data paths
+unavailable on commodity PIM. In contrast, PIVOT runs on
+unmodified UPMEM hardware and replaces distributed rank-
+ing with a CPU-derived radius for CPU-side cluster filtering
+and independent DPU-side lower-bound filtering.
+ANNS on CPUs, GPUs, and FPGAs: CPU systems opti-
+mize quantization- and graph-based ANNS through SIMD exe-
+cution, multithreading, cache-aware layouts, and storage-aware
+indexes. Representative systems include FAISS and ScaNN for
+quantization-based search, HNSW and NSG for in-memory
+graph traversal, and DiskANN and SPANN for billion-scale
+search across memory and SSDs [7], [14], [19], [23], [24],
+[38]. GPU systems exploit thread parallelism and device-
+memory bandwidth for IVF and graph search [37], [42], [49],
+[60]. FPGA and dedicated accelerators customize distance
+units, pipelines, and memory access for higher throughput
+and energy efficiency [32], [56]–[58]. These platforms offer
+different architectural advantages and operate under different
+constraints, and thus are not directly comparable to pro-
+grammable commodity PIM.
+Systems on commodity PIM: Prior work characterizes
+UPMEM’s compute, memory, communication, and scaling
+behavior [21], [22]. Architecture-aware systems redesign data
+structures and runtimes for these constraints. PIM-tree and
+PIM-trie use CPU–PIM work partitioning, data placement,
+and skew-aware scheduling for ordered indexes [26], [27].
+SimplePIM provides reusable programming and communica-
+tion primitives, while PID-Comm optimizes collective com-
+munication across isolated DPUs [5], [41]. Other work adapts
+numerical workloads to the MRAM–WRAM hierarchy, studies
+architecture-aware algorithm mapping, and reduces dynamic-
+allocation overhead [11], [31], [44]. These efforts establish
+the importance of work partitioning, communication reduction,
+WRAM management, and PIM-friendly operations. PIVOT
+applies these principles to redesign ANNS distance evaluation
+and candidate selection.
+VIII. CONCLUSION
+This
+paper
+rethinks
+ANNS
+execution
+on
+commod-
+ity PIM by addressing both the evaluation–kernel and
+search–paradigm mismatches. PIVOT combines a PIM-native
+distance-evaluation kernel with threshold-guided cooperative
+filtering. The CPU derives a conservative query-specific radius
+and filters low-yield clusters, while the DPUs independently
+filter vectors and return only survivor identifiers for CPU
+reranking. Configuration-specialized kernels and pipelined
+CPU–PIM execution sustain high utilization across both sides.
+On real UPMEM hardware, PIVOT filters out 99.3–99.7% of
+probed vectors and provides up to 18.8× and 10.2× the QPS
+of CPU and prior PIM baselines, respectively. It also preserves
+high recall across different top-k settings and remains effective
+on high-dimensional embeddings. These results show that
+efficient PIM-based ANNS requires jointly redesigning the
+distance-evaluation kernel and candidate-selection paradigm
+for the underlying architecture, rather than directly transplant-
+ing CPU-oriented workflows.
+11
+
+
+REFERENCES
+[1] A. Andoni, P. Indyk, and I. Razenshteyn, “Approximate nearest neighbor
+search in high dimensions,” in Proceedings of the International Congress
+of Mathematicians: Rio de Janeiro 2018.
+World Scientific, 2018, pp.
+3287–3318.
+[2] A. Babenko and V. Lempitsky, “Efficient indexing of billion-scale
+datasets of deep descriptors,” in 2016 IEEE Conference on Computer
+Vision and Pattern Recognition (CVPR), 2016, pp. 2055–2063.
+[3] P. Bajaj, D. Campos, N. Craswell, L. Deng, J. Gao, X. Liu,
+R. Majumder, A. McNamara, B. Mitra, T. Nguyen, M. Rosenberg,
+X. Song, A. Stoica, S. Tiwary, and T. Wang, “Ms marco: A human
+generated machine reading comprehension dataset,” 2018. [Online].
+Available: https://arxiv.org/abs/1611.09268
+[4] D. Cai, “A revisit of hashing algorithms for approximate nearest neigh-
+bor search,” IEEE Transactions on Knowledge and Data Engineering,
+vol. 33, no. 6, pp. 2337–2348, 2021.
+[5] J. Chen, J. G´omez-Luna, I. El Hajj, Y. Guo, and O. Mutlu, “Sim-
+plepim: A software framework for productive and efficient processing-
+in-memory,” in 2023 32nd International Conference on Parallel Archi-
+tectures and Compilation Techniques (PACT), 2023, pp. 99–111.
+[6] M. Chen, T. Han, C. Liu, S. Liang, K. Yu, L. Dai, Z. Yuan,
+Y. Wang, L. Zhang, H. Li, and X. Li, “Drim-ann: An approximate
+nearest neighbor search engine based on commercial dram-pims,” in
+Proceedings of the International Conference for High Performance
+Computing, Networking, Storage and Analysis, ser. SC ’25.
+New York,
+NY, USA: Association for Computing Machinery, 2025, p. 820–836.
+[Online]. Available: https://doi.org/10.1145/3712285.3759801
+[7] Q. Chen, B. Zhao, H. Wang, M. Li, C. Liu, Z. Li, M. Yang, and
+J. Wang, “Spann: Highly-efficient billion-scale approximate nearest
+neighborhood search,” in Advances in Neural Information Processing
+Systems, M. Ranzato, A. Beygelzimer, Y. Dauphin, P. Liang, and
+J. W. Vaughan, Eds., vol. 34.
+Curran Associates, Inc., 2021, pp.
+5199–5212. [Online]. Available: https://proceedings.neurips.cc/paper
+files/paper/2021/file/299dc35e747eb77177d9cea10a802da2-Paper.pdf
+[8] S. Chen, A. C. Zhou, Y. Shi, Y. Li, and X. Yao, “Upanns: Enhancing
+billion-scale anns efficiency with real-world pim architecture,” in
+Proceedings of the International Conference for High Performance
+Computing, Networking, Storage and Analysis, ser. SC ’25.
+New York,
+NY, USA: Association for Computing Machinery, 2025, p. 789–804.
+[Online]. Available: https://doi.org/10.1145/3712285.3759777
+[9] P. Covington, J. Adams, and E. Sargin, “Deep neural networks
+for youtube recommendations,” in Proceedings of the 10th ACM
+Conference on Recommender Systems, ser. RecSys ’16.
+New York,
+NY, USA: Association for Computing Machinery, 2016, p. 191–198.
+[Online]. Available: https://doi.org/10.1145/2959100.2959190
+[10] F. Devaux, “The true processing in memory accelerator,” in 2019 IEEE
+Hot Chips 31 Symposium (HCS), 2019, pp. 1–24.
+[11] S. Diab, A. Nassereldine, M. Alser, J. G´omez Luna, O. Mutlu,
+and
+I.
+El
+Hajj,
+“A
+framework
+for
+high-throughput
+sequence
+alignment using real processing-in-memory systems,” Bioinformatics,
+vol. 39, no. 5, p. btad155, 05 2023. [Online]. Available: https:
+//doi.org/10.1093/bioinformatics/btad155
+[12] M. Douze, A. Guzhva, C. Deng, J. Johnson, G. Szilvasy, P.-E. Mazar´e,
+M. Lomeli, L. Hosseini, and H. J´egou, “The faiss library,” 2025.
+[Online]. Available: https://arxiv.org/abs/2401.08281
+[13] Faiss Developers, “Faiss pull request #4550: Simplify RaBitQ slightly,
+improving speed and recall,” GitHub pull request, 2025, accessed:
+July 31, 2026. [Online]. Available: https://github.com/facebookresearch/
+faiss/pull/4550
+[14] C. Fu, C. Xiang, C. Wang, and D. Cai, “Fast approximate nearest
+neighbor search with the navigating spreading-out graph,” Proc. VLDB
+Endow., vol. 12, no. 5, p. 461–474, Jan. 2019. [Online]. Available:
+https://doi.org/10.14778/3303753.3303754
+[15] J. Gao, Y. Gou, Y. Xu, Y. Yang, C. Long, and R. C.-W. Wong,
+“Practical and asymptotically optimal quantization of high-dimensional
+vectors in euclidean space for approximate nearest neighbor search,”
+Proc. ACM Manag. Data, vol. 3, no. 3, Jun. 2025. [Online]. Available:
+https://doi.org/10.1145/3725413
+[16] J. Gao and C. Long, “Rabitq: Quantizing high-dimensional vectors with
+a theoretical error bound for approximate nearest neighbor search,”
+Proc. ACM Manag. Data, vol. 2, no. 3, May 2024. [Online]. Available:
+https://doi.org/10.1145/3654970
+[17] S.
+Ghose,
+K.
+Hsieh,
+A.
+Boroumand,
+R.
+Ausavarungnirun,
+and
+O. Mutlu, “Enabling the adoption of processing-in-memory: Challenges,
+mechanisms, future research directions,” 2018. [Online]. Available:
+https://arxiv.org/abs/1802.00320
+[18] R. Guo, X. Luan, L. Xiang, X. Yan, X. Yi, J. Luo, Q. Cheng, W. Xu,
+J. Luo, F. Liu, Z. Cao, Y. Qiao, T. Wang, B. Tang, and C. Xie,
+“Manu: a cloud native vector database management system,” Proc.
+VLDB Endow., vol. 15, no. 12, p. 3548–3561, Aug. 2022. [Online].
+Available: https://doi.org/10.14778/3554821.3554843
+[19] R. Guo, P. Sun, E. Lindgren, Q. Geng, D. Simcha, F. Chern,
+and S. Kumar, “Accelerating large-scale inference with anisotropic
+vector
+quantization,”
+in
+Proceedings
+of
+the
+37th
+International
+Conference
+on
+Machine
+Learning,
+ser.
+Proceedings
+of
+Machine
+Learning
+Research,
+H.
+D.
+III
+and
+A.
+Singh,
+Eds.,
+vol.
+119.
+PMLR,
+13–18
+Jul
+2020,
+pp.
+3887–3896.
+[Online].
+Available:
+https://proceedings.mlr.press/v119/guo20h.html
+[20] K. Guu, K. Lee, Z. Tung, P. Pasupat, and M. Chang, “Retrieval
+augmented language model pre-training,” in Proceedings of the 37th
+International Conference on Machine Learning, ser. Proceedings of
+Machine Learning Research, H. D. III and A. Singh, Eds., vol.
+119.
+PMLR, 13–18 Jul 2020, pp. 3929–3938. [Online]. Available:
+https://proceedings.mlr.press/v119/guu20a.html
+[21] J. G´omez-Luna, I. E. Hajj, I. Fernandez, C. Giannoula, G. F. Oliveira,
+and O. Mutlu, “Benchmarking a new paradigm: Experimental analysis
+and characterization of a real processing-in-memory system,” IEEE
+Access, vol. 10, pp. 52 565–52 608, 2022.
+[22] B. Hyun, T. Kim, D. Lee, and M. Rhu, “Pathfinding future pim archi-
+tectures by demystifying a commercial pim technology,” in 2024 IEEE
+International Symposium on High-Performance Computer Architecture
+(HPCA), 2024, pp. 263–279.
+[23] S. Jayaram Subramanya, F. Devvrit, H. V. Simhadri, R. Krishnawamy,
+and R. Kadekodi, “Diskann: Fast accurate billion-point nearest neighbor
+search on a single node,” in Advances in Neural Information Processing
+Systems, H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alch´e-Buc,
+E. Fox, and R. Garnett, Eds., vol. 32.
+Curran Associates, Inc.,
+2019. [Online]. Available: https://proceedings.neurips.cc/paper files/
+paper/2019/file/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Paper.pdf
+[24] J. Johnson, M. Douze, and H. J´egou, “Billion-scale similarity search
+with gpus,” IEEE Transactions on Big Data, vol. 7, no. 3, pp. 535–547,
+2021.
+[25] H. J´egou, M. Douze, and C. Schmid, “Product quantization for nearest
+neighbor search,” IEEE Transactions on Pattern Analysis and Machine
+Intelligence, vol. 33, no. 1, pp. 117–128, 2011.
+[26] H. Kang, Y. Zhao, G. E. Blelloch, L. Dhulipala, Y. Gu, C. McGuffey,
+and P. B. Gibbons, “Pim-tree: A skew-resistant index for processing-in-
+memory,” Proc. VLDB Endow., vol. 16, no. 4, p. 946–958, Dec. 2022.
+[Online]. Available: https://doi.org/10.14778/3574245.3574275
+[27] H. Kang, Y. Zhao, G. E. Blelloch, L. Dhulipala, Y. Gu, C. McGuffey,
+and P. B. Gibbons, “Pim-trie: A skew-resistant trie for processing-in-
+memory,” in Proceedings of the 35th ACM Symposium on Parallelism
+in Algorithms and Architectures, ser. SPAA ’23.
+New York, NY,
+USA: Association for Computing Machinery, 2023, p. 1–14. [Online].
+Available: https://doi.org/10.1145/3558481.3591070
+[28] V. Karpukhin, B. Oguz, S. Min, P. Lewis, L. Wu, S. Edunov,
+D. Chen, and W.-t. Yih, “Dense passage retrieval for open-domain
+question answering,” in Proceedings of the 2020 Conference on
+Empirical
+Methods
+in
+Natural
+Language
+Processing
+(EMNLP),
+B. Webber, T. Cohn, Y. He, and Y. Liu, Eds.
+Online: Association
+for Computational Linguistics, Nov. 2020, pp. 6769–6781. [Online].
+Available: https://aclanthology.org/2020.emnlp-main.550/
+[29] Y. Kwon, K. Vladimir, N. Kim, W. Shin, J. Won, M. Lee, H. Joo,
+H. Choi, G. Kim, B. An, J. Kim, J. Lee, I. Kim, J. Park, C. Park,
+Y. Song, B. Yang, H. Lee, S. Kim, D. Kwon, S. Lee, K. Kim, S. Oh,
+J. Park, G. Hong, D. Ka, K. Hwang, J. Park, K. Kang, J. Kim, J. Jeon,
+M. Lee, M. Shin, M. Shin, J. Cha, C. Jung, K. Chang, C. Jeong, E. Lim,
+I. Park, J. Chun, and S. Hynix, “System architecture and software stack
+for gddr6-aim,” in 2022 IEEE Hot Chips 34 Symposium (HCS), 2022,
+pp. 1–25.
+[30] Y.-C. Kwon, S. H. Lee, J. Lee, S.-H. Kwon, J. M. Ryu, J.-P. Son,
+O. Seongil, H.-S. Yu, H. Lee, S. Y. Kim, Y. Cho, J. G. Kim, J. Choi,
+H.-S. Shin, J. Kim, B. Phuah, H. Kim, M. J. Song, A. Choi, D. Kim,
+S. Kim, E.-B. Kim, D. Wang, S. Kang, Y. Ro, S. Seo, J. Song, J. Youn,
+K. Sohn, and N. S. Kim, “25.4 a 20nm 6gb function-in-memory dram,
+based on hbm2 with a 1.2tflops programmable computing unit using
+12
+
+
+bank-level parallelism, for machine learning applications,” in 2021 IEEE
+International Solid-State Circuits Conference (ISSCC), vol. 64, 2021, pp.
+350–352.
+[31] D. Lee, B. Hyun, Y. Kwon, and M. Rhu, “Pim-malloc: A fast and
+scalable dynamic memory allocator for processing-in-memory (pim)
+architectures,” in 2026 IEEE International Symposium on High Perfor-
+mance Computer Architecture (HPCA), 2026, pp. 1–17.
+[32] Y. Lee, H. Choi, S. Min, H. Lee, S. Beak, D. Jeong, J. W. Lee, and T. J.
+Ham, “Anna: Specialized architecture for approximate nearest neighbor
+search,” in 2022 IEEE International Symposium on High-Performance
+Computer Architecture (HPCA), 2022, pp. 169–183.
+[33] P. Lewis, E. Perez, A. Piktus, F. Petroni, V. Karpukhin, N. Goyal,
+H.
+K¨uttler,
+M.
+Lewis,
+W.-t.
+Yih,
+T.
+Rockt¨aschel,
+S.
+Riedel,
+and
+D.
+Kiela,
+“Retrieval-augmented
+generation
+for
+knowledge-
+intensive nlp tasks,” in Advances in Neural Information Processing
+Systems, H. Larochelle, M. Ranzato, R. Hadsell, M. Balcan, and
+H. Lin, Eds., vol. 33.
+Curran Associates, Inc., 2020, pp. 9459–
+9474. [Online]. Available: https://proceedings.neurips.cc/paper files/
+paper/2020/file/6b493230205f780e1bc26945df7481e5-Paper.pdf
+[34] Y. Li, Y. Jin, B. Tian, H. Zhang, and M. Gao, “Ansmet: Approximate
+nearest neighbor search with near-memory processing and hybrid
+early termination,” in Proceedings of the 52nd Annual International
+Symposium on Computer Architecture, ser. ISCA ’25.
+New York,
+NY, USA: Association for Computing Machinery, 2025, p. 1093–1107.
+[Online]. Available: https://doi.org/10.1145/3695053.3731013
+[35] C. Liu, D. Chen, Y. Huang, W. Xiao, H. Liu, Y. Zhang, H. Li,
+X. Liao, and H. Jin, “Seim: In-memory acceleration for approximate
+nearest neighbor search,” in 2025 62nd ACM/IEEE Design Automation
+Conference (DAC), 2025, pp. 1–7.
+[36] C.-C. Liu, C.-F. Wu, and Y. Jin, “Upvss: Jointly managing vector
+similarity search with near-memory processing systems,” in 2025 62nd
+ACM/IEEE Design Automation Conference (DAC), 2025, pp. 1–7.
+[37] Z. Liu, W. Ni, J. Leng, Y. Feng, C. Guo, Q. Chen, C. Li, M. Guo,
+and Y. Zhu, “Juno: Optimizing high-dimensional approximate nearest
+neighbour search with sparsity-aware algorithm and ray-tracing core
+mapping,” in Proceedings of the 29th ACM International Conference
+on Architectural Support for Programming Languages and Operating
+Systems, Volume 2, ser. ASPLOS ’24.
+New York, NY, USA:
+Association for Computing Machinery, 2024, p. 549–565. [Online].
+Available: https://doi.org/10.1145/3620665.3640360
+[38] Y. A. Malkov and D. A. Yashunin, “Efficient and robust approxi-
+mate nearest neighbor search using hierarchical navigable small world
+graphs,” IEEE Transactions on Pattern Analysis and Machine Intelli-
+gence, vol. 42, no. 4, pp. 824–836, 2020.
+[39] O. Mutlu, S. Ghose, J. G´omez-Luna, and R. Ausavarungnirun, A
+Modern Primer on Processing in Memory.
+Singapore: Springer
+Nature Singapore, 2023, pp. 171–243. [Online]. Available: https:
+//doi.org/10.1007/978-981-16-7487-7 7
+[40] O. Mutlu, S. Ghose, J. G´omez-Luna, and R. Ausavarungnirun,
+“Processing
+data
+where
+it
+makes
+sense:
+Enabling
+in-memory
+computation,” Microprocessors and Microsystems, vol. 67, pp. 28–
+41, 2019. [Online]. Available: https://www.sciencedirect.com/science/
+article/pii/S0141933118302291
+[41] S. U. Noh, J. Hong, C. Lim, S. Park, J. Kim, H. Kim, Y. Kim, and J. Lee,
+“Pid-comm: A fast and flexible collective communication framework
+for commodity processing-in-dimm devices,” in 2024 ACM/IEEE 51st
+Annual International Symposium on Computer Architecture (ISCA),
+2024, pp. 245–260.
+[42] H. Ootomo, A. Naruse, C. Nolet, R. Wang, T. Feher, and Y. Wang,
+“Cagra: Highly parallel graph construction and approximate nearest
+neighbor search for gpus,” in 2024 IEEE 40th International Conference
+on Data Engineering (ICDE), 2024, pp. 4236–4247.
+[43] N. Reimers and I. Gurevych, “Sentence-BERT: Sentence embeddings
+using Siamese BERT-networks,” in Proceedings of the 2019 Conference
+on Empirical Methods in Natural Language Processing and the 9th
+International
+Joint
+Conference
+on
+Natural
+Language
+Processing
+(EMNLP-IJCNLP), K. Inui, J. Jiang, V. Ng, and X. Wan, Eds.
+Hong
+Kong, China: Association for Computational Linguistics, Nov. 2019,
+pp. 3982–3992. [Online]. Available: https://aclanthology.org/D19-1410/
+[44] S. Rhyner, H. Luo, J. G´omez-Luna, M. Sadrosadati, J. Jiang, A. Olgun,
+H. Gupta, C. Zhang, and O. Mutlu, “Pim-opt: Demystifying distributed
+optimization algorithms on a real-world processing-in-memory system,”
+in Proceedings of the 2024 International Conference on Parallel
+Architectures and Compilation Techniques, ser. PACT ’24.
+New York,
+NY, USA: Association for Computing Machinery, 2024, p. 201–218.
+[Online]. Available: https://doi.org/10.1145/3656019.3676947
+[45] K. Santhanam, O. Khattab, J. Saad-Falcon, C. Potts, and M. Zaharia,
+“ColBERTv2: Effective and efficient retrieval via lightweight late
+interaction,” in Proceedings of the 2022 Conference of the North
+American Chapter of the Association for Computational Linguistics:
+Human Language Technologies, M. Carpuat, M.-C. de Marneffe,
+and I. V. Meza Ruiz, Eds.
+Seattle, United States: Association
+for Computational Linguistics, Jul. 2022, pp. 3715–3734. [Online].
+Available: https://aclanthology.org/2022.naacl-main.272/
+[46] A. J. Stam, “Limit theorems for uniform distributions on spheres in high-
+dimensional euclidean spaces,” Journal of Applied Probability, vol. 19,
+no. 1, p. 221–228, 1982.
+[47] UPMEM, Coding Tips and Recommended Practices, UPMEM, 2025,
+accessed: July 31, 2026. [Online]. Available: https://sdk.upmem.com/
+2025.1.0/fff CodingTips.html
+[48] UPMEM, UPMEM DPU SDK User Manual, UPMEM, 2025, accessed:
+July 31, 2026. [Online]. Available: https://sdk.upmem.com/2025.1.0/
+[49] K. Venkatasubba, S. Khan, S. Singh, H. V. Simhadri, and J. Vedurada,
+“Bang: Billion-scale approximate nearest neighbour search using a
+single gpu,” IEEE Transactions on Big Data, vol. 11, no. 6, pp. 3142–
+3157, 2025.
+[50] J. Wang, X. Yi, R. Guo, H. Jin, P. Xu, S. Li, X. Wang, X. Guo, C. Li,
+X. Xu, K. Yu, Y. Yuan, Y. Zou, J. Long, Y. Cai, Z. Li, Z. Zhang, Y. Mo,
+J. Gu, R. Jiang, Y. Wei, and C. Xie, “Milvus: A purpose-built vector
+data management system,” in Proceedings of the 2021 International
+Conference on Management of Data, ser. SIGMOD ’21.
+New York,
+NY, USA: Association for Computing Machinery, 2021, p. 2614–2627.
+[Online]. Available: https://doi.org/10.1145/3448016.3457550
+[51] M. Wang, X. Xu, Q. Yue, and Y. Wang, “A comprehensive survey and
+experimental comparison of graph-based approximate nearest neighbor
+search,” Proc. VLDB Endow., vol. 14, no. 11, p. 1964–1978, Jul. 2021.
+[Online]. Available: https://doi.org/10.14778/3476249.3476255
+[52] P. Wu, M. Xie, E. Zhao, D. Zhang, J. Wang, X. Liang, K. Ren,
+and Y. Chai, “Turbocharge ANNS on real Processing-in-Memory by
+enabling Fine-Grained Per-PIM-Core scheduling,” in 2025 USENIX
+Annual Technical Conference (USENIX ATC 25).
+Boston, MA:
+USENIX Association, Jul. 2025, pp. 1223–1241. [Online]. Available:
+https://www.usenix.org/conference/atc25/presentation/wu-puqing
+[53] W. A. Wulf and S. A. McKee, “Hitting the memory wall: implications of
+the obvious,” SIGARCH Comput. Archit. News, vol. 23, no. 1, p. 20–24,
+Mar. 1995. [Online]. Available: https://doi.org/10.1145/216585.216588
+[54] L. Xiong, C. Xiong, Y. Li, K.-F. Tang, J. Liu, P. Bennett, J. Ahmed,
+and A. Overwijk, “Approximate nearest neighbor negative contrastive
+learning for dense text retrieval,” in International Conference on
+Learning Representations (ICLR), April 2021. [Online]. Available:
+https://www.microsoft.com/en-us/research/publication/approximate-
+nearest-neighbor-negative-contrastive-learning-for-dense-text-retrieval/
+[55] X. Yi, J. Yang, L. Hong, D. Z. Cheng, L. Heldt, A. Kumthekar,
+Z. Zhao, L. Wei, and E. Chi, “Sampling-bias-corrected neural modeling
+for large corpus item recommendations,” in Proceedings of the 13th
+ACM Conference on Recommender Systems, ser. RecSys ’19.
+New
+York, NY, USA: Association for Computing Machinery, 2019, p.
+269–277. [Online]. Available: https://doi.org/10.1145/3298689.3346996
+[56] W. Yuan and X. Jin, “Fanns: An fpga-based approximate nearest-
+neighbor search accelerator,” IEEE Transactions on Very Large Scale
+Integration (VLSI) Systems, vol. 33, no. 4, pp. 1197–1201, 2025.
+[57] S. Zeng, Z. Zhu, J. Liu, H. Zhang, G. Dai, Z. Zhou, S. Li, X. Ning,
+Y. Xie, H. Yang, and Y. Wang, “Df-gas: a distributed fpga-as-a-service
+architecture towards billion-scale graph-based approximate nearest
+neighbor search,” in Proceedings of the 56th Annual IEEE/ACM
+International Symposium on Microarchitecture, ser. MICRO ’23.
+New
+York, NY, USA: Association for Computing Machinery, 2023, p.
+283–296. [Online]. Available: https://doi.org/10.1145/3613424.3614292
+[58] J. Zhang, J. Li, and S. Khoram, “Efficient large-scale approximate
+nearest neighbor search on opencl fpga,” in 2018 IEEE/CVF Conference
+on Computer Vision and Pattern Recognition, 2018, pp. 4924–4932.
+[59] Q. Zhang, S. Xu, Q. Chen, G. Sui, J. Xie, Z. Cai, Y. Chen,
+Y. He, Y. Yang, F. Yang, M. Yang, and L. Zhou, “VBASE:
+Unifying online vector similarity search and relational queries via
+relaxed monotonicity,” in 17th USENIX Symposium on Operating
+Systems
+Design
+and
+Implementation
+(OSDI
+23).
+Boston,
+MA:
+USENIX Association, Jul. 2023, pp. 377–395. [Online]. Available:
+https://www.usenix.org/conference/osdi23/presentation/zhang-qianxi
+13
+
+
+[60] W. Zhao, S. Tan, and P. Li, “Song: Approximate nearest neighbor
+search on gpu,” in 2020 IEEE 36th International Conference on Data
+Engineering (ICDE), 2020, pp. 1033–1044.
+[61] Z. Zhu, J. Liu, G. Dai, S. Zeng, B. Li, H. Yang, and Y. Wang,
+“Processing-in-hierarchical-memory architecture for billion-scale ap-
+proximate nearest neighbor search,” in 2023 60th ACM/IEEE Design
+Automation Conference (DAC), 2023, pp. 1–6.
+[62] C. Zou, S. Yang, C. Nie, Y. Zou, Y. He, C. Jiang, L. Xiao, W. Zhang,
+and Z. He, “Naszip: Software and hardware co-design to accelerate
+approximate
+nearest
+neighbor
+search
+with
+dimm-based
+near-data
+processing,” 2026. [Online]. Available: https://arxiv.org/abs/2605.21952
+14

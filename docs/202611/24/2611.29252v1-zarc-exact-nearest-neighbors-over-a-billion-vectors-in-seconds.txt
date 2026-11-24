@@ -1,0 +1,2826 @@
+ZARC: EXACT NEAREST NEIGHBORS OVER A BILLION VECTORS IN SECONDS
+Dongfang Zhao (dzhao@uw.edu)
+ABSTRACT
+Exact k-nearest-neighbor vector search lies on
+the critical path of machine learning systems,
+from sparse attention in the latest large language
+models (LLMs) to long-context memories and
+training-data deduplication.
+Exhaustive GPU
+search scans the whole dataset for every query,
+while approximate indexes return inexact neigh-
+bors. Recent methods skip almost every vector
+with a cheap half-precision proof that it lies too
+far away, but only on one GPU that holds the
+whole dataset. Our insight is to keep only the
+short rows of these proofs in GPU memory and
+to fetch the few remaining full vectors from host
+memory. Our system, ZARC, answers Euclidean,
+cosine, inner-product, and filtered queries exactly
+under updates. On four H100 GPUs, it answers
+10,000 exact queries over one billion vectors in
+1.1 seconds instead of five minutes. On eleven
+open LLMs, it retrieves the exact top-10 attention
+keys 2.2× to 13.1× faster than exhaustive search.
+In sparse attention over one million tokens, it runs
+3.1× faster than bf16 selection with FlashInfer,
+which misses the exact top-64 for most queries.
+1
+INTRODUCTION
+Exact k-nearest-neighbor vector search lies on the critical
+path of machine learning systems, in which every missed
+neighbor becomes an error of the model or of its data. In
+large language models (LLMs), sparse attention such as
+that of DeepSeek-V4 (DeepSeek-AI, 2026) attends only to
+the top-k entries of the preceding context for each query
+token. Long-context memories such as kNN-LM (Khan-
+delwal et al., 2020) and Memorizing Transformers (Wu
+et al., 2022) likewise attend to the nearest keys of a memory
+that grows with every generated token. Beyond attention,
+semantic deduplication such as SemDeDup (Abbas et al.,
+2023) relies on nearest neighbors, as does the evaluation
+of representations such as CLIP (Radford et al., 2021) and
+DINOv2 (Oquab et al., 2024) and of approximate search
+Preprint. DOI: 10.5281/zenodo.23674584.
+Code: https://github.com/hpdic/libcertex.
+Copyright © 2026 Dongfang Zhao.
+itself (Aum¨uller et al., 2020; Simhadri et al., 2022). These
+workloads run in batches over hundreds of millions to bil-
+lions of vectors, which change over time and carry the meta-
+data of filters.
+GPU vector search systems either evaluate every distance
+or search an approximate index.
+Exhaustive search in
+Faiss (Johnson et al., 2021) and cuVS (NVIDIA, 2026)
+scans every vector for every query. As a result, 10,000
+queries over BIGANN-1B (Jegou et al., 2011) take about
+five minutes on four H100 GPUs (Figure 1(a)). Exhaus-
+tive search also keeps the raw vectors in device memory,
+which model weights and KV caches claim as well. One
+billion 128-dimensional vectors alone occupy 512 GB in
+single precision (Figure 1(b)). Approximate indexes such
+as HNSW (Malkov & Yashunin, 2020), DiskANN (Subra-
+manya et al., 2019), CAGRA (Ootomo et al., 2024), and
+product-quantized inverted files (J´egou et al., 2011; Babenko
+& Lempitsky, 2012) return inexact neighbors without a
+per-query guarantee, whose errors reach the model and its
+data. For instance, CAGRA at its most accurate setting re-
+turns the exact top-10 attention keys of Qwen2.5-7B (Yang
+et al., 2024) for at most 45% of the queries. Similarly, NN-
+Descent (Dong et al., 2011) leaves 3% to 56% of the rows
+of the DataComp (Gadre et al., 2023) deduplication graph
+inexact (Figure 1(c)). On BIGANN-10M at 0.1% selectivity,
+the filtered graph index ACORN (Patel et al., 2024) returns
+the exact neighbors of only 3.4% of the queries.
+The two designs differ in the evidence on which they skip
+a vector. Exhaustive search skips no vector and therefore
+pays for every distance, whereas approximate search skips
+vectors without proof that they lie beyond the k-th distance
+and therefore loses neighbors. A vector can be skipped with-
+out any loss of exactness only with such a proof, namely a
+certified lower bound on its distance above the k-th distance.
+Certified exclusion (Zhao, 2026) obtains this proof at the
+speed of the tensor cores by computing the lower bounds in
+half precision and including the rounding error of the prod-
+uct in every bound. As a result, only the few vectors that are
+not skipped need exact distances. Yet the CertEx engine that
+introduced certified exclusion holds the whole dataset in the
+memory of one GPU and supports no deletions, concurrent
+updates, filters, or inner products.
+These proofs read only a short half-precision row of ev-
+ery vector. Our insight is to keep only these rows in GPU
+arXiv:2611.29252v1  [cs.DC]  22 Nov 2026
+
+
+102
+104
+106
+Exact queries
+100
+102
+104
+106
+Time to answers (s)
+10k queries: 1.1 s
+after a 79 s build
+299 s
+(a) BIGANN-1B, 4 GPUs
+Exhaustive cuVS
+Zarc
+10
+100
+1000
+Vectors (M)
+10−1
+100
+101
+102
+103
+Device memory (GB)
+H100, 94 GB
+(b) Memory, BIGANN
+Exhaustive fp32
+Zarc
+10−1
+100
+101
+Time (h)
+40
+60
+80
+100
+Exact rows (%)
+(c) 10-NN graph, DataComp
+NN-Descent
+cuVS fp32
+Zarc
+Figure 1. Time, memory, and exactness costs of exact search, and the effect of ZARC.
+memory and the full-precision vectors in host memory, be-
+cause exact verification reads the full vectors of only the
+few vectors that remain. This paper turns the above insight
+into ZARC, an exact vector search system with the interface
+of cuVS (NVIDIA, 2026) that installs as a Python pack-
+age. ZARC derives tight upper bounds on the k-th distance
+from partitions of the dataset and verifies the survivors from
+host memory in the order of their certified lower bounds,
+which keeps every answer exact under insertions, deletions,
+concurrent queries, filters, and inner-product queries.
+We evaluate ZARC on datasets of up to one billion vectors
+and on the attention keys of eleven open LLMs, against
+cuVS (NVIDIA, 2026) brute force, CAGRA (Ootomo et al.,
+2024), IVF-PQ (J´egou et al., 2011), DiskANN (Subramanya
+et al., 2019), and filtered graph indexes. Figure 1 shows
+the effect of ZARC on the time, the memory, and the exact-
+ness of exact search. On four H100 GPUs, ZARC indexes
+BIGANN-1B (Jegou et al., 2011) in 79 s and answers the
+same 10,000 queries exactly in 1.1 s (Figure 1(a)). On
+the eleven LLMs, from 7B to 1.6T parameters, ZARC re-
+turns the exact top-10 attention keys at 2.2× to 13.1× the
+throughput of exhaustive cuVS search, while the bf16 ma-
+trix products of LLM code miss the exact top-10 for 14%
+to 86% of the queries (Figure 3). In top-k sparse atten-
+tion over a one-million-token context, exact selection by
+ZARC shortens the forward pass of Qwen2.5-7B-Instruct-
+1M (Yang et al., 2025b) by 3.1× against bf16 selection with
+the top-k kernel of FlashInfer (Ye et al., 2025) and below
+the time of dense attention (Figure 5). On one H100, ZARC
+searches BIGANN-500M exactly within 71 GB of device
+memory, against 256 GB for exhaustive search (Figure 1(b)).
+ZARC also runs 692× faster than filtered CAGRA at 0.1%
+selectivity and builds the exact 10-nearest-neighbor graph
+of DataComp-12.8M (Gadre et al., 2023) 42× faster than
+exhaustive search (Figure 1(c)).
+This paper makes the following contributions:
+• We design certified screening across the memory hi-
+erarchy, with half-precision screening rows in GPU
+memory, full-precision vectors in host memory, and
+verification of the survivors in the order of their cer-
+tified lower bounds. Thresholds derived from data
+partitions and projections fitted to each partition cut
+the raw vectors that a query reads over PCIe to 699 on
+BIGANN-500M (Jegou et al., 2011). Updates, filters,
+and inner products reuse the same certified bounds.
+• We implement ZARC as a library with the interface of
+cuVS (NVIDIA, 2026), ahead-of-time compiled tensor-
+core kernels for Hopper and Ampere GPUs, concurrent
+updates, a calibrated cost model, and sharded search
+over the GPUs of one server.
+• We evaluate ZARC on eleven open LLMs from 7B to
+1.6T parameters, in sparse attention over a one-million-
+token context, and on billion-scale benchmarks, filtered
+search, streaming updates, semantic deduplication, and
+passage retrieval, where it is exact for every query, up
+to 270× faster than exhaustive GPU search, and 2.2×
+to 13.1× faster on LLM attention keys.
+2
+MOTIVATION AND CHALLENGES
+2.1
+Exact Search Workloads
+Various critical components of modern AI systems rely on
+efficient and accurate vector search capabilities, such as
+sparse attention, long-context memories, and deduplication.
+These applications need exact answers over large datasets
+that change over time. Exactness requires more than single-
+precision distances whenever the largest scores of a query
+lie in near ties, which attention scores often do (Section 4.2).
+For example, the ten largest attention scores of a GLM-
+5.3 (GLM-5 Team, 2026) query lie within 0.03% of each
+other. The datasets are large enough that their raw vectors
+compete for device memory with model weights and KV
+caches. For example, BIGANN-500M (Jegou et al., 2011)
+alone occupies 256 GB in single precision. The datasets
+
+
+System
+Exact
+Beyond HBM
+Updates
+Exact filters
+cuVS brute force (NVIDIA, 2026)
+partial
+✗
+✓
+partial
+cuVS IVF-PQ (J´egou et al., 2011)
+✗
+✓
+partial
+✗
+CAGRA (Ootomo et al., 2024)
+✗
+✗
+partial
+✗
+DiskANN (Subramanya et al., 2019)
+✗
+✓
+✗
+✗
+FreshDiskANN (Singh et al., 2021)
+✗
+✓
+✓
+✗
+ACORN (Patel et al., 2024)
+✗
+✗
+partial
+✗
+Filtered-DiskANN (Gollapudi et al., 2023)
+✗
+✓
+✗
+✗
+CertEx (Zhao, 2026)
+✓
+✗
+partial
+✗
+ZARC
+✓
+✓
+✓
+✓
+Table 1. Properties of GPU and CPU vector search systems.
+Searches
+Updates
+GPU
+Threshold
+per query
+screening rows
+survivors
+Host raw vectors
+Exact top-k
+A. Bound
+B. Screen
+C. Order
+D. Verify
+E. Append
+Figure 2. ZARC: search path (A to D) and updates (E).
+also change while queries run, which rules out rebuilding
+the index for every change.
+The queries also vary in form and arrive in batches. A
+query may restrict its neighbors to a metadata label or rank
+them by inner product, as dense retrievers such as TAS-
+B (Hofst¨atter et al., 2021) do. Deduplication, benchmark
+evaluation, and the decoding batches of LLM serving sys-
+tems such as Orca (Yu et al., 2022) and vLLM (Kwon et al.,
+2023) submit many queries at once. One pass over the index
+can thus serve a whole batch.
+2.2
+Comparison of Existing Systems
+Table 1 compares vector search systems on these proper-
+ties, where a partial mark denotes single-precision exact-
+ness or insertions without deletions. Exhaustive search
+in Faiss (Johnson et al., 2021; Douze et al., 2026) and
+cuVS (NVIDIA, 2026) is exact but keeps the database
+in device memory and scans it for every query. Inverted
+files (Babenko & Lempitsky, 2012) and proximity graphs
+such as HNSW (Malkov & Yashunin, 2020) avoid the full
+scan by searching a fraction of the dataset, which makes
+their recall depend on the probe count or the search width.
+A graph also absorbs a change of the dataset only by an
+extension or a rebuild. For instance, a rebuild takes 27.6 s
+for CAGRA (Ootomo et al., 2024) over 8.8M passages on
+an H100 and 49 minutes for ACORN-γ (Patel et al., 2024)
+over the 10M vectors of BIGANN-10M (Jegou et al., 2011).
+Filters raise the cost of both graph indexes and exhaustive
+search. At low selectivity, the matching vertices of a graph
+index often form a disconnected subgraph. Filtered graph
+indexes such as ACORN (Patel et al., 2024) and Filtered-
+DiskANN (Gollapudi et al., 2023) therefore add predicate-
+agnostic or label-aware edges and still return approximate
+answers. Exhaustive cuVS (NVIDIA, 2026) search stays
+exact with a bitmap prefilter but still pays for the full scan.
+2.3
+Certified Exclusion and Its Limits
+CertEx (Zhao, 2026) skips a vector when a lower bound on
+its distance to the query exceeds a threshold, which bounds
+the distance of the k-th nearest neighbor from above. The
+threshold is the k-th smallest exact distance from the query
+to a uniform sample of stored vectors, which CertEx calls
+anchors. The lower bound needs only a short screening
+row per vector, which holds in half precision the projection
+of the vector onto the leading principal components of the
+dataset. One tensor-core product evaluates the bounds of all
+screening rows for a query. Because every bound includes
+the worst-case rounding error of this product, no skipped
+vector can be a true neighbor. Exact distances in full preci-
+sion are then computed only for the few vectors that pass
+this screen, which CertEx calls survivors.
+Production workloads expose five limits of CertEx (Zhao,
+2026), which keeps the raw vectors and the screening rows
+of the whole dataset on one GPU. First, the uniform sample
+loosens the threshold on clustered and near-duplicate data
+(Section 3.2). Second, the raw vectors of a billion-scale
+dataset do not fit beside its screening rows (Section 3.3).
+Third, updates must keep every bound valid without a re-
+build (Section 3.4). Fourth, the throughput of the exact
+configurations varies by up to 5×, which calls for automatic
+tuning of the number of projected dimensions and of the
+number of anchors (Section 3.5). Finally, filters and inner
+products need certified bounds of their own (Section 3.6).
+3
+DESIGN
+3.1
+System Architecture Overview
+Figure 2 shows how ZARC executes a batch of queries in
+four stages on the GPU while the raw vectors stay in host
+memory. The threshold stage (A) computes for every query
+a threshold on its k-th distance from the exact distances of
+sampled anchors or of candidates in the nearest partitions
+of the query. The screening stage (B) then screens the half-
+precision rows of all vectors on the tensor cores and keeps
+every row whose certified lower bound does not exceed
+the threshold of the query (Appendix A). Each surviving
+query-vector pair (C) carries its computed product, from
+which ZARC derives a certified lower bound and orders the
+survivors of each query. Verification (D) finally reads the
+
+
+raw vectors of the survivors from host memory in this order
+and computes their exact distances in double precision, until
+the next lower bound exceeds the k-th distance found. Up-
+dates (E) append the screening rows and raw vectors of new
+vectors and mark the rows of deleted vectors, while queries
+keep running on a consistent view of the index (Section 3.4).
+Because every exclusion is certified and every survivor that
+might be a neighbor is verified, the pipeline returns the exact
+top-k. This guarantee rests on two invariants, namely that
+every excluded row has a certified lower bound above its
+threshold and that every threshold bounds the k-th distance
+from above (Appendix B). Every mechanism below keeps
+both invariants, including row placement across memories
+and GPUs and concurrent updates.
+ZARC screens on a persistent tensor-core kernel that never
+writes the product matrix to memory. Each thread block
+keeps a tile of query rows in shared memory and streams
+tiles of screening rows through a pipeline of asynchronous
+loads, whose products accumulate in single precision. Each
+block reduces its rows in one sequential loop without
+the split-K schedules of standard matrix-multiply libraries,
+since the rounding-error bound holds only for this accumula-
+tion order. The epilogue then compares every product with
+the threshold of its query and compacts the survivors without
+global synchronization. Each thread marks its survivors in a
+bit mask and reserves output space with one shared-memory
+atomic. As a result, an empty tile costs one comparison per
+product and no memory traffic (Appendix C.1).
+3.2
+Tighter Bounds from Partitions
+ZARC tightens the threshold with a k-means partition of the
+dataset, whose partitions it stores as contiguous blocks of
+rows. For every query, ZARC first screens under the anchor
+threshold of CertEx (Zhao, 2026) only the rows of the few
+partitions whose centroids are nearest to the query. A routed
+variant of the screening kernel performs this step in one
+launch over a list of work items, each of which pairs a tile
+of queries with a tile of rows from one partition. Among
+the screened rows, ZARC computes the exact distances of
+a small multiple of k candidates with the smallest certified
+lower bounds. The k-th smallest of these distances gives
+a second threshold, which we call the partition threshold.
+Screening of all rows then runs under the smaller threshold.
+The partition threshold is safe for any choice of partitions
+and candidates, because it is an exact distance to k distinct
+stored vectors and thus bounds the true k-th distance from
+above. The partitions therefore change only the speed of
+ZARC, whereas the partitions of an inverted file decide
+which vectors a query can return. Deduplication runs a self-
+join, in which every stored vector is a query. Such a self-join
+skips the screening of the nearest partitions. Instead, the
+queries of a batch in storage order come from one or two
+partitions, which directly give the threshold of the batch.
+On a clustered dataset, the vectors lie far from one global
+principal subspace but close to the subspace of their own
+partition. ZARC therefore gives every partition its own local
+projection onto the leading eigenvectors of the covariance of
+the partition around its centroid, which tightens the bound.
+Each partition encodes its rows with its own projection,
+scale, and rounding-error constants, so that the certified
+bound holds within the partition (Appendix D). A search
+projects every query once per partition with one batched
+matrix product, after which one routed launch screens every
+partition with its query rows. The anchors and later inser-
+tions keep the global projection and a plain launch. Every
+vector thus meets one certified test, never two.
+3.3
+Tiered Placement Across GPUs
+ZARC keeps in GPU memory only the half-precision screen-
+ing rows and the anchor sample, which every query reads,
+and keeps the full-precision vectors in pinned host mem-
+ory, which the GPU reads by zero-copy access. With rows
+several times shorter than full-precision vectors, the same
+device memory holds several times as many vectors, and
+optional one-byte integer rows halve the rows again (Ap-
+pendix E). Host memory, however, sits behind PCIe, whose
+bandwidth lies more than an order of magnitude below that
+of device memory. With the survivors at scattered positions,
+verification must read as few raw vectors as possible.
+ZARC orders verification by the certified lower bounds them-
+selves. After screening, a kernel computes the certified
+lower bound of every survivor from its stored product and
+packs the query and the bound into one integer key. A radix
+sort of these keys then groups the survivors by query in
+increasing order of their lower bounds. Verification runs
+in rounds over all queries of a batch, in which every un-
+finished query takes a window of its next survivors whose
+lower bounds lie below its current k-th exact distance. The
+window doubles from round to round instead of assigning
+one warp to each query, which would serialize the long
+survivor lists of the hardest queries over PCIe. One flat
+launch computes the exact distances of a round in double
+precision with several row reads of each warp in flight (Ap-
+pendix C.2), after which a second launch merges them into
+the top-k of each query. A query finishes once its window
+reaches a lower bound above its k-th distance, which limits
+the reads from host memory to a fraction of the survivors
+(Appendix F).
+A dataset whose screening rows exceed the memory of one
+GPU splits into contiguous shards with one index per GPU,
+which ZARC builds in parallel. Shards that screen against
+their own k-th distances would keep many more survivors.
+ZARC instead searches in two rounds. In the first round,
+every shard computes a threshold for each query from its
+
+
+own anchors. The smallest of these shard thresholds bounds
+the global k-th distance, as any k distinct vectors of one
+shard do (Appendix G). In the second round, every shard
+screens and verifies under this shared threshold, after which
+the host merges the exact shard answers. Only one threshold
+and k pairs per shard and query cross the interconnect.
+3.4
+Updates Without Re-Indexing
+ZARC inserts and deletes vectors while queries run, without
+a rebuild. The host and device buffers of the raw vectors
+and the screening rows are preallocated to a capacity, into
+which an insertion appends its rows in place. The insertion
+projects the new vectors with the existing projection, since
+the lower bound stays valid for vectors that the projection
+was not computed from. The rounding-error bound of every
+query, however, depends on the largest norm and error terms
+among all stored rows. A new vector with a larger norm
+would therefore invalidate the bound of every running query,
+unless the bound covered the new rows first.
+ZARC enforces this order with a publication protocol (Ap-
+pendix C.3). An update writes its rows beyond the published
+rows without a lock and then publishes the new row count
+together with the raised error bound under an exclusive lock.
+Every search batch holds the same lock in shared mode.
+Each batch thus reads one consistent view and never takes
+its threshold from an anchor that it does not screen. A dele-
+tion marks the row of the deleted vector so that it never
+survives screening. It also removes the vector from the an-
+chor sample. As insertions keep the projection fixed, ZARC
+periodically recomputes it and rebuilds the rows.
+3.5
+Tuning by a Calibrated Cost Model
+ZARC selects for every partition the number of projected
+dimensions, the vectors per anchor, the query batch size,
+and the memory tier of the full-precision vectors with a cost
+model. It is calibrated once per device by microbenchmarks
+and predicts the time of a batch from the screened rows,
+the anchor distances, and the expected survivors per query
+(Appendix H). As every configuration keeps every bound
+valid, a wrong prediction costs only speed.
+The survivors per query depend on the data in a way that
+no static rule captures (Appendix I). For example, the best
+number of dimensions shrinks as the dataset grows and
+depends on the query distribution. Hence, the tuner runs the
+search on two small prefixes of the dataset and extrapolates
+the survivors and verified rows per query to the full size by
+a power law. The cost model then ranks the configurations
+by their predicted batch time and keeps the fastest one.
+3.6
+Filtered and Inner-Product Queries
+A filtered query restricts its neighbors to the vectors that
+carry a given label, such as a tenant or a category. Screening
+needs no connectivity among the matching vectors, which
+reduces a filter to the removal of rows from the screen. Only
+the threshold depends on the label, because a threshold from
+vectors of other labels can lie below the k-th distance among
+the matching vectors and thus exclude true neighbors.
+ZARC supports one label per vector and one label per query
+in two ways. In the first way, the epilogue of the screen-
+ing kernel never keeps a row of another label. The an-
+chors of a query then come only from its label. This way
+serves any per-row predicate, such as the bitset filters of
+cuVS (NVIDIA, 2026), which only reject rows and leave
+every other bound unchanged. In the second way, ZARC
+stores every label as a contiguous block of rows with its own
+anchors and sorts each batch of queries by label. The routed
+kernel then pairs every tile of queries of one label only with
+the rows of that label, so that the work of the routed kernel
+shrinks in proportion to the selectivity (Appendix J).
+For inner-product queries, ZARC bounds the inner product
+directly. The standard reduction to Euclidean search ap-
+pends to every vector a coordinate that raises its norm to
+the largest norm of the dataset. Rounding this coordinate,
+however, perturbs the norms by up to one unit in the last
+place and can reorder near ties. ZARC instead builds the
+screening rows without subtracting the mean of the dataset,
+which preserves every norm. The same tensor-core product
+then bounds the inner product of every vector from above
+(Appendix B). Every vector whose bound falls below the
+k-th largest exact inner product of any k distinct vectors
+therefore lies outside the top-k. The threshold comes from
+the exact inner products of the anchors. Verification then
+ranks the survivors by exact inner products in double preci-
+sion. Cosine queries screen normalized copies with a slack
+for their rounding (Appendix K).
+4
+EVALUATION
+We implement ZARC in about 15,000 lines of CUDA C++
+and Python with tests and benchmarks (Appendix C). Ta-
+ble 2 lists its interfaces, each of which keeps the calls of an
+existing library, from the index modules of cuVS (NVIDIA,
+2026) and the flat indexes of Faiss (Johnson et al., 2021)
+to the top-k selection of PyTorch (Paszke et al., 2019) and
+FlashInfer (Ye et al., 2025). Moving code to exact search
+therefore changes little more than its imports. The Python
+binding also takes PyTorch, CuPy, and NumPy arrays with-
+out copies.
+To compute the partition threshold, ZARC
+screens the two nearest partitions and verifies four candi-
+dates per requested neighbor, which touches about 0.2% of
+the rows. Its tensor-core kernels are compiled ahead of time
+
+
+Library
+Drop-in for
+Use case
+cuVS, C++
+index modules (build, search)
+Vector databases
+cuVS, C
+cuvsBruteForce calls
+Vector databases
+cuVS, Python
+brute force module
+RAG, training-data deduplication
+Faiss
+IndexFlatL2, IndexFlatIP
+RAG, benchmark ground truth
+PyTorch
+torch.topk over attention scores
+Sparse attention, long-context memory
+FlashInfer
+top-k page-table and ragged transforms
+Sparse attention in LLM serving
+Table 2. Interfaces of ZARC.
+for Hopper and Ampere GPUs, so that no query waits for
+kernel tuning when the batch shape changes. In contrast, the
+Triton (Tillet et al., 2019) engine of CertEx (Zhao, 2026)
+tunes each kernel at run time while the queries wait.
+4.1
+Experimental Setup
+Open LLMs.
+The LLM workload covers eleven open
+LLMs from five developers with 7B to 1.6T parameters in
+the DeepSeek-V4 (DeepSeek-AI, 2026; 2025), Qwen (Yang
+et al., 2024; 2025a; Qwen Team, 2026), gpt-oss (OpenAI,
+2025), GLM (GLM-5 Team, 2026), and Hy3 (Tencent Hun-
+yuan Team, 2026) series. Per model, the memory holds
+the keys of one layer before rotary position embedding
+(RoPE) (Su et al., 2024), over the train books of PG-19 (Rae
+et al., 2020), with 10M keys for each of the first four KV
+heads on one H100. Each head receives 10,000 decoding
+queries from the test books. For the multi-head latent atten-
+tion (DeepSeek-AI, 2024) of DeepSeek and GLM, the mem-
+ory holds the absorbed latent key that all heads share, whose
+inner product with the absorbed query of a head equals its
+attention logit before RoPE. The memory excludes the first
+four positions of every chunk, the attention sinks (Xiao et al.,
+2024b) that a deployed model keeps resident. Ground truth
+comes from fp32 distances to all keys, rescored in fp64 and
+checked against their rounding error (Appendix L).
+Platform.
+The main platform is a server with four 94 GB
+H100 GPUs connected pairwise by NVLink, 192 cores of
+the Intel Xeon Platinum 8468, and 960 GB of host DRAM,
+which runs the billion-scale and LLM experiments. A sec-
+ond server with one 94 GB H100 over PCIe 5.0 x16, 48
+cores of the same processor, and 240 GB of host DRAM
+runs the other experiments on one GPU. Both run Ubuntu
+24.04, CUDA 12.6 with driver 560.35.05, CUTLASS 3.9.2,
+PyTorch 2.14.1, and cuVS 26.10. On an A100 of the earlier
+Ampere generation, every query stays exact and ZARC runs
+11× to 26× faster than exhaustive search (Appendix M).
+Datasets.
+Vector
+workloads
+use
+SIFT1M
+and
+BI-
+GANN (Jegou et al., 2011) of SIFT descriptors (Lowe,
+2004), DINOv2 (Oquab et al., 2024) embeddings of
+ImageNet (Deng et al., 2009), CLIP (Radford et al.,
+2021) embeddings of DataComp (Gadre et al., 2023),
+Deep1B (Babenko & Lempitsky, 2016), and two embed-
+dings of MS MARCO (Nguyen et al., 2016) for cosine and
+inner-product retrieval. BIGANN and Deep1B reach one
+billion vectors, while DINOv2 and DataComp contain the
+clustered and near-duplicate data on which uniform thresh-
+olds loosen. Every dataset comes with exact ground truth
+for all queries, computed in double precision (Appendix N).
+Baselines.
+Exhaustive search runs cuVS (NVIDIA, 2026)
+brute force in single precision, with a bitmap prefilter
+or a search over only the matching vectors for filtered
+queries.
+The approximate GPU baselines from cuVS
+are CAGRA (Ootomo et al., 2024) with a bitset fil-
+ter, IVF-PQ (J´egou et al., 2011) with and without ex-
+act refinement, and NN-Descent (Dong et al., 2011) for
+the 10-nearest-neighbor graph.
+The CPU baselines are
+DiskANN (Subramanya et al., 2019) on the block device,
+FreshDiskANN (Singh et al., 2021), ACORN (Patel et al.,
+2024), and Filtered-DiskANN (Gollapudi et al., 2023). For
+the LLMs, the baselines are the bf16 and fp16 matrix prod-
+uct with torch.topk of LLM code, exhaustive cuVS
+search in fp16 and fp32, CAGRA, and IVF-Flat over 4,096
+lists. In sparse attention, the strongest baseline is the bf16
+matrix product followed by the top-k kernel of FlashIn-
+fer (Ye et al., 2025). The CertEx engine (Zhao, 2026) serves
+as the reference for screening without partitions and tiers.
+Metrics.
+We report throughput in queries per second at
+fixed batch sizes, the memory of each tier, and the build and
+update throughput. For approximate baselines, the exact
+fraction counts the queries whose k distances equal the exact
+ones in double precision, which is stricter than Recall@10
+under ties. Every answer of ZARC is checked against the
+ground truth and matches it, which gives an exact fraction
+of 100% throughout, including on adversarial inputs with
+exact ties, duplicates, and extreme norms (Appendix O).
+4.2
+Attention Retrieval on Open LLMs
+We evaluate exact top-k retrieval over the attention keys
+of open LLMs, first as an operator on eleven models with
+one H100 per KV head and then within sparse attention
+end to end. Long-context inference retrieves these keys
+for every decoding query (Wu et al., 2022; Xiao et al.,
+2024a; Tang et al., 2024; Liu et al., 2025). LLM code
+implements the retrieval as a bf16 or fp16 matrix prod-
+uct followed by torch.topk, whose rounding reorders
+near ties among the largest scores. Figure 3 shows that
+ZARC is exact for every query on every model and faster
+than every exact baseline. On Qwen2.5-7B (Yang et al.,
+2024), the approximate CAGRA (Ootomo et al., 2024) and
+IVF-Flat indexes gain throughput only by missing the exact
+top-10 for many queries, whereas ZARC is exact and faster
+than bf16 and fp16 matrix products (Figure 3(a)). On the
+eleven models by Qwen (Yang et al., 2025a; Qwen Team,
+2026), OpenAI (OpenAI, 2025), Tencent (Tencent Hun-
+yuan Team, 2026), DeepSeek (DeepSeek-AI, 2026; 2025),
+
+
+100
+103
+Throughput (kQPS)
+0
+25
+50
+75
+100
+Exact queries (%)
+(a) Qwen2.5-7B
+gpt-oss 120B
+Qwen2.5 7B
+Qwen2.5 32B
+Qwen2.5 72B
+Hy3
+Qwen3 235B
+Qwen3.8 Flash
+DS-V4 Flash
+DS-V3.2
+GLM-5.3
+DS-V4 Pro
+100
+101
+102
+103
+Throughput (kQPS)
+(b) Throughput
+gpt-oss 120B
+Qwen2.5 7B
+Qwen2.5 32B
+Qwen2.5 72B
+Hy3
+Qwen3 235B
+Qwen3.8 Flash
+DS-V4 Flash
+DS-V3.2
+GLM-5.3
+DS-V4 Pro
+0
+25
+50
+75
+100
+Exact queries (%)
+Zarc: every query
+(c) Exact queries of the baselines
+CAGRA
+IVF-Flat
+bf16 matmul
+fp16 matmul
+cuVS
+Zarc
+Zarc (b)
+cuVS fp16 (b)
+bf16 matmul (b, c)
+fp16 matmul (c)
+CAGRA, most exact (c)
+Figure 3. Exact top-10 attention keys on eleven open LLMs, with one H100 per KV head.
+10
+100
+1000
+k
+100
+101
+102
+103
+Throughput (kQPS)
+(a) Throughput
+Zarc
+cuVS fp32
+bf16
+fp16
+10
+100
+1000
+k
+0
+25
+50
+75
+100
+Exact queries (%)
+Zarc
+(b) Exact queries
+Figure 4. Exact top-k on Qwen2.5-7B against k.
+k=64
+k=256
+0
+5
+10
+15
+Forward time (s)
+(a) Forward time
+k=64
+k=256
+0
+25
+50
+75
+100
+Exact top-k sets (%)
+(b) Exact selections
+bf16
+fp16
+bf16+FlashInfer
+Zarc
+dense attention
+rest of forward pass
+Figure 5. Sparse attention end to end over one million tokens.
+and Zhipu (GLM-5 Team, 2026), ZARC answers 135k to
+388k queries per second on the 64- to 256-dimensional
+keys of gpt-oss, Qwen, and Hy3, 5.8× to 13.1× exhaustive
+cuVS (NVIDIA, 2026) search, and 33k to 45k on the 512-
+and 576-dimensional keys of DeepSeek and GLM, 2.2× to
+2.8× the same search (Figure 3(b)). Yet bf16 matrix prod-
+ucts are exact for 14% to 86% of the queries, fp16 products
+for 57% to 98%, and CAGRA for at most 45% (Figure 3(c)).
+Figure 4 shows on Qwen2.5-7B (Yang et al., 2024) that
+ZARC stays exact and faster than bf16 matrix products
+and exhaustive cuVS search up to k = 2,048, which the
+sparse attention of DeepSeek-V3.2 (DeepSeek-AI, 2025)
+uses. At k = 2,048, ZARC answers 18.1k exact queries per
+second, 1.8× bf16 matrix products and 12.7× exhaustive
+cuVS (NVIDIA, 2026) search in fp32 (Figure 4(a)). Only
+1.4% of these queries are exact under bf16 matrix products,
+against 99.7% to 99.8% under cuVS in fp32 (Figure 4(b)).
+Figure 5 evaluates top-k sparse attention end to end on
+Qwen2.5-7B-Instruct-1M (Yang et al., 2025b) over the four
+H100 GPUs. For each of two PG-19 (Rae et al., 2020)
+texts, the model prefills one million tokens and evaluates
+the next 2,048 tokens, whose query heads attend to the
+attention sinks, to the preceding evaluated tokens, and to
+the top-k context keys of a selection method. With k = 64,
+ZARC selects the exact top-64 of every query and shortens
+the forward pass to 3.6 s, against 11.2 s with bf16 matrix
+products and the top-k kernel of FlashInfer (Ye et al., 2025),
+15.9 s with torch.topk, and 7.8 s for dense attention
+(Figure 5(a)). Both bf16 selections pick the exact top-64
+for only 42% to 43% of the queries (Figure 5(b)). With
+k = 256, the forward pass takes 7.6 s against 12.1 s and
+16.8 s. The perplexities of the four selections lie within
+0.3% of each other on both texts. ZARC thus makes the
+selection exact at no cost in quality and in less time. The
+exact selection also makes the attended keys a function of
+the model alone, whereas bf16 and fp16 matrix products
+attend to different keys for the same query.
+4.3
+Tighter Bounds from Partitions
+We evaluate partition thresholds and local projections on
+BIGANN (Jegou et al., 2011), where screening dominates
+
+
+10M
+100M
+0
+2000
+4000
+6000
+Survivors per query
+2,176
+3,760
+2,635
+3,996
+527
+1,065
+(a) BIGANN, 59 dims
+Original order
+Partition order
+Partition threshold
+Anc. Part. Anc. Part.
+100
+101
+102
+103
+Throughput (kQPS)
+2.6
+5.2
+23.9
+62.0
+Global
+Local
+(b) DINOv2, 255 dims
+anchor threshold
+partition threshold
+59
+59
+255
+635
+Projected dims and dataset
+102
+104
+106
+108
+Survivors per query
+3,114
+1,287
+2,635
+1,080
+842.4k
+149.5k
+2,179
+1,721
+SIFT
+BIGANN
+DINOv2
+(c) Global and local projections
+Global
+Local
+Figure 6. Partition thresholds and local projections.
+10
+100
+500
+Vectors (M)
+10−1
+101
+103
+Throughput (kQPS)
+(a) Exact search
+Zarc, 123 dims
+Zarc, 59 dims
+cuVS fp32
+10
+100
+200
+500
+Vectors (M)
+0
+100
+200
+300
+400
+Memory (GB)
+(b) Memory, 59 dims
+H100, 94 GB
+Zarc, device
+Zarc, host
+fp32, device
+100
+101
+102
+Throughput (kQPS)
+0
+50
+100
+Exact queries (%)
+(c) Exactness against throughput, BIGANN-100M
+IVF-PQ
+IVF-PQ + refine
+DiskANN, disk
+Zarc, host
+Figure 7. Tiered memory on BIGANN with one H100.
+the batch time, and on DINOv2 (Oquab et al., 2024), where
+verification dominates it. Both mechanisms change only the
+survivors, which keeps every variant exact.
+Figure 6 shows that the two mechanisms cut the survivors
+and raise the throughput where survivors are expensive. On
+BIGANN (Jegou et al., 2011) with 59-dimensional projec-
+tions, the partition threshold leaves 5.0× and 3.8× fewer
+survivors at 10M and 100M (Figure 6(a)), although the
+throughput changes little there, as screening dominates. On
+DINOv2 (Oquab et al., 2024) with 255-dimensional projec-
+tions, local projections and the partition threshold together
+raise the throughput 24×, from 2.6k to 62.0k queries per
+second (Figure 6(b)). Local projections alone cut the sur-
+vivors per query from 842k to 150k on DINOv2 and by
+2.4× on SIFT1M and BIGANN-10M (Figure 6(c)).
+1
+2
+4
+GPUs
+0
+5
+10
+15
+20
+Throughput (kQPS)
+(a) Strong scaling
+BIGANN-1B
+BIGANN-500M
+Deep1B
+Deep1B-250M
+1×
+2×
+4×
+GPUs over the fewest
+0
+2
+4
+Speedup
+(b) Speedup
+linear
+1
+2
+4
+GPUs, 250M each
+0
+5
+10
+15
+20
+Total throughput (kQPS)
+(c) Weak scaling
+BIGANN
+BIGANN, ideal
+Deep1B
+Deep1B, ideal
+59 123
+59
+96
+Projected dims and dataset
+0
+4
+8
+Throughput (kQPS)
+BIGANN
+Deep1B
+(d) 1B on 4 GPUs
+Figure 8. Sharded exact search on four H100 GPUs.
+4.4
+Tiered Memory Scaling
+We evaluate the placement of the raw vectors in host memory
+on BIGANN (Jegou et al., 2011) prefixes from 10M to 500M
+vectors on one H100, with the screening rows and an anchor
+sample of every 16th vector in device memory. Exhaustive
+fp32 search on the same GPU stops at about 190M vectors.
+Figure 7 shows that host memory extends exact search to
+500 million vectors on one GPU. At 10M and 100M, where
+exhaustive fp32 search still fits on the GPU, ZARC runs
+39× and 42× faster than it and keeps answering beyond
+that size, with 5,233 queries per second at 500M vectors and
+59-dimensional projections (Figure 7(a)). Each query reads
+only 699 of its 5,593 survivors (Appendix F). At 500M
+vectors, ZARC needs 71 GB of device memory, against
+the 256 GB that exhaustive fp32 search would need (Fig-
+ure 7(b)). Compressed and disk-resident indexes reach
+this capacity only by giving up exactness (Figure 7(c)).
+cuVS (NVIDIA, 2026) IVF-PQ (J´egou et al., 2011) needs
+exact refinement with 512 probes to be exact for 99.6% of
+the queries at 10.6k queries per second, against 20.3k for
+ZARC. DiskANN (Subramanya et al., 2019) on the block
+device, in turn, is exact for at most 97.6% of the queries at
+236 queries per second.
+4.5
+Multi-GPU Scalability
+We evaluate the sharded search on the four H100 GPUs
+of the main server, with the raw vectors of every shard in
+pinned host memory and exhaustive cuVS (NVIDIA, 2026)
+search over half-precision shards as the baseline. The shared
+threshold keeps every answer exact on every shard count.
+Figure 8 shows that the shared threshold scales exact search
+
+
+60
+80
+100
+Live vectors (M)
+0
+20
+40
+Throughput (kQPS)
+78 to 82M
+inserts per s
+(a) Updates, 123 dims
+inserted
+10% deleted
+rebuilt
+2M/s
+10M/s
+Insertion rate
+0
+20
+40
+Throughput (kQPS)
+78%
+74%
+(b) Concurrent queries
+no inserts
+while inserting
+2
+5
+10
+50
+100
+Live vectors (M)
+10−2
+100
+102
+Insertion (M vectors/s)
+(c) Insertion rate
+Zarc, one H100
+FreshDiskANN, 48 threads
+Figure 9. Updates and concurrent queries on BIGANN.
+10%
+1%
+0.1%
+Filter selectivity
+100
+101
+102
+103
+Throughput (kQPS)
+(a) Throughput
+10%
+1%
+0.1%
+Filter selectivity
+0
+25
+50
+75
+100
+Exact queries (%)
+(b) Exactness
+Zarc
+Exhaustive
+cuVS BF
+CAGRA
+ACORN
+F-DiskANN
+Figure 10. Exact filtered search on BIGANN-10M.
+to one billion vectors. On BIGANN-500M (Jegou et al.,
+2011), ZARC answers 4,759, 9,188, and 15,796 queries
+per second on one, two, and four GPUs (Figure 8(a)). On
+BIGANN-1B, four GPUs reach 1.96× the throughput of
+the two GPUs that first hold it (Figure 8(b)), with 8,997
+queries per second, 269× exhaustive cuVS (NVIDIA, 2026)
+search (Figure 1(a)). Under weak scaling at 250M vectors
+per GPU, the total throughput of all GPUs stays within
+3.6% up to one billion vectors (Figure 8(c)). This flat line
+is the ideal, since every query screens a dataset that grows
+with the GPUs. The best number of projected dimensions
+depends on the dataset (Figure 8(d)). On BIGANN-1B,
+59 dimensions answer 8,997 queries per second against
+7,046 for 123 dimensions, since the wider rows double the
+screened bytes. On Deep1B (Babenko & Lempitsky, 2016),
+the full 96 dimensions answer 7,133 against 5,087 for 59
+dimensions, as they remove survivors that verification would
+otherwise fetch from host memory as 384-byte vectors.
+4.6
+Streaming Dynamic Updates
+We evaluate updates by growing a BIGANN (Jegou et al.,
+2011) index from 50M to 100M vectors in ten insertion
+steps and then deleting 10% of the vectors, with every query
+checked against exhaustive search over the live vectors.
+FreshDiskANN (Singh et al., 2021) on 48 CPU threads
+serves as the baseline for insertions into a graph index.
+Figure 9 shows that updates keep every answer exact at the
+throughput of a rebuilt index. While insertions run at 78 to
+82 million vectors per second, the throughput follows the
+dataset size from 38.3k queries per second at 50M to 19.4k
+at 100M, which matches the 18.7k of an index rebuilt at
+100M (Figure 9(a)). While a background thread inserts 25
+million vectors at 2 or 10 million vectors per second, the
+queries keep 78% and 74% of their throughput, with every
+one of the 170,000 checked answers exact (Figure 9(b)).
+FreshDiskANN (Singh et al., 2021) on 48 CPU threads
+inserts about 1,300× slower (Figure 9(c)), as it searches the
+graph and repairs the edges around every new vector.
+4.7
+Application Workloads
+Filtered search.
+Figure 10 shows that ZARC is the fastest
+exact method at every selectivity on BIGANN-10M (Jegou
+et al., 2011), with 324k to 403k queries per second, 6.8×
+to 58× exhaustive cuVS (NVIDIA, 2026) search over the
+matching vectors (Figure 10(a)). At its most accurate setting,
+CAGRA (Ootomo et al., 2024) runs 46× and 692× slower
+than ZARC at 1% and 0.1% selectivity, because every label
+requires a separate CAGRA call. In contrast, the filtered
+graph indexes ACORN (Patel et al., 2024) and Filtered-
+DiskANN (Gollapudi et al., 2023) return the exact neighbors
+of at most 97.9% and 63.9% of the queries (Figure 10(b)).
+Semantic deduplication.
+ZARC builds the exact 10-NN
+graph of DataComp-12.8M (Gadre et al., 2023) in 8.2 min-
+utes end to end (Figure 1(c) and Appendix P), 42× faster
+than the projected 5.8 hours of exhaustive cuVS (NVIDIA,
+2026) search and 58× faster than the CertEx engine (Zhao,
+2026). The approximate cuVS NN-Descent (Dong et al.,
+2011) leaves at least 3.0% of the rows inexact, unflagged.
+The partition threshold cuts survivors per query from 10,486
+to 114, and verification reads 41.
+Passage
+retrieval.
+Retrieval-augmented
+generation
+(RAG) (Lewis et al., 2020) tolerates approximate neighbors.
+Consequently, exact search must match the speed of
+approximate indexes there. Figure 11 shows that ZARC is
+exact on the 8.84 million passages of MS MARCO (Nguyen
+et al., 2016) under both cosine similarity and inner products
+and faster than CAGRA at its most accurate setting. Under
+cosine similarity, ZARC answers 35.9k to 51.7k queries
+per second, 60× exhaustive cuVS (NVIDIA, 2026) search,
+
+
+100
+101
+102
+Throughput (kQPS)
+80
+90
+100
+Exact queries (%)
+(a) Exactness
+100
+101
+102
+Throughput (kQPS)
+0.32
+0.34
+MRR@10
+(b) MRR@10
+CAGRA, cosine
+cuVS, cosine
+Zarc, cosine
+CAGRA, inner product
+cuVS, inner product
+Zarc, inner product
+Figure 11. Exact retrieval on MS MARCO.
+whereas CAGRA (Ootomo et al., 2024) at its most accurate
+setting misses 5.5% of the queries at 29.2k. Under inner
+products, ZARC answers 30.8k to 43.0k, 13× exhaustive
+cuVS search, while CAGRA misses 8.0% of the queries
+(Figure 11(a)). Exactness carries over to retrieval quality,
+which MS MARCO measures by the mean reciprocal rank
+at 10 (MRR@10). MRR@10 averages over the queries
+the reciprocal rank of the first relevant passage among the
+top 10 results. Under cosine similarity, ZARC reaches the
+MRR@10 of exhaustive search, 0.338, against 0.321 to
+0.337 for CAGRA (Figure 11(b)).
+5
+RELATED WORK
+Exact search.
+Metric access methods such as AESA (Vi-
+dal Ruiz, 1986), cover trees (Beygelzimer et al., 2006),
+VP-trees (Yianilos, 1993), M-trees (Ciaccia et al., 1997),
+and FLANN (Muja & Lowe, 2014) and bound-based filters
+such as GEMINI (Faloutsos et al., 1994), the VA-file (Weber
+et al., 1998), and iDistance (Jagadish et al., 2005) prune can-
+didates by pointer chasing and scalar comparisons, which
+leave the matrix units of a GPU idle. Exhaustive GPU
+search, from Garcia et al. (2008) to Faiss (Johnson et al.,
+2021) and cuVS (NVIDIA, 2026), uses these matrix units
+but evaluates every distance in single precision, which can
+misrank near ties. Floating-point filters in computational
+geometry (Fortune & Van Wyk, 1993; Shewchuk, 1997)
+and validated numerics (Higham, 2002) resolve such cases
+cheaply by evaluating in fast floating point and resorting
+to exact arithmetic only where the error bound requires
+it. ZARC applies such rounding-error bounds to the half-
+precision tensor-core products that screen every vector.
+Approximate
+and
+disk-resident
+indexes.
+Inverted
+files (Johnson et al., 2021; Babenko & Lempitsky, 2012;
+Baranchuk et al., 2018) over vectors compressed by
+OPQ (Ge et al., 2013), ScaNN (Guo et al., 2020), or Ra-
+BitQ (Gao & Long, 2024) and proximity graphs such as
+HNSW (Malkov & Yashunin, 2020), NSG (Fu et al., 2019),
+CAGRA (Ootomo et al., 2024), SONG (Zhao et al., 2020),
+and GGNN (Groh et al., 2023) trade recall for through-
+put through the probe count or the search width. HM-
+ANN (Ren et al., 2020), BANG (Venkatasubba et al., 2025),
+and DeepStore (Mailthody et al., 2019) place billion-scale
+indexes in heterogeneous memory, on one GPU, or in stor-
+age, which BaM (Qureshi et al., 2023) makes directly ac-
+cessible to GPUs. DiskANN (Subramanya et al., 2019),
+Starling (Wang et al., 2024), SPANN (Chen et al., 2021),
+and FreshDiskANN (Singh et al., 2021) keep the full vec-
+tors on solid-state storage, whose reads Rummy (Zhang
+et al., 2024) and FusionANNS (Tian et al., 2025) overlap
+with distance computation on the CPU and the GPU. Pi-
+lotANN (Gui et al., 2026), SVFusion (Peng et al., 2026),
+HAVEN (Hsu et al., 2026), and IVF-RaBitQ (Shi et al.,
+2026) spread approximate search over the memory hierar-
+chy of a GPU server, where the tier of a vector decides its
+accuracy, whereas the tiers of ZARC decide only where a
+vector is read from.
+Filtered search.
+Vector databases such as Milvus (Wang
+et al., 2021), Manu (Guo et al., 2022), AnalyticDB-V (Wei
+et al., 2020), and VBase (Zhang et al., 2023) integrate re-
+lational predicates with vector indexes. At the index level,
+ACORN (Patel et al., 2024) and Filtered-DiskANN (Gol-
+lapudi et al., 2023) add predicate-agnostic or label-aware
+edges to graph indexes. Both kinds of systems depend on
+the connectivity of the matching vertices. ZARC, in contrast,
+screens only the rows of the queried label.
+Certified exclusion.
+The error bounds of RaBitQ (Gao
+& Long, 2024; Gao et al., 2025) and the conformal re-
+call guarantees of ConANN (Horchidan et al., 2025; Vovk
+et al., 2005) hold over a distribution of rotations or queries,
+whereas those of ZARC hold for every query and every vec-
+tor. These bounds come from CertEx (Zhao, 2026), which
+proposed certified exclusion for data that fit on one GPU.
+ZARC extends them with partition thresholds, memory tiers,
+sharding, concurrent updates, filters, and inner products.
+6
+CONCLUSION
+This paper presented ZARC, which makes exact vector
+search practical at the scale of billion-vector datasets and
+million-token contexts. Its central observation is that certi-
+fied exclusion needs only the short half-precision screening
+rows in GPU memory, whereas the few surviving vectors
+can stay in host memory. On billion-scale benchmarks,
+eleven open LLMs, and sparse attention over one million to-
+kens, ZARC returns the exact answer for every query while
+it runs up to 270× faster than exhaustive GPU search and,
+in retrieval, faster than approximate indexes at their most
+accurate settings. Since ZARC keeps the calls of cuVS,
+Faiss, PyTorch, and FlashInfer, adopting it changes little
+more than an import.
+
+
+REFERENCES
+Abbas, A., Tirumala, K., Simig, D., Ganguli, S., and Mor-
+cos, A. S. SemDeDup: Data-efficient learning at web-
+scale through semantic deduplication. arXiv preprint
+arXiv:2303.09540, 2023. URL https://arxiv.or
+g/abs/2303.09540.
+Adinets, A. and Merrill, D.
+Onesweep: A faster least
+significant digit radix sort for GPUs.
+arXiv preprint
+arXiv:2206.01784, 2022. doi: 10.48550/arXiv.2206.
+01784. URL https://arxiv.org/abs/2206.0
+1784.
+Aum¨uller, M., Bernhardsson, E., and Faithfull, A. ANN-
+Benchmarks: A benchmarking tool for approximate near-
+est neighbor algorithms. Information Systems, 87:101374,
+2020. URL https://doi.org/10.1016/j.is
+.2019.02.006.
+Babenko, A. and Lempitsky, V. The inverted multi-index. In
+2012 IEEE Conference on Computer Vision and Pattern
+Recognition, pp. 3069–3076, 2012. URL https://do
+i.org/10.1109/CVPR.2012.6248038.
+Babenko, A. and Lempitsky, V. Efficient indexing of billion-
+scale datasets of deep descriptors. In Proceedings of
+the IEEE Conference on Computer Vision and Pattern
+Recognition (CVPR), pp. 2055–2063, 2016. URL http
+s://doi.org/10.1109/CVPR.2016.226.
+Baranchuk, D., Babenko, A., and Malkov, Y. Revisiting
+the inverted indices for billion-scale approximate nearest
+neighbors. In Proceedings of the European Conference
+on Computer Vision (ECCV), pp. 209–224, 2018. URL
+https://doi.org/10.1007/978-3-030-012
+58-8_13.
+Beygelzimer, A., Kakade, S., and Langford, J. Cover trees
+for nearest neighbor. In Proceedings of the 23rd inter-
+national conference on Machine learning, pp. 97–104,
+2006. URL https://doi.org/10.1145/1143
+844.1143857.
+Blanchard, P., Higham, N. J., Lopez, F., Mary, T., and
+Pranesh, S.
+Mixed precision block fused multiply-
+add: Error analysis and application to GPU tensor cores.
+SIAM Journal on Scientific Computing, 42(3):C124–
+C141, 2020. URL https://doi.org/10.113
+7/19M1289546.
+Chen, Q., Zhao, B., Wang, H., Li, M., Liu, C., Li, Z., Yang,
+M., and Wang, J. SPANN: Highly-efficient Billion-scale
+approximate nearest neighbor search. In Advances in
+Neural Information Processing Systems (NeurIPS), vol-
+ume 34, pp. 5199–5212, 2021. URL https://proc
+eedings.neurips.cc/paper/2021/hash/2
+99dc35e747eb77177d9cea10a802da2-Abstr
+act.html.
+Ciaccia, P., Patella, M., and Zezula, P. M-tree: An efficient
+access method for similarity search in metric spaces. In
+Proceedings of the 23rd International Conference on Very
+Large Data Bases (VLDB), pp. 426–435, 1997. URL ht
+tp://www.vldb.org/conf/1997/P426.PDF.
+DeepSeek-AI. DeepSeek-V2: A strong, economical, and ef-
+ficient mixture-of-experts language model. arXiv preprint
+arXiv:2405.04434, 2024. URL https://arxiv.or
+g/abs/2405.04434.
+DeepSeek-AI. DeepSeek-V3.2: Pushing the frontier of open
+large language models. arXiv preprint arXiv:2512.02556,
+2025. URL https://arxiv.org/abs/2512.0
+2556.
+DeepSeek-AI.
+DeepSeek-V4: Towards highly efficient
+million-token context intelligence.
+arXiv preprint
+arXiv:2606.19348, 2026. URL https://arxiv.or
+g/abs/2606.19348.
+Deng, J., Dong, W., Socher, R., Li, L.-J., Li, K., and Fei-Fei,
+L. ImageNet: A large-scale hierarchical image database.
+In IEEE Conference on Computer Vision and Pattern
+Recognition (CVPR), pp. 248–255, 2009. URL https:
+//doi.org/10.1109/CVPR.2009.5206848.
+Dong, W., Charikar, M., and Li, K. Efficient k-nearest neigh-
+bor graph construction for generic similarity measures.
+In Proceedings of the 20th International Conference on
+World Wide Web (WWW), pp. 577–586, 2011. URL ht
+tps://doi.org/10.1145/1963405.1963487.
+Douze, M., Guzhva, A., Deng, C., Johnson, J., Szilvasy, G.,
+Mazar´e, P.-E., Lomeli, M., Hosseini, L., and J´egou, H.
+The Faiss library. IEEE Transactions on Big Data, 12(2):
+346–361, 2026. URL https://doi.org/10.110
+9/TBDATA.2025.3618474.
+Faloutsos, C., Ranganathan, M., and Manolopoulos, Y. Fast
+subsequence matching in time-series databases. In Pro-
+ceedings of the 1994 ACM SIGMOD international confer-
+ence on Management of data, pp. 419–429, 1994. URL
+https://doi.org/10.1145/191839.191925.
+Fortune, S. and Van Wyk, C. J. Efficient exact arithmetic
+for computational geometry. In Proceedings of the Ninth
+Annual Symposium on Computational Geometry (SoCG),
+pp. 163–172, 1993. URL https://doi.org/10.1
+145/160985.161015.
+Fu, C., Xiang, C., Wang, C., and Cai, D. Fast approximate
+nearest neighbor search with the navigating spreading-
+out graph. Proceedings of the VLDB Endowment, 12(5):
+461–474, 2019. URL https://doi.org/10.147
+78/3303753.3303754.
+
+
+Gadre, S. Y., Ilharco, G., Fang, A., Hayase, J., Smyrnis, G.,
+Nguyen, T., Marten, R., Wortsman, M., Ghosh, D., Zhang,
+J., Orgad, E., Entezari, R., Daras, G., Pratt, S., Ramanu-
+jan, V., Bitton, Y., Marathe, K., Mussmann, S., Vencu, R.,
+Cherti, M., Krishna, R., Koh, P. W., Saukh, O., Ratner,
+A., Song, S., Hajishirzi, H., Farhadi, A., Beaumont, R.,
+Oh, S., Dimakis, A., Jitsev, J., Carmon, Y., Shankar, V.,
+and Schmidt, L. DataComp: In search of the next gen-
+eration of multimodal datasets. In Advances in Neural
+Information Processing Systems (NeurIPS), 2023. URL
+https://doi.org/10.52202/075280-1179.
+Gao, J. and Long, C. RaBitQ: Quantizing High-Dimensional
+Vectors with a Theoretical Error Bound for Approximate
+Nearest Neighbor Search. Proceedings of the ACM on
+Management of Data, 2(3):1–27, 2024. URL https:
+//doi.org/10.1145/3654970.
+Gao, J., Gou, Y., Xu, Y., Yang, Y., Long, C., and Wong,
+R. C.-W. Practical and Asymptotically Optimal Quanti-
+zation of High-Dimensional Vectors in Euclidean Space
+for Approximate Nearest Neighbor Search.
+Proceed-
+ings of the ACM on Management of Data, 2025. URL
+https://doi.org/10.1145/3725413.
+Garcia, V., Debreuve, E., and Barlaud, M. Fast k near-
+est neighbor search using GPU. In 2008 IEEE Com-
+puter Society Conference on Computer Vision and Pattern
+Recognition Workshops, pp. 1–6, 2008. URL https:
+//doi.org/10.1109/cvprw.2008.4563100.
+Ge, T., He, K., Ke, Q., and Sun, J. Optimized Product
+Quantization for Approximate Nearest Neighbor Search.
+In IEEE Conference on Computer Vision and Pattern
+Recognition (CVPR), pp. 2946–2953, 2013. URL http
+s://doi.org/10.1109/CVPR.2013.379.
+GLM-5 Team. GLM-5: from vibe coding to agentic engi-
+neering. arXiv preprint arXiv:2602.15763, 2026. URL
+https://arxiv.org/abs/2602.15763.
+Gollapudi, S., Karia, N., Sivashankar, V., Krishnaswamy, R.,
+Begwani, N., Raz, S., Lin, Y., Zhang, Y., Mahapatro, N.,
+Srinivasan, P., Singh, A., and Simhadri, H. V. Filtered-
+DiskANN: Graph algorithms for approximate nearest
+neighbor search with filters. In Proceedings of the ACM
+Web Conference 2023 (WWW), pp. 3406–3416, 2023.
+URL https://doi.org/10.1145/3543507.
+3583552.
+Groh, F., Ruppert, L., Wieschollek, P., and Lensch, H. P. A.
+GGNN: Graph-Based GPU Nearest Neighbor Search.
+IEEE Transactions on Big Data, 9(1):267–279, 2023.
+URL https://doi.org/10.1109/tbdata.2
+022.3161156.
+Gui, Y., Yin, P., Yan, X., Zhang, C., Zhang, W., and Cheng,
+J. Pilotann: Memory-bounded gpu acceleration for vec-
+tor search. In Proceedings of the 32nd ACM SIGKDD
+Conference on Knowledge Discovery and Data Mining
+V.1, KDD ’26, pp. 348–358. Association for Computing
+Machinery, 2026. URL https://doi.org/10.1
+145/3770854.3780192.
+Guo, R., Sun, P., Lindgren, E., Geng, Q., Simcha, D., Chern,
+F., and Kumar, S. Accelerating Large-Scale Inference
+with Anisotropic Vector Quantization. In International
+Conference on Machine Learning (ICML), volume 119
+of Proceedings of Machine Learning Research, pp. 3887–
+3896, 2020. URL https://proceedings.mlr.
+press/v119/guo20h.html.
+Guo, R., Luan, X., Xiang, L., Yan, X., Yi, X., Luo, J., Cheng,
+Q., Xu, W., Luo, J., Liu, F., Cao, Z., Qiao, Y., Wang, T.,
+Tang, B., and Xie, C.
+Manu: A cloud native vector
+database management system. Proceedings of the VLDB
+Endowment, 15(12):3548–3561, 2022. URL https:
+//doi.org/10.14778/3554821.3554843.
+Higham, N. J. Accuracy and Stability of Numerical Al-
+gorithms.
+Society for Industrial and Applied Mathe-
+matics (SIAM), Philadelphia, PA, second edition, 2002.
+doi: 10.1137/1.9780898718027.
+URL https:
+//doi.org/10.1137/1.9780898718027.
+Hofst¨atter, S., Lin, S.-C., Yang, J.-H., Lin, J., and Hanbury,
+A. Efficiently Teaching an Effective Dense Retriever with
+Balanced Topic Aware Sampling. In Proceedings of the
+44th International ACM SIGIR Conference on Research
+and Development in Information Retrieval, pp. 113–122,
+2021. URL https://doi.org/10.1145/3404
+835.3462891.
+Horchidan, S., Zeiher, F., Bostr¨om, H., and Carbone, P. Co-
+nANN: Conformal approximate nearest neighbor search.
+Proceedings of the VLDB Endowment, 19(1):29–42, 2025.
+URL https://www.vldb.org/pvldb/vol19
+/p29-horchidan.pdf.
+Hsu, P.-K., Xu, W., Liu, Q., Rosing, T., and Yu, S. HAVEN:
+High-bandwidth flash augmented vector engine for large-
+scale approximate nearest-neighbor search acceleration.
+arXiv preprint arXiv:2603.01175, 2026. URL https:
+//arxiv.org/abs/2603.01175.
+Jagadish, H. V., Ooi, B. C., Tan, K.-L., Yu, C., and Zhang, R.
+iDistance: An adaptive b+-tree based indexing method for
+nearest neighbor search. ACM Transactions on Database
+Systems (TODS), 30(2):364–397, 2005. URL https:
+//doi.org/10.1145/1071610.1071612.
+Jegou, H., Tavenard, R., Douze, M., and Amsaleg, L.
+Searching in one billion vectors: Re-rank with source cod-
+ing. In 2011 IEEE International Conference on Acoustics,
+
+
+Speech and Signal Processing (ICASSP), pp. 861–864,
+2011. URL https://doi.org/10.1109/ICAS
+SP.2011.5946540.
+Johnson, J., Douze, M., and Jegou, H. Billion-Scale Similar-
+ity Search with GPUs. IEEE Transactions on Big Data, 7
+(3):535–547, 2021. URL https://doi.org/10.1
+109/TBDATA.2019.2921572.
+J´egou, H., Douze, M., and Schmid, C. Product Quantization
+for Nearest Neighbor Search.
+IEEE Transactions on
+Pattern Analysis and Machine Intelligence, 33(1):117–
+128, 2011. URL https://doi.org/10.1109/TP
+AMI.2010.57.
+Khandelwal, U., Levy, O., Jurafsky, D., Zettlemoyer, L., and
+Lewis, M. Generalization through memorization: Nearest
+neighbor language models. In International Conference
+on Learning Representations (ICLR), 2020. URL http
+s://openreview.net/forum?id=HklBjCEK
+vH.
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Ef-
+ficient memory management for large language model
+serving with PagedAttention. In Proceedings of the 29th
+Symposium on Operating Systems Principles (SOSP), pp.
+611–626, 2023. URL https://doi.org/10.114
+5/3600006.3613165.
+Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V.,
+Goyal, N., K¨uttler, H., Lewis, M., Yih, W., Rockt¨aschel,
+T., Riedel, S., and Kiela, D. Retrieval-augmented genera-
+tion for knowledge-intensive NLP tasks. In Advances in
+Neural Information Processing Systems (NeurIPS), vol-
+ume 33, pp. 9459–9474, 2020. URL https://proc
+eedings.neurips.cc/paper/2020/hash/6
+b493230205f780e1bc26945df7481e5-Abstr
+act.html.
+Liu, D., Chen, M., Lu, B., Jiang, H., Han, Z., Zhang, Q.,
+Chen, Q., Zhang, C., Ding, B., Zhang, K., Chen, C., Yang,
+F., Yang, Y., and Qiu, L. RetrievalAttention: Acceler-
+ating long-context LLM inference via vector retrieval.
+In Advances in Neural Information Processing Systems
+(NeurIPS), 2025. URL https://papers.nips.cc
+/paper_files/paper/2025/hash/4e36d40
+49fb0fea195a8267c8dcd0824-Abstract-C
+onference.html.
+Lowe, D. G.
+Distinctive Image Features from Scale-
+Invariant Keypoints. International Journal of Computer
+Vision, 60(2):91–110, 2004. URL https://doi.or
+g/10.1023/B:VISI.0000029664.99615.94.
+Mailthody, V. S., Qureshi, Z., Liang, W., Feng, Z., Garcia
+de Gonzalo, S., Li, Y., Franke, H., Xiong, J., Huang,
+J., and Hwu, W.
+DeepStore: In-storage acceleration
+for intelligent queries. In Proceedings of the 52nd An-
+nual IEEE/ACM International Symposium on Microar-
+chitecture (MICRO), pp. 224–238, 2019. URL https:
+//doi.org/10.1145/3352460.3358320.
+Malkov, Y. A. and Yashunin, D. A. Efficient and Robust
+Approximate Nearest Neighbor Search Using Hierarchi-
+cal Navigable Small World Graphs. IEEE Transactions
+on Pattern Analysis and Machine Intelligence, 42(4):824–
+836, 2020. URL https://doi.org/10.1109/TP
+AMI.2018.2889473.
+Muja, M. and Lowe, D. G. Scalable Nearest Neighbor Al-
+gorithms for High Dimensional Data. IEEE Transactions
+on Pattern Analysis and Machine Intelligence, 36(11):
+2227–2240, 2014. URL https://doi.org/10.1
+109/tpami.2014.2321376.
+Nguyen, T., Rosenberg, M., Song, X., Gao, J., Tiwary, S.,
+Majumder, R., and Deng, L. MS MARCO: A Human
+Generated MAchine Reading COmprehension Dataset. In
+Proceedings of the Workshop on Cognitive Computation:
+Integrating Neural and Symbolic Approaches, co-located
+with NeurIPS 2016, volume 1773 of CEUR Workshop
+Proceedings, 2016. URL https://ceur-ws.org/
+Vol-1773/CoCoNIPS_2016_paper9.pdf.
+NVIDIA. NVIDIA H100 tensor core GPU architecture.
+Whitepaper, 2022. URL https://resources.nv
+idia.com/en-us-hopper-architecture/nv
+idia-h100-tensor-c.
+NVIDIA. CUTLASS: CUDA templates for linear algebra
+subroutines. GitHub repository, 2025. URL https:
+//github.com/NVIDIA/cutlass.
+NVIDIA. cuVS: Vector search and clustering on the GPU.
+GitHub repository, 2026. URL https://github.c
+om/rapidsai/cuvs. Version 26.10.
+Ootomo, H., Naruse, A., Nolet, C., Wang, R., Feher, T., and
+Wang, Y. CAGRA: Highly Parallel Graph Construction
+and Approximate Nearest Neighbor Search for GPUs. In
+Proceedings of the 40th IEEE International Conference
+on Data Engineering (ICDE), pp. 4236–4247, 2024. URL
+https://doi.org/10.1109/ICDE60146.20
+24.00323.
+OpenAI. gpt-oss-120b & gpt-oss-20b model card. arXiv
+preprint arXiv:2508.10925, 2025. URL https://ar
+xiv.org/abs/2508.10925.
+Oquab, M., Darcet, T., Moutakanni, T., Vo, H., Szafraniec,
+M., Khalidov, V., Fernandez, P., Haziza, D., Massa, F.,
+El-Nouby, A., Assran, M., Ballas, N., Galuba, W., Howes,
+R., Huang, P.-Y., Li, S.-W., Misra, I., Rabbat, M., Sharma,
+
+
+V., Synnaeve, G., Xu, H., Jegou, H., Mairal, J., Labatut, P.,
+Joulin, A., and Bojanowski, P. DINOv2: Learning Robust
+Visual Features without Supervision. Transactions on
+Machine Learning Research, 2024. URL https://op
+enreview.net/forum?id=a68SUt6zFt.
+Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J.,
+Chanan, G., Killeen, T., Lin, Z., Gimelshein, N., Antiga,
+L., Desmaison, A., K¨opf, A., Yang, E., DeVito, Z., Rai-
+son, M., Tejani, A., Chilamkurthy, S., Steiner, B., Fang,
+L., Bai, J., and Chintala, S. PyTorch: An Imperative Style,
+High-Performance Deep Learning Library. In Advances
+in Neural Information Processing Systems (NeurIPS), vol-
+ume 32, 2019. URL https://proceedings.neur
+ips.cc/paper/2019/hash/bdbca288fee7f
+92f2bfa9f7012727740-Abstract.html.
+Patel, L., Kraft, P., Guestrin, C., and Zaharia, M. ACORN:
+Performant and predicate-agnostic search over vector
+embeddings and structured data.
+Proceedings of the
+ACM on Management of Data, 2(3):1–27, 2024. URL
+https://doi.org/10.1145/3654923.
+Peng, Y., Yang, D., Xie, Z., Sun, J., Shou, L., Chen, K., and
+Chen, G. SVFusion: A CPU-GPU co-processing architec-
+ture for large-scale real-time vector search. Proceedings
+of the VLDB Endowment, 19(5):1074–1087, 2026. URL
+https://www.vldb.org/pvldb/vol19/p10
+74-yang.pdf.
+Qureshi, Z., Mailthody, V. S., Gelado, I., Min, S., Masood,
+A., Park, J., Xiong, J., Newburn, C. J., Vainbrand, D.,
+Chung, I.-H., Garland, M., Dally, W., and Hwu, W. GPU-
+initiated on-demand high-throughput storage access in
+the BaM system architecture. In Proceedings of the 28th
+ACM International Conference on Architectural Support
+for Programming Languages and Operating Systems (AS-
+PLOS), Volume 2, pp. 325–339, 2023. URL https:
+//doi.org/10.1145/3575693.3575748.
+Qwen Team. Qwen3.8-Flash-Next. Hugging Face model
+repository, 2026. URL https://huggingface.co
+/Qwen/Qwen3.8-Flash-Next.
+Radford, A., Kim, J. W., Hallacy, C., Ramesh, A., Goh, G.,
+Agarwal, S., Sastry, G., Askell, A., Mishkin, P., Clark,
+J., Krueger, G., and Sutskever, I. Learning Transferable
+Visual Models From Natural Language Supervision. In
+International Conference on Machine Learning (ICML),
+volume 139 of Proceedings of Machine Learning Re-
+search, pp. 8748–8763, 2021. URL https://procee
+dings.mlr.press/v139/radford21a.html.
+Rae, J. W., Potapenko, A., Jayakumar, S. M., Hillier, C., and
+Lillicrap, T. P. Compressive transformers for long-range
+sequence modelling.
+In International Conference on
+Learning Representations (ICLR), 2020. URL https:
+//openreview.net/forum?id=SylKikSYDH.
+Reimers, N. and Gurevych, I. Sentence-BERT: Sentence
+Embeddings using Siamese BERT-Networks. In Pro-
+ceedings of the 2019 Conference on Empirical Meth-
+ods in Natural Language Processing and the 9th In-
+ternational Joint Conference on Natural Language Pro-
+cessing (EMNLP-IJCNLP), pp. 3982–3992, 2019. doi:
+10.18653/v1/D19-1410. URL https://aclantho
+logy.org/D19-1410/.
+Ren, J., Zhang, M., and Li, D. HM-ANN: Efficient billion-
+point nearest neighbor search on heterogeneous memory.
+In Advances in Neural Information Processing Systems
+(NeurIPS), volume 33, pp. 10672–10684, 2020. URL
+https://proceedings.neurips.cc/paper
+/2020/hash/788d986905533aba051261497
+ecffcbb-Abstract.html.
+Shewchuk, J. R. Adaptive precision floating-point arith-
+metic and fast robust geometric predicates. Discrete &
+Computational Geometry, 18(3):305–363, 1997. URL
+https://doi.org/10.1007/PL00009321.
+Shi, J., Gao, J., Xia, J., Feh´er, T. B., and Long, C. GPU-
+native approximate nearest neighbor search with IVF-
+RaBitQ: Fast index build and search. Proceedings of the
+VLDB Endowment, 19(11):3454–3467, 2026. URL http
+s://doi.org/10.14778/3836663.3836701.
+Simhadri, H. V., Williams, G., Aum¨uller, M., Douze, M.,
+Babenko, A., Baranchuk, D., Chen, Q., Hosseini, L.,
+Krishnaswamy, R., Srinivasa, G., Subramanya, S. J.,
+and Wang, J.
+Results of the NeurIPS’21 challenge
+on billion-scale approximate nearest neighbor search.
+In Proceedings of the NeurIPS 2021 Competitions and
+Demonstrations Track, volume 176 of Proceedings of
+Machine Learning Research, pp. 177–189, 2022. URL
+https://proceedings.mlr.press/v176/s
+imhadri22a.html.
+Singh, A., Subramanya, S. J., Krishnaswamy, R., and
+Simhadri, H. V. FreshDiskANN: A fast and accurate
+graph-based ANN index for streaming similarity search.
+arXiv preprint arXiv:2105.09613, 2021. URL https:
+//arxiv.org/abs/2105.09613.
+Su, J., Ahmed, M., Lu, Y., Pan, S., Bo, W., and Liu, Y.
+RoFormer: Enhanced transformer with rotary position
+embedding. Neurocomputing, 568:127063, 2024. doi:
+10.1016/j.neucom.2023.127063. URL https://doi.
+org/10.1016/j.neucom.2023.127063.
+Subramanya, S. J., Devvrit, Simhadri, H. V., Krishnaswamy,
+R., and Kadekodi, R. DiskANN: Fast Accurate Billion-
+point Nearest Neighbor Search on a Single Node. In
+
+
+Advances in Neural Information Processing Systems
+(NeurIPS), volume 32, 2019. URL https://pape
+rs.nips.cc/paper_files/paper/2019/ha
+sh/09853c7fb1d3f8ee67a61b6bf4a7f8e6-A
+bstract.html.
+Tang, J., Zhao, Y., Zhu, K., Xiao, G., Kasikci, B., and Han,
+S. Quest: Query-aware sparsity for efficient long-context
+LLM inference. In International Conference on Machine
+Learning (ICML), volume 235, pp. 47901–47911, 2024.
+URL https://proceedings.mlr.press/v2
+35/tang24l.html.
+Tencent Hunyuan Team. Hy3. Hugging Face model reposi-
+tory, 2026. URL https://huggingface.co/ten
+cent/Hy3.
+Tian, B., Liu, H., Tang, Y., Xiao, S., Duan, Z., Liao, X.,
+Jin, H., Zhang, X., Zhu, J., and Zhang, Y. Towards high-
+throughput and low-latency billion-scale vector search via
+CPU/GPU collaborative filtering and re-ranking. In 23rd
+USENIX Conference on File and Storage Technologies
+(FAST 25), pp. 171–185, 2025. URL https://www.
+usenix.org/conference/fast25/present
+ation/tian-bing.
+Tillet, P., Kung, H. T., and Cox, D. Triton: an intermedi-
+ate language and compiler for tiled neural network com-
+putations. In Proceedings of the 3rd ACM SIGPLAN
+International Workshop on Machine Learning and Pro-
+gramming Languages, pp. 10–19, 2019. URL https:
+//doi.org/10.1145/3315508.3329973.
+Venkatasubba, K., Khan, S., Singh, S., Simhadri, H. V., and
+Vedurada, J. BANG: Billion-scale approximate nearest
+neighbour search using a single GPU. IEEE Transactions
+on Big Data, 11(6):3142–3157, 2025. URL https:
+//doi.org/10.1109/TBDATA.2025.3581085.
+Vidal Ruiz, E. An algorithm for finding nearest neighbours
+in (approximately) constant average time. Pattern Recog-
+nition Letters, 4(3):145–157, 1986. URL https://do
+i.org/10.1016/0167-8655(86)90013-9.
+Vovk, V., Gammerman, A., and Shafer, G. Algorithmic
+Learning in a Random World. Springer, Boston, MA,
+2005. doi: 10.1007/b106715. URL https://doi.or
+g/10.1007/b106715.
+Wang, J., Yi, X., Guo, R., Jin, H., Xu, P., Li, S., Wang, X.,
+Guo, X., Li, C., Xu, X., Yu, K., Yuan, Y., Zou, Y., Long,
+J., Cai, Y., Li, Z., Zhang, Z., Mo, Y., Gu, J., Jiang, R.,
+Wei, Y., and Xie, C. Milvus: A purpose-built vector data
+management system. In Proceedings of the 2021 ACM
+SIGMOD International Conference on Management of
+Data, pp. 2614–2627, 2021. URL https://doi.or
+g/10.1145/3448016.3457550.
+Wang, M., Xu, W., Yi, X., Wu, S., Peng, Z., Ke, X., Gao,
+Y., Xu, X., Guo, R., and Xie, C.
+Starling: An I/O-
+efficient disk-resident graph index framework for high-
+dimensional vector similarity search on data segment.
+Proceedings of the ACM on Management of Data, 2(1):
+1–27, 2024. URL https://doi.org/10.1145/
+3639269.
+Weber, R., Schek, H.-J., and Blott, S. A quantitative analysis
+and performance study for similarity-search methods in
+high-dimensional spaces. In Proceedings of the 24th Inter-
+national Conference on Very Large Data Bases (VLDB),
+pp. 194–205, 1998. URL http://www.vldb.org
+/conf/1998/p194.pdf.
+Wei, C., Wu, B., Wang, S., Lou, R., Zhan, C., Li, F., and Cai,
+Y. AnalyticDB-V: A hybrid analytical engine towards
+query fusion for structured and unstructured data. Pro-
+ceedings of the VLDB Endowment, 13(12):3152–3165,
+2020. doi: 10.14778/3415478.3415541. URL https:
+//doi.org/10.14778/3415478.3415541.
+Wu, Y., Rabe, M. N., Hutchins, D., and Szegedy, C. Mem-
+orizing transformers. In International Conference on
+Learning Representations (ICLR), 2022. URL https:
+//openreview.net/forum?id=TrjbxzRcnf-.
+Xiao, C., Zhang, P., Han, X., Xiao, G., Lin, Y., Zhang, Z.,
+Liu, Z., and Sun, M. InfLLM: Training-free long-context
+extrapolation for LLMs with an efficient context memory.
+In Advances in Neural Information Processing Systems
+(NeurIPS), 2024a. URL https://neurips.cc/v
+irtual/2024/poster/94480.
+Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Effi-
+cient streaming language models with attention sinks. In
+International Conference on Learning Representations
+(ICLR), 2024b. URL https://arxiv.org/abs/
+2309.17453.
+Yang, A., Yang, B., Zhang, B., Hui, B., Zheng, B., Yu, B.,
+Li, C., Liu, D., Huang, F., Wei, H., Lin, H., Yang, J., Tu,
+J., Zhang, J., Yang, J., Yang, J., Zhou, J., Lin, J., Dang,
+K., Lu, K., Bao, K., Yang, K., Yu, L., Li, M., Xue, M.,
+Zhang, P., Zhu, Q., Men, R., Lin, R., Li, T., Tang, T., Xia,
+T., Ren, X., Ren, X., Fan, Y., Su, Y., Zhang, Y., Wan,
+Y., Liu, Y., Cui, Z., Zhang, Z., and Qiu, Z. Qwen2.5
+technical report. arXiv preprint arXiv:2412.15115, 2024.
+URL https://arxiv.org/abs/2412.15115.
+Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng, B.,
+Yu, B., Gao, C., Huang, C., Lv, C., Zheng, C., Liu, D.,
+Zhou, F., Huang, F., Hu, F., Ge, H., Wei, H., Lin, H., Tang,
+J., Yang, J., Tu, J., Zhang, J., Yang, J., Yang, J., Zhou,
+J., Zhou, J., Lin, J., Dang, K., Bao, K., Yang, K., Yu, L.,
+Deng, L., Li, M., Xue, M., Li, M., Zhang, P., Wang, P.,
+Zhu, Q., Men, R., Gao, R., Liu, S., Luo, S., Li, T., Tang,
+
+
+T., Yin, W., Ren, X., Wang, X., Zhang, X., Ren, X., Fan,
+Y., Su, Y., Zhang, Y., Zhang, Y., Wan, Y., Liu, Y., Wang,
+Z., Cui, Z., Zhang, Z., Zhou, Z., and Qiu, Z. Qwen3
+technical report. arXiv preprint arXiv:2505.09388, 2025a.
+URL https://arxiv.org/abs/2505.09388.
+Yang, A., Yu, B., Li, C., Liu, D., Huang, F., Huang, H.,
+Jiang, J., Tu, J., Zhang, J., Zhou, J., Lin, J., Dang, K.,
+Yang, K., Yu, L., Li, M., Sun, M., Zhu, Q., Men, R., He,
+T., Xu, W., Yin, W., Yu, W., Qiu, X., Ren, X., Yang, X.,
+Li, Y., Xu, Z., and Zhang, Z. Qwen2.5-1m technical
+report. arXiv preprint arXiv:2501.15383, 2025b. URL
+https://arxiv.org/abs/2501.15383.
+Ye, Z., Chen, L., Lai, R., Lin, W., Zhang, Y., Wang, S.,
+Chen, T., Kasikci, B., Grover, V., Krishnamurthy, A., and
+Ceze, L. FlashInfer: Efficient and customizable attention
+engine for LLM inference serving. In Proceedings of
+Machine Learning and Systems (MLSys), volume 7, 2025.
+URL https://proceedings.mlsys.org/pa
+per_files/paper/2025/hash/dbf02b21d7
+7409a2db30e56866a8ab3a-Abstract-Confe
+rence.html.
+Yianilos, P. N. Data structures and algorithms for nearest
+neighbor search in general metric spaces. In Proceedings
+of the Fourth Annual ACM-SIAM Symposium on Discrete
+Algorithms (SODA), pp. 311–321, 1993. URL https:
+//dl.acm.org/doi/10.5555/313559.3137
+89.
+Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun,
+B.-G. Orca: A distributed serving system for transformer-
+based generative models. In 16th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI
+22), pp. 521–538, 2022. URL https://www.usen
+ix.org/conference/osdi22/presentatio
+n/yu.
+Zhang, Q., Xu, S., Chen, Q., Sui, G., Xie, J., Cai, Z., Chen,
+Y., He, Y., Yang, Y., Yang, F., Yang, M., and Zhou,
+L. VBASE: Unifying online vector similarity search
+and relational queries via relaxed monotonicity. In 17th
+USENIX Symposium on Operating Systems Design and
+Implementation (OSDI 23), pp. 377–395, 2023. URL
+https://www.usenix.org/conference/os
+di23/presentation/zhang-qianxi.
+Zhang, Z., Liu, F., Huang, G., Liu, X., and Jin, X. Fast vector
+query processing for large datasets beyond GPU memory
+with reordered pipelining. In 21st USENIX Symposium
+on Networked Systems Design and Implementation (NSDI
+24), pp. 23–40, 2024. URL https://www.usenix
+.org/conference/nsdi24/presentation/
+zhang-zili-pipelining.
+Zhao, D. CertEx: Exact Visual Retrieval at Scale by Certi-
+fied Exclusion. arXiv preprint arXiv:2610.21325, 2026.
+URL https://arxiv.org/abs/2610.21325.
+Zhao, W., Tan, S., and Li, P. SONG: Approximate Nearest
+Neighbor Search on GPU. In 2020 IEEE 36th Inter-
+national Conference on Data Engineering (ICDE), pp.
+1033–1044, 2020. URL https://doi.org/10.1
+109/icde48307.2020.00094.
+A
+CERTIFIED SCREENING ROWS
+The propositions of this appendix build on one guarantee
+of screening, which Section 2.3 describes and the screening
+stage of Section 3.1 relies on. This section restates it in the
+notation of ZARC. Consider a dataset of vectors x ∈RD, a
+center c ∈RD, and a matrix V ∈Rm×D with orthonormal
+rows, which ZARC computes as the leading eigenvectors
+of the covariance of a sample of the dataset. CertEx (Zhao,
+2026) defines the lift
+ℓ(x) =
+
+V(x −c); ∥(I −V⊤V)(x −c)∥
+
+∈Rm+1, (1)
+whose squared norm a(x) = ∥ℓ(x)∥2 equals ∥x −c∥2.
+Every query q and vector x thus satisfy ∥q −x∥2 ≥
+a(q) + a(x) −2⟨ℓ(q), ℓ(x)⟩, because the Cauchy-Schwarz
+inequality bounds the inner product of the two residuals
+by the product of their norms. Throughout this appendix,
+U(q) and rk(q) denote squared distances, which leaves the
+statements of the paper unchanged, as squaring preserves
+the order of distances.
+ZARC evaluates this bound in half precision with the round-
+ing certificate of CertEx (Zhao, 2026). Every stored vector
+becomes a screening row of m + 1 half-precision lifted
+coordinates, scaled by a common factor 1/α so that every
+lifted row has norm at most 64, followed by four certificate
+coordinates. Two certificate coordinates hold rounded-up
+bounds on the norm of the row and on its rounding error,
+while the other two hold −a(x)/(2α2) as a sum of two
+half-precision numbers. With the matching coordinates in
+the query row, one tensor-core product v(q, x) with fp32
+accumulation evaluates the scaled bound together with its
+error terms. A vector survives if and only if v(q, x) ≥θ(q),
+where
+θ(q) = down
+a(q) −U(q)
+2α2
+−µ(q)
+
+(2)
+and the margin µ(q) covers the remaining error terms
+through the maxima of the certificate coordinates over the
+dataset. For a survivor, the computed product yields the
+certified lower bound
+λ(q, x) =
+ a(q)/α2 −2(v(q, x) + ϵ(q))
+
+α2,
+(3)
+where ϵ(q) collects the accumulation error and the margin.
+
+
+Proposition 1 (Certified Screening). If the certificate max-
+ima cover every stored row and every product accumu-
+lates its terms in one sequential chain in single precision,
+then every vector that fails the test v(q, x) ≥θ(q) satis-
+fies ∥q −x∥2 > U(q), whereas every survivor satisfies
+λ(q, x) ≤∥q −x∥2.
+Proposition 1 restates the guarantee of CertEx (Zhao,
+2026), whose error analysis follows the standard analysis of
+floating-point dot products (Higham, 2002) and of tensor-
+core arithmetic (Blanchard et al., 2020). Its accumulation
+condition constrains the kernels of Section C.1. Specifically,
+the error constant γ = 16 L u with u = 2−24 bounds a se-
+quential fp32 accumulation over a row of L padded halves.
+Every product thus accumulates in one chain of tensor-core
+instructions, since ZARC never splits the reduction over the
+row length across thread blocks.
+B
+CORRECTNESS OF THRESHOLDS,
+UPDATES, AND INNER PRODUCTS
+The paper states three guarantees of the design in prose,
+which this section proves. The first concerns the partition
+threshold of Section 3.2, the second the insertions and dele-
+tions of Section 3.4, and the third the inner-product screen-
+ing of Section 3.6. Each proof uses only the lower bound of
+Section A and the certificate of Proposition 1.
+Proposition 2 (Partition Threshold). For a query q and any
+k distinct stored vectors x1, . . . , xk, the true k-th nearest
+distance satisfies rk(q) ≤maxi ∥q −xi∥. Consequently,
+screening under min(U0, U1) never excludes a true k near-
+est neighbor of q.
+Proof. The k-th nearest distance rk(q) is the smallest ra-
+dius of a ball around q that contains k stored vectors. The
+ball of radius maxi ∥q −xi∥contains the k distinct vectors
+x1, . . . , xk, hence rk(q) ≤maxi ∥q −xi∥. The threshold
+U0 is the k-th smallest exact distance among distinct live an-
+chors, which equals this maximum for the k nearest anchors.
+Similarly, U1 equals this maximum for the k nearest of the
+ρk distinct candidates. Both thresholds and therefore their
+minimum bound rk(q) from above. Every true neighbor x
+then satisfies ∥ℓ(q) −ℓ(x)∥≤∥q −x∥≤min(U0, U1),
+since the lifted distance never exceeds the true distance. The
+rounding certificate of CertEx (Zhao, 2026) keeps every
+vector whose lifted distance is at most the threshold, which
+includes the true neighbor x.
+Proposition 3 (Update Correctness Invariant). For a fixed
+orthonormal projection and center, the lifted lower bound
+holds for every stored vector. If the maxima of the rounding
+certificate cover every stored row, the certified test never
+excludes a true neighbor among the live vectors. Hence,
+insertions with the existing projection and deletions that
+disable rows and anchors preserve exactness.
+Proof. The lifted lower bound ∥ℓ(q) −ℓ(x)∥≤∥q −x∥of
+CertEx (Zhao, 2026) holds for every orthonormal projection
+and every center, as its proof uses only the orthogonal split
+of q−c and x−c into the span of V and its complement. An
+insertion lifts the new vectors with the existing projection
+and center, for which the bound also holds. The rounding
+certificate bounds the error of the half-precision product
+through the database maxima of the certificate coordinates.
+Because an insertion raises these maxima to cover its rows
+before any search reads them, the certified test keeps every
+live vector within the threshold, as in a static dataset. A
+deleted row meets the constant coordinate of every query
+with the most negative half-precision value. Its product
+thus falls below every threshold, which excludes the row
+from every screening. A deleted anchor no longer enters
+the threshold, which thus remains the k-th smallest exact
+distance among live vectors and bounds the k-th distance
+among the live vectors from above by Proposition 2.
+For inner-product queries, Section 3.6 lifts every vector
+around the origin as ℓ(x) = [Vx; ∥(I −V⊤V)x∥] and
+screens the score s(q, x) = ∥q∥2 −2⟨q, x⟩by the lower
+bound
+s(q, x) ≥∥ℓ(q)∥2 −2⟨ℓ(q), ℓ(x)⟩.
+(4)
+Proposition 4 (Exact Inner-Product Screening). Consider
+any orthonormal V and any k distinct vectors whose k-th
+smallest score is T. Every vector whose bound in Eq. (4)
+exceeds T lies outside the k vectors of largest inner product
+with q among all stored vectors.
+Proof. Define the residual rx := (I−V⊤V)x, which gives
+ℓ(x) = [Vx; ∥rx∥] and likewise ℓ(q). Because the rows of
+V are orthonormal, x = V⊤Vx + rx splits x into orthog-
+onal parts, which gives ⟨q, x⟩= ⟨Vq, Vx⟩+ ⟨rq, rx⟩and
+∥q∥2 = ∥ℓ(q)∥2. The Cauchy-Schwarz inequality bounds
+⟨rq, rx⟩by ∥rq∥∥rx∥, hence ⟨q, x⟩≤⟨ℓ(q), ℓ(x)⟩, which
+yields Eq. (4). The k given vectors show that the k-th small-
+est score over the dataset is at most T. A vector whose
+bound exceeds T has a score above T and hence lies outside
+the k vectors of smallest score. These vectors are the k
+vectors of largest inner product, since the score decreases as
+the inner product grows.
+The inner-product bound of Section 3.6 has no term that
+depends on the vector alone. The screening rows thus keep
+their layout and their rounding certificate, with the two
+coordinates of −a(x)/2 set to zero. The threshold T comes
+from the exact scores of the anchors, as in the Euclidean case.
+Verification then ranks the survivors by s(q, x) in double
+precision and returns the exact top-k by inner product.
+
+
+C
+IMPLEMENTATION DETAILS
+C.1
+GPU Screening Kernels
+On Hopper GPUs (NVIDIA, 2022), every thread block
+of the screening kernel of Section 3.1 keeps a tile of 128
+query rows in shared memory and walks every G-th tile of
+database rows, where G is the number of blocks that share
+the query tile. The grid holds at most two resident blocks
+per streaming multiprocessor, as one more block would start
+a second wave and nearly double the pass time. The Tensor
+Memory Accelerator (TMA) loads the row tiles through a
+three-stage pipeline, from which warpgroup matrix-multiply
+instructions accumulate their half-precision products in sin-
+gle precision with the layouts of CUTLASS (NVIDIA,
+2025). The reduction over the row runs in one sequential
+loop in the block, which gives every product the accumula-
+tion order that Proposition 1 assumes.
+Each thread of the epilogue collects the survivors of its
+accumulator fragment in a bit mask and reserves space for
+them in the output segment of its block with one shared-
+memory atomic. Blocks thus never contend for a global
+counter. For rows of 128 and 256 halves, ZARC runs a warp-
+specialized variant, in which a producer warpgroup streams
+row tiles with TMA and two or three consumer warpgroups
+take the tiles in turn. The epilogue of one consumer then
+overlaps the tensor-core work of the others. Rows of 64
+halves give each consumer too short a product to hide a
+heavy epilogue, and the cooperative kernel therefore serves
+them up to 225 rows.
+The routed variant takes a list of work items, each of which
+pairs a tile of queries with a tile of rows from one contiguous
+partition that TMA loads at any row offset. The same routed
+kernel screens the label partitions of filtered search. On
+Ampere GPUs such as the A100, ZARC runs kernels with
+the same epilogue that issue mma.sync instructions and load
+tiles with asynchronous copies in place of TMA.
+C.2
+Verification from Host Memory
+For the verification of Section 3.3, the GPU reads the raw
+vectors from pinned host memory through unified virtual
+addressing, which spares verification any staging of rows on
+the device. The sort keys of Section F hold the query index
+in their high bits and the order-preserving bit pattern of the
+lower bound in their low bits, which a radix sort (Adinets &
+Merrill, 2022) orders in one pass. Every temporary buffer
+of a batch comes from a stream-ordered allocator, since
+an ordinary device free synchronizes the whole GPU and
+would stall the pipeline of a batch at every buffer.
+In round r of verification, every unfinished query takes its
+next 32 · 2r survivors whose lower bounds lie below its
+current k-th exact distance. One flat launch computes the
+exact distances of all these pairs in double precision, with
+eight row reads of each warp in flight. A second launch
+merges the distances of each query into its top-k. A query
+finishes when its window stops at a lower bound above its
+k-th distance or at its last survivor.
+C.3
+Updates and Interface
+For the updates of Section 3.4, a deletion sets the coordinate
+of the screening row that meets the constant coordinate of
+every query row to the most negative half-precision value,
+which pushes the product of the row below every threshold.
+The deletion also marks the vector, which then no longer
+sets a threshold as an anchor. Searches hold a reader-writer
+lock in shared mode for the duration of a batch, while an
+update takes it in exclusive mode only while it publishes the
+new row count and the certificate maxima.
+The interface of ZARC (Table 2) follows the build, extend,
+remove, and search calls of cuVS (NVIDIA, 2026). A
+search takes a batch of queries, the number k of neighbors,
+and optionally one label per query or a bitset filter. The
+index ranks the vectors by Euclidean distance, by cosine
+similarity, or by inner product. For sparse attention, a key
+cache keeps one index per KV head and returns the exact
+top-k either in the layout of torch.topk (Paszke et al.,
+2019) or as the int32 positions of the top-k transforms of
+FlashInfer (Ye et al., 2025). The engine chooses the number
+of projected dimensions and the anchor stride with the cost
+model of Section 3.5 at build time.
+D
+PER-PARTITION LOCAL PROJECTIONS
+The local bounds of Section 3.2 replace the global lift inside
+every partition, which requires the certificate to hold per
+partition. Every partition Pj receives its own center cj, its
+own orthonormal directions Vj, its own scale αj, and its
+own certificate maxima, with which its rows are encoded.
+A search lifts every query once per partition with a batched
+matrix product. The search then sets the threshold of each
+pair of query and partition from the common U(q) with the
+scale and maxima of the partition, after which one routed
+pass screens every partition with its own query rows.
+Proposition 5 (Local Projections). If the rows of every
+partition are encoded with the projection and certificate
+maxima of that partition, and the queries of the routed pass
+for the partition are lifted with the same projection, then
+Proposition 1 holds for every query of the routed pass and
+every row of the partition.
+Proof. The lifted bound of Eq. (1) holds for every orthonor-
+mal V and every center, and in particular for (cj, Vj). The
+rounding certificate of a pair bounds the error of its product
+with the maxima of the rows that the query meets, which are
+the maxima of partition Pj. Both premises of Proposition 1
+
+
+hence hold within each partition, where every pair meets
+the same U(q).
+The anchors keep rows of the global projection, because the
+anchor stage compares every query with every anchor. Vec-
+tors added after the build likewise keep the global projection.
+The routed pass covers the partitions, and the plain pass the
+remaining rows, which subjects every vector to one certified
+test. Under a filter, every admitted neighbor still survives,
+as the threshold comes from admitted anchors. Verification
+then drops the survivors that the filter rejects, after which
+the remaining top-k is the exact filtered answer.
+E
+COMPACT INT8 SCREENING ROWS
+Half-precision screening rows take 2(m + 5) bytes per
+vector, while int8 codes with one scale per row take
+about half of that at the same width, which extends the
+dataset that one GPU holds in the tiered placement of Sec-
+tion 3.3. Every lifted vector stores its projection coordi-
+nates zx = sx(cx + ex) as int8 codes cx with the scale
+sx = maxj |zx,j|/127, which keeps |ex,j| ≤1/2. Each row
+also stores a(x)/2, sx, ∥ex∥, ∥cx∥, and the residual norm
+in single precision. The tensor cores accumulate ⟨cq, cx⟩
+exactly in int32, and the value converts exactly to single
+precision because 1272m < 224.
+The Cauchy-Schwarz inequality bounds the remaining terms
+of the product of the projection coordinates, which gives
+⟨zq, zx⟩≤sqsx
+ ⟨cq, cx⟩+ ∥ex∥(∥cq∥+ ∥eq∥)
++ ∥eq∥∥cx∥
+
+.
+(5)
+Consider the lower bound β(q, x) that results from the
+lifted bound with Eq. (5) in place of ⟨zq, zx⟩, and its single-
+precision evaluation ˜β.
+Proposition 6 (int8 Rows). If the pass keeps every pair
+with ˜β ≤U(q) + η(q), where η(q) = 64u(
+p
+a(q) +
+p
+maxx a(x))2, then every excluded vector has ∥q−x∥2 >
+U(q), whereas ˜β −η(q) bounds the squared distance of
+every survivor from below.
+Proof. Eq. (5) bounds ⟨zq, zx⟩from above,
+hence
+β(q, x) ≤∥ℓ(q) −ℓ(x)∥2 ≤∥q −x∥2.
+The single-
+precision evaluation of β takes at most 16 rounded op-
+erations per term, whose terms sum in magnitude to at
+most 2.6(∥ℓ(q)∥+ ∥ℓ(x)∥)2. With these counts, the stan-
+dard error analysis of floating-point sums (Higham, 2002)
+gives |˜β −β| ≤η(q).
+An excluded vector therefore
+has β > ˜β −η(q) > U(q), whereas every survivor has
+˜β −η(q) ≤β ≤∥q −x∥2.
+The int8 rows return the same exact neighbors as half-
+precision rows, with the additional survivors that their quan-
+tization admits.
+The anchors keep half-precision rows,
+which serve only to choose the anchors whose exact dis-
+tances form U(q). Since the int8 bound only admits more
+survivors, Proposition 7 applies unchanged and the search
+returns the exact top-k.
+F
+ORDERED VERIFICATION
+Ordered verification (Section 3.3) reads the raw vector of
+a survivor only while the survivor can still enter the top k,
+which bounds the reads from host memory by the tightness
+of the certified lower bounds. A kernel computes λ(q, x)
+of Eq. (3) for every survivor and rounds it down to single
+precision. The kernel then forms a key that concatenates
+the query index with the order-preserving bit pattern of the
+bound, with which one radix sort orders the survivors by
+query and then by bound. A binary search finds the first
+survivor of every query. The implementation runs this veri-
+fication in rounds over all queries of a batch (Section C.2).
+The k-th distance at the start of a round is never below the
+one that a sequential verification would use at the same
+survivor. As a result, the rounds verify every survivor that
+sequential order verifies and return the same top-k.
+Proposition 7 (Ordered Verification). If U(q) ≥rk(q)
+and Proposition 1 holds, the verification that stops at the
+first survivor whose bound exceeds the current k-th exact
+distance returns k vectors of smallest distance.
+Proof. Every vector x with ∥q −x∥2 ≤rk(q) satisfies
+∥q −x∥2 ≤U(q) and therefore survives by Proposition 1.
+Consider the moment when the verification stops with cur-
+rent k-th exact distance b. Every unverified survivor has a
+bound of at least the bound that triggered the stop, which
+exceeds b. Proposition 1 then gives it a distance above b.
+As a result, an unverified survivor cannot replace any of the
+current k vectors, whose distances are at most b. The current
+k vectors are thus k vectors of smallest distance among all
+survivors, and hence among all vectors.
+Proposition 7 bounds the number of exact distances by the
+survivors whose bound lies below the k-th distance at the
+start of the last round. Consequently, a query whose answer
+settles within its first 32 survivors reads at most 32 raw rows,
+while a survivor whose bound lies far above the k-th distance
+costs one key in the sort and no read of its vector. This
+property explains why the tiered layout of Section 3.3 keeps
+its throughput: on BIGANN-500M (Jegou et al., 2011),
+verification reads only 699 of the 5,593 survivors per query.
+G
+MULTI-GPU SHARED THRESHOLD
+A dataset that exceeds one GPU splits into contiguous shards
+with one index per device, over which a search runs in
+two rounds (Section 3.3). In the first round, every shard
+computes the threshold Us(q) of every query from its own
+
+
+anchors. In the second round, every shard searches under
+the smallest threshold over all shards and returns the exact
+k nearest vectors of its own dataset within that threshold,
+which the host merges by exact distance. Since every shard
+skips its own threshold stage in the second round, the two
+rounds cost little beyond a single-GPU search. Only k
+identifier and distance pairs per shard and query cross the
+interconnect, which keeps the merge independent of the size
+of the shards. ZARC builds the shard indexes in parallel,
+with one host thread driving each device, and on four GPUs
+the host merges the answers of 10,000 queries in 16.7 ms.
+Proposition 8 (Shared Threshold). The merge of the shard
+answers under the threshold mins Us(q) returns k vectors
+of smallest distance over all shards.
+Proof. Each Us(q) is the k-th exact distance of k distinct
+vectors of the dataset, hence mins Us(q) ≥rk(q) for the
+k-th distance rk(q) over all shards by Proposition 2. Every
+vector among the k nearest over all shards therefore lies
+within the shared threshold and among the k nearest vectors
+of its own shard. Each shard returns its exact k nearest
+vectors within the threshold by Proposition 7. The merge of
+these sets therefore contains the k nearest vectors.
+H
+EVALUATION OF THE COST MODEL
+The cost model of Section 3.5 predicts the time of a batch as
+T(m, s, B) = αscr B Np(m + 5) + αanc B Np
+s
++ αver B S(m, s),
+(6)
+where Np is the number of vectors in the probed partitions,
+S(m, s) is the expected number of survivors per query, and
+αver depends on the memory tier of the full-precision vec-
+tors.
+We evaluate the cost model of Section 3.5 on BIGANN (Je-
+gou et al., 2011) from 10M to 500M vectors with the tiered
+layout, where tuning from prefixes of 1M and 4M vectors
+takes 4.9 to 5.2 s per dataset size. Since every candidate
+configuration is exact, a wrong choice costs only through-
+put.
+Figure 12 shows that the model predicts the survivors per
+query within 2.7% over this 50× range of dataset sizes
+(Figure 12(a)) and selects the fastest measured configuration
+from 100M to 500M vectors (Figure 12(b)). The selected
+width shrinks from 123 at 10M and 100M to 59 at 200M
+and 500M, which gives 11.4k against 10.2k queries per
+second at 200M, although the rows of width 123 still fit
+in device memory. At 10M, the selected anchor stride of
+16 lies within 4% of the faster stride of 32. The predicted
+throughput of the selected configurations lies 1% to 11%
+above the measured one.
+102
+103
+104
+Measured survivors
+102
+103
+104
+Predicted survivors
+(a) Survivors
+m=59
+m=123
+exact
+10
+100 200 500
+Vectors (M)
+0.6
+0.7
+0.8
+0.9
+1.0
+Relative throughput
+(b) Selected configuration
+other, m=59
+selected
+other, m=123
+Figure 12. Cost-model predictions and selections on BIGANN.
+I
+CONFIGURATION EFFECTS
+Measurements of the CertEx engine (Zhao, 2026) at every
+evaluated width on 21 dataset configurations reveal three
+effects that a static choice cannot capture, which motivate
+the tuner of Section 3.5. First, the throughput is unimodal
+in m with a flat top. Widths below the best one lose up to
+a factor of 5 as the looser bound multiplies the survivors,
+while widths above it lose only 5% to 35%. A static rule
+that takes the smallest tile-aligned width capturing 95% of
+the variance of the database reaches at least 0.87 of the
+best throughput and selects the best width on 12 of the 21
+configurations. Second, the best width shrinks as the dataset
+grows, since the screening pass scales with N(m+5) while
+the verification cost per query depends only on the number
+of survivors. On BIGANN (Jegou et al., 2011), the width
+123 is fastest up to 20M vectors, whereas the width 59
+is fastest from 50M vectors on, which no rule based on
+the variance alone can predict. Third, the variance of the
+database does not describe queries from another distribution.
+For CLIP (Radford et al., 2021) text queries against CLIP
+image embeddings, the width of the 95% rule admits more
+than 2 × 108 survivors per batch of 10,000 queries and
+overflows the survivor buffer, whereas the next width is
+the fastest. A batch whose survivors exceed the staging
+buffer is re-executed for each half of its queries, which
+keeps every answer exact even when the survivor count
+was underestimated. The re-executed passes keep the shape
+of the full batch and give the inactive queries an infinite
+threshold, as a new batch shape would re-tune the kernel
+during the query and cost several seconds.
+J
+FILTERED SEARCH AND LABEL
+PARTITIONS
+Filtered search admits for every query only the vectors that
+a predicate accepts. An exact filtered answer is thus the
+exact top-k over these admitted vectors, which both ways
+of Section 3.6 return. The first way applies the predicate
+only to the pairs that pass the threshold, after the anchor
+stage has applied the same predicate to the anchors. The
+threshold of every query thus comes from admitted vectors
+
+
+alone. Proposition 2 and Proposition 7 with the admitted
+vectors of each query then give the exact filtered answer, in
+which every entry beyond the admitted vectors holds the id
+−1 in place of a neighbor.
+The second way sorts a copy of the screening rows by label
+and maps every row of the copy to the id of its vector. A
+search with query labels sorts each batch of queries by label
+and routes every tile of queries to the rows of its label. This
+routed kernel screens only tiles that pair queries of one
+label with rows of the same label and masks the rows of a
+loaded tile that lie outside the label. Vectors inserted after
+partitioning form a tail, which the first way screens. The
+survivors of the tail then join those of the routed pass.
+Proposition 9 (Label Partitions). A search with query labels
+over a label partition and its tail returns, for every query, k
+live vectors of its label of smallest distance.
+Proof. The routed pass screens every row of the label of
+each query in the partition, while the first way screens every
+row of the tail under the label predicate. Every admitted
+vector of a query thus meets the certified test exactly once.
+The masks also keep no pair of different labels. The thresh-
+old comes from live anchors of the label of the query and
+bounds the k-th admitted distance by Proposition 2. Since
+the survivors map to vector ids before verification, Proposi-
+tions 3 and 7 applied to the live vectors of the label of each
+query then give the claim.
+K
+EXACT COSINE SIMILARITY
+Cosine similarity (Section 3.6) needs a separate argument,
+as ZARC returns the exact cosine of the vectors as given
+while the screening rows lift normalized copies whose
+rounding perturbs them. The score of a pair is s(q, x) =
+2 −2⟨q, x⟩/(∥q∥∥x∥), the squared distance of the exact
+unit vectors, which ZARC computes in double precision
+from the stored vectors. The screening rows instead lift
+the float32-normalized copies q′ and x′, whose rounding
+moves each of them from its exact unit vector by at most
+η1 = (D + 16)u.
+The triangle inequality bounds the difference between ∥q′ −
+x′∥and the exact unit distance by η = 2η1. Because ∥q′ −
+x′∥≤2 + η, the exact score is at least ∥q′ −x′∥2 −δ with
+δ = 2η(2 + η). ZARC therefore adds δ to U(q) in Eq. (2)
+and subtracts it from λ(q, x) in Eq. (3).
+Proposition 10 (Exact Cosine). With the slack δ, every vec-
+tor that fails the certified test has a cosine score above U(q),
+whereas every survivor satisfies λ(q, x) −δ ≤s(q, x).
+Proof. A vector that fails the test satisfies ∥q′ −x′∥2 >
+U(q) + δ by Proposition 1 applied to the normalized copies
+with the threshold U(q) + δ. Its exact score is at least
+Model
+Layer
+Dim
+Heads
+Chunk
+Keys per head
+gpt-oss-120b
+17 of 36
+64
+4
+8,192
+10.0M
+Qwen2.5-7B
+14 of 28
+128
+4
+8,192
+250.0M
+Qwen2.5-32B
+32 of 64
+128
+4
+8,192
+40.0M
+Qwen2.5-72B
+40 of 80
+128
+4
+8,192
+40.0M
+Hy3
+20 of 80
+128
+4
+8,192
+10.0M
+Qwen3-235B-A22B
+47 of 94
+128
+4
+8,192
+10.0M
+Qwen3.8-Flash-Next
+23 of 48
+256
+2
+8,192
+2.5M
+DeepSeek-V4-Flash
+21 of 43
+512
+4
+4,096
+10.0M
+DeepSeek-V3.2
+20 of 61
+576
+4
+4,096
+10.0M
+GLM-5.3
+24 of 78
+576
+4
+4,096
+10.0M
+DeepSeek-V4-Pro
+12 of 61
+512
+4
+2,048
+10.0M
+Table 3. Extracted layer and memory of each open LLM.
+∥q′ −x′∥2 −δ and thus exceeds U(q). Every survivor
+satisfies λ(q, x) ≤∥q′ −x′∥2 by the same proposition,
+which together with the lower bound on the exact score
+gives λ(q, x) −δ ≤s(q, x).
+Proposition 10 supplies the two properties that Proposi-
+tions 2 and 7 use, namely exclusion above the threshold
+and a lower bound for every survivor. Since the thresholds
+of cosine search come from exact scores of anchors and
+candidates, both propositions apply with s in place of the
+squared distance. The inner-product case needs no slack,
+because its lift of Section 3.6 creates no normalized copy.
+L
+OPEN LLMS
+Table 3 lists the eleven open LLMs of Section 4.2. Every
+memory holds the keys of one layer before rotary position
+embedding (RoPE) (Su et al., 2024), computed on chunks
+of the PG-19 training books (Rae et al., 2020) without their
+first four positions, which are attention sinks (Xiao et al.,
+2024b). The queries of a memory are 10,000 pre-RoPE
+queries from the held-out test books, drawn uniformly from
+the query heads of the searched KV head. The middle layer
+serves where the layers below it fit the four H100 GPUs, and
+earlier layers serve the largest checkpoints. For multi-head
+latent attention (DeepSeek-AI, 2024), the memory holds the
+absorbed key [c; krope] that all heads share, and the query
+of head j is [W⊤
+uk,jqnope,j; qrope,j]. The inner product of
+key and query then equals the pre-RoPE attention logit.
+DeepSeek-V4 (DeepSeek-AI, 2026) shares one key head
+across all query heads. Each of the four searched heads then
+takes its queries from one quarter of the query heads. The
+memory of Qwen3.8-Flash-Next (Qwen Team, 2026) holds
+2.5M keys, since its linear-attention layers ran at about 340
+tokens per second without fused kernels, and its queries
+come from 256 positions of each of 40 test chunks. Every
+compared method reads the same memory of 10M keys per
+head, or the whole memory where it holds fewer keys.
+Figure 13 extends Qwen2.5-7B (Yang et al., 2024) to
+one billion keys and to a growing memory. With 250M
+keys per head, four H100 GPUs hold one billion keys,
+
+
+Zarc
+cuVS fp16
+0
+2
+4
+6
+8
+Throughput (kQPS)
+7.4
+0.8
+(a) 1B keys, per head
+10
+20
+Keys in memory (M)
+0
+5
+10
+15
+Insertion (M keys/s)
+every checked
+search exact
+(b) Appends
+Figure 13. Qwen2.5-7B with one billion keys and with appends.
+on which ZARC answers 7.4k exact queries per second
+per head with the raw keys in host memory, 9.5× exhaus-
+tive cuVS (NVIDIA, 2026) search in half precision (Fig-
+ure 13(a)). A memory that grows from 5M to 25M keys in
+steps of 1M absorbs 10.4M to 12.8M keys per second per
+head while every checked search stays exact (Figure 13(b)).
+M
+GPU GENERATIONS
+We evaluate whether ZARC keeps its exactness and its advan-
+tage over exhaustive search on an earlier GPU generation.
+The evaluation compares an NVIDIA A100 with 80 GB
+of HBM2e memory against the H100 of the other experi-
+ments (Section 4.1), on BIGANN-10M (Jegou et al., 2011)
+and BIGANN-100M at the widths 59 and 123 with batches
+of 512 to 8,192 queries. The A100 experiments run on a
+third server with two 64-core AMD EPYC 7763 processors,
+503 GB of host DRAM, and one NVIDIA A100 80 GB
+PCIe GPU, which runs as one MIG instance of the 7g.80gb
+profile with 98 of its 108 streaming multiprocessors. This
+server runs the same driver and software stack, except that
+the library is compiled by CUDA 12.9 with CUTLASS
+4.1 (NVIDIA, 2025). The same rows and thresholds apply
+on both GPUs, because the rounding certificate bounds the
+fp32 accumulation error of the product without assuming
+a summation order. On the H100, ZARC answers 86.6k to
+98.5k queries per second at m = 59 and 155k to 181k at
+m = 123 on BIGANN-10M over this batch range, against
+4.5k for exhaustive cuVS (NVIDIA, 2026) search. Figure 14
+compares the A100 with these values.
+On the A100, every query is exact for both sizes, both
+widths, and all five batch sizes, where every configura-
+tion keeps the same survivors per query as on the H100.
+Figure 14(a) shows that the A100 answers 28.4k to 37.2k
+queries per second on BIGANN-10M (Jegou et al., 2011)
+and 3.1k to 6.6k on BIGANN-100M, against 2.5k and 251
+for exhaustive cuVS (NVIDIA, 2026) search on the same
+GPU. ZARC is therefore 11× to 15× faster than exhaus-
+tive search on BIGANN-10M and 12× to 26× faster on
+BIGANN-100M (Figure 14(b)), against 19× to 42× on the
+59
+123
+59
+123
+Width m and vectors
+10−1
+100
+101
+102
+103
+104
+Throughput (kQPS)
+10M
+100M
+(a) Exact search
+cuVS fp32
+Zarc, A100
+Zarc, H100
+59
+123
+59
+123
+Width m and vectors
+0
+20
+40
+60
+Speedup over cuVS
+10M
+100M
+(b) Same GPU
+A100
+H100
+Figure 14. Exact throughput on A100 and H100 GPUs.
+H100. The speedup is smaller on the A100 because the
+screening pass takes 90% of the batch time on BIGANN-
+10M there, and its Ampere kernels, which issue mma.sync
+instructions, reach a smaller share of the peak tensor-core
+throughput than the TMA and WGMMA kernels of the
+H100. For the same reason, the narrower width 59 is the
+faster one on the A100 at 100M vectors, with 5.0k to 6.6k
+queries per second, whereas both widths reach the same
+throughput on the H100.
+N
+EVALUATION DETAILS
+Datasets.
+Table 4 summarizes the datasets of Section 4.1
+and the workloads that each serves. The evaluation covers
+local image descriptors, visual foundation-model embed-
+dings, and web-scale multimodal embeddings. SIFT1M
+and BIGANN (Jegou et al., 2011) contain 128-dimensional
+SIFT (Lowe, 2004) descriptors under Euclidean distance.
+The BIGANN prefixes from 10M to 1B vectors come with
+official exact ground truth. DINOv2-1.28M contains 768-
+dimensional embeddings of the ImageNet-1k (Deng et al.,
+2009) training images from the DINOv2 (Oquab et al., 2024)
+ViT-B encoder. DataComp-12.8M contains the 12.79 mil-
+lion 768-dimensional CLIP (Radford et al., 2021) ViT-L/14
+image embeddings of the DataComp (Gadre et al., 2023)
+small pool, normalized to unit length, on which Euclidean
+distance ranks neighbors as cosine similarity does. Filtered
+search assigns random labels to BIGANN-10M at 10%,
+1%, and 0.1% selectivity. MS MARCO (Nguyen et al.,
+2016) contains 8.84 million text passages, which we em-
+bed with two models. The Sentence-BERT (Reimers &
+Gurevych, 2019) model msmarco-distilbert-cos-v5 yields
+unit vectors for cosine retrieval, while TAS-B (Hofst¨atter
+et al., 2021) yields unnormalized vectors for inner-product
+retrieval. Deep1B (Babenko & Lempitsky, 2016) contains
+one billion 96-dimensional float32 image descriptors with
+10,000 queries and official ground truth, whose 250M and
+500M prefixes take their exact ground truth from a brute
+force in double precision.
+
+
+Dataset
+Vectors
+Dim
+Metric
+Workload
+SIFT1M
+1,000,000
+128
+L2
+Local bounds
+DINOv2-1.28M
+1,281,167
+768
+L2
+Local bounds
+BIGANN
+10M to 1B
+128
+L2
+Tiers, filters, updates, tuning
+DataComp-12.8M
+12,790,000
+768
+cosine
+10-NN graph
+Deep1B
+1,000,000,000
+96
+L2
+Multi-GPU scaling
+MS MARCO
+8,841,823
+768
+cos, IP
+Retrieval, inner product
+Table 4. Evaluated datasets and workloads.
+Input
+Metrics
+Exact queries
+Gaussian vectors
+L2, IP, cos
+100%
+Rank-4 data
+L2
+100%
+50 copies of every vector
+L2, IP
+100%
+Coordinates in {0, 1, 2}
+L2, IP
+100%
+Pairs one float32 ulp apart
+L2
+100%
+Gaussian scaled by 10−6
+L2, cos
+100%
+Gaussian scaled by 104
+L2, IP
+100%
+Norms 10−3 and 103 mixed
+L2, IP
+100%
+Gaussian, 10% deleted
+L2
+100%
+Table 5. Exact queries under adversarial inputs.
+Ground truth of Deep1B.
+The exact answers also expose
+three errors in the official ground truth of Deep1B (Babenko
+& Lempitsky, 2016). On three of the 10,000 queries, the
+answers of ZARC differ from the official ground truth. An
+independent double-precision brute force over all one bil-
+lion vectors confirms the answers of ZARC in all three cases.
+Two of these queries have 16,863 and 23,515 exact dupli-
+cates at distance zero in the dataset, of which the official list
+keeps only six. The official 10th neighbor of the third query
+lies farther than the vector that ZARC returns. The Deep1B
+results consequently use the official ground truth with these
+three rows corrected, which shows that benchmark ground
+truth itself needs exact search at a billion vectors.
+O
+EXACTNESS UNDER ADVERSARIAL
+INPUTS
+We test the exactness of ZARC on inputs built to break a
+floating-point bound, which Section 4.1 summarizes. Ta-
+ble 5 lists nine inputs of one million 128-dimensional vec-
+tors, which range from exact ties and duplicates to values
+below and far above the normal range of half precision, to-
+gether with the metrics that each input stresses: Euclidean
+distance (L2), inner product (IP), and cosine similarity (cos).
+For every input and metric, 1,000 queries with k = 10 and
+k = 100 are compared with exhaustive search in double
+precision, where a query counts as exact when its k returned
+ids are distinct and their double-precision distances equal
+the k smallest ones.
+Every query is exact on every input, for both values of k and
+for all 32 combinations of input, metric, and k. The inputs
+exercise the two places where a floating-point search can
+fail. Ties and duplicates at the k-th distance test whether
+verification in double precision resolves the order that half
+precision cannot, whereas the scaled and mixed norms test
+10−2
+100
+102
+Time (h)
+Zarc
+CertEx
+cuVS
+NN-Descent
+8.2 min, 100.0%
+7.9 h, 100.0%
+5.8 h, 99.6%
+2.7 min, 97.0%
+(a) Time, exact rows
+Survivors Verified
+101
+102
+103
+104
+105
+Rows
+10,486
+232
+114
+41
+(b) Work per query
+CertEx
+Zarc
+Figure 15. The exact 10-NN graph of DataComp-12.8M.
+whether the rounding-error bound of every screening row
+still covers the error of its product.
+P
+SEMANTIC DEDUPLICATION
+Figure 15 details the deduplication workload of Section 4.7,
+with the end-to-end time and the exact rows of every
+method for the 10-nearest-neighbor graph of DataComp-
+12.8M (Gadre et al., 2023), together with the survivors and
+the verified rows per query of ZARC and of the CertEx en-
+gine (Zhao, 2026). ZARC finishes in 8.2 minutes, 42× faster
+than the projected 5.8 hours of exhaustive cuVS (NVIDIA,
+2026) search, while NN-Descent (Dong et al., 2011) leaves
+3.0% of the rows inexact (Figure 15(a)). The partition thresh-
+old cuts the survivors per query from 10,486 to 114, of
+which verification reads 41 (Figure 15(b)).
