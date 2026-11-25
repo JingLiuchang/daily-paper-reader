@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-24</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-25</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 20 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 21 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>6</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>7</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>14</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-24 04:47:22 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-25 03:06:55 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日从20篇论文中精读6篇、速读14篇，重点锁定两篇9.0分的向量检索研究。最值得看的是PIM原生向量搜索与协同过滤，以及面向多组件近邻检索的Skyline联合图方法。普通读者可先读这两篇精读，再按兴趣浏览智能体与长视频理解等速读内容。</p>
+<p>今日精读7篇、速览21篇，重点聚焦向量检索架构与自适应复用中的HNSW迁移标准化方法。最值得看的是两篇9分精读：一是嵌入模型更换下的HNSW迁移容错方案，二是TriVS对磁盘驻留向量搜索的重构。普通读者可先读这两篇精读，把握迁移与存储架构的关键结论。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +78,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">6 篇</strong>
+    <strong class="dpr-home-dashboard-count">7 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Rethinking ANNS on Commodity PIM: PIM-Native Vector Search with Cooperative Filtering">Rethinking ANNS on Commodity PIM: PIM-Native Vector Search with Cooperative Filtering</span></li><li><span class="dpr-home-dashboard-paper-title" title="SJG: A Skyline Joint Graph for Multi-Component Approximate Nearest Neighbor Search">SJG: A Skyline Joint Graph for Multi-Component Approximate Nearest Neighbor Search</span></li><li><span class="dpr-home-dashboard-paper-title" title="OpenMAS-GApp: A Comprehensive Benchmark for Domain-Adaptive Multi-Agent Application Construction">OpenMAS-GApp: A Comprehensive Benchmark for Domain-Adaptive Multi-Agent Application Construction</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Standardized Tolerance for Adaptive Reuse and Repair: A Method for HNSW Migration Under Embedding Model Change Scenarios">Standardized Tolerance for Adaptive Reuse and Repair: A Method for HNSW Migration Under Embedding Model Change Scenarios</span></li><li><span class="dpr-home-dashboard-paper-title" title="Look Before You Leap: Re-Architecting Disk-Resident Vector Search with TriVS">Look Before You Leap: Re-Architecting Disk-Resident Vector Search with TriVS</span></li><li><span class="dpr-home-dashboard-paper-title" title="LEDGER: Auditable Agent Memory Under Change">LEDGER: Auditable Agent Memory Under Change</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>2</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>4</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>1</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -94,9 +94,9 @@
     <strong class="dpr-home-dashboard-count">14 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Tracking Representations in LLM Reasoning Traces for Iterated Games">Tracking Representations in LLM Reasoning Traces for Iterated Games</span></li><li><span class="dpr-home-dashboard-paper-title" title="When Agents Play Differently: Localizing Human--Agent Behavioral Divergence with Conditional Distributional Testing">When Agents Play Differently: Localizing Human--Agent Behavioral Divergence with Conditional Distributional Testing</span></li><li><span class="dpr-home-dashboard-paper-title" title="VMSA: Video Memory Skill Agent for Long Video Understanding">VMSA: Video Memory Skill Agent for Long Video Understanding</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Lost in the Hallway: Benchmarking Persistent Spatial Memory Across Revisits">Lost in the Hallway: Benchmarking Persistent Spatial Memory Across Revisits</span></li><li><span class="dpr-home-dashboard-paper-title" title="SciResearch-Eval: Evaluating Scientific Judgment in Autonomous Experimental Agents">SciResearch-Eval: Evaluating Scientific Judgment in Autonomous Experimental Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="The abc index: Exact Retrieval for Learned Sparse Representations">The abc index: Exact Retrieval for Learned Sparse Representations</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-trace <strong>6</strong></span><span class="dpr-home-dashboard-tag">agent <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>2</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>7</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>4</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>2</strong></span><span class="dpr-home-dashboard-tag">agent-trace <strong>1</strong></span></div>
 </section>
 </div>
 

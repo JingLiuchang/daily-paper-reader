@@ -1,0 +1,215 @@
+Title: Engram: Multi-Stage Memory for Agentic Tuning of Heterogeneous Models
+
+URL Source: https://arxiv.org/pdf/2611.28356v1
+
+Published Time: Tue, 24 Nov 2026 01:27:50 GMT
+
+Number of Pages: 5
+
+Markdown Content:
+# Engram: Multi-Stage Memory for Agentic Tuning of Heterogeneous Models 
+
+## Huanran Li, Nhat X.T. Le, Kevin De Angeli, Yao Xuan, Alireza Vahdatpour, Djordje Gligorijevic 
+
+Meta Platforms, Inc. {huanranli,nhatle,kevindeangeli,yxuan,alirezav,gligorijevic}@meta.com 
+
+Abstract 
+
+Large language model (LLM) agents can now tune neural net-works, yet without cross-session memory they spend costly trials rediscovering known lessons. Reuse is difficult because production models differ in architecture, training setup and inference budget. We present Engram, a memory system that links past trial out-comes with the hypotheses and rationale behind them and assesses whether this evidence applies to the current model. An online agent curates evidence at the decision points where it is needed: Initial Guidance supplies validated lessons at the start, Session Retrieval supplies related past sessions before each batch of hypotheses is generated, and Trial Candidate Review checks each trial candidate against matching past trials. Between sessions, an offline agent distills validated lessons, making the memory self-improving. On two ads models, Engram reaches the 32-trial result of a no-memory control with 47% fewer trials and also ends with a better model on average. 
+
+1 Introduction 
+
+Tuning deep neural networks has long relied on human expertise: engineers choose experiments from experience and the literature and then inspect the results. Automated methods such as Bayesian optimization [8] reduce this effort but search a fixed, predominantly numeric space that must be specified in advance. Large language model (LLM) agents remove this restriction by reasoning directly over the model and its configuration. Given the current baseline configuration, an objective and a compute budget, an agent reads the model’s code and logs, formulates a hypothesis with its ra-tionale, runs a training trial, and uses the outcome to select its next experiment [11, 12]. Such agents have proven effective: AIDE outperforms H2O AutoML on average across 16 tabular Kaggle tasks [5], and agents for recommendation systems report produc-tion launches and an eightfold reduction in training time without loss in business metrics [9]. As agents emerge as a tool for model tuning, it is inevitable that they will tune many heterogeneous models, and each of them repeatedly. For example, large advertising platforms maintain an extensive ecosystem of models that serve different product surfaces, ranking stages and advertiser objectives [6]. Production models are regularly retrained on fresh data, extended with new features and redesigned around new architectures, and each change calls for a new tuning session. However, reusing earlier sessions is difficult be-cause production models differ in targets, features and architecture, in training setup (data, run length and optimizer schedule), and in the time span of their training data. From our experience in tuning production models, we identify five challenges for agent memory across heterogeneous models. (C1) Past gains depend on the spe-cific model and training setup: the effect of a change such as a 0 8 16 24 32 
+
+> −10
+> −8
+> −6
+> −4
+> −20
+
+Tuning trials (one training run each) Best loss change (%)  Agent starting from scratch Agent with history 
+
+Figure 1: Tuning an ads model: best normalized log loss on unseen data (mean and range over five sessions). With history, the agent needs 47% fewer trials to match its 32-trial result from scratch. 
+
+larger embedding dimension varies with the model, its baseline and its training setup, so a gain on one model may not recur on another. 
+
+(C2) Applicable changes depend on the inference budget: achange that helped a model with a generous FLOPs budget may be inapplicable under a tight one. (C3) Outcomes alone do not explain a result: a record of configurations and outcomes rarely reveals the assumptions under which a result should hold, so it cannot tell a later agent whether the result transfers. (C4) The relevance of past sessions changes during the current tuning session: once the current model’s outcomes show which changes work, the most useful past sessions are those that gained from the same changes, rather than those most similar at launch or most recent. (C5) Misapplied evidence can degrade the search: past results from models that differ too much from the current one can steer the agent toward worse configurations. Engram addresses this problem by jointly interpreting past trial outcomes and their rationale against the current model and budget, then delivering applicable evidence at the decision stage where it can guide the search (Figure 1). 
+
+Related work. Prior work on reusing experience in LLM agents falls into three lines. LLM agents for model tuning reuse earlier solutions and outcomes within a task [5], provide a score-sorted journal of past configurations [9], or carry distilled heuristics across datasets [1], but none judges whether a result applies to another model or budget (C1, C2, C5). We adopt a journal of past sessions sorted by their performance gain as a baseline to measure what such judgments add. Experience memory systems supply distilled insights and similar trajectories [14], rerank and rewrite retrieved experience [2], or learn which memories are useful [13] and when to stop retrieval [10], but perform neither baseline-relative compar-ison nor budget checks. Transfer methods for Bayesian optimization arXiv:2611.28356v1 [cs.AI] 20 Nov 2026 Li et al. 
+
+warm-start the search from similar past datasets [3] or weight past tasks by learned similarity [7], but transfer numerical results with-out the rationale that explains whether a result should transfer (C3). Figure 2 gives an overview of Engram. Our contributions are as follows: 
+
+• Joint analysis of trial outcomes and rationale: a relational store links the outcome of every past trial with its hypothesis and rationale, and an LLM-based online agent uses both to judge whether a recalled result is well supported and applicable to the current model and budget (C1, C3). 
+
+• Multi-stage retrieval: Initial Guidance (IG) supplies validated lessons whose scope matches the current model at launch, Ses-sion Retrieval (SR) retrieves related past sessions and re-ranks them by current feedback before each batch, and Trial Candidate Review (TCR) checks each trial candidate against matching past trials and the budget (C2, C4, C5). 
+
+• Self-improving memory through knowledge consolidation: 
+
+between sessions, an offline agent derives lessons from completed sessions, validates them on later sessions and applies them in subsequent ones. 
+
+• Preliminary evidence: Engram outperforms a no-memory con-trol early in the search on two ads models and a journal sorted by performance on the model with a poor history. 
+
+2 Engram Design 2.1 Problem Setting 
+
+A tuning session starts from a baseline configuration 𝑥 0 in a fixed evaluation context and may submit at most 𝐾 trials, each evaluating one configuration 𝑥 𝑘 of search parameters such as learning rates and layer widths. Each trial measures a quality metric 𝑞 (𝑥 ), for which lower is better, and an inference cost 𝑐 (𝑥 ); a trial is feasible if its cost does not exceed 𝜌 times that of the baseline. The agent chooses each trial using only the outcomes of trials completed so far, and the session returns 
+
+𝑥 ★ = arg min   
+
+> 𝑥 ∈ { 𝑥 0,...,𝑥 𝐾 }
+
+𝑞 (𝑥 ) s.t. 𝑐 (𝑥 ) ≤ 𝜌 𝑐 (𝑥 0). (1) In our setting, 𝑞 is the normalized entropy (NE), the log loss di-vided by the entropy of the average label rate [4], and 𝑐 is the inference FLOPs; we use these names below. The tuning agent runs an observe–reason–act loop [12] with the LLM as an optimizer [11]: it reads a tuning guide of general advice and the outcomes of the current session, writes each hypothesis with its rationale, and sub-mits trials. Engram complements this feedback with evidence from past sessions, which the agent would otherwise not see. 
+
+2.2 Memory, Knowledge and Consolidation 
+
+Engram maintains two stores that separate raw evidence from vali-dated lessons. Memory holds the raw evidence, which a daily backfill ingests from every concluded session. For each trial, it records the configuration changes, NE, FLOPs and status together with the tuning agent’s hypothesis, rationale and analysis. The rationale is written before a trial runs and explains why the hypothesis should improve NE, whereas the analysis interprets the measured outcome                  
+
+> 1Database 2Retrieve 3Online Agent Knowledge
+> Claim: raise LR →lower loss Scope: click-prediction model
+> Memory Session Baseline Trials Result
+> s1 b1 {...} {...} s2 b2 {...} {...}
+> Consolidate
+> Initial Guidance
+> At session start
+> Session Retrieval
+> Before generation
+> Trial Candidate Review
+> Before submission Assess Revise Compose
+> Recall refinement
+> Tuning agent Trial executor
+> Curated evidence Multi-stage retrieval request + Current feedback Store memory Configuration Feedback: Performance, Cost, Status
+
+Figure 2: Online Agent: multi-stage retrieval and curation of evidence for the tuning agent. Insets are schematic. 
+
+afterwards. Knowledge in turn holds the lessons that offline consol-idation derives from Memory and validates. Each lesson specifies a parameter, a range of starting values and a change to apply from that range, which together define a move. It also states a claim about the move’s effect on NE and a scope that defines the models to which the claim applies, such as models of a given architecture or trained on a given amount of data. 
+
+Offline consolidation. This process distills evidence across all models into global lessons and stores each lesson in Knowledge 
+
+only after validating it. In this way, the offline agent turns Memory 
+
+into Knowledge , which makes Engram a self-improving memory 
+
+whose guidance strengthens as it tunes more models. Code first mines candidate lessons from pairs of trials within a session, mea-suring how each move changed NE relative to the configuration it modified. Single-parameter and joint changes are mined separately, and lessons from joint changes are stated only as correlations be-cause their effect cannot be attributed to one parameter. The offline agent then reviews each candidate with its supporting trials and recorded rationale, keeps it, narrows its scope or drops it, and re-lates it to the default advice in the tuning guide. A candidate is published only if it (1) predicts outcomes more accurately than the default tuning guide, both on the full history and under temporal cross-validation, (2) draws on multiple distinct models (five by de-fault), and (3) is endorsed by multiple independent LLM reviews (two by default). 
+
+2.3 Multi-Stage Retrieval 
+
+Algorithm 1 shows when each stage acts: Initial Guidance runs once when a session starts, after which the session proceeds in rounds until its trial budget is exhausted. In each round, Session Retrieval retrieves past sessions given the outcomes so far, the tuning agent proposes a batch of trials, and Trial Candidate Review checks it before submission. At each stage, an LLM-based online agent receives the retrieved evidence with the current baseline and outcomes and operates in a loop: it assesses whether the evidence applies to the current model, revises the retrieval when evidence is insufficient, and composes the text that the tuning agent reads. We next describe how each stage retrieves and curates its evidence. Engram: Multi-Stage Memory for Agentic Tuning of Heterogeneous Models 
+
+Initial Guidance (IG). When a session starts, Initial Guidance informs the tuning agent which validated lessons can be applied to its model. A lesson from the latest consolidation run applies if (1) its scope covers the current model, (2) the model exposes the lesson’s parameter, and (3) the baseline value of that parameter lies within the move’s starting range. The online agent reviews all applicable lessons against the baseline configuration and composes a brief that recommends the moves these lessons support and reports joint-change lessons as correlations rather than recommendations. 
+
+Session Retrieval (SR). Before the tuning agent generates each batch of hypotheses, Session Retrieval retrieves past sessions that resemble the current one and explains what they found. It ranks each past session 𝑐 by a weighted metadata match plus a weighted agreement of hypotheses and outcomes: score (𝑐 ) =∑︁ 
+
+> 𝑖
+
+𝑤 𝑖 Match 𝑖 (𝑐 ) + 𝜆 Agreement (𝑐 ). (2) Each Match 𝑖 (𝑐 ) ∈ [ 0, 1] compares one metadata field of 𝑐 with that of the current session, such as the model architecture, the model scale or the explored parameters. The weight 𝑤 𝑖 sets the impor-tance of each field. Agreement (𝑐 ) measures how much of the cur-rent session’s NE gain so far comes from hypotheses that changed parameters which 𝑐 also explored and improved. The weight 𝜆 sets its importance relative to the metadata match. Because Agreement is recomputed after every batch, the ranking evolves with new outcomes. The online agent receives the ranked sessions with their measurements and rationale, checks whether they cover the param-eters that can be tuned on the current model, fit the FLOPs budget and remain recent, and may exclude sessions or adjust 𝑤 𝑖 and 𝜆 to retrieve a revised set. It then writes advice citing the measurements and rationale of the retained sessions, while the tuning agent keeps the choice of the next hypothesis. 
+
+Trial Candidate Review (TCR). After the tuning agent proposes a batch of trials, Trial Candidate Review checks each trial candidate against past trials in Memory that made the same change. Whereas Session Retrieval reasons about whole sessions, Trial Candidate Review examines the individual trials that bear on a proposed change. The online agent receives each candidate together with past trials that moved the same parameters. It judges whether the candidate is likely to improve NE and stay within the FLOPs cap, and the tuning agent must replace or justify every candidate judged unlikely to improve NE or over the cap. 
+
+3 Experiments 
+
+We examine whether historical evidence helps an agent find useful tuning hypotheses earlier and which stage supplies the evidence that matters. We call a past model close to the current one if both belong to the same production model type, and distant otherwise. A model type fixes the ad product, ranking stage, predicted event and attribution window, and hence the traffic it serves; close models still differ in architecture, features and training regime. We study two ads models that differ in their history. Model 1 serves as the main study and has a rich history of 227 sessions, 59 of which come from close models with eight other baselines. Model 2 tests whether the findings generalize when the history is poor: all 299 of its sessions come from distant models, although some share its architecture 
+
+Algorithm 1 Engram in one tuning session 
+
+Require: baseline configuration 𝑥 0, trial budget 𝐾 , FLOPs cap 𝜌  
+
+> 1:
+
+Compose the Initial Guidance (IG) brief  
+
+> 2:
+
+for each batch of trials within the budget 𝐾 do  
+
+> 3:
+
+Run Session Retrieval (SR) on the outcomes observed so far  
+
+> 4:
+
+repeat  
+
+> 5:
+
+The tuning agent proposes trials or revises flagged ones  
+
+> 6:
+
+Run Trial Candidate Review (TCR) on the proposed trials  
+
+> 7:
+
+until no trial is flagged or the review limit is reached  
+
+> 8:
+
+Execute the trials and record their outcomes  
+
+> 9:
+
+end for  
+
+> 10:
+
+Store the session in Memory for offline consolidation  
+
+> 11:
+
+return 𝑥 ★, the best feasible configuration 
+
+Table 1: Experiment arms and mean best feasible NE change (%) over five sessions after 8, 16, 24 and 32 trials. Bold: ahead of the control (exact Mann–Whitney U, 𝑝 < 0.05 , uncorrected).                                                                               
+
+> Model 1 Model 2 Arm 816 24 32 816 24 32
+> Baselines
+> Control (no memory) −2.17 −3.75 −5.66 −6.61 −0.29 −0.63 −0.85 −1.11
+> NE-sorted journal −3.55 −6.01 −7.91 −9.09 −0.32 −0.65 −0.96 −1.26
+> Engram stages
+> IG only −2.97 −5.88 −7.62 −8.66 −0.48 −0.78 −0.95 −1.15
+> SR only −4.17 −6.48 −7.97 −9.01 −0.32 −0.61 −1.11 −1.34
+> IG + SR −3.47 −5.85 −7.37 −9.03 −0.44 −0.95 −1.18 −1.35
+> Full Engram −3.97 −6.43 −8.22 −8.93 −0.40 −0.96 −1.33 −1.46
+> Ablations of full Engram
+> No curation −3.49 −5.89 −7.66 −8.63 −0.41 −0.65 −1.10 −1.33
+> No agreement −4.04 −5.95 −7.42 −8.76 −0.48 −0.89 −1.10 −1.27
+> Distant history only −4.79 −6.40 −7.59 −8.65 Same as full Engram
+
+family. Neither history includes the current evaluation baseline. Table 1 summarizes the arm design. 
+
+3.1 Experimental Setup and Metrics 
+
+Both models are evaluated with eight arms: the no-memory control, an NE-sorted journal in place of Engram, IG only, SR only, IG with SR, full Engram, and full Engram without online curation or without feedback agreement. Model 1 additionally runs full Engram with distant history only; on Model 2 this arm coincides with full Engram because the entire history is distant. Each arm comprises five sessions that submit trials in synchronized batches of eight under an inference-FLOPs cap of 𝜌 = 1.5. Each trial trains for a single epoch on about 190M examples for Model 1 and about 144M examples for Model 2, and a batch takes about five and three hours, respectively. Apart from the batch size, the number of epochs and the FLOPs cap, the search space is unrestricted; agents mostly adjust learning rates (LR), warmup schedules, optimizer settings, embedding and layer sizes, and input features. The tuning agent and its subagents use Claude Opus 5.5, and the online agent uses the smaller Claude Sonnet 5.5 to reduce Engram’s cost and latency, since each of its calls judges supplied evidence without tool use. Within each session, Initial Guidance runs once, Session Retrieval retrieves up to 50 sessions and revises its retrieval at most twice per batch, and Trial Candidate Review checks each batch once. In Li et al. 
+
+Table 2: Decisive hypotheses within 32 trials: stage, sessions testing it, median first trial ( >32 if never) as control / Engram, and mean NE change of trials making it. Bold: Engram ahead.                                       
+
+> Model Hypothesis Stage Sessions 1st trial NE (%) 1Dense LR 0.04 → ≥ 0.12 IG 3 / 529 / 18 −8.29
+> 1Embedding size 4→8SR 5 / 5 4 / 1−5.74
+> 2Dense LR >0.04 IG 5 / 5 6 / 1−0.73
+> 2Shorter LR warmups SR 3 / 528 / 11 −1.17
+
+practice, tuning sessions on these models run a median of 9–10 trials, and 90% end within 25, so early gains matter most; we analyze 32 trials to verify that they persist. 
+
+Metrics. Because each trial trains for a single epoch and every example is scored before the model trains on it, NE is always mea-sured on unseen data. We report NE as a percentage change relative to the baseline, so negative values indicate improvements. We re-port each arm’s mean best feasible NE change after 8, 16, 24 and 32 trials, which reflects both search speed and final quality, with differences in percentage points. We compare two arms with a two-sided exact Mann–Whitney U test on their five session outcomes each. We use a rank test because five sessions cannot support a normality assumption and the outcomes are often bimodal, since sessions either find the decisive change or stall. 
+
+3.2 Speed and Final Quality 
+
+Engram reaches strong configurations earlier on both models, and on Model 2 it also achieves a better final result (Table 1). On both models, full Engram’s mean reaches the control’s 32-trial mean with 47% fewer trials (17 instead of 32). On Model 1, full Engram, SR alone, IG with SR, the NE-sorted journal and the distant-only arm all lead the control after 8 and 16 trials ( 𝑝 ≤ 0.008), and full Engram still leads at 24 trials. The control then narrows the gap: three of its sessions independently discover the decisive LR lever (Section 3.3) and reach −8.89% to −9.30%, whereas the other two never do and remain near −3%. On Model 2, neither stage suffices alone. IG alone leads the control only at 8 trials and reaches the control’s 32-trial mean only at trial 30, whereas SR alone stays level with the control through 16 trials. Full Engram, by contrast, leads the control at 16 and 24 trials ( 𝑝 = 0.008), still leads at 32 trials (𝑝 = 0.032; −1.46% against −1.11%), and leads both single stages at 16 and 24 trials ( 𝑝 = 0.008). The NE-sorted journal shows when Engram’s applicability judgments matter. It matches full Engram at every checkpoint on Model 1 ( 𝑝 ≥ 0.22), where 59 past sessions come from close models. On Model 2, where the entire history is distant, it never leads the control significantly and trails full Engram at 16, 24 and 32 trials ( 𝑝 ≤ 0.032). 
+
+3.3 How Evidence Reaches the Search 
+
+The decisive evidence originates from different stages on the two models, which supports multi-stage retrieval. For each decisive hy-pothesis, Table 2 reports which stage supplied the evidence and how many control and full-Engram sessions test it and when. This ret-rospective analysis does not isolate the effects of individual stages. On Model 1, Initial Guidance supplies a lesson to triple the learning rate of non-embedding parameters (the dense LR) from its baseline value of 0.04, beyond the tuning guide’s range of 0.02–0.08 and into the region where the guide warns of divergence. Every full-Engram session raises the LR to 0.12 or more (first at trials 10–25), whereas only three control sessions do so (at trials 18–29), and the two that never do finish last. With IG alone, however, the lead over the control is not significant at any checkpoint ( 𝑝 ≥ 0.056). Session Retrieval additionally supplies the appropriate embedding size from close-model sessions: every full-Engram session adopts it in its first trial, whereas the control and the distant-only arm find it only at trials 2–7 and spend 21 and 11 trials on larger sizes, respectively. On Model 2, the initial LR lesson merely moves the first LR increase to trial 1; the decisive change is instead shortening both the dense and the sparse LR warmups. This schedule appears only in history from distant models: every full-Engram session adopts it at trials 10–15 and cites a single recalled session as its source, whereas three control sessions discover it independently from trial 18 onward and SR alone first makes it only at trials 13–26. 
+
+4 Conclusion 
+
+Engram links measurements with their rationale, curates evidence at three stages of tuning and validates lessons offline. On two ads models, it reaches the 32-trial result of a no-memory control with 47% fewer trials, including on a model whose history comes entirely from distant models, and its decisive evidence originated from different stages on each model. These preliminary findings cover two models with five sessions per arm; broader transfer and the benefit of the self-improving memory across repeated consolidation remain to be evaluated. Engram’s central design principle is to assess which past evidence applies and deliver it when the tuning agent needs it, rather than merely supply more history. 
+
+Ethics Statement 
+
+Engram reads only the configurations, metrics and rationale of completed tuning sessions and collects no user data. 
+
+References                       
+
+> [1] Shiteng Cao, Jingwen Liu, Junda She, and Zhiheng Li. 2026. VirtualMLE: A Virtual ML Engineer that Optimizes Sequential Recommenders. arXiv:2606.03221. [2] Zouying Cao, Jiaji Deng, Li Yu, et al. 2026. Remember Me, Refine Me: A Dynamic Procedural Memory Framework for Experience-Driven Agent Evolution. In
+> Findings of ACL .[3] Matthias Feurer, Jost Tobias Springenberg, and Frank Hutter. 2015. Initializing Bayesian Hyperparameter Optimization via Meta-Learning. In AAAI .[4] Xinran He, Junfeng Pan, Ou Jin, et al. 2014. Practical Lessons from Predicting Clicks on Ads at Facebook. In ADKDD .[5] Zhengyao Jiang, Dominik Schmidt, Dhruv Srikanth, et al. 2025. AIDE: AI-Driven Exploration in the Space of Code. arXiv:2502.13138. [6] Jiang Liu, John Martabano Landy, Yao Xuan, et al. 2026. Design Once, De-ploy at Scale: Template-Driven ML Development for Large Model Ecosystems. arXiv:2603.24963. [7] Valerio Perrone, Rodolphe Jenatton, Matthias W. Seeger, and Cédric Archambeau. 2018. Scalable Hyperparameter Transfer Learning. In NeurIPS .[8] Jasper Snoek, Hugo Larochelle, and Ryan P. Adams. 2012. Practical Bayesian Optimization of Machine Learning Algorithms. In NeurIPS .[9] Haochen Wang, Yi Wu, Daryl Chang, Li Wei, and Lukasz Heldt. 2026. Self-Evolving Recommendation System: End-To-End Autonomous Model Optimiza-tion With LLM Agents. In RecSys .[10] Menglin Xia, Xuchao Zhang, Shantanu Dixit, et al. 2026. Memora: A Harmonic Memory Representation Balancing Abstraction and Specificity. In ICML .[11] Chengrun Yang, Xuezhi Wang, Yifeng Lu, et al. 2024. Large Language Models as Optimizers. In ICLR .[12] Shunyu Yao, Jeffrey Zhao, Dian Yu, et al. 2023. ReAct: Synergizing Reasoning and Acting in Language Models. In ICLR .
+
+Engram: Multi-Stage Memory for Agentic Tuning of Heterogeneous Models 
+
+[13] Shengtao Zhang, Jiaqian Wang, Ruiwen Zhou, et al. 2026. MemRL: Self-Evolving Agents via Runtime Reinforcement Learning on Episodic Memory. arXiv:2601.03192v2. [14] Andrew Zhao, Daniel Huang, Quentin Xu, et al. 2024. ExpeL: LLM Agents Are Experiential Learners. In AAAI .

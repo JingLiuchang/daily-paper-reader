@@ -1,0 +1,862 @@
+Title: S^2LMR: Supervised Sequential Long-Context Multi-Step Retriever
+
+URL Source: https://arxiv.org/pdf/2611.28995v1
+
+Published Time: Tue, 24 Nov 2026 02:34:54 GMT
+
+Number of Pages: 25
+
+Markdown Content:
+Preprint 
+
+# S2LMR: S UPERVISED SEQUENTIAL LONG -C ONTEXT 
+
+# MULTI -S TEP RETRIEVER 
+
+Qiang Hu & Kaiyi Ji 
+
+Department of Computer Science and Engineering University at Buffalo Buffalo, NY, USA 
+
+{qhu5,kaiyiji }@buffalo.edu 
+
+Project page: https://fujump.github.io/s2lmr_page/ 
+
+# ABSTRACT 
+
+Multi-step retrieval over long contexts is a key capability for retrieval-augmented generation, but strong existing approaches are costly and complex to train. Su-pervised retrievers are far simpler and cheaper, yet they fall well behind in this setting. We show that this gap stems not from supervised training itself, but from three misalignments between training and inference: easy training nega-tives, noisy retrieval prefixes, and position-agnostic scoring. Guided by this anal-ysis, we introduce S 2LMR, a simple yet effective supervised sequential retriever that models multi-step retrieval as the evolution of an explicit textual state en-coded by a single shared Transformer. On long-context reasoning, multi-hop QA, and needle-in-a-haystack benchmarks with context lengths ranging from 4K to 10M tokens, S 2LMR achieves performance comparable to state-of-the-art meth-ods, substantially outperforming prior supervised retrievers. Notably, it requires only ∼2 hours of training on a single A6000 for contexts of up to 10M tokens, while remaining robust across a wide range of hyperparameter settings. 
+
+# 1 INTRODUCTION 
+
+Retrieval-Augmented Generation (RAG) has become a standard paradigm for augmenting large language models (LLMs) with external knowledge, improving factuality without requiring large knowledge sources to be directly included in the model context (Lewis et al., 2020; Guu et al., 2020; Izacard & Grave, 2021; Gao et al., 2023). Most existing RAG studies focus on single-step retrieval, which is often sufficient for relatively simple tasks such as Needle-in-a-Haystack (Hsieh et al., 2024). However, single-step retrieval is insufficient for emerging scenarios that require multi-ple rounds of interaction with the context, such as multi-hop question answering (Yang et al., 2018; Trivedi et al., 2022) and reasoning over millions of tokens (Kuratov et al., 2024). These settings require the retriever to progressively gather relevant evidence across multiple steps. There are several types of approaches for multi-step retrieval. Graph-based approaches build struc-tured graphs over retrieved information to connect evidence across documents, but often incur addi-tional overhead from graph construction and traversal (Li et al., 2024; Mao et al., 2021). Some works use LLM agents to guide multi-step retrieval through generated reasoning or instructions (Anokhin et al., 2024; Singh et al., 2025). However, repeated LLM calls increase inference cost, while noisy evidence can misguide later retrieval steps. Another line of work fine-tunes LLMs to interact with re-trieval tools (Jin et al., 2025; Song et al., 2025), but fine-tuning LLMs can be expensive and difficult to scale. More recently, Sorokin et al. (2026) proposed a more resource-efficient approach, Q-RAG, that uses reinforcement learning (RL) to fine-tune the embedder model, achieving state-of-the-art results on multiple long-context multi-step benchmarks with contexts of up to 10 million tokens. However, compared with conventional supervised retrieval using bi-encoders or cross-encoders (Xiong et al., 2020; Zhang et al., 2024), this approach introduces additional RL components, such as value and 1arXiv:2611.28995v1 [cs.LG] 21 Nov 2026 Preprint target networks, as well as temporal-difference updates, increasing implementation complexity and introducing additional hyperparameters. This raises an intriguing but non-trivial question: 
+
+Can we achieve effective multi-step retrieval over million-token contexts using only a simple supervised learning framework? 
+
+Through extensive analysis, we identify three misalignments that explain why supervised retrievers fall far behind recent methods such as Q-RAG: (i) training negatives are easy, unrelated passages, whereas test-time distractors come from the same context as the gold passage; (ii) later hops are trained on the model’s own, sometimes wrong, retrieval prefixes, which injects noise into their su-pervision; and (iii) the scorer ignores where a candidate lies relative to the passages already retrieved, even though this position strongly predicts the next relevant passage. Motivated by these observations, we propose the Supervised Sequential Long-Context Multi-Step 
+
+Retriever (S 2LMR), a supervised bi-encoder designed to align training with long-context multi-step retrieval. S 2LMR addresses the identified mismatches through same-context negatives, gold-prefix next-evidence supervision, and history-adaptive relative positions, using a single shared Transformer encoder with an explicit textual state that evolves across retrieval hops. Across (ultra)-long context benchmarks and multi-hop QA, S 2LMR matches or outperforms the state-of-the-art RL-based re-triever Q-RAG (Sorokin et al., 2026). Our main contributions are as follows: • We propose S 2LMR, a supervised sequential retriever built on a single shared Transformer encoder and a simple contrastive supervision. • On long-context commonsense reasoning, multi-hop QA, and needle-in-a-haystack tasks with contexts from 4K to 10M tokens, S 2LMR matches or outperforms the state-of-the-art Q-RAG. It also substantially outperforms Beam Retriever, the strongest existing supervised retriever. On BabiLong QA3, S 2LMR keeps fact EM above 0.95 at up to 10M tokens, while Beam Retriever reaches only 0.2–0.3. • We further show that S 2LMR offers substantial advantages in training efficiency and sta-bility. For example, on BabiLong QA3, S 2LMR reaches its peak performance in 1.4 GPU hours and completes training in 2.25h on a single A6000, compared with 3h and 54.4h for Q-RAG, and more than 400 GPU hours for Beam Retriever. Moreover, compared with Q-RAG, S 2LMR exhibits more stable training dynamics and is substantially more robust to a wide range of hyperparameter choices, including learning rate and batch size. 
+
+# 2 RELATED WORKS 
+
+Multi-step retrieval. Multi-hop retrieval methods (Das et al., 2019; Qi et al., 2019) extend single-step dense retrieval (Karpukhin et al., 2020; Izacard et al., 2021) by conditioning each retrieval decision on previously retrieved evidence. MDR (Xiong et al., 2020) uses a bi-encoder and it-eratively augments the query with retrieved passages, while BeamRetriever (Zhang et al., 2024) combines a cross-encoder with beam search for stronger multi-hop retrieval at higher inference cost. Q-RAG (Sorokin et al., 2026) further studies embedder-based multi-step retrieval in long-context settings. Another line of work uses LLM agents to interleave retrieval with generated reasoning (Yao et al., 2022; Trivedi et al., 2023; Shao et al., 2023; Asai et al., 2024; Singh et al., 2025; Jin et al., 2025; Song et al., 2025). These methods provide flexible reasoning but require repeated LLM in-ference across retrieval steps. S 2LMR focuses instead on more efficient sequential retrieval with a lightweight shared encoder. 
+
+Retrieval for long-context tasks. Long-context benchmarks such as RULER (Hsieh et al., 2024) and BabiLong (Kuratov et al., 2024) evaluate reasoning over contexts ranging from thousands to millions of tokens. Existing approaches improve long-context processing through architectural changes, in-cluding recurrent memory (Bulatov et al., 2022; Behrouz et al., 2026; 2025; Rodkin et al., 2024), state-space models (Gu & Dao, 2023), and positional encoding adaptation (Shang et al., 2025). An alternative is to first retrieve a small subset of relevant content from the long context (Jiang et al., 2024a;b). Q-RAG (Sorokin et al., 2026) follows this direction and shows that learned chunk embed-dings can support multi-step retrieval over very long contexts. S 2LMR builds on this retrieval-based paradigm while introducing history-adaptive retrieval states and candidate positions for simple su-pervised multi-step retrieval. 2Preprint 
+
+Figure 1: Overview of S 2LMR, which performs sequential multi-hop retrieval with a shared bi-encoder. The initial state s0 contains the query q, and all chunks of the long context are embedded and cached at the start. At each hop t, S 2LMR embeds the current state st, re-rotates cached chunk embeddings according to the retrieval history, and scores candidate chunks by their inner products with the state embedding. During training (blue), gold chunks provide per-hop supervision; during inference (orange), S 2LMR greedily selects and appends the highest-scoring chunk. 
+
+Supervised training for dense retrieval. Dense retrievers are commonly trained with contrastive objectives (Oord et al., 2018; Karpukhin et al., 2020). DPR (Karpukhin et al., 2020) trains a bi-encoder using in-batch negatives together with hard negatives from term-based retrieval, and multi-hop methods such as MDR (Xiong et al., 2020) largely follow the same training strategy. Such objectives were originally developed for open-domain retrieval, where negatives often come from other queries or documents. In long-context multi-step retrieval, however, the main competitors at inference are chunks from the same context, and the correct target can also depend on previously retrieved evidence. Q-RAG (Sorokin et al., 2026) instead formulates retrieval as a Markov decision process and trains with temporal-difference learning (Mnih et al., 2015). In contrast, S 2LMR retains simple supervised contrastive training while aligning the candidate set, retrieval state, and relative positions with those encountered during inference. 
+
+# 3 METHODS 
+
+3.1 REVISITING SUPERVISED RAG FOR LONG -C ONTEXT MULTI -S TEP RETRIEVAL 
+
+Supervised retrievers remain attractive for multi-step retrieval because they are efficient and can be trained directly from retrieval labels. Two representative approaches are MDR (Xiong et al., 2020) and Beam Retriever (BR) (Zhang et al., 2024). MDR performs sequential dense retrieval with a bi-encoder, while BR scores each new candidate together with the question and previously retrieved passages. These methods were mainly developed for open-domain or relatively small candidate sets. Long-context retrieval is different: the model must search over many passages from the same context, where distractors can be highly similar to the correct evidence. To test how well existing designs transfer to this setting, we first train a bi-encoder with the standard DPR/MDR recipe on the challenging long-context BabiLong QA3 benchmark (Kuratov et al., 2024). It achieves only 1.6% fact exact match (fact-EM), substantially below recent multi-step retrievers. We identify three issues that become especially important as the context and candidate pool grow. 
+
+Issue 1: Training negatives do not match hard same-context distractors. MDR mainly learns from negatives associated with other queries, which are often easier than distractors from the same context. In long-context retrieval, however, incorrect passages may mention the same entities, de-3Preprint   
+
+> (a) (b) (c)
+
+Figure 2: Evidence for Issues 1 and 2. (a) Hop-1 cosine distributions under MDR-style training: gold vs. same-context and in-batch negatives. (b) Distribution of the hop-1 gold-vs-distractor cosine gap at ns =6 .4k. (c) Hop-1 failure rate as the candidate pool grows to ∼10M tokens. Table 1: Per-hop retrieval failure of a fine-tuned chunk-position-agnostic bi-encoder on BabiLong QA3 at N =100 . margin t = cos( qt, gold )max − cos( qt, distractor )max . See Appendix C.3.                
+
+> Metric hop-1 hop-2 hop-3 K=3
+> P(margin ≤0) 0.66 0.53 0.80 —Per-hop pick success 0.34 0.47 0.20 8.5%
+
+scribe related events, and use very similar language. BR uses candidates from the same example, but its original training setting contains only 10–20 candidates, far fewer than the thousands of chunks that may appear in long contexts. Existing training therefore provides limited supervision for distin-guishing the gold passage from many highly similar distractors. Figure 2a illustrates this problem: on our 128 evaluation examples, an MDR-style model ranks at least one same-context distractor above the correct first-hop passage in every case. 
+
+Issue 2: Predicted prefixes make multi-hop supervision noisy. BR trains later hops using pas-sages selected by earlier hops. If an earlier prediction is wrong, later hops are trained on an incorrect retrieval history. This makes the supervision noisier and can reduce the score gap between the gold passage and strong distractors. On 100 held-out QA3 examples with 400k candidates each ( ∼10M tokens), BR-style training gives a negative gold-vs-distractor margin on 12% of examples, with a worst margin of −0.247 , while a matched model trained with ground-truth prefixes flips on only 
+
+4% of examples, with a worst value of −0.034 (Fig. 2b). The problem becomes more serious as the candidate pool grows: from 100 to 400k passages ( ∼10M tokens), the hop-1 failure rate rises from 
+
+0.4% to 10% and end-to-end EM drops from 0.994 to 0.880 , while the matched control remains below 3% (Fig. 2c). 
+
+Issue 3: Retrieval scores ignore the chunk position. Neither MDR nor BR explicitly uses where a candidate appears in the document. This loses useful information in long-context tasks, where rel-evant facts are often positionally related. On BabiLong QA3, the next relevant fact lies within 25% of the previous pick’s position in 90% of examples, with a median offset of only 5%. For example, after retrieving a fact at chunk 48 for the question “Where was the apple before the bathroom?”, the word “before” suggests that the next relevant fact should appear earlier in the document. Aposition-agnostic retriever cannot directly use this signal. Table 1 shows the consequence: even af-ter fine-tuning, the model often assigns similar scores to the gold passage and its strongest distractor, and per-hop success remains only 20%–47%, limiting three-hop retrieval EM to 8.5%. 3.2 SUPERVISED SEQUENTIAL LONG -C ONTEXT MULTI -S TEP RETRIEVER 
+
+Motivated by Sec. 3.1, we propose S 2LMR, a supervised sequential retriever for long-context multi-step retrieval. It aligns training with inference along three complementary dimensions: the candidate set used for contrastive supervision, the sequential retrieval state conditioned on previous evidence, and the history-adaptive relative positions used to score candidates. S2LMR uses a shared encoder fθ : X → Rd to represent both retrieval states and candidate chunks. Given a text input x, we mean-pool its final-layer hidden states over non-padding tokens and apply 
+
+ℓ2 normalization to obtain fθ (x). Each example consists of a query q and a context divided into N
+
+chunks c1, . . . , c N , indexed by C = {1, . . . , N }.4Preprint 
+
+Sequential retrieval state. S2LMR retrieves one chunk per hop, and each hop is conditioned on the chunks retrieved before it. Let c(t) = cit be the chunk retrieved at hop t, where it is its document index, and let π be the permutation of {1, . . . , t − 1} with iπ1 < · · · < i πt−1 . The state at hop t is 
+
+st =  q, c (π1), . . . , c (πt−1) , (1) with s1 = q, where [·] denotes concatenation with a fixed separator token such as [SEP] . The permutation only determines how the retrieved chunks are arranged in the input. Chunks are still retrieved one at a time, but the encoder always reads them in document order. During training, S 2LMR uses the gold retrieval prefix c(1) , . . . , c (t−1) = ( ci⋆ 
+
+> 1
+
+, . . . , c i⋆t−1 ) to con-struct st. Rather than conditioning later-hop supervision on noisy model-generated retrieval pre-fixes, S 2LMR therefore reformulates multi-hop retrieval as a sequence of conditionally supervised retrieval decisions, where each hop directly supervises the next evidence-selection decision given the preceding gold evidence. Fig. 3b shows the effect. The performance gap between beam-expanded supervision and ours widens as context length increases. The gold indices (i⋆
+
+> 1
+
+, . . . , i ⋆K ) follow the annotated reasoning chain when available (MuSiQue, Ba-biLong) and document order otherwise (HotpotQA). Under this ordering, each hop has a single des-ignated target, while later gold chunks remain candidates rather than being simultaneously treated as positive. This explicitly trains the model to distinguish which evidence should be retrieved next, rather than only which evidence belongs to the final support set. 
+
+History-adaptive candidate positions. A candidate’s position should describe where it lies relative to the evidence retrieved so far, not where it lies in the document. Let i(1) < · · · < i (t−1) be the sorted document indices of the chunks retrieved before hop t, with i(0) = 0 and i(t) = N + 1 .These indices divide the remaining candidates into t segments Sk = { j | i(k) < j < i (k+1) } for 
+
+k = 0 , . . . , t − 1, one for each gap between consecutive retrieved chunks. For j ∈ Sk we set 
+
+p(t) 
+
+> j
+
+= k∆ + 0 .9 ∆ j − i(k)
+
+i(k+1) − i(k)
+
+, (2) with a fixed step size ∆ > 0. Segment k occupies [k∆, (k + 0 .9)∆) , and the remaining 0.1∆ 
+
+separates it from segment k + 1 . Two candidates on opposite sides of a retrieved chunk are therefore assigned clearly different positions, even if they are adjacent in the document. The relative chunk axis is taken similarly to that of Q-RAG (Sorokin et al., 2026). The main dif-ference is that positions in S 2LMR are computed from the gold prefix in training. This has two consequences. First, a position now tells the model which two pieces of retrieved evidence a can-didate lies between and how far along that gap it sits, which is the information the next hop needs. Second, p(t) 
+
+> j
+
+< t ∆ ≤ K∆ regardless of document length, so the model never encounters a position at test time that it did not see during training. Absolute chunk indices do not have this property because they grow with N .Fig. 3c compares three positional schemes: no positional encoding, static (absolute) RoPE, and our history-adaptive relative positions. Removing positional encoding entirely performs poorly across all context lengths. Static RoPE is competitive near the training length but degrades sharply beyond it, whereas ours remains accurate even at the longest context length we evaluated. 
+
+Full-context contrastive supervision. Given st and p(t) 
+
+> j
+
+, the score of candidate cj is given by 
+
+score( st, c j ) = fθ (st), RoPE  fθ (cj ), p (t)
+
+> j
+
+ , (3) where RoPE (Su et al., 2024) is applied only to the candidate chunk embedding, while the query-state embedding fθ (st) is kept at position zero. Since p(t) 
+
+> j
+
+already measures the candidate’s position relative to the retrieved history represented by st, this makes the score depend directly on the history-adaptive candidate position. At training hop t, the candidate set contains every chunk not yet retrieved, At = C \ { i⋆
+
+> 1
+
+, . . . , i ⋆t−1},and the loss is a softmax over this full set, averaged over hops: 
+
+Lt = − log exp   score( st, c i⋆t )/τ P 
+
+> j∈A t
+
+exp   score( st, c j )/τ  , LS2LMR = 1
+
+K
+
+> K
+
+X
+
+> t=1
+
+Lt, (4) with temperature τ . We use neither sampled nor in-batch negatives. The difficult negatives in multi-hop retrieval are chunks from the same context that mention the right entities but are not the next step 5Preprint in the chain, and they only enter the loss if the entire context is in the denominator. Fig. 3a shows the effect. Replacing same-context negatives with in-batch negatives lowers Fact EM from 0.99 to 
+
+0.28 , and Table 8 shows that most of S 2LMR’s margin over distractors comes from same-context negatives. Because the gold sequence fixes the training state at every hop, all K decisions receive a direct gradient, and no trajectory sampling or search is needed during training. 
+
+Inference. At test time, the gold history is replaced by the model’s own previous retrievals, and the state construction, position rule, and scoring function are unchanged. Chunk embeddings 
+
+{fθ (cj )}Nj=1 are computed once and cached. At hop t, the candidate set is At = C \ { i1, . . . , i t−1}.S2LMR selects 
+
+it = arg max 
+
+> j∈A t
+
+score( st, c j ),
+
+appends cit to the history, and recomputes the candidate positions. Algorithm 1 in the appendix gives the full procedure. 3.3 EXTENSIONS OF S2 LMR The per-hop formulation extends naturally to settings with less information. We describe three ex-tensions: stopping without a known number of hops, training from unordered gold sets, and training from answers only. Each reuses the state, positions and scoring function of Sec. 3.2, and changes only how the number of hops or the training targets are obtained. 
+
+Stopping without a known K. The number of hops a question needs is often unknown at test time. Since S 2LMR retrieves one chunk per hop, stopping reduces to a decision before each hop t: take the next pick c(t), or return the t − 1 chunks retrieved so far. Let σt = score( st, c (t)) be the score of the next pick and σ′ 
+
+> t
+
+the second-highest score over At. Besides a fixed budget of T hops, we consider two rules based on these scores: a score threshold, which stops once σt < κ , and a learned stop, a logistic regression on ϕt = ( σt, σ t − σ′
+
+> t
+
+, σ t − σt−1, σ t − σ1) and the hop index, which predicts whether c(1) , . . . , c (t−1) already contain all gold chunks and stops when this probability exceeds ρ. Both rules are fit post hoc on held-out data, so the retriever needs no retraining. 
+
+Training from unordered gold sets. Eq. 4 uses an ordered gold sequence: hop t targets i⋆t , and its teacher-forced state contains the gold chunks of earlier hops. Some datasets annotate only the set of supporting facts, which is why Sec. 3.2 falls back to document order on HotpotQA. Given only the gold set G = {i⋆
+
+> 1
+
+, . . . , i ⋆K }, let Lπ be the loss of Eq. 4 under teacher forcing in order π, an ordering of G. We minimize the soft minimum over orderings, 
+
+Lsoft = −β log X
+
+> π
+
+exp( −L π /β ),
+
+with temperature β > 0. As β → 0, Lsoft approaches min π Lπ , so each example is trained along the ordering the model currently finds easiest rather than a fixed one. We enumerate all K! orderings for K ≤ 3 and sample 12 for K ≥ 4.
+
+Training from answers only. When only question–answer pairs are available, we let an instruction-tuned LLM label the gold chunks. Given the question, the gold answer and the numbered con-text chunks, it lists the chunks needed to derive the answer in reasoning order, starting from the chunk that links the question to an intermediate entity. The listed chunks and their order replace 
+
+(i⋆
+
+> 1
+
+, . . . , i ⋆K ) in Eq. 4, and training proceeds as before. 
+
+# 4 EXPERIMENTS 
+
+4.1 EXPERIMENTAL SETUP 
+
+We evaluate S 2LMR on both long-context retrieval and open-domain multi-hop retrieval, cover-ing the primary settings of multi-step dense retrieval. Long-context evaluation is conducted on 
+
+RULER (Hsieh et al., 2024), which contains synthetic retrieval tasks with context lengths ranging from 4K to 1M tokens, including both single- and multi-step retrieval, and on BabiLong (Kuratov et al., 2024), which evaluates multi-hop reasoning over contexts of up to millions of tokens. Open-domain evaluation is conducted on HotpotQA (Yang et al., 2018) and MuSiQue (Trivedi et al., 2022), with typical context lengths of 1–2K and 2–3K tokens, respectively. 6Preprint 
+
+Figure 3: Verification of the three S 2LMR designs on BabiLong QA3, measured by Fact EM: (a) 
+
+negative sampling with varying fractions of in-batch negatives; (b) teacher-forced versus beam-expanded per-hop supervision ( B=2 ); and (c) re-anchored, static absolute, and no chunk-axis posi-tional encoding. Vertical dashed lines indicate the training context length (2K). 
+
+Figure 4: Comparison of answer accuracy on the long-context benchmark BabiLong. Solid lines de-note methods fine-tuned on the BabiLong, while dashed lines denote zero-shot methods. a) Average performance across tasks Q1–QA5. b) Performance on the hardest task, QA3, which requires the longest reasoning chain and temporal awareness. Following prior work, retrieval quality on HotpotQA and MuSiQue is evaluated using Supporting Fact F1/EM together with final answer F1/EM. For RULER and BabiLong, we report Fact EM across retrieval subtasks and context lengths. Unless otherwise specified, we use identical retrieval budgets and decoding procedures where applicable. Q-RAG results come from the authors’ released check-points or from retraining with the official code. Appendix C.4 details the sources and compares both methods under alternative evaluation protocols, including those used in the Q-RAG paper. Chunk-axis PE is disabled on RULER, HotpotQA and MuSiQue, where evidence comes from independent passages and its position carries no information about the next hop. Detailed training hyperparame-ters are listed in Appendix D. In the result tables, ◦ marks reported baselines whose scores are taken directly from the original papers, while ✓ marks reproduced baselines that we fine-tuned and/or evaluated using released code or publicly available checkpoints. 4.2 RETRIEVAL PERFORMANCE 
+
+1) Ultra-long Context Reasoning. We compare S 2LMR with the state-of-the-art long-context retrieval methods including Q-RAG (Sorokin et al., 2026), Beam Retriever (Zhang et al., 2024), ARMT (Rodkin et al., 2024), RMT (Bulatov et al., 2022), Mamba2 (Dao & Gu, 2024), and other long-context language models and LLM-based agents (Achiam et al., 2023; Grattafiori et al., 2024) reported in prior work. Figure 4 reports average performance across all QA tasks. S 2LMR main-tains strong performance across the entire context range, remaining above 95% even at 10M tokens and closely matching Q-RAG throughout. It also substantially outperforms existing long-context architectures, including recurrent transformers and state-space models. We further examine QA3, the most challenging BabiLong task requiring three-step reasoning. As shown in Figure 4, S 2LMR again maintains strong performance as context length increases, closely matching Q-RAG across the full range. Together, these results show that a supervised bi-encoder can effectively support multi-step retrieval and reasoning even in extremely long contexts. 7Preprint Table 2: Results on the RULER benchmark, evaluating long-context retrieval performance across various context lengths. S (Single-needle): Find one value for one key. MK (Multi-keys): Find one value for one key among many. MV (Multi-values): Find all values for one key. MQ (Multi-query): Answer multiple questions over the context. MH QA : open domain multi-hop question answering. 
+
+SH QA : single-hop question answering. 
+
+S MK MV MQ NIAH QA Len Methods 1-st 2-nd 3-rd 1-st 2-nd 3-rd Avg. SH MH 4K 
+
+> ◦
+
+Titans 98.4 99.8 89.4 n/a n/a n/a n/a n/a n/a n/a n/a 
+
+> ◦
+
+Atlas 99.2 100 90.6 n/a n/a n/a n/a n/a n/a n/a n/a 
+
+> ◦
+
+Mamba2-Hybrid 100 100 95.7 89.5 95.5 96 97.9 97.6 96.5 56.5 48.8 
+
+> ◦
+
+LongRoPE2-8B 100 100 99 100 100 97 99.7 100 99.7 79 60 
+
+> ✓
+
+Beam-Retriever 100 98 98 98 98 97 98 99 98.5 29.0 39.0 
+
+> ✓
+
+Q-RAG 100 100 100 100 100 100 100 100 100 55 64 S2LMR (Ours) 100 100 100 100 100 100 100 100 100 56 64 
+
+16K 
+
+> ◦
+
+Titans 96.2 80.2 n/a n/a n/a n/a n/a n/a n/a n/a n/a 
+
+> ◦
+
+Atlas 97 84 n/a n/a n/a n/a n/a n/a n/a n/a n/a 
+
+> ◦
+
+Mamba2-Hybrid 100 100 81.5 92 92.2 83 89.8 90.2 91.1 48.8 44 
+
+> ◦
+
+LongRoPE2-8B 100 100 99 99 100 98 95 98.2 98.8 69 58 
+
+> ✓
+
+Beam-Retriever 100 100 97 96.5 96 95 80 98 95.3 24.0 35.0 
+
+> ✓
+
+Q-RAG 100 100 100 100 100 100 100 100 100 53 60 
+
+S2LMR (Ours) 100 100 100 100 100 100 100 100 100 51 62 
+
+32K 
+
+> ◦
+
+Mamba2-Hybrid 100 100 96.7 84 76.5 81.5 84.3 80.9 88.0 41.8 38.5 
+
+> ◦
+
+LongRoPE2-8B 100 100 100 99 98 100 98 96.2 98.9 72 55 
+
+> ✓
+
+Q-RAG 100 100 100 100 100 100 100 100 100 52 63 S2LMR (Ours) 100 100 100 100 100 100 100 100 100 50 63 
+
+128K 
+
+> ✓
+
+Mamba2-Hybrid 100 92 96 81 81 75 48.8 72.5 80.8 36 26 
+
+> ◦
+
+LongRoPE2-8B 100 100 99 96 91 94 96.5 97 96.7 56 50 
+
+> ✓
+
+Q-RAG 100 100 100 100 100 100 100 100 100 50 61 
+
+S2LMR (Ours) 100 100 100 100 100 100 100 100 100 47 62 
+
+1M ✓Q-RAG 100 100 100 98.5 99.0 100 100 100 99.7 50 56 
+
+S2LMR (Ours) 100 100 100 100 99.0 100 100 100 99.8 46 59 
+
+Table 3: Comparison on HotPotQA (1–2K tokens) and MuSiQue (2–3K tokens). Bold/underline mark best/2nd.                                                                                             
+
+> HotPotQA MuSiQue Avg Methods Fact F1 Fact EM Ans F1 Ans EM Fact F1 Fact EM Ans F1 Ans EM Ans F1 Ans EM Finetuned
+> ✓Q-RAG 0.92 0.87 0.76 0.59 0.78 0.57 0.55 0.41 0.66 0.50
+> ◦Beam-Retriever 0.97 0.94 0.77 0.61 0.86 0.69 0.59 0.43 0.68 0.52
+> ◦Search-R1 0.81 0.66 0.65 0.52 ––––––
+> ◦RAG-RL 0.82 –0.69 –––––––
+> S2LMR (Ours) 0.95 0.90 0.78 0.62 0.83 0.67 0.56 0.42 0.67 0.52
+> Zero Shot
+> ◦Multi-step RAG 0.73 0.54 0.65 0.50 0.51 0.30 0.40 0.27 0.53 0.39
+> ◦GraphReader ––0.46 0.24 ––0.40 0.20 0.43 0.22
+> ◦Single step RAG ––0.53 0.39 ––0.28 0.17 0.41 0.28
+
+2) Long-context retrieval. Table 2 reports results on RULER across context lengths from 4K to 1M tokens. The baselines include Beam Retriever (Zhang et al., 2024), Titans (Behrouz et al., 2026), Atlas (Behrouz et al., 2025), Mamba2 (Dao & Gu, 2024), LongRoPE2 (Shang et al., 2025), and Q-RAG (Sorokin et al., 2026). S2LMR consistently matches or exceeds Q-RAG on nearly every retrieval task across the full context range. On single-needle, multi-key, multi-value, and multi-query retrieval, both methods achieve near-perfect accuracy, while S 2LMR also remains competitive with Q-RAG on long-context ques-tion answering and substantially outperforms previous long-context architectures, including recur-rent transformers and state-space models. These results demonstrate that S 2LMR remains effective across diverse retrieval tasks and context lengths, including contexts of up to 1M tokens. 8Preprint  
+
+> (a) Learning-rate robustness. (b) Batch-size robustness.
+
+Figure 5: Hyperparameter robustness on BabiLong QA3. Shaded regions indicate the stable training range; black × marks Q-function collapse. 
+
+3) Open-domain multi-hop retrieval. Table 3 compares S 2LMR with multiple strong baselines on HotPotQA and MuSiQue, including Beam Retriever (Zhang et al., 2024), Q-RAG (Sorokin et al., 2026), Search-R1 (Jin et al., 2025), RAG-RL (Huang et al., 2025), GraphReader (Li et al., 2024), and a conventional single-step RAG baseline (Lewis et al., 2020). On HotPotQA, S 2LMR achieves the best downstream answer performance (Ans F1/EM) while remaining competitive with Beam Retriever on supporting-fact retrieval. Across both benchmarks, S 2LMR outperforms Q-RAG on every metric and ties Beam Retriever for the best average answer EM. Notably, S 2LMR fine-tunes only the dense retriever rather than the language model, yet achieves comparable downstream per-formance. These results show that S 2LMR generalizes beyond long-context retrieval to standard short-context multi-hop QA. Q-RAG’s own MuSiQue evaluation stops once all gold facts are re-trieved. Appendix C.4 compares both methods under this protocol as well. 4.3 TRAINING STABILITY 
+
+Training efficiency and stability directly affect the practical cost and reproducibility of retriever training. We compare S 2LMR with Q-RAG on BabiLong QA3 from two complementary perspec-tives: (1) robustness to hyperparameter choices and (2) stability of training dynamics. 
+
+1) Hyperparameter robustness. Figure 5 sweeps S 2LMR and Q-RAG over learning rate (panel a) and effective batch size (panel b), while keeping the trainable retriever backbone fixed. Learning-rate robustness. S2LMR maintains near-peak performance across a learning-rate range spanning nearly two orders of magnitude ( ≈ 100 ×). Q-RAG remains stable only within a much narrower 
+
+≈ 8× range, with its Q-function collapsing at higher learning rates (crashes marked by ×). Thus, S2LMR provides a usable learning-rate range more than an order of magnitude wider than Q-RAG’s. 
+
+Batch-size robustness. At a fixed 3K-step training budget, S 2LMR reaches near-peak EM across a 16 × batch-size range, from 16 to 256. Under the same budget, Q-RAG has a usable range of only 4×: at batch sizes below 64, it fails to reach peak performance within the standard budget and requires several times more optimizer steps to escape its initial low-EM phase. This additional step requirement further increases its practical training cost. Beyond robustness to individual hyperparameters, S 2LMR also has fewer method-specific hyperpa-rameters to tune. Q-RAG’s value-based formulation introduces additional TD-related choices, in-cluding the discount factor, target-network update schedule, and value-network learning rate, which are absent from the supervised bi-encoder formulation. 
+
+2) Training dynamics. Figure 6 compares the training dynamics of S 2LMR and Q-RAG at the same learning rate, using Q-RAG’s reported best setting. Peak-arrival speed. S2LMR reaches its peak EM of 0.983 within ∼ 83 minutes of wall-clock training, whereas Q-RAG requires ∼ 180 
+
+minutes to reach a peak of 0.876 (Figure 6a). S 2LMR converges 2.2× faster and to +0 .11 higher final EM. Loss stability. Across the learning rates within each method’s stable range, S 2LMR’s training loss decreases smoothly, whereas Q-RAG’s Q-function loss is substantially more volatile and diverges at larger learning rates (Figure 6b,c). The smoother optimization of S 2LMR also makes its performance less sensitive to the learning rate within the stable range, reducing the need for repeated restarts or fine-grained tuning. 9Preprint   
+
+> (a) Peak-arrival speed. (b) S 2LMR training loss. (c) Q-RAG qf-loss.
+
+Figure 6: Training stability on BabiLong QA3. (a) Peak EM vs. training time. (b) S 2LMR training loss across learning rates. (c) Q-RAG Q-function loss across learning rates. Table 5: Retrieval rules on MuSiQue (full dev) when K is unknown. Table 6: Cross-dataset Fact EM: each model is trained on the other dataset.                        
+
+> Retrieval rule Fact EM #picks Known K=|gold |0.67 2.65 Fixed T=2 /3/40.39/0.65/0.77 2/3/4 Score threshold 0.63 2.60 Learned stop 0.65 2.70 Evaluated on Method MuSiQue HotpotQA Q-RAG 0.55 0.68 S2LMR 0.54 0.76 S2LMR, order-agnostic 0.60 0.77
+
+4.4 TRAINING EFFICIENCY 
+
+Table 4: Time cost on BabiLong QA3.                                                       
+
+> Method Train (h) Infer. (s/sample)
+> 1K 32K 128K 1M 10M
+> Retrieval-only (+0.44s Qwen3-4B)
+> S2LMR 2.25 0.20 1.00 3.20 27.8 279 Q-RAG 54.4 0.20 1.10 3.42 29.0 318 Beam Retriever ∼450 1.2 39 155 ∼1200 ∼12000
+> End-to-end fine-tuned
+> RMT-137M ∼20 0.21 0.90 3.15 24.5 253 Llama3-8B+RAG >40 0.65 0.75 1.23 7.82 64.8 Mamba-130M >400 4.21 81.8 OOM OOM OOM
+> End-to-end zero-shot
+> Mamba-2.8B 08.81 133 OOM OOM OOM Llama-3.1-8B 00.61 11.9 49 limit limit
+
+We compare the training and in-ference costs of S 2LMR and rep-resentative baselines on a single NVIDIA RTX A6000 GPU (Ta-ble 4). For retrieval-based methods, we report retrieval time and add 
+
+0.44 s for Qwen3-4B answer gen-eration; end-to-end LLM methods report total inference time. “OOM” denotes out-of-memory runs, and “limit” denotes runs exceeding the model’s maximum context length. For methods without reported train-ing compute, we estimate training time from reported FLOPs or train-ing data size and calibrate it on our hardware. On BabiLong QA3, S 2LMR requires only 2.25 hours of training, compared with 54 .4 hours for our Q-RAG reproduction, corresponding to a roughly 
+
+24 × lower training cost. A similar cost gap is observed on RULER. Compared with methods that fine-tune long-context language models, which can require tens to thousands of GPU-hours, S 2LMR achieves comparable or stronger retrieval performance at substantially lower training cost. 4.5 EVALUATION ON EXTENDED SETTINGS 
+
+We evaluate the three extensions of S 2LMR (see Sec. 3.3) on multi-hop QA. 
+
+Stopping without a known K. We evaluate on MuSiQue, whose questions need 2–4 paragraphs, and calibrate the stopping rules by 2-fold cross-validation on dev. Table 5 shows a trade-off between recall and compactness. A larger fixed budget raises recall: with T = 4 , Fact EM rises to 0.77, and answer quality also improves (QwQ-32B Ans F1/EM 0.62/0.47 vs. 0.56/0.42 with known K), suggesting that the reader is robust to a few extra paragraphs. The learned stop instead keeps the evidence set compact, recovering most of the known-K Fact EM (0.65 vs. 0.67) with nearly the same number of picks (2.70 vs. 2.65). 10 Preprint 
+
+Training from unordered gold sets. Trained without order labels, Lsoft performs on par with the fixed-order model in-domain (Fact EM 0.90 vs. 0.90 on HotpotQA, 0.69 vs. 0.67 on MuSiQue) and transfers better across datasets. Table 6 trains on one dataset and evaluates on the other, following Q-RAG’s protocol (up to four steps on MuSiQue, stopping once all gold paragraphs are found; two steps on HotpotQA). The fixed-order model already outperforms Q-RAG from MuSiQue to HotpotQA (0.76 vs. 0.68) and is on par in the other direction (0.54 vs. 0.55), while the order-agnostic model performs best in both directions. 
+
+Training from answers only. On HotpotQA, we discard all supporting-fact annotations and gener-ate pseudo-labels with Qwen3-8B; the annotations are used only for evaluation. The pseudo-labels identify both gold paragraphs for 77% of questions. Trained on them, S 2LMR reaches 0.88 Fact EM on the full dev set, close to the 0.90 obtained with gold labels and well above the 0.65 of the zero-shot encoder. 
+
+# 5 CONCLUSION 
+
+We introduced S 2LMR, a simple supervised bi-encoder for long-context multi-step retrieval. We showed that supervised retrievers fall behind in this setting not because supervision is too weak, but because their training is misaligned with how they are used. By correcting these misalignments, S2LMR matches or outperforms the strongest RL-based retriever at up to 10M tokens, while train-ing substantially faster and remaining robust to hyperparameters. Future work includes extending S2LMR to heterogeneous retrieval corpora with evidence distributed across different sources. 
+
+# REFERENCES 
+
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Ale-man, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. arXiv preprint arXiv:2303.08774 , 2023. Petr Anokhin, Nikita Semenov, Artyom Sorokin, Dmitry Evseev, Andrey Kravchenko, Mikhail Burt-sev, and Evgeny Burnaev. Arigraph: Learning knowledge graph world models with episodic memory for llm agents. arXiv preprint arXiv:2407.04363 , 2024. Akari Asai, Zeqiu Wu, Yizhong Wang, Avi Sil, and Hannaneh Hajishirzi. Self-rag: Learning to retrieve, generate, and critique through self-reflection. In International conference on learning representations , volume 2024, pp. 9112–9141, 2024. Ali Behrouz, Zeman Li, Praneeth Kacham, Majid Daliri, Yuan Deng, Peilin Zhong, Meisam Raza-viyayn, and Vahab Mirrokni. Atlas: Learning to optimally memorize the context at test time. 
+
+arXiv preprint arXiv:2505.23735 , 2025. Ali Behrouz, Peilin Zhong, and Vahab Mirrokni. Titans: Learning to memorize at test time. Ad-vances in Neural Information Processing Systems , 38:113506–113543, 2026. Aydar Bulatov, Yury Kuratov, and Mikhail Burtsev. Recurrent memory transformer. Advances in neural information processing systems , 35:11079–11091, 2022. Tri Dao and Albert Gu. Transformers are ssms: Generalized models and efficient algorithms through structured state space duality. arXiv preprint arXiv:2405.21060 , 2024. Rajarshi Das, Shehzaad Dhuliawala, Manzil Zaheer, and Andrew McCallum. Multi-step retriever-reader interaction for scalable open-domain question answering. arXiv preprint arXiv:1905.05733 , 2019. Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia, Jinliu Pan, Yuxi Bi, Yi Dai, Jiawei Sun, Meng Wang, and Haofen Wang. Retrieval-augmented generation for large language models: A survey. 
+
+arXiv preprint arXiv:2312.10997 , 2023. Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The llama 3 herd of models. arXiv preprint arXiv:2407.21783 , 2024. 11 Preprint Albert Gu and Tri Dao. Mamba: Linear-time sequence modeling with selective state spaces. arXiv preprint arXiv:2312.00752 , 2023. Kelvin Guu, Kenton Lee, Zora Tung, Panupong Pasupat, and Mingwei Chang. Retrieval augmented language model pre-training. In International conference on machine learning , pp. 3929–3938. PMLR, 2020. Cheng-Ping Hsieh, Simeng Sun, Samuel Kriman, Shantanu Acharya, Dima Rekesh, Fei Jia, Yang Zhang, and Boris Ginsburg. Ruler: What’s the real context size of your long-context language models? arXiv preprint arXiv:2404.06654 , 2024. Jerry Huang, Siddarth Madala, Risham Sidhu, Cheng Niu, Hao Peng, Julia Hockenmaier, and Tong Zhang. Rag-rl: Advancing retrieval-augmented generation via rl and curriculum learning. arXiv preprint arXiv:2503.12759 , 2025. Gautier Izacard and Edouard Grave. Leveraging passage retrieval with generative models for open domain question answering. In Proceedings of the 16th conference of the european chapter of the association for computational linguistics: main volume , pp. 874–880, 2021. Gautier Izacard, Mathilde Caron, Lucas Hosseini, Sebastian Riedel, Piotr Bojanowski, Armand Joulin, and Edouard Grave. Unsupervised dense information retrieval with contrastive learning. 
+
+arXiv preprint arXiv:2112.09118 , 2021. Huiqiang Jiang, Qianhui Wu, Xufang Luo, Dongsheng Li, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. Longllmlingua: Accelerating and enhancing llms in long context scenarios via prompt com-pression. In Proceedings of the 62nd Annual Meeting of the Association for Computational Lin-guistics (Volume 1: Long Papers) , pp. 1658–1677, 2024a. Ziyan Jiang, Xueguang Ma, and Wenhu Chen. Longrag: Enhancing retrieval-augmented generation with long-context llms. arXiv preprint arXiv:2406.15319 , 2024b. Bowen Jin, Hansi Zeng, Zhenrui Yue, Jinsung Yoon, Sercan Arik, Dong Wang, Hamed Zamani, and Jiawei Han. Search-r1: Training llms to reason and leverage search engines with reinforcement learning. arXiv preprint arXiv:2503.09516 , 2025. Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey Edunov, Danqi Chen, and Wen-tau Yih. Dense passage retrieval for open-domain question answering. In Pro-ceedings of the 2020 conference on empirical methods in natural language processing (EMNLP) ,pp. 6769–6781, 2020. Yuri Kuratov, Aydar Bulatov, Petr Anokhin, Ivan Rodkin, Dmitry Sorokin, Artyom Sorokin, and Mikhail Burtsev. Babilong: Testing the limits of llms with long context reasoning-in-a-haystack. 
+
+Advances in Neural Information Processing Systems , 37:106519–106554, 2024. Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich K¨ uttler, Mike Lewis, Wen-tau Yih, Tim Rockt¨ aschel, et al. Retrieval-augmented gener-ation for knowledge-intensive nlp tasks. Advances in neural information processing systems , 33: 9459–9474, 2020. Shilong Li, Yancheng He, Hangyu Guo, Xingyuan Bu, Ge Bai, Jie Liu, Jiaheng Liu, Xingwei Qu, Yangguang Li, Wanli Ouyang, et al. Graphreader: Building graph-based agent to enhance long-context abilities of large language models. In Findings of the Association for Computational Linguistics: EMNLP 2024 , pp. 12758–12786, 2024. Yuning Mao, Pengcheng He, Xiaodong Liu, Yelong Shen, Jianfeng Gao, Jiawei Han, and Weizhu Chen. Generation-augmented retrieval for open-domain question answering. In Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th Interna-tional Joint Conference on Natural Language Processing (Volume 1: Long Papers) , pp. 4089– 4100, 2021. Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Andrei A Rusu, Joel Veness, Marc G Belle-mare, Alex Graves, Martin Riedmiller, Andreas K Fidjeland, Georg Ostrovski, et al. Human-level control through deep reinforcement learning. nature , 518(7540):529–533, 2015. 12 Preprint Aaron van den Oord, Yazhe Li, and Oriol Vinyals. Representation learning with contrastive predic-tive coding. arXiv preprint arXiv:1807.03748 , 2018. Gabriel Pereyra, George Tucker, Jan Chorowski, Łukasz Kaiser, and Geoffrey Hinton. Regularizing neural networks by penalizing confident output distributions. arXiv preprint arXiv:1701.06548 ,2017. Peng Qi, Xiaowen Lin, Leo Mehr, Zijian Wang, and Christopher D Manning. Answering complex open-domain questions through iterative query generation. In Proceedings of the 2019 conference on empirical methods in natural language processing and the 9th international joint conference on natural language processing (EMNLP-IJCNLP) , pp. 2590–2602, 2019. Ivan Rodkin, Yuri Kuratov, Aydar Bulatov, and Mikhail Burtsev. Associative recurrent memory transformer. arXiv preprint arXiv:2407.04841 , 2024. Ning Shang, Li Lyna Zhang, Siyuan Wang, Gaokai Zhang, Gilsinia Lopez, Fan Yang, Weizhu Chen, and Mao Yang. Longrope2: Near-lossless llm context window scaling. arXiv preprint arXiv:2502.20082 , 2025. Zhihong Shao, Yeyun Gong, Yelong Shen, Minlie Huang, Nan Duan, and Weizhu Chen. Enhancing retrieval-augmented large language models with iterative retrieval-generation synergy. In Find-ings of the Association for Computational Linguistics: EMNLP 2023 , pp. 9248–9274, 2023. Aditi Singh, Abul Ehtesham, Saket Kumar, Tala Talaei Khoei, and Athanasios V Vasilakos. Agentic retrieval-augmented generation: A survey on agentic rag. arXiv preprint arXiv:2501.09136 , 2025. Huatong Song, Jinhao Jiang, Yingqian Min, Jie Chen, Zhipeng Chen, Wayne Xin Zhao, Lei Fang, and Ji-Rong Wen. R1-searcher: Incentivizing the search capability in llms via reinforcement learning. arXiv preprint arXiv:2503.05592 , 2025. Artyom Sorokin, Nazar Buzun, Aleksandr Anokhin, Egor Vedernikov, Petr Anokhin, Mikhail Burt-sev, and Evgeny Burnaev. Q-rag: Long context multi-step retrieval via value-based embedder training. In International Conference on Learning Representations , volume 2026, pp. 32481– 32506, 2026. Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu. Roformer: En-hanced transformer with rotary position embedding. Neurocomputing , 568:127063, 2024. Christian Szegedy, Vincent Vanhoucke, Sergey Ioffe, Jon Shlens, and Zbigniew Wojna. Rethink-ing the inception architecture for computer vision. In Proceedings of the IEEE conference on computer vision and pattern recognition , pp. 2818–2826, 2016. Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot, and Ashish Sabharwal. musique: Multihop questions via single-hop question composition. Transactions of the Association for Computational Linguistics , 10:539–554, 2022. Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot, and Ashish Sabharwal. Interleaving re-trieval with chain-of-thought reasoning for knowledge-intensive multi-step questions. In Pro-ceedings of the 61st annual meeting of the association for computational linguistics (volume 1: long papers) , pp. 10014–10037, 2023. Wenhan Xiong, Xiang Lorraine Li, Srini Iyer, Jingfei Du, Patrick Lewis, William Yang Wang, Yashar Mehdad, Wen-tau Yih, Sebastian Riedel, Douwe Kiela, et al. Answering complex open-domain questions with multi-hop dense retrieval. arXiv preprint arXiv:2009.12756 , 2020. Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William Cohen, Ruslan Salakhutdinov, and Christopher D Manning. Hotpotqa: A dataset for diverse, explainable multi-hop question answering. In Proceedings of the 2018 conference on empirical methods in natural language processing , pp. 2369–2380, 2018. Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and Yuan Cao. React: Synergizing reasoning and acting in language models. arXiv preprint arXiv:2210.03629 ,2022. 13 Preprint Jiahao Zhang, Haiyang Zhang, Dongmei Zhang, Liu Yong, and Shen Huang. End-to-end beam retrieval for multi-hop question answering. In Proceedings of the 2024 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technolo-gies (Volume 1: Long Papers) , pp. 1718–1731, 2024. 14 Preprint 
+
+Algorithm 1 S2LMR: Supervised Sequential Long-Context Multi-Step Retriever (one training up-date) 
+
+1: Hyperparameters: batch size B, hops K, temperature τ , RoPE step ∆, learning rate η.
+
+2: Model: shared bi-encoder fθ ; chunk-axis RoPE( ·, p ).
+
+3: Sample batch   q(b), {c(b) 
+
+> j
+
+}Nj=1 , (i⋆, (b)1 , . . . , i ⋆, (b) 
+
+> K
+
+) Bb=1 
+
+4: for b = 1 , . . . , B do 
+
+5: hj ← fθ (c(b) 
+
+> j
+
+) for j = 1 , . . . , N ▷ encode candidates once 
+
+6: S1 ← ∅
+
+7: for t = 1 , . . . , K do 
+
+8: build st via Eq. 1 with c(k) = c(b)
+
+> i⋆, (b)
+> k
+
+for k < t ▷ teacher-forced state 
+
+9: compute (p(t) 
+
+> j
+
+)Nj=1 from St via Eq. 2 
+
+10: At ← { 1, . . . , N } \ S t
+
+11: ˜h(t) 
+
+> j
+
+← RoPE( hj , p (t) 
+
+> j
+
+) for all j ∈ A t
+
+12: L(b) 
+
+> t
+
+← − log exp  ⟨fθ (st), ˜h(t)
+
+> i⋆, (b)
+> t
+
+⟩/τ P 
+
+> j∈A t
+
+exp  ⟨fθ (st), ˜h(t) 
+
+> j
+
+⟩/τ  ▷ Eq. 4 
+
+13: St+1 ← S t ∪ { i⋆, (b) 
+
+> t
+
+}
+
+14: end for 
+
+15: L(b) ← 1
+
+> K
+
+PKt=1 L(b)
+
+> t
+
+16: end for 
+
+17: L ← 1
+
+> B
+
+PBb=1 L(b); θ ← θ − η ∇θ L
+
+# A S2LMR TRAINING PROCEDURE 
+
+Algorithm 1 makes the training loop of Sec. 3.2 explicit for one batched update. Candidate chunks are encoded once per example (line 5); at every hop the query state st is rebuilt from the gold prefix (line 8), the chunk-axis positions p(t) 
+
+> j
+
+are recomputed from the already-selected indices St (line 9), and candidate embeddings are re-rotated accordingly (line 10). The per-hop InfoNCE loss (line 12) instantiates Eq. 4 on At = {1, . . . , N } \ S t, and the example loss averages over the K hops before the batch gradient step. 
+
+# B CONNECTION BETWEEN VALUE -B ASED RL AND SUPERVISED RETRIEVAL 
+
+This section formalizes the connection between the value-based RL formulation of Q-RAG and direct supervised learning for multi-step retrieval. We show that under a particular limiting regime, namely T = K, λ = 1 , and α → 0, the Q-RAG learning signal reduces to binary supervision over sampled state–action pairs. This does not imply that the Q-RAG and S 2LMR objectives are mathematically identical, rather, it shows that the distinctive components of value-based RL become unnecessary for constructing the learning signal in this regime. B.1 PROBLEM SETUP 
+
+Consider a multi-step retrieval problem with K ground-truth supporting facts. At retrieval step t, the state consists of the query and the supporting facts retrieved at previous steps. S 2LMR constructs the state st by teacher forcing (Eq. 1 with c(k) = ci⋆k for k < t ). For brevity, let 
+
+˜h(t) 
+
+> j
+
+= RoPE  fθ (cj ), p (t)
+
+> j
+
+
+
+denote the rotated candidate embedding at hop t, so that score( st, c j ) = ⟨fθ (st), ˜h(t) 
+
+> j
+
+⟩ (Eq. 3). The per-hop InfoNCE objective from Eq. 4 can then be written as 
+
+LS2LMR  
+
+> t
+
+= − log exp  ⟨fθ (st), ˜h(t) 
+
+> i⋆t
+
+⟩/τ P 
+
+> j∈A t
+
+exp  ⟨fθ (st), ˜h(t) 
+
+> j
+
+⟩/τ  , (5) where τ is the contrastive temperature and At = C \ { i⋆
+
+> 1
+
+, . . . , i ⋆t−1} is the remaining candidate set at hop t.15 Preprint Q-RAG instead defines a value function over state–action pairs, 
+
+Q(st, c j ) = ⟨ϕ(st), ψ (cj )⟩,
+
+and uses a Boltzmann policy 
+
+πα(cj | st) = exp( Q(st, c j )/α )
+
+P 
+
+> j′∈A t
+
+exp( Q(st, c j′ )/α ) , (6) where α controls the degree of stochastic exploration. The value function is trained by minimizing the squared error to a λ-return: 
+
+LQ-RAG = E
+
+h Q(st, c it ) − Gλt
+
+2i
+
+.
+
+For the multi-hop QA setting considered here, the terminal reward is constructed from the ground-truth supporting-fact indices: 
+
+rT = 1[{i⋆
+
+> 1
+
+, . . . , i ⋆K } ⊆ { i1, . . . , i T }] .
+
+Thus, a trajectory receives positive reward when the retrieved set covers all annotated supporting facts. B.2 EFFECT OF THE RETRIEVAL HORIZON 
+
+We first consider the limiting case in which the retrieval horizon equals the number of supporting facts: 
+
+T = K. 
+
+Assume that additional retrieval beyond the K required supporting facts is penalized, as in the setting considered in our analysis. Since a successful trajectory must contain all K supporting facts and contains exactly K retrieval steps, a successful trajectory cannot contain an additional non-supporting passage. Therefore, 
+
+rT =
+
+1, {i1, . . . , i K } = {i⋆
+
+> 1
+
+, . . . , i ⋆K },
+
+0, otherwise .
+
+This condition removes the ambiguity caused by extra retrieved passages. In the general set-based reward formulation, a trajectory may receive reward 1 even if it contains irrelevant passages in addition to all supporting facts. When T = K, this ambiguity disappears because there is no additional retrieval step available after covering the K supporting facts. B.3 EFFECT OF THE λ-R ETURN 
+
+Next, consider the case 
+
+λ = 1 .
+
+With only a terminal reward, the λ-return reduces to the Monte Carlo return: 
+
+Gλtλ=1 
+
+= GMC  
+
+> t
+
+= rT ,
+
+up to the discounting convention used by the implementation. In the undiscounted setting considered here, this gives Gλt ∈ { 0, 1}.Consequently, the Q-RAG objective becomes 
+
+LQ-RAG = E
+
+h Q(st, c it ) − yt
+
+2i
+
+, yt = rT ∈ { 0, 1}.
+
+Thus, the target no longer depends on a bootstrapped estimate of a future value. A state–action pair on a successful trajectory receives target 1, whereas a state–action pair on a failed trajectory receives target 0. This removes the bootstrapping component that distinguishes the general temporal-difference formulation. B.4 DETERMINISTIC POLICY LIMIT 
+
+Finally, consider the limit 
+
+α → 0.
+
+16 Preprint For the Boltzmann policy in Eq. 6, the probability mass concentrates on actions with the maximum value: 
+
+lim  
+
+> α→0
+
+πα(cj | st) = 
+
+(
+
+1, cj ∈ arg max cj′ Q(st, c j′ ),
+
+0, otherwise ,
+
+with an arbitrary tie-breaking rule when multiple actions attain the same maximum. Hence, in this limit, sampling becomes equivalent to greedy action selection: 
+
+it = arg max 
+
+> j∈A t
+
+Q(st, c j ).
+
+The stochastic exploration component of the policy is therefore removed. Importantly, this limit alone does not guarantee a successful trajectory; rather, once the policy has converged to a successful deterministic policy, the resulting rollouts repeatedly expose state–action pairs that lead to successful retrieval. B.5 RESULTING LEARNING SIGNAL 
+
+Combining T = K, λ = 1 , and α → 0, the terminal outcome provides a binary target for each sampled state–action pair: 
+
+yt =
+
+1, (st, c it ) on a successful trajectory ,
+
+0, (st, c it ) on a failed trajectory .
+
+The Q-RAG objective consequently takes the form 
+
+LQ-RAG = E
+
+h Q(st, c it ) − yt
+
+2i
+
+, yt ∈ { 0, 1}.
+
+The corresponding gradient with respect to the parameters of Q is 
+
+∇L Q-RAG = 2  Q(st, c it ) − yt
+
+ ∇Q(st, c it ).
+
+Therefore, successful state–action pairs are pushed toward value 1, while state–action pairs observed on failed trajectories are pushed toward value 0. In this limiting regime, the Q-RAG learning signal can thus be viewed as a binary supervised regression objective over sampled trajectory actions. B.6 RELATION TO S2 LMR S2LMR instead uses the contrastive objective in Eq. 5. Its gradient with respect to the query-state embedding is 
+
+∇fθ (st)LS2LMR  
+
+> t
+
+= − 1
+
+τ ˜h(t) 
+
+> i⋆t
+
+− X
+
+> j∈A t
+
+pτ (j | st) ˜h(t)
+
+> j
+
+!
+
+,
+
+where 
+
+pτ (j | st) = exp( ⟨fθ (st), ˜h(t) 
+
+> j
+
+⟩/τ )
+
+P 
+
+> j′∈A t
+
+exp( ⟨fθ (st), ˜h(t) 
+
+> j′
+
+⟩/τ ) .
+
+Thus, S 2LMR increases the score of the ground-truth supporting passage while decreasing the scores of competing candidates, with the magnitude of the negative signal determined by their current softmax probabilities. The two objectives are therefore not mathematically identical. Their difference is summarized in Table 7. The key connection is therefore not an exact equivalence between the two loss functions. Rather, under the limiting regime considered above, the Q-RAG formulation loses the main components that distinguish value-based RL from direct supervised learning: extra-step credit assignment, bootstrap-ping, and stochastic exploration. What remains is a supervised learning signal that encourages rele-vant actions to receive higher scores than sampled irrelevant actions. S 2LMR directly provides this signal through fixed per-hop supervision and contrasts each positive passage against all in-context candidates. 17 Preprint Table 7: Comparison between S 2LMR and the limiting form of Q-RAG.                    
+
+> Property S2LMR Q-RAG limiting case Learning signal Fixed per-hop supervision Sampled trajectory outcome Objective InfoNCE Binary MSE Positive signal Ground-truth supporting passage Action on successful trajectory Negative signal All in-context candidates Sampled actions on failed trajectories Bootstrapping None None ( λ= 1 )Exploration None None in the limit ( α→0)State construction Teacher forcing Policy-generated trajectory
+
+Table 8: Hop-1 median cosine similarities on 128 BabiLong QA3 samples (RoPE-rotated). margin sc = sim(gold) − sim(sc-neg); margin ib = sim(gold) − sim(ib-neg). MDR training widens the in-batch margin more than the same-context margin (its own objective converges on the wrong distribution). S 2LMR training widens the same-context margin most, matching what inference re-quires. All three checkpoints use identical encoder/tokenizer/RoPE.                     
+
+> Checkpoint sim(gold) sim(sc-neg) sim(ib-neg) margin sc margin ib
+> Contriever (zero-shot) 0.29 0.23 0.23 +0.06 +0.06 MDR-repro (in-batch trained) 0.45 0.36 0.34 +0.09 +0.11
+> S2LMR (same-context trained) 0.67 0.46 0.54 +0.21 +0.13
+
+This analysis motivates our empirical comparison: when supporting-fact supervision is available, value-based RL introduces additional optimization machinery beyond the direct supervised signal, while it remains an empirical question whether that additional machinery yields better retrieval performance. 
+
+# C ADDITIONAL RESULTS 
+
+C.1 EMPIRICAL EVIDENCE FOR ISSUE 1 ( DISTRACTOR -DISTRIBUTION MISMATCH )To isolate what MDR-style in-batch training actually optimizes, we compare the encoder’s hop-1 discrimination on the two negative distributions that matter—the training pool (other in-batch queries’ gold chunks) and the inference pool (same-document distractors)—across three check-points: (i) a zero-shot Contriever initialization, (ii) an MDR-style reproduction trained on in-batch negatives, and (iii) the S 2LMR checkpoint trained on same-context negatives. All three share the same encoder, tokenizer, and RoPE positional encoding. Query states are teacher-forced with the true hop-0 answer so measurements isolate per-hop discrimination. The pattern is symmetric at initialization (margin sc =margin ib =0 .06 ) and diverges opposite to in-ference needs under MDR training (margin ib >margin sc ). MDR’s gradient signal itself is strong (median p(gold ) on its in-batch pool is 0.04, implying gradient-magnitude proxy ≈ 0.96 ), so the failure is not gradient collapse but distributional misalignment—the encoder converges to a bound-ary that separates the wrong distribution. Consequently the MDR checkpoint ranks the hop-1 gold above the 99 same-document distractors on 0 of 128 samples, whereas S 2LMR does so on all 128 (Figure 7). C.2 TEACHER FORCING OR NOT : SUPERVISION NOISE VS . EXPOSURE BIAS 
+
+BR-style beam-expanded supervision was originally motivated by an exposure-bias concern: train-ing only on gold prefixes leaves the model unfamiliar with the noisier trajectories it will produce at inference. S2LMR accepts this trade-off because the alternative—training on noisy predicted prefixes—is empirically more harmful in the long-context regime. Fig. 2c and Fig. 3b show that as context length grows, the beam-expanded performance degrades noticeably faster than the teacher-forced curve, while at the training length the two are within 0.04 Fact EM (Figure 2c, Issue 2). The exposure gap that teacher forcing incurs is small enough to be dominated by per-hop InfoNCE against the full same-context pool, which keeps the gold-vs-distractor margin large enough that small prefix perturbations at inference rarely flip the argmax. 18 Preprint 
+
+Figure 7: Distractor-distribution mismatch on 128 BabiLong QA3 samples. Top row: distributions of cosine similarity between the query state and (i) the gold chunk, (ii) 31 same-document distrac-tors, (iii) 31 in-batch negatives. Bottom row: distributions of softmax p(gold) at τ =0 .02 under the in-batch pool (MDR training pool, 32 candidates) and the same-context pool (inference pool, 32 candidates). Columns: Contriever (zero-shot), MDR-style checkpoint trained with in-batch nega-tives, and S 2LMR trained with same-context negatives. C.3 POSITIONAL BOTTLENECK IN CHUNK -POSITION -AGNOSTIC RETRIEVERS 
+
+This appendix expands the analysis in Sec. 3.1 of the positional-encoding bottleneck in existing supervised multi-hop retrievers. We (i) enumerate the architectural facts that make MDR and BR chunk-position-agnostic, (ii) quantify the positional structure of BabiLong QA3 that these architec-tures cannot exploit, (iii) measure the resulting per-hop retrieval margin, and (iv) show the failure mode is stable across all three hops. C.3.1 ARCHITECTURE : TOKEN -AXIS ONLY POSITIONAL ENCODING 
+
+MDR (Xiong et al., 2020). MDR uses a shared RoBERTa-base bi-encoder to embed candidates and queries independently. Each candidate chunk cj is embedded as Ea(cj ) = RoBERTa( cj ).Only tokens within cj receive positional information via RoBERTa’s absolute learned positional embeddings (maximum position 514). The resulting embedding depends solely on the text of cj and is invariant to cj ’s document-level position. At the query side, MDR concatenates the question with previously retrieved passages and re-encodes. The maximum sequence length is again 514 tokens, and no chunk-level position is exposed. 
+
+BR (Zhang et al., 2024). BR uses a DeBERTa cross-encoder that scores candidates in flat con-catenation [CLS ; Q; ˆ p1; . . . ; ˆ pt−1; cj ; SEP ] (maximum 512 tokens). DeBERTa’s disentangled rela-tive positional encoding operates on token-token offsets within this flat sequence. BR’s Appendix E 
+
+explicitly shuffles the order of concatenated passages during training to enforce robustness to per-mutations. This is architecturally equivalent to training the encoder to be order-invariant across chunks: any positional distinction between the concatenated passages that could have arisen from token positions in the flat sequence is deliberately regularized away. 
+
+Common consequence. In both architectures, the retrieval decision at hop t depends only on the 
+
+textual content of cj and the (question, previous picks) tuple, never on where cj sits in the source document. We call this property chunk-position-agnostic .C.3.2 TASK -SIDE POSITIONAL STRUCTURE IN BABI LONG QA3 BabiLong (Kuratov et al., 2024) embeds bAbI supporting facts as a temporally-ordered subsequence within a long stream of PG-19 noise sentences. QA3 (“three-supporting-facts”) requires retrieving three temporally consecutive facts about a person’s location history. Because the story is ordered in 19 Preprint Table 9: Concentration of next-gold document-position offsets in BabiLong QA3 , computed on 500 samples per N . The last column reports the fraction of samples with |δt|/N ≤ 0.10 (range across the two hop transitions). The distribution is scale-invariant in N and far tighter than the uniform baseline, giving any position-aware retriever a substantial candidate-pool reduction.                                        
+
+> |δ2|/N |δ3|/N P(|δt|/N Nmedian IQR 90th pct median IQR 90th pct ≤0.10)
+> Uniform 0.333 0.500 0.900 0.333 0.500 0.900 0.190 100 0.060 0.090 0.200 0.050 0.070 0.210 0.70–0.79 800 0.056 0.092 0.218 0.048 0.089 0.182 0.69–0.73 6400 0.055 0.088 0.214 0.049 0.087 0.193 0.71–0.73
+
+time and the question refers to a temporal anchor (“ Where was X before Y? ”), each gold fact appears in a specific positional relation to the others. 
+
+Case study. Consider a QA3 sample from the test set with question “Where was the apple before the bathroom?” and answer “office” . The three supporting facts, ordered as the model must retrieve them under fixed-order supervision, are: 1. (chunk 48): “John discarded the apple there.” 
+
+2. (chunk 31): “John journeyed to the bathroom.” 
+
+3. (chunk 27): “John went to the office.” 
+
+The doc positions are strictly decreasing: 48 → 31 → 27. This is determined by the semantics of the question — the temporal marker “ before ” places each subsequent gold earlier in the story than the previously picked one. A question with “ after ” would invert the direction. The direction is therefore 
+
+semantically conditional : which side of the picked chunk to search depends on the question, and cannot be reduced to a fixed rule. 
+
+Statistical structure. Table 9 reports the distribution of the normalized offset |δt|/N , where δt =
+
+sf t − sf t−1, across 500 QA3 samples at each N ∈ { 100 , 800 , 6400 }. Two properties stand out: 1. Concentration. The median |δt|/N is 0.05 –0.06 (vs. 0.33 under uniform sampling), and 
+
+70% of samples have |δt|/N ≤ 0.10 . The IQR is 0.07 –0.09 (vs. 0.50 uniform). A retriever that could restrict candidates to |position − last pick | ≤ 0.10 N would retain 70% of golds while shrinking the candidate pool 10 ×.2. Scale invariance. The distribution normalized by N is essentially identical at N = 100 ,
+
+N = 800 , and N = 6400 : the positional structure is a property of the task, not of the context size. The case study and statistics together establish a claim we will use repeatedly: document position is a strong, semantically-conditional retrieval signal in BabiLong QA3 . A chunk-position-agnostic encoder cannot access this signal. C.3.3 SEMANTIC -ONLY RANKING FAILS AT EVERY HOP 
+
+We now measure the retrieval margin achievable by a fine-tuned bi-encoder that mirrors MDR’s chunk-position-agnostic architecture. 
+
+Proxy encoder. We use the Contriever (Izacard et al., 2021) bi-encoder architecture, fine-tuned on BabiLong QA3 ( N = 100 ) for 2000 optimizer steps with per-hop InfoNCE loss, label smooth-ing 0.05 , and CCR regularization λ = 0 .02 , with chunk-axis positional encoding disabled. Every element of the training setup matches our other BabiLong retrievers except the absence of chunk-axis positional information. The resulting encoder is architecturally chunk-position-agnostic while task-specifically fine-tuned. 20 Preprint Table 10: Hop-1 semantic margin of a fine-tuned chunk-position-agnostic bi-encoder is scale-invariant in N . Aggregated over 200 samples per N . The margin is ≈ 0 regardless of context size.                                  
+
+> N10 20 50 100 800 6400 gold max cos (median) 0.962 0.962 0.962 0.962 0.962 0.962 best noise cos (median) 0.963 0.963 0.963 0.963 0.963 0.963 margin (median) −0.001 −0.001 −0.001 −0.001 −0.001 −0.001
+> P(margin ≤0) 0.670 0.670 0.670 0.670 0.670 0.655
+
+Metric. For each sample and each hop t, we encode the query context (question concatenated with oracle previous gold picks sf 1, . . . , sf t−1), score all remaining chunks by inner product with the query embedding, and record gold max cos t = max  
+
+> j∈gold
+
+cos( qt, c j ),
+
+best noise cos t = max  
+
+> j / ∈gold
+
+cos( qt, c j ),
+
+margin t = gold max cos t − best noise cos t.P (margin t ≤ 0) is the fraction of samples on which the top-scoring chunk (which the retriever picks by argmax) is a distractor rather than a gold. 
+
+Scale invariance. Table 10 sweeps N from 10 to 6400 at hop 1. Both gold max cos and best noise cos are stable (0.962 vs. 0.963, respectively), the median margin sits at −0.001 , and 
+
+P (margin ≤ 0) ranges only from 0.655 to 0.670 . Fine-tuning has successfully pushed both gold and distractors to high cosine ( ≈ 0.96 ), but has not opened any margin between them. And this failure is independent of the candidate pool size, ruling out “noise-tail-grows-with-N ” as the expla-nation. The bottleneck is the encoder’s inability to semantically separate a gold bAbI fact from a same-domain distractor. 
+
+Why fine-tuning cannot separate gold from distractors. BabiLong noise chunks are sampled from PG-19 book text but interleaved with bAbI-style distractor sentences that share the same syn-tactic template as the gold facts (subject-verb-location: “ Mary moved to the office. ”). Under In-foNCE fine-tuning, the encoder learns to give high cosine to any (question, bAbI-template sentence about the queried entity) pair. Because the distractors are indistinguishable from golds under a purely semantic similarity criterion — both mention the queried entity, both involve a location and an ac-tion — the fine-tune procedure pushes them to the same region of the embedding space. Positional information is the only signal that separates them, and this signal is absent by construction. C.3.4 PER -HOP FAILURE PERSISTS ACROSS ALL THREE HOPS 
+
+Table 11 extends the measurement to hops 2 and 3, with oracle previous gold picks fed as prev-context. Two observations sharpen the diagnosis: • The failure mode persists at every hop. P (margin ≤ 0) is 0.66 at hop 1, 0.53 at hop 2, and 0.80 at hop 3 (all at N = 100 ). The chunk-position-agnostic architecture fails to distinguish gold from distractor at every step of the multi-hop chain, not merely at hop 1. • Hop 3 is the hardest. Hop 2 is slightly easier because the single gold prev-context injects task-specific semantic content that the encoder can exploit ( P (margin ≤ 0) = 0 .53 vs. 0.66 at hop 1). Hop 3 is the hardest ( P = 0 .80 ): with two prev-context chunks the query context is longer and more diffuse, and the encoder’s discriminative capacity is exceeded. 
+
+Joint K=3 retrieval success. Under oracle previous picks (200 QA3 samples), the chunk-position-agnostic encoder scores the gold chunk above all non-gold chunks at every hop in only 8.5% of samples, versus 98–99% with chunk-axis PE. C.4 Q-RAG BASELINE : SOURCES AND EVALUATION PROTOCOLS 
+
+Q-RAG is our main baseline. Because its published numbers, released code, and released check-points do not always agree, this section states where each Q-RAG number comes from and how 21 Preprint Table 11: Per-hop P (margin ≤ 0) under oracle previous picks. The failure rate is stable at every hop across N . Hop 3 is the hardest, hop 2 marginally easier due to the injected gold-prev-context.             
+
+> NHop 1 Hop 2 Hop 3 100 0.670 0.530 0.795 800 0.670 0.520 0.795 6400 0.660 0.485 0.795
+
+Table 12: MuSiQue (full dev) under two retrieval protocols. Q-RAG: released checkpoint. S 2LMR: Fact is the mean of two seeds; Ans is seed 42. Answers by QwQ-32B. Protocol Method Fact F1 Fact EM Ans F1 Ans EM 
+
+K = |gold | Q-RAG 0.78 0.57 0.55 0.41 S2LMR 0.83 0.67 0.56 0.42 
+
+≤4 steps, stop when all gold found Q-RAG 0.81 0.72 0.60 0.45 S2LMR 0.86 0.77 0.62 0.47 
+
+evaluation protocols differ. In all main comparisons, S 2LMR and Q-RAG use the same data, evalu-ation script, and reader. 
+
+Sources. We evaluate the checkpoints released by (Sorokin et al., 2026) on RULER QA, Hot-potQA and MuSiQue, and retrain Q-RAG with the configuration in the official repository on Ba-biLong, HotpotQA and MuSiQue. The repository configuration differs from that of the released checkpoints, which likely explains why retraining scores slightly lower (HotpotQA Fact F1/EM 0.92/0.87 vs. 0.93/0.89; MuSiQue 0.80/0.69 vs. 0.81/0.72 under Q-RAG’s protocol); we therefore report both. The training-dynamics study (Section 4.3, Figures 5–6) requires training runs and uses our own Q-RAG runs with the paper’s best reported setting. Figure 4 follows Q-RAG’s evaluation protocol, a budget of T =6 retrieval steps credited whenever all gold facts are retrieved, whereas Figure 6a evaluates both methods with T =K=3 steps that must all be correct. 
+
+MuSiQue. Q-RAG’s evaluation allows up to four retrieval steps and stops an episode once all gold facts have been retrieved, a stopping rule that uses gold labels. S 2LMR retrieves exactly K = |gold |
+
+passages. Table 12 reports both methods under both protocols; S 2LMR is ahead under each. 
+
+RULER SH/MH QA. Q-RAG’s paper (Appendix G) uses T = 4 retrieval steps, whereas its re-leased evaluation commands use T = 1 for SH and T = 3 for MH. Table 2 uses the released setting. Table 13 reports both settings with the released checkpoint, alongside the published numbers. The 
+
+T = 4 setting reproduces the published SH scores within two points. Under either setting, S 2LMR matches or exceeds Q-RAG on MH at every length; on SH it is better at 4K and behind at longer contexts. C.5 HYPERPARAMETER ABLATION 
+
+Beyond robustness to training hyperparameters (Section 4.3), we evaluate S 2LMR’s sensitivity to its three method-specific hyperparameters: the InfoNCE temperature τ , the confidence-regularizer weight λCCR , and the label-smoothing coefficient αLS .
+
+Regularized objective. Let Pθ (j | st) denote the softmax over At in Eq. 4, so that Lt =
+
+− log Pθ (i⋆t | st). In practice, each per-hop term is 
+
+˜Lt = (1 − αLS ) Lt − αLS 
+
+|A t|
+
+X
+
+> j∈A t
+
+log Pθ (j | st) − λCCR H Pθ (· | st), (7) i.e., cross-entropy with label smoothing (Szegedy et al., 2016) plus a confidence regularizer (CCR) that rewards a higher-entropy candidate distribution, the confidence penalty of Pereyra et al. (2017). Defaults are αLS = 0 .05 and λCCR = 0 .02 unless Table 16 states otherwise. Across a 10 × range of each hyperparameter, S 2LMR’s Fact EM stays within a narrow band— 
+
+> 0.94 on QA2, > 0.97 on QA3, and within a ∼ 0.04 band around 0.88 on HotpotQA—degrading 22 Preprint Table 13: RULER QA (EM) at 4K/16K/32K/128K/1M. Both methods are trained on Hot-potQA+MuSiQue with gte-multilingual-base and use the Qwen3-4B reader (no thinking), as in Q-RAG’s Appendix G. Setting Method SH MH Code ( T = 1 /3) Q-RAG 55/53/52/50/50 64/60/63/61/56 S2LMR 56/51/50/47/46 64/62/63/62/59 Paper ( T = 4 ) Q-RAG 61/59/59/57/53 62/60/58/60/57 S2LMR 63/57/57/55/45 65/61/63/63/61 Published Q-RAG 62/59/59/55/52 67/64/65/65/61 
+
+Figure 8: Fact EM vs (a) softmax temperature τ , (b) CCR strength λCCR , (c) label smoothing αLS .Stars denote per-task best. only at extreme values ( τ = 0 .2 or αLS ≥ 0.05 ). The three benchmarks share overlapping op-timal regions across all three hyperparameters, so a single default setting transfers across both long-context and open-domain retrieval without per-task tuning. Controlled component ablations further validate the contribution of S 2LMR’s core design choices (Appendix C.6). Together with the training-hyperparameter robustness of Section 4.3, this shows that S 2LMR can be deployed on a new benchmark with minimal hyperparameter search. C.6 LEAVE -O NE -O UT ABLATION OF CORE MECHANISMS 
+
+Table 14 reports Fact EM on BabiLong QA3 when each of the three components corresponding to Issue 1–Issue 3 identified in Section 3.1 is individually removed from the full S 2LMR while all other design choices are held fixed. Removing same-context negatives (Issue 1) drops EM to 0.28 (∆EM = −0.71 ), confirming that distractor-matched negative sampling is essential rather than incidental. Replacing teacher-forced per-hop supervision with beam-expanded per-hop supervision in the spirit of Beam Retriever (Zhang et al., 2024) (Issue 2) costs 0.04 EM, showing that beam expansion of prev-hop contexts is neither necessary nor optimal. Removing chunk-axis RoPE (Issue 3) causes a near-total collapse of retrieval performance ( 0.99 → 0.11 , ∆EM = −0.89 ), the largest single source of gain in this ablation. Together, the three mechanisms are individually necessary and jointly account for essentially the entire gap between vanilla supervised bi-encoders and S 2LMR. 
+
+Figure 9: Fact EM vs (a) softmax temperature τ , (b) CCR strength λCCR , (c) label smoothing αLS .Stars denote per-task best. S 2LMR maintains Fact EM > 0.94 (QA2) and > 0.97 (QA3) across a 10× range of each hyperparameter, degrading only at extreme values ( τ = 0 .2 or αLS ≥ 0.05 ). 23 Preprint Table 14: Leave-one-out ablation of S 2LMR’s three core mechanisms on BabiLong QA3 ( K=3 ,strict Fact EM).                     
+
+> Variant Fact EM ∆EM S2LMR (full) 0.992 —
+> −Issue 1 (same-context →in-batch negatives) 0.28 −0.71
+> −Issue 2 (teacher-forced →beam-expanded per-hop, B=2 )0.948 −0.04
+> −Issue 3 (chunk-axis RoPE →no chunk-axis PE) 0.106 −0.89
+
+Table 15: Fact EM with the paper backbones and with Qwen3-Embedding-0.6B. Paper backbone Qwen3-Embedding-0.6B Zero-shot S2LMR Zero-shot S2LMR BabiLong QA3 0.00 (Contriever) 0.99 0.00 0.97 HotpotQA 0.65 (e5-large) 0.90 0.54 0.90 C.7 MODERN EMBEDDING BACKBONE 
+
+We use the same backbones as Q-RAG for comparability. To test whether S 2LMR depends on the encoder, we retrain it with Qwen3-Embedding-0.6B (last-token pooling, task instruction), using each benchmark’s original training budget and keeping all other hyperparameters fixed. S2LMR transfers to the modern backbone without tuning, while a stronger off-the-shelf embedder alone does not help: zero-shot Qwen3-Embedding is no better than the paper backbones. 
+
+Issue 1 with a hard-negative-pretrained backbone. Hard negatives in modern embedders are mined offline per query for single-step retrieval. In multi-step retrieval, however, a chunk’s role depends on the hop: relevant facts, including later gold facts, act as negatives until their turn. We repeat the Issue 1 ablation of Table 14 with the Qwen3 backbone, with chunk-axis PE in both arms. Same-context negatives reach 0.97 Fact EM on QA3, versus 0.36 with in-batch negatives (Contriever, Table 14: 0.99 vs. 0.28). The gap persists, so the issue lies in the training signal rather than in backbone strength. 
+
+# D PER -BENCHMARK TRAINING HYPERPARAMETERS 
+
+Table 16 lists the main training hyperparameters for S 2LMR. Shared defaults across all runs: per-sample per-hop InfoNCE with τ =0 .02 , label smoothing αLS =0 .05 , and confidence-regularizer weight λCCR =0 .02 ; AdamW with weight decay 0.01 and gradient clipping 1.0; cosine LR sched-ule with 100 warmup steps; mean pooling with ℓ2-normalized embeddings; and greedy argmax inference. At inference we set the retrieval horizon T equal to K, the number of gold supporting facts per query. BabiLong and RULER NIAH runs use facebook/contriever , HotpotQA and MuSiQue use intfloat/multilingual-e5-large . “ ∆” is the chunk-axis RoPE step (Eq. 2), “–” means chunk-axis PE is disabled. Following Sorokin et al. (Sorokin et al., 2026), the RULER SH/MH QA subtasks use a single checkpoint trained on HotpotQA and MuSiQue with 
+
+Alibaba-NLP/gte-multilingual-base , the backbone of Q-RAG’s released RULER QA checkpoint. For Q-RAG, we evaluate the checkpoints released by Sorokin et al. (2026) on RULER QA, HotpotQA and MuSiQue, and retrain it with the configuration in the official repository on Ba-biLong, HotpotQA and MuSiQue. Where the published numbers were obtained under a different setting, we report both (Appendix C.4). The stability comparison in Section 4.3 additionally sweeps learning rate and effective batch size as described there. 
+
+Stability experiments. The training-stability comparison in Section 4.3 (Figures 5 and 6) uses the same recipe as “BabiLong QA3” above with an extended schedule matched to Q-RAG’s reported setting: effective batch 64 (32 ×2 grad accumulation), lr =1 .5×10 −5, 50 K steps, linear LR schedule with 1000 warmup steps, and weight decay 0.1.24 Preprint Table 16: Per-benchmark training hyperparameters for S 2LMR. Lmax : max tokens per chunk; ∆:chunk-axis RoPE step (Eq. 2). 
+
+Benchmark Lmax Batch LR Steps ∆
+
+BabiLong QA1/2/4/5 256 8 1.5×10 −5 2000 20 BabiLong QA3 64 32 1.06 ×10 −5 2000 200 HotpotQA 256 8 1.5×10 −5 2000 –MuSiQue 512 8 1.5×10 −5 2500 –RULER NIAH (S/MK/MV/MQ) 256 8 1.5×10 −5 2000 –
+
+# E FACT -LEVEL METRICS .
+
+Let Sgt be the set of ground-truth supporting chunk indices and Spred the set of chunks returned by the retriever. Following (Sorokin et al., 2026), our Fact-EM metric is defined as 
+
+Fact -EM = 
+
+1, if Sgt ⊆ Spred ,
+
+0, otherwise .
+
+Fact-EM gives full credit whenever the prediction covers all ground-truth chunks, even if it also contains additional, irrelevant ones. It does not require the two sets to be exactly equal. 25

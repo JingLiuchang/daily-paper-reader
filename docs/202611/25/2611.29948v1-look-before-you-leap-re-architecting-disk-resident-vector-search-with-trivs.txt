@@ -1,0 +1,638 @@
+Title: Look Before You Leap: Re-Architecting Disk-Resident Vector Search with TriVS
+
+URL Source: https://arxiv.org/pdf/2611.29948v1
+
+Published Time: Tue, 24 Nov 2026 04:18:46 GMT
+
+Number of Pages: 16
+
+Markdown Content:
+# Look Before You Leap: Re-Architecting Disk-Resident Vector Search with TriVS 
+
+## Yizou Chen 1 Baotong Lu 2 Peiqi Yin 1 Zhisheng Hu 1 Qi Chen 2 Ming-Chang Yang 11The Chinese University of Hong Kong 2Microsoft Research 
+
+{chenyz,zshu23,pqyin22,mcyang}@cse.cuhk.edu.hk {baotonglu,cheqi}@microsoft.com 
+
+## Abstract 
+
+Disk-resident approximate nearest-neighbor search (ANNS) scales vector search beyond DRAM, yet state-of-the-art sys-tems remain I/O-bound, even with fast SSDs and sophisti-cated I/O execution. To understand this bottleneck, we con-duct an I/O-centric analysis that breaks each query down into an approach phase that locates a query-near region and a 
+
+converge phase that resolves the final top-k. This analysis reveals complementary I/O tradeoffs: cluster-based search circumvents approach-phase I/O through in-memory routing but reads coarse-grained, full clusters during convergence, whereas graph-based search employs fine-grained, vector-level I/O throughout, enabling efficient convergence at the cost of inevitable I/O during the approach phase. To combine the complementary I/O benefits of the two granularities, we present TriVS , a new paradigm that re-architects disk-resident vector search as a trilogy: approach coarsely, distill progressively, and converge exactly . Its key in-novations come in two parts. First, it decouples the approach and converge phases from a single search granularity, em-ploying cluster-based search to avoid approach-phase I/O and leveraging vector-level I/O for efficient convergence. Second, to bridge the two granularities, it introduces a new in-memory 
+
+distill phase between the original two, progressively reduc-ing routed clusters to a vector-level shortlist using compact quantized vectors before disk access. Moreover, coarser clus-tering shrinks the centroid-routing index, allowing TriVS to reallocate existing memory to distillation rather than expand its memory budget. Our evaluation on five datasets spanning diverse vector types and scales shows that, at Recall@10=0.9, TriVS achieves on average 3 .42 × PipeANN’s throughput, 51.2% lower latency, and 63.7% less disk I/O, while using less memory and storage than PipeANN. 
+
+## 1 Introduction 
+
+Modern search and retrieval systems represent images, text, and other objects as high-dimensional vectors. Because exact nearest-neighbor search is prohibitively expensive over large high-dimensional collections, approximate nearest-neighbor search (ANNS) trades a small loss in recall for substantially less work [26]. As datasets grow to billions of vectors, disk-resident ANNS has become a de facto standard for cost-efficient vector search: it offloads full-precision vectors and their large indices (each often requiring hundreds of giga-bytes [10]) to SSDs while retaining only compact search state in DRAM. Based on how they organize and access the index and disk-resident data, existing disk-resident ANNS systems generally fall into two categories: 1) cluster-based ANNS that manages vectors at a coarse-grained cluster granularity (with SPANN [9] as a state-of-the-art baseline) and 2) graph-based ANNS that organizes vectors into a proximity graph at vector granularity (exemplified by the representative DiskANN [28] and PipeANN [20]). While both (cluster-based and graph-based) search paradigms have seen widespread adoption and extensive opti-mization, we nevertheless observe that even with faster SSDs, they remain inherently I/O-bound, especially under high con-currency. Specifically, our measurements on a high-end PCIe 5.0 NVMe SSD show that SPANN, DiskANN, and PipeANN stop scaling as query concurrency increases: they all approach the SSD’s I/O capacity, causing exposed I/O wait to account for 87–93% of total query latency at high concurrency. This bottleneck persists even for PipeANN despite its optimized pipelined execution. These results identify I/O volume as the primary bottleneck to scalability, establishing a key de-sign principle that scalable disk-resident ANNS systems must pursue: minimize per-query disk I/O .To identify what drives this per-query I/O volume, we break each query down into an approach phase , which locates a re-gion likely to contain the nearest neighbors, and a converge phase , which examines candidates within that region to deter-mine the final top-k. Our analysis and experiments reveal that 
+
+fine and coarse search granularities provide complementary I/O benefits across the two phases . Specifically, cluster-based search avoids approach-phase I/O through in-memory cen-troid routing, but it reads coarse-grained, full clusters during 1arXiv:2611.29948v1 [cs.DB] 23 Nov 2026 convergence, incurring excessive I/O volume. By contrast, graph-based search performs fine-grained, vector-level I/O across both phases: this granular retrieval effectively limits the I/O volume during the convergence phase, but it incurs unavoidable I/O overhead during the approach phase. Aiming at combining the identified, complementary I/O benefits of the two granularities,we present TriVS , a new paradigm that re-architects disk-resident vector search as a 
+
+tri logy: approach coarsely, distill progressively, and con-verge exactly . Specifically, TriVS adopts cluster granular-ity to avoid approach-phase I/O and employs vector gran-ularity for efficient convergence. Meanwhile, to bridge the huge gap between the two granularities, TriVS introduces an in-memory distill phase that progressively reduces routed clusters to a vector-level shortlist using compact quantized vectors before disk access. This three-phase workflow de-fines a third path beyond the existing fixed-granularity graph-based or cluster-based approaches: it adaptively leverages progressively-shrinking granularities as the search advances and the query space narrows, establishing a novel search-aware methodology to fundamentally minimize per-query disk I/O. Making this design practical requires balancing I/O re-duction with in-memory compute overhead. To meet this requirement, we develop TriSearch, a vector search algorithm that progressively increases quantization precision as the can-didate set shrinks. It combines the progressive refinement with early termination and lower-bound pruning to limit in-memory computation and exact-vector I/O. In addition, TriVS reallocates rather than expands memory. By enabling coarser clustering, in-memory distillation reduces the number of cen-troids and shrinks the routing index, freeing DRAM for the quantized vectors needed by the distill phase. We comprehensively evaluate TriVS across datasets span-ning diverse vector types and scales. Across five datasets at Recall@10=0.9, TriVS achieves, on average, 3 .42 × Pi-peANN’s throughput, 51.2% lower latency, and 63.7% less disk I/O, while using less memory and storage than PipeANN. This paper makes three contributions: • We present an I/O-centric analysis that identifies disk I/O as the scalability bottleneck in existing disk-resident ANNS and reveals how fine and coarse search granularities shift I/O between the approach and converge phases (§3). • We design TriVS as a trilogy that decouples search gran-ularity through in-memory distillation, and develop the TriSearch algorithm and an efficient implementation to re-alize this design (§4). • We comprehensively evaluate TriVS across diverse work-loads and scales, showing that it achieves higher throughput and lower latency than state-of-the-art disk-resident ANNS systems by reducing disk I/O (§5). 
+
+## 2 Background 2.1 Disk-Resident ANNS 
+
+Given a vector dataset X and a query vector q, vector search retrieves the k vectors in X closest to q under a chosen dis-tance metric. Because exact search is prohibitively expensive on high-dimensional datasets [26], modern vector search sys-tems [11, 24, 36] rely on approximate nearest-neighbor search (ANNS) to significantly reduce search cost at the expense of a small, acceptable accuracy loss. ANNS accuracy is typically measured by Recall@ k, the fraction of true top-k neighbors retrieved. As datasets grow to hundreds of millions or billions of high-dimensional vectors, the full-precision vectors alone can occupy hundreds of gigabytes, and the index can require comparable or greater capacity [10,28,60]. Large-scale vector search therefore commonly uses disk-resident ANNS, storing the bulk of the vectors and index on SSD while retaining compact search state in DRAM [9, 20, 25, 28, 48]. Existing disk-resident ANNS systems can be classified by the granularity at which they organize the index and disk-resident data. Cluster-based systems such as SPANN [9] use coarse-grained cluster granularity, whereas graph-based sys-tems such as DiskANN [28] and PipeANN [20] use fine-grained vector granularity. The chosen granularity shapes index size, data placement, query workflow, and disk access, as Figure 1 summarizes. 
+
+Cluster-based Disk-Resident ANNS. Cluster-based systems such as SPANN [9] organize vectors at cluster granularity: nearby vectors are assigned to a cluster, stored together on disk, and represented by its centroid (Figure 1(a)). Because one centroid represents many vectors, the routing index con-tains far fewer entries than a per-vector graph and can remain in memory. At query time, the system searches the in-memory index for the centroids closest to the query, then reads the cor-responding clusters from disk in a batch and computes the exact distance to each retrieved vector. This coarser organi-zation eliminates navigation I/O and enables batched reads, but fetching at cluster granularity can amplify disk I/O by transferring every vector in each selected cluster. To maintain recall while limiting cluster probes, SPANN [9] replicates boundary vectors across neighboring clusters, trading storage overhead for lower per-query I/O. 
+
+Graph-based Disk-Resident ANNS. Graph-based systems such as DiskANN [28] and PipeANN [20] organize vectors into a proximity graph at vector granularity: each vertex repre-sents a vector, and edges connect nearby vectors (Figure 1(b)). Because each vector links to multiple neighbors, the graph edges can collectively rival the raw vector data in size [10,60]. Under practical DRAM budgets, graph-based systems keep compact quantized vectors in memory and co-locate each ex-act vector with its graph neighbor list in one disk record, so one read returns both the full-precision vector and graph edges needed for exact distance computation and continued traversal. 2Disk  
+
+> Replication at Cluster Boundary
+
+Memory  Centroids of Clusters         
+
+> Index of Centroids
+> Vector 1
+> Cluster 1 Cluster 2 Cluster 3
+> I/O
+> Vector 2 Vector k ......
+> Format:
+> Vector 2 Vector 5 Vector k ......
+> ......
+> Query 13......
+> Read Nearest Centroids'
+> Corresonding Clusters
+
+(a) Cluster-based ANNS: organized at cluster granularity Disk  Vectors & 
+
+> Proximity Graph
+
+Memory  Quantized  Vectors            
+
+> Entry Graph or Node Cache For Next Vector in Search Path:
+> Read Vector and Its Neighbor List
+> Format:
+> Vector 1 34679
+> Record 1 Record 2 Record 3
+> Neighbors of Vector 1 in Proximity Graph
+> ......
+> 1
+> 2
+> 34
+> I/O
+
+(b) Graph-based ANNS: organized at vector granularity 
+
+Figure 1: Data placement and query flow in existing disk-resident ANNS. Cluster-based systems locate nearby clusters through an in-memory centroid index and read each selected cluster as a unit, avoiding navigation I/O but potentially fetching many vectors in each cluster. Graph-based systems store a full-precision vector and its proximity-graph neighbors in each disk record, so expanding a vertex (i.e., vector) requires I/O to read its neighbor list, which guides the subsequent search path. 
+
+These systems commonly use best-first search [3, 49], which repeatedly expands the closest unvisited vector in a candidate list. Each expansion reads the exact vector and its neighbor list from disk, computes its exact distance to the query, and uses memory-resident quantized vectors to score its neighbors and update the candidate list. Compared with cluster-based approaches, this vector-granularity organization keeps indi-vidual reads selective and reduces redundant data access for high system throughput, but may incur higher query latency due to the dependent I/O inherent in graph traversal. The state-of-the-art PipeANN [20] pipelines reads across search steps and adapts I/O parallelism to overlap I/O with computation, but retains the same per-vector disk layout and access pattern. 
+
+## 2.2 Vector Quantization 
+
+Vector quantization maps a high-dimensional vector to a com-pact code that approximates its distance to a query. Common methods include scalar quantization (SQ), product quantiza-tion (PQ) [32], OPQ [19], LVQ [1], and RaBitQ [16, 18]. For high-dimensional vectors, SAQ [37] segments PCA-projected vectors and allocates more bits to high-impact dimensions, while DADE [13], ADSampling [17], and LeanVec [42] re-duce or adapt the dimensions used for distance evaluation. Across these methods, different code widths, quantizer config-urations, and dimension subsets provide different trade-offs among accuracy, memory, and computation. Disk-resident graph systems such as DiskANN [28] and PipeANN [20] keep PQ codes in memory to guide vector-level navigation. After reading an expanded vector’s neighbor list from disk, the system uses quantized codes to estimate each neighbor’s distance to the query and updates the ordered candidate list which it then uses to select the next graph records. This in-memory distance estimation avoids fetching every neighbor’s full-precision vector from disk. Among these methods, RaBitQ [16, 18] is a prominent state-of-the-art quantizer that provides multiple precision lev-els and theoretical error bounds. Given a reference center c,typically a cluster centroid, RaBitQ normalizes the residuals of the data vector and query, applies a shared random rotation, and represents each residual dimension with one or more bits. A one-bit code provides an initial estimate, while additional bit planes progressively refine it and reuse the earlier compu-tation. During index construction, RaBitQ stores each vector’s code together with a few precomputed terms derived from that vector and its center. At precision level ℓ, search evaluates the code against the transformed query residual and combines the result with these terms to obtain an estimated distance Dℓ. Ra-BitQ also uses a stored error term and the query residual norm to derive an error width Eℓ, which bounds the exact distance within [Dℓ − Eℓ, Dℓ + Eℓ] at the specified confidence level. We denote the corresponding lower bound as LB ℓ = Dℓ − Eℓ.
+
+## 3 Observation and Motivation: An I/O-Centric View of Disk-Resident ANNS 
+
+In this section, we take an I/O-centric view of disk-resident ANNS. We first show that existing systems scale poorly as query concurrency increases, even on a high-end PCIe 5.0 NVMe SSD, and identify disk I/O as their shared bottleneck. To understand where this disk I/O arises, we break down the vector search process into approach and converge phases and examine the granularity at which each phase operates. This analysis reveals that existing systems apply one granularity throughout the vector search process, thereby determining the amount and distribution of disk I/O across its phases. 
+
+## 3.1 Existing Systems Remain I/O-Bound 
+
+We begin by measuring the throughput scalability of SPANN, DiskANN, and PipeANN on DEEP-100M at Recall@10=0.9, using 1–96 query threads on the same PCIe 5.0 NVMe SSD. Figure 2(a) shows that all three systems scale sublinearly: SPANN reaches its throughput plateau at only 4 threads, while DiskANN and PipeANN increasingly fall below their early scaling trends. Figure 2(b) links this scaling behavior to SSD 31 4 8 16 32 48 64 80 96      
+
+> Number of Threads
+> 05K 10K 15K 20K
+> Throughput (QPS)
+> (a) Query throughput
+> 14816 32 48 64 80 96
+> Number of Threads
+> 025 50 75 100
+> SSD I/O Capacity Utilization (%)
+> (b) SSD I/O capacity utilization
+> SPANN DiskANN PipeANN
+
+Figure 2: Throughput scaling and SSD I/O utilization. On DEEP-100M at Recall@10=0.9, each system stops scaling as it approaches the SSD I/O capacity. SPANN DiskANN PipeANN      
+
+> 012
+> Latency (ms)
+> (a) 1 Thread
+> SPANN DiskANN PipeANN
+> 0510 33.5
+> (b) 96 Threads
+> 030 60 90 26% 72% 44% 030 60 90
+> Fraction of Exposed I/O Wait Time (%) 93% 90% 87%
+> Exposed I/O Wait Time Compute-Overlapped I/O Time (PipeANN) Other Processing Fraction of Exposed I/O Wait Time
+
+Figure 3: Latency decomposition and exposed I/O wait on DEEP-100M at Recall@10=0.9. At 1 thread, SPANN exposes less I/O wait because it avoids the dependent I/O rounds required to traverse a disk-resident proximity graph; at full system load (96 threads), however, I/O wait dominates latency in all three systems. 
+
+I/O utilization. SPANN reaches 96% of the SSD I/O capacity 1
+
+at only 4 threads, where its throughput plateaus. As concur-rency increases, DiskANN and PipeANN also approach the capacity and deliver diminishing throughput gains. Thus, even on a high-end SSD, existing systems cannot sustain through-put growth as query concurrency drives SSD I/O utilization toward capacity. To examine how this I/O bottleneck manifests in per-query latency, we decompose latency and quantify the disk wait time exposed to each query in Figure 3. At 1 thread, SPANN’s ex-posed I/O wait time constitutes 26% of latency, less than in DiskANN and PipeANN because it can batch cluster reads and avoid dependent I/O rounds in graph traversal. Although PipeANN optimizes I/O execution to overlap part of the I/O time with computation, its exposed I/O wait time remains significant at 44% of query latency. Moreover, at full system load (96 threads), all three systems are I/O-dominated, with the exposed I/O wait time accounting for 87–93% of latency. These measurements identify I/O volume as the primary scala-bility limit, with dependent I/O rounds imposing an additional latency cost at low load. In summary, existing systems, both cluster- and graph-based, stop scaling as they approach SSD I/O capacity. Opti-
+
+> 1We use SSD I/O capacity to refer to the maximum sustainable read IOPS at each system’s access granularity, measured using fio [2].
+
+mizations such as compute–I/O overlap (e.g., PipeANN [20]) can hide part of the I/O latency at low concurrency, but they leave per-query I/O volume unchanged. Consequently, at high concurrency, latency and throughput remain bounded by the SSD’s I/O capacity. Scalable disk-resident ANNS must there-fore follow a principle: minimize per-query disk I/O .
+
+## 3.2 Different Search Granularities Determine Disk I/O 
+
+Having established disk I/O as the shared bottleneck, we next examine how it arises during vector search. Following prior analyses of vector-index traversal [20, 58, 60], we break each query down into two analytical phases: the approach phase 
+
+and the converge phase . The approach phase moves the search from its entry point into a region likely to contain the query’s nearest neighbors. The converge phase examines candidates within that region to determine the final top-k. We apply this analytical lens to cluster- and graph-based vector search and study the disk I/O incurred in each phase. Our analysis and experiments reveal a common source of excessive I/O: existing architectures couple both phases to a single search granularity, optimizing one phase at the expense of the other. This mismatch arises because the two phases favor different granularities: cluster-level routing keeps the index compact enough to reside in memory, eliminat-ing approach-phase I/O, whereas vector-level access restricts converge-phase I/O to selected vectors. 
+
+Cluster-based disk-resident ANNS eliminates approach-phase I/O at the cost of amplified converge-phase I/O. 
+
+SPANN [9] applies cluster granularity to both phases, as Fig-ure 4(a) illustrates. During the approach phase, its compact centroid index selects query-near clusters entirely in DRAM, avoiding routing I/O. However, the converge phase fetches each selected cluster in full, although only a small fraction of its vectors can contribute to the final result. Figure 5 quan-tifies this tradeoff: SPANN incurs no approach-phase I/O but transfers 426 pages per query during convergence, 7.8 ×
+
+PipeANN’s total I/O. 
+
+Graph-based disk-resident ANNS reduces converge-phase I/O through selective vector reads but incurs dependent approach-phase I/O. DiskANN [28] and PipeANN [20] op-erate at vector granularity in both phases, treating each vector as a vertex in the proximity graph (Figure 4(b)). During the ap-proach phase, best-first search follows a vector-level path from the entry point toward the query; during the converge phase, it continues expanding individual nodes around the query. The full vector-level navigation state includes one graph record and adjacency list per vector and is too large to retain entirely in DRAM under a practical serving budget, so each expansion reads a disk record containing a full-precision vector and its adjacency list. This fine-grained access is selective during the converge phase because the search fetches individual vec-tors rather than the surrounding region. During the approach 4Converge Phase:      
+
+> 4
+> 56
+> 7
+> 810
+> 9
+> 11
+> Query
+> 12
+> 13 14
+> 16
+> 17
+> 18
+> 15
+> Selected
+> Cluster 2
+> 12
+> 10
+> 18
+> 7
+> 14
+> I/O
+> kReplication
+> at Cluster Boundary
+> Disk : Clusters Memory :Index for
+> Centroids of Clusters
+
+Approach Phase:  
+
+> Select clusters in memory
+> I/O for ALL selected clusters
+> Selected
+> Cluster 1
+> Selected
+> Cluster 3
+> Selected
+> Cluster 4
+> I/O in Converge Phase
+
+(a) Cluster-based ANNS: cluster-level approach & converge phases 1 
+
+> 2
+> 3
+> 4
+> 56
+
+Entry Point  7Approach Phase  
+
+> 810
+> 9
+> 11
+
+Converge Phase 
+
+Query   
+
+> 12
+> I/O (Exploration Path) in Approach Phase
+> I/O (Exploration Path) in Converge Phase
+> 13 14
+> 16
+> 17
+> 18
+> 15
+> Disk:Vectors & Proximity Graph
+
+(b) Graph-based ANNS: vector-level approach & converge phases 
+
+Figure 4: Existing disk-resident ANNS systems apply one granularity throughout the search process. Cluster-based systems select query-near clusters in memory and read every vector in them, with boundary replication further amplifying the transfer. Graph-based systems follow a vector-level path toward the query and expand individual graph records around it. 80 60 40 20 0SPANN DiskANN PipeANN      
+
+> 059.4 25.5
+> 20 40 60
+> 35.1 28.8
+> 100 300 500
+> 426
+> I/O Volume per Query (4 KB Page)
+> Approach Phase Converge Phase
+
+Figure 5: Existing architectures incur phase-specific I/O. 
+
+DEEP-100M at Recall@10=0.9. Cluster-based SPANN elimi-nates approach-phase I/O but transfers far more data during the converge phase. Graph-based DiskANN and PipeANN limit converge-phase I/O but incur approach-phase I/O. 
+
+phase, however, each expansion must read the current vector’s disk-resident neighbor list before discovering new candidates, introducing dependent graph-record I/O along the navigation path. As shown in Figure 5, DiskANN and PipeANN respec-tively read 59.4 and 25.5 pages per query in approach phase, followed by 35.1 and 28.8 pages in converge phase 2.In summary, our analysis traces substantial I/O in existing systems to coupling both phases to a single search granularity. Cluster- and vector-level search granularities each impose phase-specific I/O costs, yet provide complementary I/O ben-efits for the approach and converge phases, respectively. 
+
+## 4 TriVS 
+
+To reduce I/O costs both in approach and converge phases, we present TriVS , which decouples their search granulari-ties by assigning cluster granularity to the approach phase and vector granularity to the converge phase, then bridges the two phases through an in-memory distill phase that nar-rows promising clusters to a vector-level shortlist before exact-vector I/O. TriVS thereby organizes disk-resident vector  
+
+> 2For each query, we use completion of exact evaluation for the closest vector in its final top-k(e.g., top-10) as the phase boundary; pages completed by then are attributed to approach phase, and later pages to converge phase.
+
+search as a Tri logy : approach coarsely, distill progressively, and converge exactly. §4.1 derives the granularity decoupling and its in-memory enabler; §4.2 maps the design onto index construction and data layout; and §4.3 presents the query workflow and the TriSearch algorithm, which carries each query through the trilogy while bounding both in-memory computation and disk I/O. §4.4 details the optimizations that make TriVS more efficient, while §4.5 discusses support for online updates. 
+
+## 4.1 Decoupling Search Granularity with In-Memory Distillation 
+
+Decoupling search granularity could capture the I/O benefits of both existing paradigms: a cluster-level approach phase avoids vector-level graph-traversal I/O, while a vector-level converge phase preserves selective reads rather than fetching full clusters. However, these granularities cannot be composed directly: the cluster-level approach phase identifies promising clusters, while the vector-level converge phase must select a small subset of the vectors within them. Without an in-memory mechanism to select this subset, the system must read and scan the selected clusters in full, recreating cluster-level convergence and its coarse-grained I/O. We observe that compact quantized vectors, which can be kept in memory, provide the missing bridge between cluster-level approach and vector-level convergence. Even within query-near clusters, most vectors remain sufficiently far from the query to be pruned using approximate distance estimates computed from these in-memory representations. After clus-ter routing, TriVS can therefore scan the quantized vectors entirely in memory, discard unlikely candidates, and retain only a vector-level shortlist for the converge phase. This in-memory reduction closes the granularity gap be-tween the cluster-level approach phase and the vector-level converge phase; we call it the distill phase . The approach ,
+
+distill , and converge phases together define TriVS, a third paradigm for disk-resident ANNS beyond conventional graph-55 6   
+
+> 7
+> 810
+> 9
+> 11
+> query
+> 12
+> 13 14
+> 17
+> 18
+> 15
+> Selected
+> Cluster 1
+> Selected
+> Cluster 2
+> I/O
+> Disk : Exact Vectors Memory
+> Converge Phase:
+> Approach Phase
+> I/O for Selected Vectors
+> I/O in Converge Phase
+> Selected Clusters
+> Selected Vectors
+> Distill
+> Phase
+> Index for
+> Centroids of Clusters
+> Quantized Vectors
+> Selected Clusters
+> Selected Vectors
+
+Figure 6: TriVS decouples search granularity through in-memory distillation. The approach phase selects clusters using an in-memory centroid index; the distill phase scans their quantized vectors and emits a vector-level shortlist; the converge phase reads only the shortlisted exact vectors from disk rather than every vector in the selected clusters. 
+
+and cluster-based designs. As shown in Figure 6, TriVS or-ganizes vector search as a trilogy: it approaches query-near regions at cluster granularity, distills the selected clusters into a vector-level shortlist entirely in memory, and converges over only the shortlisted exact vectors on disk. Compared with ex-isting graph-based and cluster-based workflows (Figures 4(a) and 4(b)), TriVS avoids vector-level graph-traversal I/O in the approach phase without resorting to full-cluster reads in the converge phase. The distill phase provides the in-memory bridge between these granularities, transforming promising clusters into individual candidates before exact-vector I/O. 
+
+Distillation reallocates rather than expands memory. Anatural concern is whether using in-memory quantized vectors for distillation increases memory usage. It does not: TriVS reallocates existing memory to support distillation rather than expanding its total memory footprint. On the one hand, com-pared with graph-based systems, distillation adds no new form of per-vector evidence: these systems already keep compact quantized vectors in memory to guide search. PipeANN [20] pairs these codes with a sampled entry graph, while TriVS pairs them with a centroid index of comparable size. On the other hand, compared with cluster-based SPANN [9], TriVS can scan more and larger clusters because evaluating their in-memory quantized codes does not incur additional full-cluster disk reads. This flexibility elegantly enables coarser cluster-ing and removes the need for boundary replication. Coarser clustering produces fewer clusters and therefore fewer cen-troids, shrinking the centroid-routing index and making room for one compact code per vector. Assigning each vector to one cluster further prevents those codes from being replicated. Together, these reallocations let distillation change the search workflow without increasing memory usage. Our evaluation in §5.2 confirms that TriVS uses less memory than PipeANN at both 100M and 1B scales. 
+
+## 4.2 Index Organization 
+
+With in-memory distillation providing the missing cluster-to-vector interface, TriVS separates its serving state by phase: memory-resident structures support the approach and distill phases, while full-precision vectors remain on disk until dis-tillation finalizes the shortlist. Figure 7 shows how offline construction produces this layout and how queries use it at serving time. 
+
+Offline index construction. Given a vector dataset, TriVS first applies size-bounded hierarchical k-means with a tar-get cluster size T (128 vectors in our implementation), as shown at the top of Figure 7. Specifically, it recursively ap-plies k-means to any cluster containing more than 2 T vectors. TriVS deliberately adopts much coarser clustering: its cluster count is only about 0.7–0.8% of the vector count, compared with roughly 10–12% for SPANN [9]. This coarser clustering is both practical and beneficial: in-memory distillation can scan larger clusters without full-cluster disk reads, while the smaller centroid index leaves more memory for quantized vectors. Notably, in TriVS, each vector belongs to exactly one cluster, avoiding boundary replication and thereby reducing memory and storage overhead while simplifying construc-tion. For datasets that exceed available construction memory, TriVS processes the hierarchy one subtree at a time. After clustering, TriVS builds an in-memory routing index (e.g., HNSW [38]) over the final cluster centroids. Within each cluster, it quantizes vectors relative to the cluster cen-troid using RaBitQ [18]. The per-cluster reference reduces residual spread and improves distance estimation during the distill phase. Finally, TriVS stores the quantized vectors con-tiguously by cluster in memory and packs the full-precision vectors in the same cluster order on disk. 
+
+Serving-time data layout. At serving time, TriVS keeps the centroid index, vector IDs, exact-vector locations, and RaBitQ codes in memory, with per-vector state laid out contiguously by cluster. The cluster-contiguous RaBitQ representation sup-ports incremental refinement while occupying only two bits per dimension. Consequently, the approach and distill phases access only DRAM; disk reads begin only after distillation fi-nalizes the shortlist and resolves each candidate’s exact-vector location. 
+
+## 4.3 The TriSearch Algorithm 
+
+We design TriSearch, a vector search algorithm that carries each query through TriVS’s three-phase workflow: approach, distill, and converge. Across these phases, TriSearch bounds both in-memory computation and exact-vector I/O. First, the cluster-level approach phase searches the in-memory centroid index and returns up to P query-near clusters. Next, the dis-till phase progressively filters vectors in the selected clusters using cluster-contiguous RaBitQ codes entirely in memory, forming a shortlist of at most R candidate vectors and their 6Of fl ine Construction 
+
+Data Layout     
+
+> Dataset Hierarchical Clustering Quantization
+> Index for Centroids
+> of Clusters (e.g., HNSW)
+> Qunatized Vector
+> (e.g., RaBitQ )
+
+Query Work fl ow 
+
+Memory  Disk  Full-precision Vectors 
+
+> (Organized by Clusters)
+> Coarse-grained Find
+> Top-P n earest clusters
+
+Approach Phase 
+
+> Broad Screening
+> at Low-precision
+> with early-termination
+
+Converge Phase Distill  Phase 
+
+TriSearch   
+
+> Progressively Select
+> Top-R nearest vectors
+> Fine-grained Read & Rank
+> Final Top-k nearest vectors
+> Selective Re fi nement
+> by Mid-precision
+> Bounded Pruning
+> via Error Bound
+> Deduplicate & Merge
+> Page Reads
+> Read and Re-Rank
+> Full-precision Vector
+
+Figure 7: TriVS overview. Offline construction creates size-bounded clusters, assigns each vector to one cluster, and materializes a centroid index and cluster-organized quantized vectors in memory alongside cluster-organized full-precision vectors on disk. During search, the TriSearch algorithm routes to query-near clusters, distills their quantized vectors to a vector-level shortlist entirely in memory, and only then reads and re-ranks the shortlisted full-precision vectors. disk locations. Finally, the vector-level converge phase reads only the shortlisted full-precision vectors from disk and re-ranks them to return the final top-k. Because distillation iden-tifies all exact-vector accesses before disk I/O begins, these reads can be issued as a batch, reducing latency by avoid-ing dependent I/O rounds. Figure 7 provides an overview of this three-phase workflow; Algorithm 1 details its complete execution. 
+
+Cluster-level approach phase. Given a query q, TriSearch first searches the DRAM-resident centroid index using stan-dard HNSW [38] to locate query-near clusters (Algorithm 1, Line 2). The search returns an ordered set C of at most P clus-ters, where P is the cluster-probe budget, and uses a search width of e f = 1.2P. These routed clusters become the input to in-memory distillation. At this point, the query has accessed only centroids; no disk-resident vector has been read. 
+
+Progressive in-memory distillation. After the approach phase, the routed clusters still contain a broad set of vec-tors. Granularity decoupling shifts cluster-to-vector candidate selection from disk reads to quantized-distance evaluation over the routed vectors in DRAM. This additional compu-tation must remain small enough to avoid replacing the I/O bottleneck with a CPU bottleneck. Evaluating every routed vector with a more accurate quantized representation would be too costly, whereas using only a coarse representation would leave too many candidates for exact-vector I/O. To balance these costs, TriSearch progressively increases quantization precision as the candidate set shrinks: it first screens every routed vector using 1-bit RaBitQ, then reads one additional bit plane only for competitive candidates to evaluate them at mid precision (2-bit RaBitQ). To implement this progression, TriSearch visits the routed clusters in order and calls ProgressiveScan on their com-pact vector codes (Lines 5–6). For every vector block, the 1-bit RaBitQ evaluation computes a low-precision distance es-timate for each vector (Lines 17–18). TriSearch maintains an 
+
+R-entry max heap H ordered by mid-precision distance (2-bit RaBitQ). The capacity R bounds the refined candidate pool passed to exact-access selection. Notably, RaBitQ pairs each estimate with a confidence-controlled lower bound, which TriSearch uses to decide whether the vector merits 2-bit re-finement. Before H is full, every vector remains eligible for refinement; afterward, the worst mid-precision distance in H
+
+becomes the admission threshold. TriSearch computes the mid-precision distance for a vector only when its 1-bit Ra-BitQ lower bound falls below this threshold, then uses the refined distance to update the R-entry heap H if it enters the current top R (Lines 20–22). Every successful refinement tightens the heap threshold for subsequent vectors, making later screening more selec-tive. Across clusters, the absence of heap updates provides an early-termination signal: TriSearch stops after W consec-utive routed clusters fail to update H, where W is derived from P (Lines 5–7). Together, within-cluster promotion and cluster-level early termination reserve increasingly precise computation for increasingly smaller candidate sets. 
+
+Exact-access selection. When the scan terminates, H contains at most R candidates with mid-precision distances and lower bounds. TriSearch seeds the exact-access shortlist S with the approximate top-k and uses their kth-best distance as a threshold for the remaining candidates. TriSearch then retains any remaining candidate whose mid-precision lower bound does not exceed this threshold and adds candidates stored on pages already selected for S, since their exact evaluation requires no additional page read (Lines 9–12). 
+
+Vector-level converge phase (exact re-ranking). After the shortlist S is finalized, TriSearch maps its vectors to disk pages, deduplicates and coalesces the reads, and computes ex-act distances from the full-precision vectors as the requested pages arrive (Lines 13–14). It re-ranks the shortlist by these 7Algorithm 1 Pseudocode for TriSearch.                                                                                                                           
+
+> Input: For query q, return its top-knearest neighbors;
+> P: maximum clusters probed;
+> R: maximum exact vectors re-ranked (I/O); At precision level ℓ,Dℓand LB ℓdenote the estimated distance and a lower bound on the distance, respectively.
+> 1: def TriSearch (q,k;P,R)
+> // 1. Cluster-level approach phase
+> 2: C←RouteClusters (q,P)
+> 3: H←empty max heap of capacity R, keyed by Dmid
+> 4: W←early-termination window derived from P// 2. In-memory distill phase // Broad screening, selective refinement, and ranking
+> 5: for all c∈Cin routing order do
+> 6: updated ←ProgressiveScan (q,c,H)
+> 7: if updated =false for Wconsecutive clusters then
+> 8: break
+> // Exact-access selection
+> 9: S←the top-kcandidates in H
+> 10: τk←the kth-smallest Dmid in H
+> 11: S←S∪ { x∈H: LB mid (q,x)≤τk}
+> 12: S←AddSamePageCandidates (S,H)
+> // 3. Vector-level converge phase
+> 13: A←PlanPages (S)
+> 14: return ExactRerank (q,S,A,k)
+> 15: def ProgressiveScan (q,c,H)
+> 16: updated ←false
+> 17: for all vector blocks bin cluster cdo
+> 18: (Dlow ,LB low )←EvaluateLow (q,b)
+> 19: for all x∈bdo
+> 20: if LB low (q,x)<Threshold (H)then
+> 21: (Dmid [x],LB mid [x]) ←EvaluateMid (q,x)
+> 22: if UpdateHeap (H,x,Dmid [x])then
+> 23: updated ←true
+> 24: return updated
+
+exact distances and returns the top-k vectors. 
+
+Generality across quantizers. TriSearch is not tied to Ra-BitQ. Its low- and mid-precision stages can use different code widths, quantizer configurations, or dimension subsets from different quantization methods. TriSearch uses RaBitQ’s the-oretical lower bounds to enhance candidate promotion and pruning, but quantizers without such bounds can rely on esti-mated distances, fixed refinement ratios, or quantizer-specific pruning criteria. Different quantizers may affect accuracy and efficiency but preserve TriSearch’s three-phase workflow. 
+
+## 4.4 Implementation and Optimizations 
+
+TriSearch bounds the work performed in each phase of the search process; we further optimize the complete workflow to reduce computation, I/O, and memory footprint. 
+
+Efficient progressive distillation. For distillation, each clus-ter stores a 1-bit-per-dimension RaBitQ base code plus one additional bit plane, forming a nested 2-bit-per-dimension representation. The codes are arranged in 32-vector blocks for an AVX-512 FastScan kernel [14]. The kernel computes the base-precision estimate and lower bound together; refine-ment reuses this work and evaluates only the additional bit plane. The final partial block stores only valid lanes and is reconstructed in thread-local scratch space for aligned access, avoiding per-cluster padding. 
+
+Compact in-memory state. The centroid HNSW stores 8-bit scalar-quantized (SQ8) centroids, a configuration supported by Faiss [14] and suited to identifying a broad set of promising clusters. Within each cluster, TriVS also encodes the per-vector RaBitQ estimator fields in SQ8. Using each cluster centroid as the RaBitQ reference gives its distance-estimation factors and bound-error terms a narrow local range, enabling SQ8 encoding with little accuracy loss. Conservative rounding of the error terms preserves valid pruning bounds. 
+
+Page-efficient vector-level convergence. The full-precision vector file densely packs vectors in cluster order, allowing one page read to cover multiple candidates from the same cluster. After the mid-precision gate, TriVS includes candidates on already selected pages at no extra read cost, then deduplicates page IDs and coalesces adjacent pages into larger reads. 
+
+Inline and pooled re-ranking. The exact re-ranking step can run either inline in the query thread or in a dedicated thread pool. In pooled mode, query threads pass finalized shortlists to dedicated re-ranking threads, which continuously issue new exact reads as earlier requests complete. This continu-ous refill can drive SSD utilization closer to its IOPS limit. Pooled re-ranking helps when I/O remains the bottleneck after distillation, but introduces handoff and queueing overhead. Accordingly, TriVS uses pooled re-ranking for workloads that remain I/O-bound after the distill phase and inline re-ranking when the resulting I/O reduction from the distill phase shifts pressure toward computation. 
+
+## 4.5 Discussion 
+
+TriVS focuses on search optimization, while online-update support is orthogonal to its core design. Prior work treats on-line updates as a dedicated design problem: SPFresh [53] sup-ports updates in cluster-based disk-resident ANNS systems; FreshDiskANN [41], IP-DiskANN [52], and OdinANN [21] support updates in graph-based disk-resident ANNS systems. TriVS could adapt SPFresh’s local rebalancing: an insertion assigns a vector to its nearest cluster, stores its cluster-local quantized representation, and records its exact-vector loca-tion, while a deletion invalidates the vector’s unique entry. This approach would preserve the existing query workflow and simplify update handling because TriVS assigns each vector to exactly one cluster without replication, avoiding replica-version tracking and cleanup. 85 Evaluation 
+
+We evaluate TriVS against state-of-the-art disk-resident ANNS systems across diverse workloads and scales. Our key findings include: • At Recall@10=0.9, TriVS achieves on average 3 .42 × Pi-peANN’s throughput, 51.2% lower latency, and 63.7% less disk I/O across five datasets. • TriVS has memory and storage footprints comparable to or, in most cases, smaller than those of existing disk-resident ANNS systems. • TriVS progressively narrows query work; the saved I/O time outweighs distillation overhead, and its advantage grows with query concurrency. 
+
+## 5.1 Experimental Setup 
+
+Table 1: Datasets used in the evaluation. Dim. is vector dimension, Dist. is distance metric for vector similarity.                             
+
+> Dataset Dim. Type Dist. #Vector #Query Size(GiB)
+> DEEP-100M [54] 96 float32 L2 100M 10K 35.8 Text-to-Image [5] 200 float32 IP 100M 100K 74.5 Wiki [50] 384 float32 L2 100M 15.8K 143.1 SIFT-1B [33] 128 uint8 L2 1B 10K 119.2 DEEP-1B [54] 96 float32 L2 1B 10K 357.6
+
+Datasets. We comprehensively evaluate TriVS on five public datasets with diverse vector types and application domains, spanning scales from 100 million to 1 billion vectors, dif-ferent dimensionalities, and different distance metrics (Ta-ble 1). Specifically, we include popular datasets from the BigANN benchmark [5], including DEEP-100M [54] and the billion-scale SIFT-1B [33] and DEEP-1B [54] workloads. We also include Yandex Text-to-Image [5], a cross-modal dataset with base vectors derived from images and query vectors derived from text. The base and query vectors fol-low different distributions in their shared embedding space, making it an out-of-distribution workload [7]. Finally, fol-lowing PipeRAG [31] and existing work [55], we construct a 384-dimensional RAG-oriented dataset named Wiki using the BGE embedding model [6], with 100M base vectors gen-erated from Wikipedia text data [50] and 15.8K query vectors generated from the MMLU text dataset [22]. 
+
+Baseline systems. We compare TriVS with three state-of-the-art disk-resident ANNS systems: DiskANN [28], Pi-peANN [20], and SPANN [9]. DiskANN and PipeANN use PQ for their in-memory quantized vectors. PQ is their default and recommended configuration and the setting under which they report strong performance. Since TriVS uses RaBitQ, we additionally include PipeANN ’s official RaBitQ implemen-tation, denoted PipeANN+R , configured with the same 2-bit-per-dimension RaBitQ representation as TriVS to isolate the effect of the quantization method. Following PipeANN [20], the DiskANN and PipeANN indexes use R = 96 for graph degree, Lbuild = 128, and matching PQ widths (32 bytes for DEEP and SIFT, 50 for Text-to-Image, and 96 for Wiki). At query time, DiskANN uses a beam width of 4 to balance throughput and latency, while PipeANN follows its default policy of dynamically increasing the I/O pipeline width from 4 to at most 32. Since PipeANN keeps a 1% sampled entry graph in memory, it uses more DRAM than DiskANN . For a fair memory comparison with PipeANN , we additionally include DiskANN+C , a DiskANN variant whose node cache is sized to approximately match PipeANN ’s memory usage. 
+
+Testbed. All experiments run on a server equipped with two 48-core AMD EPYC 9455 processors, 384 GB of DRAM, and a Samsung 9100 PRO PCIe 5.0 NVMe SSD. The SSD delivers up to 1 million IOPS for 4-KB random reads, as mea-sured using fio [2]. The operating system is Ubuntu 24.04.4 with Linux 6.8.0. Unless stated otherwise, experiments use all 96 physical cores and access the SSD through direct I/O. 
+
+TriVS parameters. We set the target cluster size T to 128 vectors. TriVS uses 2-bit-per-dimension RaBitQ, aligning its per-vector quantization budget with PipeANN [20], whose PQ representation uses approximately one byte per four di-mensions. We set the RaBitQ confidence parameter to its default value, ε0 = 1.9. We jointly sweep the cluster-probe budget P and the exact-vector budget R and retain the best-performing configuration at each recall level to obtain TriVS’s Pareto frontier over recall and performance. Different (P, R)
+
+combinations can achieve similar recall by shifting work be-tween in-memory distillation and exact-vector I/O. Empiri-cally, TriVS favors smaller P and larger R at low concurrency (e.g., 1 thread), when SSD capacity remains ample, and larger 
+
+P and smaller R at high concurrency (e.g., 96 threads), when the SSD becomes more stressed. For each configuration, we set the early-termination window W to approximately 0 .3P.By default, TriVS assigns one eighth of its total threads to pooled re-ranking. For the compute-intensive Wiki dataset and configurations with fewer than eight threads, each query thread performs inline re-ranking. 
+
+Performance metrics. Our primary performance metrics are query throughput, measured in queries per second (QPS); query latency, measured as the average processing time per query; and disk I/O volume, measured as the average amount of data read per query. We also report memory usage dur-ing query processing. Following prior work [9, 20, 28, 48], we measure search quality using Recall@10 and report the average Recall@10 across all queries. 
+
+## 5.2 Overall Performance 
+
+Query throughput and latency. At Recall@10=0.9, the top and middle rows of Figure 8 show that TriVS delivers the highest throughput and lowest latency on all five datasets. Compared with PipeANN , TriVS achieves 3.42 × the through-90.8 0.85 0.9 0.95                                           
+
+> Recall@10
+> 015K 30K 45K 60K
+> Throughput (QPS)
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 5K 10K 15K 20K
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 12K 24K 36K 48K
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 8K 16K 24K 32K
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 9K 18K 27K 36K
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 0510 15 20
+> Latency (ms)
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 030 60 90 120 150
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 02468
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 0510 15 20
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 0612 18 24
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 0250 500 750 1000
+> Disk I/O (KiB/Query)
+> (a) DEEP-100M
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 01000 2000 3000 4000 5000
+> (b) Text-to-Image
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 080 160 240 320
+> (c) Wiki
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 0200 400 600 800
+> (d) SIFT-1B
+> 0.8 0.85 0.9 0.95
+> Recall@10
+> 0250 500 750 1000
+> (e) DEEP-1B
+
+TriVS PipeANN PipeANN+R DiskANN DiskANN+C SPANN Figure 8: Overall performance. Columns correspond to the five datasets; the three rows respectively report throughput, latency, and per-query disk I/O volume as Recall@10 varies. TriVS improves throughput and latency by reducing disk I/O. 
+
+put and 51.2% lower latency on average. Against the strongest baseline for each metric on each workload, TriVS delivers 1.29 ×–3.94 × the throughput (2.18 × on average) and 28.5%– 68.1% lower latency (44.8% on average). These gains hold across 100M- and billion-scale datasets, including the high-dimensional RAG-oriented Wiki and out-of-distribution Text-to-Image workloads. Because SPANN substantially trails the other baselines on DEEP-100M, our smallest workload, we omit it from the larger or higher-dimensional workloads, con-sistent with prior evaluations [20, 48, 56]. 
+
+I/O volume drives the gains. The bottom row of Figure 8 shows that lower disk I/O drives these throughput and latency gains. At Recall@10=0.9, TriVS reduces disk I/O by 47.3%– 74.7% relative to the lowest-I/O baseline on each workload (57.7% on average) and by 63.7% relative to PipeANN on average. TriVS routes and selects candidates in memory, then reads only shortlisted exact vectors; graph-based base-lines read graph records during approach, whereas SPANN 
+
+reads entire clusters during convergence. A node cache lets 
+
+DiskANN+C avoid some approach-phase reads, but cannot eliminate them, leaving the same structural I/O bottleneck as 
+
+PipeANN . RaBitQ alone does not explain these gains: despite using the same 2-bit-per-dimension representation as TriVS, 
+
+PipeANN+R performs more I/O and is slower than PipeANN 
+
+on all five workloads. Its coarse reference centers cover dis-Table 2: Query-serving memory and storage on DEEP-100M/1B (GiB). SPANN is omitted on DEEP-1B because construction exceeds available memory. 
+
+Memory Storage System 100M 1B 100M 1B 
+
+TriVS 4.14 42.0 42.98 430.0 
+
+PipeANN 5.91 43.4 80.20 798.2 
+
+PipeANN+R 6.27 59.3 81.41 814.1 
+
+DiskANN 3.02 29.9 79.31 792.8 
+
+DiskANN+C 6.09 43.5 79.31 792.8 
+
+SPANN 6.74 – 235.01 –
+
+persed graph vectors, whereas TriVS quantizes vectors within clusters. 
+
+Memory usage. Table 2 shows that these performance gains do not come at the cost of higher query-serving memory. At the 100M and 1B scales, TriVS uses 30% and 3% less memory than PipeANN , respectively, and less than every other evalu-ated baseline except DiskANN . TriVS achieves this footprint with coarser clustering, which shrinks the centroid-routing in-dex and frees DRAM for compact distillation codes. Without a node cache, DiskANN remains the lowest-memory option and can serve under tighter DRAM budgets, but at the cost of substantially lower throughput and higher latency. 10 Table 3: Progressive reduction in per-query work at Recall@10=0.9. Low and Mid count vectors screened and refined at low and mid precision, respectively; Exact counts full-precision vectors read from disk for re-ranking. Probed/Scanned counts clusters selected during approach and scanned during distillation; early termination reduces the latter for easy queries.                           
+
+> Dataset Total #Vector Probed / Scanned #Cluster Low #Vector Mid #Vector Exact #Vector
+> DEEP-100M 100M 688.0 / 459.8 66.0K 766.6 23.4 Text-to-Image 100M 3.07K / 2.82K 273.6K 13.4K 112.8 Wiki 100M 712.0 / 573.1 84.8K 641.2 25.4 SIFT-1B 1B 864.0 / 701.0 97.8K 1.03K 30.6 DEEP-1B 1B 768.0 / 621.1 89.4K 1.22K 32.4
+
+Storage usage. In addition, TriVS has the smallest storage footprint, using about 46% less storage than graph-based base-lines and 82% less than SPANN . Compared with graph-based systems, TriVS avoids storing a per-vector adjacency graph. Compared with SPANN , TriVS assigns each vector to exactly one cluster, avoiding storage amplification from boundary replication. TriVS preserves selective exact reads through in-memory distillation over coarser clusters. 
+
+## 5.3 Micro Studies 
+
+We next evaluate TriVS’s key design choices and system be-havior. Unless otherwise noted, the micro studies use DEEP-100M at Recall@10=0.9. 
+
+Each stage progressively reduces query work. Table 3 quantifies how each stage narrows query work across all five datasets. Early termination avoids scanning 8–33% of the clusters probed during approach. Mid precision evaluates only 0.8–4.9% of the vectors screened at low precision, while exact re-ranking reads only 0.8–4.0% of the mid-precision survivors. Overall, TriVS reduces the candidate set by more than three orders of magnitude before exact-vector I/O. 
+
+Progressive precision balances computation, I/O, and ac-curacy. The reductions in Table 3 rely on applying higher precision only after the candidate set has narrowed. Figure 9 compares the complete Low + Mid + Exact pipeline with three two-level variants: Low + Exact , Mid + Exact , and Low + Mid . At Recall@10=0.9, the complete pipeline outperforms 
+
+Mid + Exact by 1.06 × and 1.58 ×, and Low + Exact by 3.33 ×
+
+and 2.33 × on DEEP-100M and Wiki, respectively. Low + Ex-act generates larger exact shortlists and more I/O because its estimates are coarse, whereas Mid + Exact evaluates every scanned vector at mid precision, increasing computation, es-pecially on Wiki. Low + Mid avoids exact-vector I/O, but without full-precision re-ranking it cannot attain high recall, plateauing at 0.71 and 0.78 Recall@10 on DEEP-100M and Wiki, respectively. Thus, all three levels are necessary: low precision limits computation, mid precision limits I/O, and 0.7 0.8 0.9       
+
+> Recall@10
+> 015K 30K 45K 60K
+> Throughput (QPS)
+> 0.7 0.8 0.9
+> Recall@10
+> 012K 24K 36K 48K
+> 0.7 0.8 0.9
+> Recall@10
+> 036912
+> Latency (ms)
+> (a) DEEP-100M
+> 0.7 0.8 0.9
+> Recall@10
+> 036912
+> (b) Wiki
+> Low + Mid + Exact (TriVS) Low + Exact Mid + Exact Low + Mid
+
+Figure 9: Progressive-precision performance on DEEP-100M and Wiki. Low + Exact requires larger exact shortlists because its estimates are coarse; Mid + Exact spends more computation by evaluating every scanned vector at mid preci-sion, especially on high-dimensional Wiki; Low + Mid avoids exact I/O but cannot attain high recall. 1 4 8 16 32 48 64 80 96       
+
+> Number of Threads
+> 015K 30K 45K
+> Throughput (QPS)
+> (a) Query throughput
+> 14816 32 48 64 80 96
+> Number of Threads
+> 02468
+> Latency (ms)
+> (b) Query latency
+> TriVS PipeANN DiskANN SPANN
+
+Figure 10: Throughput and latency across thread counts. 
+
+TriVS remains close to PipeANN at one thread and delivers higher throughput and lower latency at high concurrency. 
+
+exact re-ranking enables high recall. 
+
+Scalability with query concurrency. Figure 10 adds TriVS to the baseline scaling experiment in Figure 2 and compares throughput and latency across thread counts. At one thread, TriVS remains close to PipeANN, with 5% lower through-put and 10% higher latency. As concurrency grows and the baselines approach the SSD I/O limits identified in Figure 2, TriVS’s lower per-query I/O allows the same device capacity to serve more queries. The change in TriVS’s scaling slope around 32 threads partly reflects how it balances in-memory distillation and exact-vector I/O: at the same recall target, TriVS favors smaller P and larger R at lower concurrency, when SSD capacity is ample, and larger P and smaller R at higher concurrency, when the SSD is more stressed. At 96 threads, TriVS delivers 2.43 × and 2.79 × the throughput of PipeANN and DiskANN, respectively, while reducing their latency by 47% and 54%. 11 TriVS PipeANN DiskANN SPANN 012   
+
+> Latency (ms)
+> (a) 1 Thread
+> TriVS PipeANN DiskANN SPANN 0510
+> Latency (ms)
+> 33.5
+> (b) 96 Threads
+> Routing Distillation Exposed I/O Wait Other Processing
+
+Figure 11: Latency breakdown with 1 and 96 threads. At high concurrency, TriVS’s routing and in-memory distillation are offset by substantially less exposed I/O wait. 1 5 10 20 50 100             
+
+> kof Top-k
+> 020K 40K 60K 80K
+> Throughput (QPS)
+> (a) Query throughput
+> 50 100 07K 14K
+> 1510 20 50 100
+> kof Top-k
+> 015 30 45 60
+> Latency (ms)
+> (b) Query latency
+> 15036
+> TriVS PipeANN DiskANN SPANN
+
+Figure 12: Top-k sensitivity on DEEP-100M at 0.9 recall. 
+
+TriVS maintains higher throughput and lower latency as the number of returned neighbors increases. 
+
+The saved I/O time outweighs distillation. Figure 11 ex-plains this scaling trend by comparing TriVS’s latency com-ponents with PipeANN at one and 96 threads. At one thread, TriVS’s 0.53 ms of routing and distillation exceeds the 0.11 ms it saves in exposed I/O wait, leaving latency 7% higher. At 96 threads, however, TriVS spends 1.24 ms on rout-ing and distillation but saves 4.53 ms of exposed I/O wait; this reduction outweighs its added in-memory work and lowers end-to-end latency by 46%. 
+
+Top-k sensitivity. Figure 12 varies k, the number of near-est neighbors returned by ANNS, from 1 to 100 and main-tains Recall@ k=0.9. TriVS delivers the highest throughput and lowest latency across the range, with 1 .81 × PipeANN’s throughput and 28% lower latency at k = 100. 
+
+Pooled re-ranking. Figure 13 compares inline and pooled re-ranking with the same 96-core budget. By decoupling query execution from exact re-ranking, pooling steadily replenishes the I/O queue as reads complete, raising SSD IOPS utilization from 69% to 99% and throughput from 31.5K to 42.1K QPS. 
+
+Sensitivity to cluster size. In Figure 14, we vary target clus-ter size T and maintain the target Recall@10=0.9. Our de-fault T = 128 balances query throughput and memory usage. Smaller clusters increase centroid count and routing overhead, whereas larger clusters require more in-memory scanning and exact-vector reads to maintain recall. Meanwhile, as T grows, total memory approaches the measured 3.83 GiB non-routing component because compact per-vector quantization codes and other serving state do not shrink with the routing index. Inline Pooled  
+
+> 015K 30K 45K
+> Throughput (QPS)
+> 31.5K 42.1K
+> 025 50 75 100
+> SSD IOPS util. (%)
+> 69% 99%
+> Throughput SSD IOPS Utilization
+
+Figure 13: Inline and pooled re-ranking. Pooling raises SSD utilization and query throughput. 32 64 128 256 512 1K 2K  
+
+> Target Cluster Size (T)
+> 012K 24K 36K 48K
+> Throughput (QPS)
+> 0.0 1.5 3.0 4.5 6.0
+> Memory (GiB)
+> Non-routing memory
+> Throughput Memory
+
+Figure 14: Sensitivity to tar-get cluster size. T = 128 bal-ances query throughput and memory usage. 
+
+## 6 Related Work 
+
+Disk-resident ANNS systems. Cluster-based systems such as SPANN [9] use an in-memory centroid index to select disk-resident clusters but fetch and scan each selected cluster in full. Helmsman [25] augments SPANN with learned cluster pruning (not publicly released) and specialized SSD-array execution, but retains a single cluster granularity. On the other hand, graph-based systems retain vector-level selectivity but read graph records from disk during proximity-graph traversal, as in DiskANN [28]. Starling [48] and MARGO [57] reorder graph records to improve page locality but require extra construction time and memory. PageANN [35] builds a page-aligned graph, letting one read examine multiple nearby vectors. These locality gains depend on multiple useful vectors sharing a page and diminish as higher dimensionality reduces page capacity [56]. Cache-oriented designs include GoVector [62], which combines hybrid node caching with similarity-aware reordering, and GPS [56], which targets high-dimensional vectors by prior-itizing adjacency lists over full vectors in memory and on disk. PipeANN [20] relaxes strict best-first-search ordering to pipeline dependent graph reads with computation, aligning graph search with SSD characteristics to achieve state-of-the-art performance. Together, page-aware layouts, caching, and pipelined execution reduce graph I/O or hide its latency but cannot eliminate approach-phase I/O. In contrast, TriVS eliminates this I/O through its in-memory approach and dis-till phases, reading only shortlisted full-precision vectors from disk during convergence. Page-aware placement and caching are orthogonal and could further optimize TriVS’s convergence-phase I/O; our evaluation shows that TriVS out-performs PipeANN despite its pipelined execution. 
+
+Other ANNS systems. Conventional in-memory ANNS spans inverted-file [4, 34], graph-based [38], tree-based [47], hash-based [12], and hybrid indexes [8]. Beyond DRAM-only platforms, several ANNS systems build on emerging memory and storage technologies, including persistent memory [40], CXL-attached memory [27], processing-in-memory [51], and computational storage [43]. Accelerator-based systems use GPUs and FPGAs to exploit specialized parallelism for vec-tor search [23, 29, 30, 39, 44, 45, 59, 60]. Distributed ANNS 12 systems scale search across machines [46,61], while disaggre-gated systems separate compute and memory [15, 55]. TriVS focuses on disk-resident vector search using the widely avail-able single-node CPU, DRAM, and SSD platform. 
+
+## 7 Conclusion 
+
+We present TriVS, a new paradigm for disk-resident ANNS that decouples the approach and converge phases from a single search granularity through an in-memory distill phase. TriVS organizes vector search as a trilogy that approaches coarsely, distills progressively, and converges exactly, combining the complementary I/O benefits of cluster and vector granularities to reduce per-query disk I/O. Across diverse workloads, TriVS outperforms state-of-the-art systems in throughput and latency without increasing memory usage. 
+
+## References 
+
+[1] Cecilia Aguerrebere, Ishwar Singh Bhati, Mark Hilde-brand, Mariano Tepper, and Theodore Willke. Similarity search in the blink of an eye with compressed indices. 
+
+Proc. VLDB Endow. , 16(11):3433–3446, July 2023. [2] Jens Axboe. fio: Flexible I/O tester, 2006. [3] Ilias Azizi, Karima Echihabi, and Themis Palpanas. Graph-based vector search: An experimental evaluation of the state-of-the-art. Proc. ACM Manag. Data , 3(1), February 2025. [4] Dmitry Baranchuk, Artem Babenko, and Yury Malkov. Revisiting the inverted indices for billion-scale approx-imate nearest neighbors. In European Conference on Computer Vision , pages 209–224. Springer, 2018. [5] Big ANN Benchmarks Organizers. Billion-scale approx-imate nearest neighbor search challenge: Neurips’21 competition track. https://big-ann-benchmarks. com/neurips21.html , 2021. [6] Jianlv Chen, Shitao Xiao, Peitian Zhang, Kun Luo, Defu Lian, and Zheng Liu. M3-embedding: Multi-linguality, multi-functionality, multi-granularity text embeddings through self-knowledge distillation, 2025. [7] Meng Chen, Kai Zhang, Zhenying He, Yinan Jing, and X. Sean Wang. Roargraph: A projected bipartite graph for efficient cross-modal approximate nearest neighbor search. Proc. VLDB Endow. , 17(11):2735–2749, July 2024. [8] Qi Chen, Haidong Wang, Mingqin Li, Gang Ren, Scar-lett Li, Jeffery Zhu, Jason Li, Chuanjie Liu, Lintao Zhang, and Jingdong Wang. SPTAG: A library for fast approximate nearest neighbor search , 2018. [9] Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li, Mao Yang, and Jingdong Wang. Spann: highly-efficient billion-scale approximate nearest neighbor search. In Proceedings of the 35th International Conference on Neural Information Pro-cessing Systems , NIPS ’21, Red Hook, NY, USA, 2021. Curran Associates Inc. [10] Rongxin Cheng, Yifan Peng, Xingda Wei, Hongrui Xie, Rong Chen, Sijie Shen, and Haibo Chen. Character-izing the dilemma of performance and index size in billion-scale vector search and breaking it with second-tier memory, 2024. [11] Paul Covington, Jay Adams, and Emre Sargin. Deep neural networks for youtube recommendations. In Pro-ceedings of the 10th ACM Conference on Recommender Systems , RecSys ’16, page 191–198, New York, NY, USA, 2016. Association for Computing Machinery. [12] Mayur Datar, Nicole Immorlica, Piotr Indyk, and Va-hab S. Mirrokni. Locality-sensitive hashing scheme based on p-stable distributions. In Proceedings of the Twentieth Annual Symposium on Computational Geome-try , SCG ’04, page 253–262, New York, NY, USA, 2004. Association for Computing Machinery. [13] Liwei Deng, Penghao Chen, Ximu Zeng, Tianfu Wang, Yan Zhao, and Kai Zheng. Efficient data-aware distance comparison operations for high-dimensional approxi-mate nearest neighbor search. Proc. VLDB Endow. ,18(3):812–821, November 2024. [14] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. The faiss library. 2024. [15] Fei Fang, Yi Liu, and Chen Qian. d-hnsw: A high-performance vector search engine on disaggregated memory. Proc. ACM Meas. Anal. Comput. Syst. , 10(2), May 2026. [16] Jianyang Gao, Yutong Gou, Yuexuan Xu, Yongyi Yang, Cheng Long, and Raymond Chi-Wing Wong. Prac-tical and asymptotically optimal quantization of high-dimensional vectors in euclidean space for approximate nearest neighbor search. Proc. ACM Manag. Data , 3(3), June 2025. [17] Jianyang Gao and Cheng Long. High-dimensional ap-proximate nearest neighbor search: with reliable and efficient distance comparison operations. Proc. ACM Manag. Data , 1(2), June 2023. [18] Jianyang Gao and Cheng Long. Rabitq: Quantizing high-dimensional vectors with a theoretical error bound 13 for approximate nearest neighbor search. Proc. ACM Manag. Data , 2(3), May 2024. [19] Tiezheng Ge, Kaiming He, Qifa Ke, and Jian Sun. Op-timized product quantization. IEEE Transactions on Pattern Analysis and Machine Intelligence , 36(4):744– 755, 2014. [20] Hao Guo and Youyou Lu. Achieving low-latency graph-based vector search via aligning best-first search algo-rithm with ssd. In 19th USENIX Symposium on Oper-ating Systems Design and Implementation (OSDI 25) ,pages 171–186, Boston, MA, 2025. USENIX Associa-tion. [21] Hao Guo and Youyou Lu. OdinANN: Direct insert for consistently stable performance in Billion-Scale Graph-Based vector search. In 24th USENIX Conference on File and Storage Technologies (FAST 26) , pages 133– 147, Santa Clara, CA, February 2026. USENIX Associ-ation. [22] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob Steinhardt. Measuring massive multitask language understanding. 
+
+Proceedings of the International Conference on Learn-ing Representations (ICLR) , 2021. [23] Chengying Huan, Renjie Yao, Shaonan Ma, Rong Gu, Zhengyi Yang, Lizheng Chen, Zhibin Wang, Mingxing Zhang, Fang Xi, Guihai Chen, and Chen Tian. Cmanns: Gpu-accelerated graph index construction for anns via compute–memory disaggregation. Proc. ACM Manag. Data , 4(3), May 2026. [24] Jui-Ting Huang, Ashish Sharma, Shuying Sun, Li Xia, David Zhang, Philip Pronin, Janani Padmanabhan, Giuseppe Ottaviano, and Linjun Yang. Embedding-based retrieval in facebook search. In Proceedings of the 26th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining , KDD ’20, page 2553–2561, New York, NY, USA, 2020. Association for Computing Machinery. [25] Yuchen Huang, Baiteng Ma, Yiping Sun, Yang Shi, Xiao Chen, Xiaocheng Zhong, Zhiyong Wang, Yao Hu, Erci Xu, and Chuliang Weng. The clustering strikes back: Building Cost-Effective and High-Performance ANNS at scale with helmsman (operational systems). In 20th USENIX Symposium on Operating Systems Design and Implementation (OSDI 26) , pages 1623–1639, Seattle, WA, July 2026. USENIX Association. [26] Piotr Indyk and Rajeev Motwani. Approximate near-est neighbors: towards removing the curse of dimen-sionality. In Proceedings of the Thirtieth Annual ACM Symposium on Theory of Computing , STOC ’98, page 604–613, New York, NY, USA, 1998. Association for Computing Machinery. [27] Junhyeok Jang, Hanjin Choi, Hanyeoreum Bae, Se-ungjun Lee, Miryeong Kwon, and Myoungsoo Jung. CXL-ANNS: Software-Hardware collaborative mem-ory disaggregation and computation for Billion-Scale approximate nearest neighbor search. In 2023 USENIX Annual Technical Conference (USENIX ATC 23) , pages 585–600, Boston, MA, July 2023. USENIX Association. [28] Suhas Jayaram Subramanya, Fnu Devvrit, Harsha Vard-han Simhadri, Ravishankar Krishnawamy, and Rohan Kadekodi. Diskann: Fast accurate billion-point near-est neighbor search on a single node. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-Buc, E. Fox, and R. Garnett, editors, Advances in Neural Information Processing Systems , volume 32. Curran Associates, Inc., 2019. [29] Haodi Jiang, Hao Guo, Minhui Xie, Jiwu Shu, and Youyou Lu. High-throughput, cost-effective billion-scale vector search with a single gpu. Proc. ACM Manag. Data , 3(6), December 2025. [30] Wenqi Jiang, Shigang Li, Yu Zhu, Johannes De Fine Licht, Zhenhao He, Runbin Shi, Cedric Renggli, Shuai Zhang, Theodoros Rekatsinas, Torsten Hoefler, and Gustavo Alonso. Co-design hardware and algorithm for vector search. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis , SC ’23, New York, NY, USA, 2023. Association for Computing Machinery. [31] Wenqi Jiang, Shuai Zhang, Boran Han, Jie Wang, Bernie Wang, and Tim Kraska. Piperag: Fast retrieval-augmented generation via algorithm-system co-design, 2024. [32] Herve Jégou, Matthijs Douze, and Cordelia Schmid. Product quantization for nearest neighbor search. IEEE Transactions on Pattern Analysis and Machine Intelli-gence , 33(1):117–128, 2011. [33] Hervé Jégou, Romain Tavenard, Matthijs Douze, and Laurent Amsaleg. Searching in one billion vectors: Re-rank with source coding. In 2011 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP) , pages 861–864, 2011. [34] Hervé Jégou, Romain Tavenard, Matthijs Douze, and Laurent Amsaleg. Searching in one billion vectors: Re-rank with source coding. In 2011 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP) , pages 861–864, 2011. 14 [35] Dingyi Kang, Dongming Jiang, Hanshen Yang, Hang Liu, and Bingzhe Li. Scalable disk-based approximate nearest neighbor search with page-aligned graph, 2025. [36] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Se-bastian Riedel, and Douwe Kiela. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. In H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan, and H. Lin, editors, Advances in Neural Information Pro-cessing Systems , volume 33, pages 9459–9474. Curran Associates, Inc., 2020. [37] Hui Li, Shiyuan Deng, Xiao Yan, Xiangyu Zhi, and James Cheng. Saq: Pushing the limits of vector quan-tization through code adjustment and dimension seg-mentation. Proc. ACM Manag. Data , 3(6), December 2025. [38] Yu A Malkov and Dmitry A Yashunin. Efficient and robust approximate nearest neighbor search using hierar-chical navigable small world graphs. IEEE transactions on pattern analysis and machine intelligence , 42(4):824– 836, 2018. [39] Hiroyuki Ootomo, Akira Naruse, Corey Nolet, Ray Wang, Tamas Feher, and Yong Wang. Cagra: Highly par-allel graph construction and approximate nearest neigh-bor search for gpus. In 2024 IEEE 40th International Conference on Data Engineering (ICDE) , pages 4236– 4247, 2024. [40] Jie Ren, Minjia Zhang, and Dong Li. Hm-ann: effi-cient billion-point nearest neighbor search on heteroge-neous memory. In Proceedings of the 34th International Conference on Neural Information Processing Systems ,NIPS ’20, Red Hook, NY, USA, 2020. Curran Asso-ciates Inc. [41] Aditi Singh, Suhas Jayaram Subramanya, Ravis-hankar Krishnaswamy, and Harsha Vardhan Simhadri. Freshdiskann: A fast and accurate graph-based ann in-dex for streaming similarity search, 2021. [42] Mariano Tepper, Ishwar Singh Bhati, Cecilia Aguer-rebere, Mark Hildebrand, and Ted Willke. Leanvec: Searching vectors faster by making them fit, 2024. [43] Bing Tian, Haikun Liu, Zhuohui Duan, Xiaofei Liao, Hai Jin, and Yu Zhang. Scalable billion-point approx-imate nearest neighbor search using SmartSSDs. In 
+
+2024 USENIX Annual Technical Conference (USENIX ATC 24) , pages 1135–1150, Santa Clara, CA, July 2024. USENIX Association. [44] Bing Tian, Haikun Liu, Yuhang Tang, Shihai Xiao, Zhuo-hui Duan, Xiaofei Liao, Hai Jin, Xuecang Zhang, Jun-hua Zhu, and Yu Zhang. Towards high-throughput and low-latency billion-scale vector search via CPU/GPU collaborative filtering and re-ranking. In 23rd USENIX Conference on File and Storage Technologies (FAST 25) , pages 171–185, Santa Clara, CA, February 2025. USENIX Association. [45] Karthik Venkatasubba, Saim Khan, Somesh Singh, Har-sha Vardhan Simhadri, and Jyothi Vedurada. Bang: Billion-scale approximate nearest neighbour search us-ing a single gpu. IEEE Transactions on Big Data ,11(6):3142–3157, 2025. [46] Jianguo Wang, Xiaomeng Yi, Rentong Guo, Hai Jin, Peng Xu, Shengjun Li, Xiangyu Wang, Xiangzhou Guo, Chengming Li, Xiaohai Xu, Kun Yu, Yuxing Yuan, Yinghao Zou, Jiquan Long, Yudong Cai, Zhenxiang Li, Zhifeng Zhang, Yihua Mo, Jun Gu, Ruiyi Jiang, Yi Wei, and Charles Xie. Milvus: A purpose-built vector data management system. In Proceedings of the 2021 Inter-national Conference on Management of Data , SIGMOD ’21, page 2614–2627, New York, NY, USA, 2021. Asso-ciation for Computing Machinery. [47] Jingdong Wang, Naiyan Wang, You Jia, Jian Li, Gang Zeng, Hongbin Zha, and Xian-Sheng Hua. Trinary-projection trees for approximate nearest neighbor search. 
+
+IEEE Transactions on Pattern Analysis and Machine Intelligence , 36(2):388–403, 2014. [48] Mengzhao Wang, Weizhi Xu, Xiaomeng Yi, Songlin Wu, Zhangyang Peng, Xiangyu Ke, Yunjun Gao, Xiaoliang Xu, Rentong Guo, and Charles Xie. Starling: An i/o-efficient disk-resident graph index framework for high-dimensional vector similarity search on data segment. 
+
+Proc. ACM Manag. Data , 2(1), March 2024. [49] Mengzhao Wang, Xiaoliang Xu, Qiang Yue, and Yuxi-ang Wang. A comprehensive survey and experimental comparison of graph-based approximate nearest neigh-bor search. Proc. VLDB Endow. , 14(11):1964–1978, July 2021. [50] Wikimedia Foundation. Wikimedia downloads. https: //dumps.wikimedia.org , 2007. [51] Puqing Wu, Minhui Xie, Enrui Zhao, Dafang Zhang, Jing Wang, Xiao Liang, Kai Ren, and Yunpeng Chai. Turbocharge ANNS on real Processing-in-Memory by enabling Fine-Grained Per-PIM-Core scheduling. In 
+
+2025 USENIX Annual Technical Conference (USENIX ATC 25) , pages 1223–1241, Boston, MA, July 2025. USENIX Association. 15 [52] Haike Xu, Magdalen Dobson Manohar, Philip A. Bern-stein, Badrish Chandramouli, Richard Wen, and Har-sha Vardhan Simhadri. In-place updates of a graph in-dex for streaming approximate nearest neighbor search, 2025. [53] Yuming Xu, Hengyu Liang, Jin Li, Shuotao Xu, Qi Chen, Qianxi Zhang, Cheng Li, Ziyue Yang, Fan Yang, Yuqing Yang, Peng Cheng, and Mao Yang. Spfresh: Incremental in-place update for billion-scale vector search. In Pro-ceedings of the 29th Symposium on Operating Systems Principles , SOSP ’23, page 545–561, New York, NY, USA, 2023. Association for Computing Machinery. [54] Artem Babenko Yandex and Victor Lempitsky. Efficient indexing of billion-scale datasets of deep descriptors. In 
+
+2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR) , pages 2055–2063, 2016. [55] Peiqi Yin, Xiao Yan, Shiyuan Deng, Hui Li, Yifan Zhu, Xiangyu Zhi, Jingqi Mao, Ran Xu, Wenliang Zhang, and James Cheng. DistVS: Large-scale vector search with Compute-Memory disaggregation. In 23rd USENIX Symposium on Networked Systems Design and Imple-mentation (NSDI 26) , pages 449–467, Renton, WA, May 2026. USENIX Association. [56] Peiqi Yin, Xiao Yan, Qihui Zhou, Hui Li, Xiaolu Li, Meiling Wang, Lin Zhang, Xin Yao, and James Cheng. Gps: Revisiting the data layout for disk-based high-dimensional vector search. Proc. ACM Manag. Data ,4(3), May 2026. [57] Ziyang Yue, Bolong Zheng, Ling Xu, Kanru Xu, Shuhao Zhang, Yajuan Du, Yunjun Gao, Xiaofang Zhou, and Christian S. Jensen. Select edges wisely: Monotonic path aware graph layout optimization for disk-based ann search. Proc. VLDB Endow. , 18(11):4337–4349, July 2025. [58] Qianxi Zhang, Shuotao Xu, Qi Chen, Guoxin Sui, Ji-adong Xie, Zhizhen Cai, Yaoqi Chen, Yinxuan He, Yuqing Yang, Fan Yang, Mao Yang, and Lidong Zhou. VBASE: Unifying online vector similarity search and relational queries via relaxed monotonicity. In 17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23) , pages 377–395, Boston, MA, July 2023. USENIX Association. [59] Zili Zhang, Fangyue Liu, Gang Huang, Xuanzhe Liu, and Xin Jin. Fast vector query processing for large datasets beyond GPU memory with reordered pipelin-ing. In 21st USENIX Symposium on Networked Systems Design and Implementation (NSDI 24) , pages 23–40, Santa Clara, CA, April 2024. USENIX Association. [60] Haoru Zhao, Jingkai He, Jingyao Zeng, Mingkai Dong, and Dong Du. Disentangling graph dependencies for efficient Billion-Scale GPU vector search. In 20th USENIX Symposium on Operating Systems Design and Implementation (OSDI 26) , pages 1563–1584, Seattle, WA, July 2026. USENIX Association. [61] Xiangyu Zhi, Meng Chen, Xiao Yan, Baotong Lu, Hui Li, Qianxi Zhang, Qi Chen, and James Cheng. Cotra: Towards efficient and scalable distributed vector search with rdma. Proc. ACM Manag. Data , 4(1), April 2026. [62] Yijie Zhou, Shengyuan Lin, Shufeng Gong, Song Yu, Shuhao Fan, Yanfeng Zhang, and Ge Yu. Govector: An i/o-efficient caching strategy for high-dimensional vector nearest neighbor search, 2025. 16
