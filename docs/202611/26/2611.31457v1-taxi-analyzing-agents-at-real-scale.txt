@@ -1,0 +1,1357 @@
+Title: Taxi: Analyzing Agents at (Real) Scale
+
+URL Source: https://arxiv.org/pdf/2611.31457v1
+
+Published Time: Wed, 25 Nov 2026 01:15:04 GMT
+
+Number of Pages: 33
+
+Markdown Content:
+# Taxi: Analyzing Agents at (Real) Scale 
+
+Technical Report 
+
+Guy Dar 
+
+Rival Research 
+
+guydar@rivalsecurity.io 
+
+In this technical report, we present Taxi – a system for debugging, clustering, and monitoring agents at scale. Taxi scales easily to millions of steps efficiently, without spurious expenses. This is made possible by a combination of scalable analysis methods. Taxi relies primarily on clustering to gen-erate a taxonomy over steps for a structured overview of the data, and provides full SQL access for engineers and automated agents to ask complex questions. Clustering and querying are best used to-gether in a hybrid pipeline guided by a coding agent. Taxi also includes an experimental integration of Jev-style decision models: models that map state and bounded questions directly to typed, prob-abilistic decisions. They add low-cost semantic routing and evaluation where embeddings or literal queries alone are insufficient. In addition, Taxi provides an extensible ecosystem, including built-in evaluators and daily reports. To accommodate growth, Taxi is designed to be modular, hackable, and easy to plug-and-play for individuals and teams. 
+
+## 1 Introduction 
+
+Agents now run for hours or days [18], chaining together planning, tool use, and error recovery across long trajectories. Every run leaves a rich record of what the agent did that goes beyond just success and failure. Agent runs contain a costly yet elusive class of problems. To name a few examples: behavioral bugs that never raise an error, agents that quietly exceed the scope of what they were asked to do, the same unnecessary step repeated across thousands of independent runs, unexpected tool results, and other undesired phenomena. These phenomena are not necessarily easy to predict in advance. Some failure modes lead the agent astray, resulting in wrong conclusions [38]. Others may be local and recoverable, but they still come at the cost of extended work [17]. At production scale, a single undetected recurring “soft failure” pattern is a burden, whether it is an actual mistake or just wasted tokens [11, 6]. The solution to both lies in observability. Trajectory logging is common practice today. But for real observability, we contend there are, at minimum, two more things we need: (a) structured overview of agent behavior across the corpus, and (b) letting users 
+
+query that behavior and ask arbitrarily complex questions. Modern products are emerging that fulfill these criteria to a certain degree [20, 22, 27]. Unfortunately, they all rely heavily on language models touching every trajectory (or a limited sample, for affordability), which is prohibitive at production volumes, due to costs, rate limits, latency, and limited coverage. Research pipelines that induce taxonomies with LLMs similarly have a model read each trajectory or a sample of them [26, 8, 16]. Taxi is built with scalability as a first-class citizen. Even with a production-grade workload and relatively limited resources, Taxi won’t falter. In fact, the methods we use encourage granular visibility into agent 1arXiv:2611.31457v1 [cs.AI] 23 Nov 2026 RIVAL RESEARCH CLIENTS     
+
+> Web UI
+> same HTTP API as MCP
+> Interactive chat
+> web chat & coding agents
+> Slack bot
+> answers @mentions
+> Scheduled jobs
+> daily evals & insights
+> SKILLS — METHODOLOGY OVER THE SHARED TOOLS
+> taxi-agent taxonomizer taxi-eval taxi-insights slack-agent
+> Primitive surface (MCP tools)
+> Scope · Corpus access · Draft taxonomy · Evaluators · Insights
+> execute_sql · cluster_by_embedding · publish_eval · save_insight_report
+> Database backbone
+> trajectories · steps · embeddings · taxonomy clusters — via scoped project_* views
+
+Figure 1 Taxi architecture: clients share one primitive surface (MCP tools) over one database backbone, with skills as the methodology layer that steers agents over those tools. trajectories, giving rise to a better perspective on the agents’ work. Its two established analysis paths are cheap clustering and direct text querying. Taxi now adds an experimental third path based on Jev-style de-cision models (Section 2.2). These models accept a state and bounded questions and return typed decisions with probabilities rather than generated text [1]. In this report, Jev-style refers to this broader interface, not only TypeSafe AI’s original Jev model. Its substantially lower per-decision cost makes semantic judgment applicable at a different scale than general-purpose generation. For structured overview, Taxi builds a tax-onomy , a tree of hierarchical clusters, over the steps in the data. Then, each step is assigned to one of the clusters. Building on that, a user or agent can track information about the trajectories and get a better view of the data before analyzing it. In the following, we present the main aspects of Taxi’s design. For the interested reader, we provide full details in the Appendix. Appendix H walks through Taxi on one public agent benchmark, layer by layer. Taxi is designed for individuals and teams, with out-of-the-box support for a range of sophisticated features, detailed below. Upon community interest, we will open source it. 
+
+## 2 The Taxi System 
+
+2.1 Data Layer 
+
+Data sources. A data source holds a team’s corpus of trajectories (complete agent runs). Each trajectory is an ordered sequence of steps – messages, tool calls, and observations. A text embedding is computed and assigned to each step. The corpus is loaded from an external origin through a loader (LangSmith, Hugging Face, JSON export, and similar). All loaders write the same schema, so supporting a new origin just means adding a loader. Loader-specific extra information is captured under the metadata field. Data sources are shared across the team – everyone reads the same trajectories and embeddings, and nobody re-ingests the same logs for their own copy. Origins that keep producing new runs (LangSmith is one) are syncable : each sync bumps a monotonic data version, and every trajectory records which version first contained it. 
+
+Projects. A project is a personal view over one data source. It belongs to a single user and can apply its own filters (e.g., a project filtered by a specific run name). That split lets the team pay the cost of ingestion once, while each person keeps a separate workspace. The main artifact in a project is a taxonomy :a hierarchical tree of step clusters (Section 2.3). Each cluster has a short label and description, and each 2RIVAL RESEARCH 
+
+step is assigned to one cluster, or left unassigned when no rule matches. Taxonomies are versioned and immutable once published – editing the tree means publishing a new taxonomy version. After a data-source sync, a project can pull the new trajectories and assign their steps under its current taxonomy version; the cluster definitions and assignment rules stay as they were, and only membership of new steps is filled in. Decoupling data evolution (via data versions) and taxonomy evolution is desired to keep the two orthogonal – the steps of an old trajectory can be discretized into new clusters, and a new trajectory can be discretized with an old taxonomy. 
+
+2.2 Design 
+
+Architecture. Taxi is organized in three layers (Figure 1). At the bottom there’s a shared database of trajectories broken into steps, with embeddings and (when present) a taxonomy of step clusters. All the other layers use the database. The middle layer is a set of a few dozen tools exposed over MCP [2]. These tools support querying a project, building or editing a taxonomy draft, publishing evaluators and insight definitions. On top sit skills [3] – short instruction documents that tell a coding agent or chat model which tools to use, and how, for a particular job (explore the data, build a taxonomy, write an eval, produce a daily report). All clients, web UI, scheduled jobs, and others, use the same pool of tools. The point of the split is that analysis methods change faster than the data model – a new way to taxonomize or a new kind of report is usually a new skill or a tool, not a rewrite of storage or every client. 
+
+Scaling. Taxi combines two established methods with a Jev-style path: • Embedding and Clustering – vector clustering over embeddings is cheap and scales easily enough to run over every step in the corpus [4, 12], giving us a structured overview with no LLM calls (Sec-tion 2.3). • Querying and Textual Regularity – much of agent behavior is searchable as plain text: tool names, error strings, argument shapes. SQL and pattern matching over steps answer a surprisingly wide range of questions with no need for AI (Section 2.4). • Jev-style Decision Models – when a category is semantic rather than geometric or lexical, a decision model can answer a bounded choice or yes/no question directly, returning probabilities without gen-erating an explanation. Taxi uses this interface both to route steps through taxonomy levels and to evaluate trajectories. Its cost profile permits semantic decisions to be applied far more broadly than generative-model calls, giving it the potential to become the main approach for semantic analysis. The first two methods remain Taxi’s established core. When a remaining task requires a generative-model judgment, Taxi can use clusters and queries to narrow the relevant set before sampling it; this is a cost-control tactic rather than a separate analysis approach. Table 1 compares the three routing methods, with a generative LLM for reference; all scale linearly in the number of steps. 
+
+2.3 Taxonomy Construction 
+
+Taxi’s design supports switching and composing assignment methods. We present a flat clustering pipeline and an agentic construction pipeline; the latter can mix three routing mechanisms within one tree. 
+
+Simple Flat Clustering. That’s the simplest form of taxonomy construction. We run a clustering algo-rithm, e.g. k-means [21], on the embeddings. The resulting clusters then form the taxonomy. Naming the 3RIVAL RESEARCH                    
+
+> Cost per step After a taxonomy edit Coverage Category defined by Embedding low, once cheap full proximity Regex none cheap partial surface form Jev-style medium rerun model full definition Generative LLM high rerun model full definition
+
+Table 1 Routing steps into a taxonomy. clusters takes place by calling an LLM on a small sample of steps from each cluster. Upon sync, new steps are simply assigned to the cluster which they are closest to. Despite its simplicity, these clusters tend to be useful for understanding and debugging agents. 
+
+Agentic Taxonomy Construction. This method can be used by any agentic harness. It builds and refines the cluster tree, rather than running a single clustering pass. The procedure is an agent skill : a short instruc-tion document that steers the model over relevant MCP tools. The full details of the pipeline are provided in Appendix C. The main pieces are: • Corpus exploration – SQL over the scoped views, plus TF-IDF term lists that surface recurring vo-cabulary in the steps (and, when useful, inside clusters). • Embedding-based clustering – k-means over step embeddings to propose a partition at the root or under an existing cluster. • Regex-based clustering – clusters defined by patterns over step text, when a behavior has a stable surface form; We defer more details to Appendix C. • Jev-based routing – clusters defined by natural-language labels and descriptions. A decision model chooses among the sibling definitions, with an explicit “none of these” option and a confidence thresh-old. This is useful when membership is semantic but the categories are already known. • Jev-based construction (experimental) – discovers Jev categories from the corpus instead of taking them as given: the decision model makes every decision and an LLM only writes the categories it decides to change (Appendix D). • Scoped refinement – the above tools can be restricted to one cluster’s members (TF-IDF inside a cluster, split by another k-means call, merge near-duplicates, and so on), so the agent can iterate until clusters are interpretable and distinct. 
+
+Discretization. Apart from being a goal unto itself, taxonomization plays a few more roles. First, it provides a starting point for an agent or human analyzing the dataset, giving them context for understanding the domain and behaviors worth looking into during query-based work (Section 2.4). Second, it discretizes the steps – breaks them into a finite set of discrete clusters. This opens up a new world of possibilities – now trajectories can be interpreted as coming from a state machine , and the transition map can be analyzed, and tools for analyzing discrete trajectories can be used, including tools from process mining [29, 30], motif analysis [7], and anomaly detection [10]. 
+
+2.4 Querying the Corpus and Textual Regularity 
+
+A taxonomy gives a birdseye view. It does not replace asking arbitrary questions about what agents did. Our trust in the power of text-based exploration is not speculative. Modern coding agents rely on exact text and regex-based tools to explore code all the time [33], and recent work has shown that grep is often stronger 4RIVAL RESEARCH Iterate until agent satisfied        
+
+> SETUP
+> Orient
+> 8.4k steps
+> ITERATE
+> Propose
+> k-means, k=14
+> Examine
+> cohesion 0.71
+> Revise
+> split into 2
+> COMMIT
+> Name
+> “timeout”
+> Publish
+> →v7
+> flat pipeline: propose →name, nothing in between
+
+Figure 2 Taxonomy construction as the taxonomizer skill runs it. The clustering call proposes, the exam-ination step decides. The dashed shortcut is the flat pipeline, which skips examination. than embeddings [24]. In a way, this indicates that text is more structured than one might assume, and the same phrases are used for similar things. In Taxi, we nickname that the “regularity of text”. Taxi keeps the full text of every step, so a human or a tool-using LLM can search and filter the corpus directly – e.g., how often a tool error appears, which runs hit a given cluster, whether a phrase shows up in final answers, or how behavior differs across models or time. SQL queries don’t usually need access to the raw tables in the database. Before executing any query, a scope 
+
+is defined (also called a view ): either a project (a data source with that project’s filters and latest taxonomy) or one or more data sources (raw corpus, no taxonomy). Queries then run as read-only SQL inside this scope, given easy access to the scope’s trajectories, steps, and, under a project, also clusters and step-to-cluster assignments. This all happens automatically when an engineer or AI agent uses the execute_sql 
+
+tool (scope must be set first by using set_project /set_data_sources ). Agents, evaluators, and insight reports all use the same path. 
+
+2.5 Ecosystem 
+
+Until now, we have discussed the core of Taxi, which is based on a unified trajectory-step-embedding database and clustering procedures. On top of that common ground, many extensions can be designed. Below we describe two such built-in extensions that we designed. Due to the ease of developing such extensions with little concern to the underlying core, we view them as Taxi’s ecosystem .
+
+Evaluators (Appendix E) are regression checks over trajectories. Once a behavioral bug is understood – an agent that skips a required tool, leaks a secret into a user-facing report, or repeats a pattern that was already fixed – the team writes a check that fails when that pattern shows up again. This way, past bug fixes can be turned into checks. A coding agent can even create the evaluation check on its own. If given access to recent code changes, it can identify bug fixes in the code and design an evaluator automatically. Evaluator criteria may be SQL or regex queries, or a Jev-style yes/no question applied per trajectory or per step. SQL remains useful for cheap narrowing before semantic judgment. 
+
+Insight reports (Appendix F) answer a different question. It focuses on periodically keeping an eye on recently generated trajectories. It finds surprising or otherwise relevant agent behavior in trajectories created after the last report. This complements other approaches that focus on the aggregate behavior. Insights can run as a scheduled routine. Findings focus around how the agents acted, but in some cases can highlight interesting outcomes of the inspected agents themselves. 5RIVAL RESEARCH 
+
+## 3 Limitations and Outlook 
+
+Taxi relies on the correctness of its clusters. Clustering long text is hard – steps may contain long code blocks that do not contribute to the axes we care about, and hyperparameters are hard to set well. The agentic approach improves precision substantially but can still miss nuances. Trajectory behavior may also drift over time [14]; an old taxonomy can force a stale lens on new data. Jev-style routing and evaluator criteria have only recently been integrated into Taxi and have not yet been tested end to end across the full system; for now we therefore mark these paths experimental. Finally, Taxi does not yet handle multi-agent systems out-of-the-box. These are limitations of Taxi’s current behavior , not its architecture. Its modularity can accommodate multi-agent support, better taxonomization instructions, and other extensions without redesign. Taxi is fully operational and under active development with feedback from our internal agents team. We believe it is ready to integrate into both academic and commercial pipelines, while also open to further improvement in parallel. 
+
+## 4 Conclusion 
+
+We presented Taxi, a system for interpreting agent trajectories at scale, built on a queryable relational back-bone that serves as the integration point for every part of the system. Its main contribution is scalability – integrated into every design decision, while not excluding potential use of heavier methods when required. Alongside embedding-based clustering and literal querying, the system now supports Jev-style typed deci-sions for semantic taxonomy routing and evaluation. This extends the same scale-first design to semantic judgments and may become the primary path for them. We discussed several key points in our design, fur-ther elaborated in the appendices. We additionally discussed how we maintain modular structure to make the method suitable for extension and flexible. We hope our system is useful to others building an interpretive science of agent behavior at production scale, as well as to more modest scales. 
+
+## Ethics Statement 
+
+The trajectories analyzed in this work come from the authors’ own agentic systems and public data, and do not involve human-subjects data. 
+
+## References 
+
+[1] Diogo Almeida. Introducing system one models & Jev. https://typesafe.ai/blog/ introducing-system-one-models-and-jev , September 2026. TypeSafe AI. Accessed 2026-11-01. [2] Anthropic. Introducing the model context protocol. https://www.anthropic.com/news/ model-context-protocol , November 2024. [3] Anthropic. Introducing agent skills. https://claude.com/blog/skills , October 2025. [4] Sunil Arya and David M. Mount. Approximate nearest neighbor queries in fixed dimensions. In 
+
+Proceedings of the Fourth Annual ACM-SIAM Symposium on Discrete Algorithms , SODA ’93, page 271–280, USA, 1993. Society for Industrial and Applied Mathematics. 6[5] Shir Ashury-Tahan, Yifan Mai, Elron Bandel, Michal Shmueli-Scheuer, and Leshem Choshen. Er-rormap and erroratlas: Charting the failure landscape of large language models. arXiv preprint arXiv:2601.15812 , 2026. [6] Longju Bai, Zhemin Huang, Xingyao Wang, Jiao Sun, Rada Mihalcea, Erik Brynjolfsson, Alex Pent-land, and Jiaxin Pei. How do ai agents spend your money? analyzing and predicting token consumption in agentic coding tasks. arXiv preprint arXiv:2604.22750 , 2026. [7] Timothy L Bailey, Charles Elkan, et al. Fitting a mixture model by expectation maximization to discover motifs in bipolymers. 1994. [8] Mert Cemri, Andrei Cojocaru, Melissa Pan, Shu Liu, Shubham Agarwal, Alexander Krentsel, Jay Tang, Kannan Ramchandran, Joseph E Gonzalez, Matei Zaharia, et al. Fantastic adaptive taxonomies and how to use them. arXiv preprint arXiv:2607.16387 , 2026. [9] Mert Cemri, Melissa Z Pan, Shuyi Yang, Lakshya A Agrawal, Bhavya Chopra, Rishabh Tiwari, Kurt Keutzer, Aditya Parameswaran, Dan Klein, Kannan Ramchandran, et al. Why do multi-agent llm systems fail? Advances in Neural Information Processing Systems , 38, 2026. [10] Varun Chandola, Arindam Banerjee, and Vipin Kumar. Anomaly detection: A survey. ACM computing surveys (CSUR) , 41(3):1–58, 2009. [11] Alejandro Cuadron, Dacheng Li, Wenjie Ma, Xingyao Wang, Yichuan Wang, Siyuan Zhuang, Shu Liu, Luis Gaspar Schroeder, Tian Xia, Huanzhi Mao, et al. The danger of overthinking: Examining the reasoning-action dilemma in agentic tasks. arXiv preprint arXiv:2502.08235 , 2025. [12] Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré, Maria Lomeli, Lucas Hosseini, and Hervé Jégou. The faiss library. 2024. [13] Jake Feiglin and Guy Dar. Sastbench: A benchmark for testing agentic sast triage. arXiv preprint arXiv:2601.02941 , 2026. [14] João Gama, Indr˙ e Žliobait˙ e, Albert Bifet, Mykola Pechenizkiy, and Abdelhamid Bouchachia. A survey on concept drift adaptation. ACM Comput. Surv. , 46(4), March 2014. [15] Jie Gao, Kaiser Sun, Jen-tse Huang, Katherine Van Koevering, Sijie Ji, Heyuan Huang, Weiyan Shi, Zhuoran Lu, Ziang Xiao, Daniel Khashabi, et al. How to interpret agent behavior. arXiv preprint arXiv:2605.13625 , 2026. [16] Aryaman Gupta, Yusuf Umut Ciftci, and Somil Bansal. Unsupervised discovery of failure taxonomies from deployment logs. arXiv preprint arXiv:2506.06570 , 2025. [17] Yiran Hu, Nan Jiang, Shanchao Liang, Anik Dey, Yi Wu, and Lin Tan. Analyzing and mitigating cost-inefficient behaviors in coding agents. arXiv preprint arXiv:2609.30725 , 2026. [18] Thomas Kwa, Ben West, Joel Becker, Amy Deng, Katharyn Garcia, Max Hasin, Sami Jawhar, Megan Kinniment, Nate Rush, Sydney Von Arx, et al. Measuring ai ability to complete long software tasks. 
+
+Advances in Neural Information Processing Systems , 38:92213–92266, 2026. [19] Michelle S Lam, Janice Teoh, James A Landay, Jeffrey Heer, and Michael S Bernstein. Concept induction: Analyzing unstructured text with high-level concepts using lloom. In Proceedings of the 2024 CHI Conference on Human Factors in Computing Systems , pages 1–28, 2024. [20] Laminar AI Team. Laminar: Open-source observability for ai agents. https://laminar.sh/ , 2026. Accessed: 2026-09-03. 7[21] S. Lloyd. Least squares quantization in pcm. IEEE Transactions on Information Theory , 28(2):129– 137, 1982. [22] Kevin Meng, Vincent Huang, Jacob Steinhardt, and Sarah Schwettmann. Introducing docent. https: //transluce.org/docent/blog/introducing-docent , March 2025. [23] Chau Minh Pham, Alexander Hoyle, Simeng Sun, Philip Resnik, and Mohit Iyyer. TopicGPT: A prompt-based topic modeling framework. In Kevin Duh, Helena Gomez, and Steven Bethard, editors, 
+
+Proceedings of the 2024 Conference of the North American Chapter of the Association for Compu-tational Linguistics: Human Language Technologies (Volume 1: Long Papers) , pages 2956–2984, Mexico City, Mexico, June 2024. Association for Computational Linguistics. [24] Sahil Sen, Akhil Kasturi, Elias Lumer, Anmol Gulati, and Vamse Kumar Subbiah. Is grep all you need? how agent harnesses reshape agentic search. arXiv preprint arXiv:2605.15184 , 2026. [25] Chirag Shah, Ryen White, Reid Andersen, Georg Buscher, Scott Counts, Sarkar Das, Ali Montazer, Sathish Manivannan, Jennifer Neville, Nagu Rangan, Tara Safavi, Siddharth Suri, Mengting Wan, Leijie Wang, and Longqi Yang. Using large language models to generate, validate, and apply user intent taxonomies. ACM Trans. Web , 19(3), August 2025. [26] Alex Tamkin, Miles McCain, Kunal Handa, Esin Durmus, Liane Lovitt, Ankur Rathi, Saffron Huang, Alfred Mountfield, Jerry Hong, Stuart Ritchie, et al. Clio: Privacy-preserving insights into real-world ai use. arXiv preprint arXiv:2412.13678 , 2024. [27] Ben Tannyhill. Introducing langsmith engine. https://www.langchain.com/blog/ introducing-langsmith-engine , May 2026. [28] Riya Tyagi, Daria Ivanova, Arthur Conmy, and Neel Nanda. Global CoT analysis: Initial attempts to uncover patterns across many chains of thought. AI Alignment Forum, Jan 2026. [29] Wil Van Der Aalst, Arya Adriansyah, Ana Karla Alves De Medeiros, Franco Arcieri, Thomas Baier, Tobias Blickle, Jagadeesh Chandra Bose, Peter Van Den Brand, Ronald Brandtjen, Joos Buijs, et al. Process mining manifesto. In International conference on business process management , pages 169– 194. Springer, 2011. [30] Wil MP Van der Aalst and Anton JMM Weijters. Process mining: a research agenda. Computers in industry , 53(3):231–244, 2004. [31] Mengting Wan, Tara Safavi, Sujay Kumar Jauhar, Yujin Kim, Scott Counts, Jennifer Neville, Siddharth Suri, Chirag Shah, Ryen W White, Longqi Yang, et al. Tnt-llm: Text mining at scale with large language models. In Proceedings of the 30th ACM SIGKDD conference on knowledge discovery and data mining , pages 5836–5847, 2024. [32] Zihan Wang, Jingbo Shang, and Ruiqi Zhong. Goal-driven explainable clustering via language descrip-tions. In Houda Bouamor, Juan Pino, and Kalika Bali, editors, Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing , pages 10626–10649, Singapore, December 2023. Association for Computational Linguistics. [33] John Yang, Carlos Jimenez, Alexander Wettig, Kilian Lieret, Shunyu Yao, Karthik Narasimhan, and Ofir Press. Swe-agent: Agent-computer interfaces enable automated software engineering. Advances in Neural Information Processing Systems , 37:50528–50652, 2024. 8RIVAL RESEARCH 
+
+[34] Qingkai Zeng, Yuyang Bai, Zhaoxuan Tan, Shangbin Feng, Zhenwen Liang, Zhihan Zhang, and Meng Jiang. Chain-of-layer: Iteratively prompting large language models for taxonomy induction from lim-ited examples. In Proceedings of the 33rd ACM international conference on information and knowl-edge management , pages 3093–3102, 2024. [35] Ruiqi Zhong, Charlie Snell, Dan Klein, and Jacob Steinhardt. Describing differences between text dis-tributions with natural language. In Kamalika Chaudhuri, Stefanie Jegelka, Le Song, Csaba Szepesvari, Gang Niu, and Sivan Sabato, editors, Proceedings of the 39th International Conference on Machine Learning , volume 162 of Proceedings of Machine Learning Research , pages 27099–27116. PMLR, 17–23 Jul 2022. [36] Ruiqi Zhong, Heng Wang, Dan Klein, and Jacob Steinhardt. Explaining datasets in words: Statisti-cal models with natural language parameters. Advances in Neural Information Processing Systems ,37:79350–79380, 2024. [37] Ruiqi Zhong, Peter Zhang, Steve Li, Jinwoo Ahn, Dan Klein, and Jacob Steinhardt. Goal driven discovery of distributional differences via language descriptions. Advances in Neural Information Processing Systems , 36:40204–40237, 2023. [38] Kunlun Zhu, Zijia Liu, Bingxuan Li, Muxin Tian, Yingxuan Yang, Jiaxun Zhang, Pengrui Han, Qipeng Xie, Fuyang Cui, Weijia Zhang, et al. Where llm agents fail and how they can learn from failures. arXiv preprint arXiv:2509.25370 , 2025. 
+
+## Appendix Contents A The Web UI 
+
+The web application is a client of the server described above, not a layer of its own: it is a single-page React app that reads and writes through the same HTTP API that backs the MCP tool surface, and only provides an easy interface to Taxi for visualization purposes. Below is a description of its components. 
+
+Projects sidebar and home screen. A collapsible sidebar lists the user’s own projects and those shared with them, each with its step count, alongside actions to create a project (name, data source, and for Lang-Smith sources, an optional run-name filter) and to open the data source manager. 
+
+Data sources. Each data source appears as a card with its counts, its current data version, and controls to sync, embed, or pause and resume a running job. Creating one selects a loader and fills in that loader’s form: a drop zone for a trajectories JSON export; dataset, split, messages column, row range, and role filter for Hugging Face; workspace, project, metadata-key filters, and a limit for LangSmith. 
+
+Project workspace. A project opens on three tabs over the same corpus. Taxonomy shows the published tree at its current version – clusters with their sizes and shares, expandable into children – and, upon selecting a cluster, its description, a per-day distribution of its steps (togglable between absolute counts and share of all steps that day, and draggable to filter to a date range), and the trajectories it draws from. A sync control sits next to the data-source version and the version the project has ingested through, so the gap between them is visible before anyone acts on the tree. 9RIVAL RESEARCH 
+
+Figure 3 Home screen and projects sidebar. 
+
+Trajectories. The second tab is a paginated list of trajectories with their step counts and the data version they arrived in; selecting one renders its steps in order, each with its role, action, and observation, and links back to the run in LangSmith where the source provides one. This is the view that makes the taxonomy checkable: a cluster is only as good as the steps it turns out to contain. 
+
+Job progress. Long-running work is not hidden behind a spinner. Wherever a pipeline is running – ingest, embedding, clustering, labeling, publishing – the UI renders its stages in order, marks which one is live, and shows that stage’s progress with a count and an estimate, driven by the job event stream over server-sent events; an event log can be expanded for the raw sequence. The UI holds no progress state of its own: every element here is a rendering of rows and events in the database, which is why a reload mid-pipeline loses nothing. 
+
+## B MCP Tools and Skills 
+
+Taxi is designed on top of reusable MCP services and skill documents. Then clients, like the web UI (Appendix A), can be built on top of them, with loose coupling. Anything a user can do with the web UI – querying the corpus, refining a taxonomy, publishing an evaluator, running an insight – is similarly reachable by a coding agent or any other external caller. That shared surface has two layers: • MCP tools – the primitives: scoped SQL, vocabulary extraction, draft-taxonomy operators, and pub-lish/run hooks for evaluators and insights. • Skills – methodology documents that tell an agent how to use those primitives for a particular job. 10 RIVAL RESEARCH 
+
+Figure 4 Data-source manager and loader forms. Capability lives in the documents, not in separate subsystems; adding a new interpretive procedure means writing a skill over the existing tools rather than growing a privileged code path the UI alone can see. 
+
+Discovery. A session begins with taxi_init , which lists every skill under 
+
+.claude/skills/*/SKILL.md as {name, description, whenToUse, resource} . The agent reads whenToUse to decide relevance, then fetches only the matching taxi://skills/{name} resource for the full body. Skills are never duplicated into the server: editing a SKILL.md updates both the catalog and the body on the next call. The point of this indirection is budget – an agent loads methodology only when the task warrants it, rather than carrying every procedure in every turn. 
+
+Session scope. Almost every tool requires an active scope, set before the agent can use them. Scopes are either projects or data sources: • set_project – scopes to a project’s filters and its latest taxonomy, so the pre-filtered views of Appendix J (project_trajectories , project_steps , project_clusters ,
+
+project_step_assignments ) apply automatically. 11 RIVAL RESEARCH 
+
+Figure 5 Taxonomy tab: published tree and cluster detail. 
+
+Figure 6 Trajectory inspector. • set_data_sources – the lighter path for raw corpora: the same trajectory and step views resolve, but the cluster views are empty because there is no taxonomy without a project. 
+
+list_projects , list_data_sources , and create_project discover or open the target before either is called. 
+
+Primitive surface. The tools fall into five groups over that scope. 
+
+Scope 
+
+12 RIVAL RESEARCH 
+
+Figure 7 Job progress, rendered from the job event stream. • taxi_init – list available skills as {name, description, whenToUse, resource} . Call this be-fore non-trivial work; fetch the resource URI only for a skill whose whenToUse matches the task. • list_projects – return the caller’s projects (id, name). Use before set_project when the target is not already known. • set_project – activate one project: its filters and latest taxonomy apply to every subsequent query. • list_data_sources – return every data source (id, name, counts, version). • set_data_sources – activate one or more data sources (or "*" for all) without a project; cluster views stay empty. • create_project – create a project on a named data source and set it as the active scope in one step. 
+
+Corpus access 
+
+• execute_sql – run a read-only SELECT against the database. It is provided access to the scoped 
+
+project_* views ( SET TRANSACTION READ ONLY , capped at 200 rows). This is one of the main workhorses of Taxi, sitting at the base of every textual search into the data. • get_taxonomy_context – return the published cluster tree for the active project: each cluster’s label, member count, and description. Call at the start of any session where taxonomy structure matters. • get_tfidf_terms – top TF-IDF terms from step action text in the active scope. The default asks for hundreds of terms because the vocabulary that distinguishes behaviors lives in the long tail. • sample_steps – draw a random sample of raw step texts, optionally restricted to members of a specific cluster. 
+
+Draft taxonomy. Construction is session-local until publish: operators mutate an in-memory draft, and nothing is visible to other clients until publish_taxonomy commits it. • cluster_by_embedding – run k-means over step embeddings and add the resulting clusters to the draft. With parent_id , only steps that already route to that draft cluster are clustered (a scoped split); without it, clustering is at the root. Returns representative samples plus cohesion and nearest-neighbor stats for triage. Large scopes are subsampled by default for the k-means input; at publish, every step is still routed by nearest centroid. • cluster_by_regex – add regex clusters at root or under a parent. Each cluster is a pattern matched case-insensitively against step action text; at each tree level, the first matching sibling wins. • cluster_by_jev – add semantic categories defined by a label and description at root or under a parent. The configured Jev-style decision model receives the step action as state and one Choice question over the sibling definitions, plus “None of these.” A low-confidence or none-of-these answer leaves the step at its parent. The tool previews the resulting assignments on a trajectory sample before publish. 13 RIVAL RESEARCH 
+
+• construct_by_jev – (experimental) discover a Jev level, or optionally a tree, at root or under a parent, as a background job (Appendix D). • apply_jev_construction – report that job’s progress and, once it completes, write the constructed categories into the draft. • get_draft_taxonomy – show the current draft tree (labels, patterns, parent links) before further edits or publish. • clear_draft – discard the draft entirely. • draft_from_taxonomy – copy a published taxonomy version into the draft for redesign. • add_draft_cluster – insert one cluster without replacing its siblings. A pattern creates a regex cluster; without one, it follows the sibling level’s routing kind. • remove_draft_cluster – delete a cluster and all of its descendants. • update_draft_cluster – set or change a cluster’s label and description (the description defines what the steps do, not how the cluster was produced). • split_draft_cluster – replace one cluster with regex children when the split is cleanly describable by patterns, or Jev children when it is cleanly describable by semantic definitions; for an embedding split, call cluster_by_embedding with that cluster as parent_id instead. • merge_draft_clusters – merge sibling clusters into one (embedding centroids combine by size-weighted mean, regex patterns are OR-combined, and Jev descriptions are combined into a new se-mantic definition). Use after find_similar_clusters flags near-duplicates. • find_similar_clusters – report pairs of embedding clusters whose centroids are very close (default cosine ≥ 0.9), including across different branches – the signal that one theme has fragmented. • sample_cluster_representatives – sample members of a draft cluster in one of three modes: 
+
+centroid (closest to the centroid), edge (farthest from the centroid), or diverse .• cluster_terms – distinctive TF-IDF terms for one draft cluster versus the whole corpus; an aid for naming and for spotting when two clusters are the same theme. • publish_taxonomy – commit the draft atomically as a new taxonomy version, assign all project steps by tree-walk routing, clear the draft, and return a job id whose assignment runs in the background. The construction loop these tools support – propose, examine, revise, name as a set, publish – is the taxon-omizer skill’s subject (Appendix C). 
+
+Evaluators (Appendix E) • publish_eval – validate a complete evaluator YAML document and upsert it into Postgres by name 
+
+(re-publishing the same name replaces it in place). No project scope required; the YAML itself declares project or data-source scope. • run_eval – run every published evaluator, or one by name, optionally narrowed to a recency window (7d , 24h , or a date). Returns one structured record per evaluator (status, filtered/success/failure counts, discrimination-check detail). 
+
+Insights (Appendix F) • publish_insight – validate and upsert an insight definition YAML by name (data sources to cover, optional Slack channel, free-form focus instructions). • list_insights – list enabled published insight definitions. 14 RIVAL RESEARCH 
+
+• get_insight_context – after set_data_sources on exactly one source, return and activate that source’s analysis window: a bootstrap week on a first run, everything since the last saved report other-wise, or an up-to-date verdict that means skip. Scoped views then return only that window. • save_insight_report – persist one (insight, data source, version) Markdown report plus a short summary a digest can quote. Idempotent: the first save for that triple wins. • post_insight_reports – take every report id saved in the current run and post exactly one consoli-dated Slack digest; full per-source reports stay in Taxi. 
+
+Skills. Five skill documents currently sit on that surface. Each is a system prompt for one job: what to call, in what order, what not to invent, and how to present the result. The same MCP tools serve all of them. • taxi-agent – interactive exploration and debugging in the web chat (and similar harnesses). Uses 
+
+execute_sql and get_taxonomy_context only; answers must be grounded in query results. • taxonomizer – agentic taxonomy construction (Section 2.3). Drives the full draft surface: orient on the corpus (counts, TF-IDF, raw samples), propose partitions, examine against evidence, revise (split / merge / deepen), name as a set, then publish. Detailed in Appendix C. • taxi-eval – author, validate, publish, and run YAML evaluators. Encodes how to turn a bug fix’s diff into an observable signature, choose between SQL and a Jev-style semantic criterion, and decide when to prefer data-source scope over project scope. Detailed in Appendix E. • taxi-insights – scheduled insight runner in two modes: investigate exactly one data source and save_insight_report , or compose a digest from that run’s saved summaries and 
+
+post_insight_reports . Refuses local file or schema repair; stops on a required MCP failure. De-tailed in Appendix F. • slack-agent – system prompt for the Slack bot that answers @mentions. Each message is a fresh invocation, so it must set_project every turn; uses the same SQL/taxonomy tools as taxi-agent ;must end with a final_answer ; formats in Slack mrkdwn (no UI link syntax). 
+
+## C Taxonomy Construction in Detail 
+
+A taxonomy is a named tree of step clusters – one lens on a trajectory corpus, not a replacement for SQL over the same steps (Section 2.1). It serves two jobs at once: a birdseye overview of what agents actually do, and a stepping stone that gives a human or an agent enough grasp of the dataset’s shape to write targeted queries afterward. Both construction paths below produce the same artifact shape (a versioned tree in Postgres); they differ in where summarization of “what behaviors exist” happens, and in how much human or agent judgment sits between a clustering call and a published label. 
+
+Shared Taxonomy Tree. Embedding-based, regex-based, and Jev-based clusters can sit in the same tree, including as siblings of different parents, but at any one level all siblings share a single routing method. • Embedding clusters. k-means over step embeddings proposes a partition; the geometry itself is the summarization of the corpus. Coverage at an embedding level is exhaustive among steps that have embeddings: every such step is assigned to the nearest centroid. Large scopes may subsample to compute centroids (reported explicitly in the tool response); at publish, every embedded step is still routed by nearest centroid regardless. • Regex clusters. Each cluster is a case-insensitive pattern over step action text. Summarization is a separate, upstream step – currently TF-IDF over the corpus ( get_tfidf_terms ), with room for other 15 RIVAL RESEARCH 
+
+vocabulary methods – after which an agent (or a human) designs the patterns. Coverage need not be exhaustive: a step matching no sibling pattern is simply left unclustered at that level, and that is fine. • Jev clusters. Each sibling is defined by a short label and a natural-language description. The config-ured Jev-style decision model receives the step’s action text and a Choice question whose options are those sibling definitions plus “None of these.” The chosen sibling wins only when the returned confi-dence clears a configurable threshold. Thus these levels express semantic categories directly, without requiring a centroid or a lexical pattern. The asymmetry matters for method choice. Much of what an agent emits is templated – tool names, argu-ment shapes, stereotyped observations, recurring error strings – and for that material a literal pattern names a behavior exactly where a semantic neighborhood only approximates it. Embedding proximity is useful when the categories must first be discovered from the corpus. Once categories can be stated as definitions, Jev routing can assign variable wording directly against those definitions. The taxonomizer is free to use any operator per region of the tree rather than once for the whole corpus. In particular, a regex parent can cheaply pre-filter a Jev child level, so only steps that reach that branch require a model decision. 
+
+Routing. After publish, every step is assigned by walking the tree from the root: • Regex siblings: first matching pattern wins (order among siblings is significant). • Embedding siblings: nearest centroid wins. • Jev siblings: the model chooses among labels and descriptions; “None of these” or a low-confidence answer produces no match at that level. • A step that matches a parent but no child stays at the parent. • A step matching nothing at the root is unassigned. The same tree-walk is what later sync uses: new steps are routed through the published version without rebuilding it (Section 2.1). 
+
+Simple flat clustering. The default non-agentic pipeline is one k-means pass over the project’s embedded steps, followed by an LLM label for each cluster from a small sample near its centroid, then an atomic publish. There is no examination loop between proposal and name – the clustering call is the partition, and each label is written in isolation, blind to sibling clusters. Despite that myopia it is often useful in practice; most of the production cases in Appendix G came from flat k-means taxonomies. It remains available as a first pass and as a baseline the agentic path is meant to improve on. 
+
+Agentic construction. The taxonomizer skill (Appendix B) treats every clustering call as a proposal to examine , not a result to accept. There is no scoring rubric to optimize: the tools return evidence (samples, distinctive terms, cohesion and nearest-cluster statistics), and the agent decides what is a coherent cluster, what is a grab-bag, and what is one theme split in two. The loop, summarized in Figure 2, is: 1. Orient. Corpus size via SQL; hundreds of TF-IDF terms (distinguishing vocabulary lives well down the ranking); raw step samples. Get a feel for the behaviors present before imposing structure. On a redesign, load the published tree first ( get_taxonomy_context / draft_from_taxonomy ). 2. Propose. Cluster at a granularity that matches the thematic richness just seen – enough clusters to separate real behaviors, not a deliberately small k to patch later. A rough root range is often 8–30 depending on corpus size and diversity; k is adjusted up (split) and down (merge) as evidence arrives. Embedding, regex, and Jev operators all accept a parent_id , so a propose step can be scoped to 16 RIVAL RESEARCH 
+
+one cluster’s members. Jev categories are most natural once exploration or embedding clusters have revealed definitions worth routing against. 3. Examine. For each cluster, read centroid samples (the core), edge samples (farthest from the centroid – where a grab-bag shows itself), diverse samples, distinctive cluster_terms , and the triage numbers 
+
+cohesion and nearest_sim . A handful of centroid samples plus top terms is not enough evidence to name or accept from. 4. Revise. Confirm against the text before acting: • Low cohesion, or edge samples that read like a different activity than the core → grab-bag; split with cluster_by_embedding(parent_id=...) or, if the split is cleanly describable, 
+
+split_draft_cluster with regex patterns or Jev descriptions. • High nearest_sim , or find_similar_clusters pairing two clusters whose terms and samples overlap → one theme fragmented; merge_draft_clusters .• A dominant cluster holding a large share of the corpus → usually several behaviors collapsed; go deeper. • An empty cluster, or a child that covers almost all of its parent → remove it / do not nest there. Sub-cluster only where distinct sub-behaviors earn a deeper level, not to hit a depth. 5. Name as a set. Settle membership before naming. Name from centroid samples and distinctive terms, never from a handful of stray examples. Then read all names together: consistent abstraction level, parallel form, clear contrast. Prefer behavioral names (“Searching AWS for Lambda functions”) over structural ones (“step contains serverless JSON”). The description stored on a cluster is a 1–3 sen-tence definition of what those steps are or do – never a process log (“split from cluster X”). For a Jev cluster, this text is also the routing criterion and must be sufficient to decide membership. 6. Publish. publish_taxonomy commits the draft atomically as a new taxonomy version, assigns all project steps by the tree-walk above, and clears the draft. Before calling it, present the proposed tree – name, size, routing rule per cluster – and say explicitly what was left broad, dropped, or unembedded. Prefer clean coverage over forced coverage: a smaller set of strong, distinct clusters beats padding the tree to cover every last step. 
+
+Draft vs. published. While the loop runs, the tree is session-local draft state (Appendix B). Other clients and the project’s published taxonomy are untouched. Publish is the only transition that makes the tree durable, and it is all-or-nothing: version row, cluster rows, and step assignments land in one Postgres trans-action, or none do (Appendix J). Prior versions remain readable; sync of newly ingested steps always targets the version the project currently uses. 
+
+Relation to the flat pipeline. The agentic path reuses the same operators and the same publish/routing machinery as the flat pipeline. What it adds is everything between propose and name: scoped re-clustering, examination against evidence, merge and split, and naming with visibility into sibling clusters. The flat pipeline is the propose-and-name fragment of Figure 2 with the middle boxes removed; the taxonomizer skill is the full loop, written as methodology over the MCP surface rather than as a second clustering subsystem. 
+
+## D Experimental: Jev-Based Taxonomy Construction 
+
+Jev routing (Appendix C) assigns steps to categories that are already defined. construct_by_jev discovers those categories from the corpus, the way cluster_by_embedding discovers embedding clusters. The 17 RIVAL RESEARCH 
+
+division of labor is strict: the decision model makes every decision – which category a step belongs to, and whether the level should change – and an LLM is called only to write a category once a change has been decided. Figure 8 summarizes the procedure. Next batch of steps 
+
+> INPUT
+
+Steps                                    
+
+> random order
+> PER BATCH
+> Assign
+> category or new
+> Decide
+> fits? mixed? overlap? uncovered?
+> Edit
+> rewrite, split, merge, add
+> ONCE SETTLED
+> Re-assign
+> all steps
+> Recurse
+> optional
+> EXAMPLE BATCH 1
+> grep -rn "yaml.load" →new aws ec2 describe… →new
+> uncovered? 0.93
+> add
+> Code search 6
+> Cloud queries 4
+> BATCH 2
+> cat package-lock.json →Code… rg "def handler" →Code…
+> Code search: mixed? 0.84
+> split
+> Source search 7
+> Manifest reads 6
+> Cloud queries 9
+> BATCH 3
+> kubectl get pods →Cloud… aws s3 ls →Cloud…
+> Cloud queries: fits? 0.28
+> rewrite
+> Source search 10
+> Manifest reads 8
+> Cloud inventory 14
+> SETTLED
+> size held for 3 batches no new category
+> re-assign every step read
+> Source search 41
+> Manifest reads 33
+> Cloud inventory 52
+> children per category (optional)
+> jev decides (choice and yes/no, with probability) LLM writes categories category just written
+
+Figure 8 Jev-based construction of one taxonomy level. Each batch is assigned, judged, and edited; once the level settles, every step is re-assigned to the finished categories. 
+
+Online construction. The scope’s steps stream in a fixed random order, a batch at a time. Each new step is assigned once, with the same question routing uses, to one of the current categories or to “new behavior.” After each batch, the decision model answers yes/no questions over all the steps seen so far: • Fits? Does a category’s description fit its member steps? • Mixed? Does a category hold more than one behavior? • Overlap? Do the members of two categories fit both equally well? Candidate pairs come from asking which other category is closest to each category, and from how often two categories competed for the same steps. • Uncovered? Do the uncategorized steps share a behavior no category covers? The answers’ probabilities rank the candidates, and only the top few edits per batch are made. An LLM then writes each one: a rewritten description, the parts of a split, a merged category, or a new category. The LLM sees the other categories, so it does not recreate one that exists. A split is kept only if the decision model can tell its parts apart, and only the steps an edit touched are assigned again. 
+
+No target count. The number of categories is not fixed in advance. Two share bounds, relative to the steps seen, frame the level: a category above the upper bound is split ahead of others, and no merge may create one; a category below the lower bound is dropped. Within those bounds, the count is whatever the decisions above produce. An optional ceiling is available. 
+
+Stopping and the final pass. The level is settled once its size has held for a few batches and the last batch created no category, so construction usually reads only part of the sample. Every step read is then assigned once more to the finished categories, so the sizes and examples reported are what publishing will produce; a category left empty is dropped. 18 RIVAL RESEARCH 
+
+Optional hierarchy. With a depth above one, every category with enough member steps gets children, constructed the same way over its own members, with share bounds relative to its own steps. A node that keeps fewer than two children stays a leaf, so depth and width come from the data. The result is written into the draft as ordinary Jev clusters, routed and published like any other level. Construction runs as a background job and checkpoints after every batch, so an interrupted job resumes where it stopped. 
+
+## E Evaluators 
+
+An evaluator (Section 2.5) is a single YAML document. Once published it is stored verbatim in the 
+
+evaluators table (Appendix J) and can be run from any client without a local checkout. The full field set: 
+
+name: required-tool-called # eval name 
+
+project: my-project # option A: the scope of the eval is a project # data_source: my-ds # option B: a single data source # data_sources: [ds-a, ds-b] # option C: several (union) # data_sources: "*" # option D: every data source 
+
+tickets: TAXI-123 # optional; string or list # metadata: # optional freeform map # owner: platform 
+
+description: > # for human readability: what it guards against 
+
+The tool required_tool() must be used in every trajectory of the cloud agent. failure_examples: # sanity check: trajectory ids known to fail 
+
+- past-bad-run-1 - past-bad-run-2 filter_sql: | # optional: subset of relevant trajectories 
+
+SELECT id FROM project_trajectories WHERE meta->>’run_name’ = ’cloud-agent’ success_sql: | # what is considered a good trajectory 
+
+SELECT DISTINCT s.trajectory_id AS id FROM project_steps s WHERE s.tool_calls::text ~* ’required_tool’ 
+
+# or alternatively, use failure_sql (what is considered a bad trajectory) # A semantic criterion can instead use the configured Jev-style model: # failure: # jev: Does the agent stop without attempting a fix? # threshold: 0.7 # hit when P(yes) >= threshold; default 0.5 # per: trajectory # or step # state: | # optional SQL returning (id, state) # SELECT trajectory_id AS id, action AS state FROM project_steps 
+
+Exactly one of project or data_source /data_sources is required, and the choice decides what the eval-uator can see. A project scope reads the filtered views of Section 2.1, so the project’s own filters and its latest 19 RIVAL RESEARCH 
+
+taxonomy apply and project_clusters and project_step_assignments are meaningful; a data-source scope queries the underlying trajectory and step tables, where those two cluster views are empty. Evaluation then proceeds in three stages, each narrowing the previous: scope, then filter, then criterion. If 
+
+filter_sql is set, the scope is intersected with the ids it returns, and an empty filtered set yields skip rather than pass, since nothing was actually tested. The filtered set is intersected with the criterion, of which exactly one form may be given. SQL criteria retain the existing behavior: with success_sql the evaluator passes iff every filtered trajectory is a hit, and with failure_sql it passes iff none is. A success or failure 
+
+mapping may instead contain a jev yes/no question. By default the decision model sees all actions in a trajectory in order; with per: step , it sees one action at a time and the trajectory is a hit when any step reaches the probability threshold. An optional state query can select other text or structured state while preserving the same trajectory identifiers. SQL filters and state queries therefore continue to perform cheap exact narrowing before any model call. Results are reported as n_success /n_filtered together with a failure count. There are four possible outcomes: success, fail, skip, and error. Skip means the filtered set was empty, and error is reserved for problems with the definition rather than the corpus — an unresolvable or ambiguous scope name, SQL that does not execute, or a failed discrimination check. Error is deliberately distinct from fail because the two demand different responses: a fail is a finding about the agents, an error is a bug in the check. Ids listed under failure_examples are verified before the live corpus result. Each must exist in scope, match the filter SQL, and be classified as a failure by the criterion. If any does not hold, the evaluator reports an error even when the current corpus would otherwise pass. The evaluator is authored as a YAML document, and a durable copy lives in Postgres. Publishing takes either the complete YAML text through the publish_eval tool, validates it, and upserts by name , so re-publishing the same name replaces that evaluator in place. run_eval executes every published evaluator, or one by name, optionally within a recency window, and returns one structured record per evaluator carrying its status, its filtered, success and failure counts, and any error or discrimination-check detail. These reports are created as scheduled reports that keep a per-data-source watermark – the ingest version last evaluated – so it considers only trajectories that arrived past it, and advances it once the run finishes. Beyond hand-written invariants, the same format supports turning engineering history into checks, and that methodology is documented in the evaluator skill document. Candidates come from reading a commit log or closed tickets broadly. Then the agent is tasked with translating that into an observable signature , i.e., something we can query over trajectories. 
+
+## F Insight Reports 
+
+An insight is a recurring investigation of one or more data sources, defined in YAML, published to Postgres, and run by an agent on a schedule. A definition names the insight, the data sources it covers (a list, or "*" 
+
+for every source), and the channel its digest is posted to; anything else in the document is carried through to the investigating agent as context. As with evaluators, publishing upserts by name. There are three modes covering three cases: if no report already exists for this data source, a bootstrap run runs over last week’s trajectories; any other case gets everything from the data version its last report covered, unless there was no new data ingested, which immediately receives an up-to-date verdict and stops. Each investigation saves one Markdown report plus a short summary that a Slack digest can quote. Findings are ordered by how much they would surprise a competent reviewer, and a corpus’s own outcome tallies are background rather than the headline unless the rate itself is the surprise. Agent behavior is the 20 RIVAL RESEARCH 
+
+subject — strategy, tool choice and sequencing, instruction following, wasted or repeated action, recovery, stopping behavior — rather than a catalog of the tasks or artifacts the agents happened to touch. When a batch is small enough to read end to end it is read end to end rather than sampled, and every number must come from a query run in that same investigation. 
+
+## G Real-World Case Studies 
+
+Below is a short anecdotal description of real-world cases our users found during organic use of our system.             
+
+> Case Surfacing cluster Underlying issue
+> Broken tool regex a distinct “search returned nothing” cluster a valid pattern was silently reported as a non-match by a downstream tool Scope violation a cluster of steps outside the declared task scope the agent expanded its investigation beyond an explicitly user-scoped tar-get Redundant lookup a repeated “re-derive static infrastruc-ture fact” cluster the same unchanging information was rediscovered from scratch on every run Missing dependency arepeated “tool not found, retry, abandon” cluster the agent assumed a sandbox capabil-ity that was never actually installed Expired credential a cluster of near-identical authentica-tion failures a revoked API token was causing fail-ures across many unrelated runs
+
+Table 2 Five production cases in which taxonomy clustering, rather than an outcome label, surfaced a behavioral failure that would otherwise have gone unnoticed. 
+
+Broken tool regex. A cluster of steps whose observations all resembled a failed search turned out, upon inspection, to share a specific and surprising cause: a downstream tool’s pattern matching silently treated regex patterns as a non-match, so the agent was truthfully told “no matches found” for searches that should have succeeded. No individual run looked like a bug from the outside – the agent adapted, tried alternatives, and often still completed its task – so nothing about task outcome flagged the issue. The cluster made the 
+
+frequency and uniformity of this specific failure shape visible in a way no single trace could. 
+
+Scope violation. A cluster grouped steps whose content fell outside a task’s explicitly stated boundary (investigating only a designated, user-controlled input) instead of a generalized exploration the agent was never authorized to perform. Individually, each such run still “worked” by task-completion standards; the cluster is what made the systematic boundary violation legible across many otherwise-unrelated runs. 
+
+Redundant lookup. A cluster captured many independent runs each re-deriving the same essentially static piece of infrastructure information from scratch, rather than treating it as known. None of these runs failed, and none was individually expensive – the cost was in the aggregate, thousands of repeated, avoidable steps, visible only once grouped. 
+
+Missing dependency. A cluster of steps shared a distinctive failure-then-abandon shape: the agent assumed a tool was available in its execution environment, attempted to use it repeatedly, failed each time, and even-tually gave up on that line of work. The cluster’s consistency across runs pointed directly at an environment configuration gap rather than a per-task modeling failure. 
+
+Expired credential. A cluster of near-identical authentication failures, all citing the same external service, made a revoked API credential visible as a single incident affecting many runs simultaneously, rather than 21 RIVAL RESEARCH 
+
+as scattered, seemingly unrelated failures that might otherwise have been investigated (and worked around) independently, run by run. 
+
+## H Taxi on SastBench 
+
+This appendix walks through one corpus with Taxi, layer by layer: querying, vocabulary, taxonomies, state machines, decision-model questions, and analyses built on top of the discretized runs. Each part shows what a capability surfaced, and every claim was checked against its obvious confounds before being kept. 
+
+Setup. Four agents — Claude Sonnet 4.5, Gemini 3 Pro, Gemini 2.5 Pro and DeepSeek R1 — triage the same 2,737 static-analysis findings of SastBench [13] with the same ReAct harness (read, grep, symbol lookup, a vulnerability-pattern tool, at most 20 steps), deciding whether each finding is a true or a false positive. That gives 10,515 runs and 87,140 steps, loaded as one corpus with a view per agent. 89% of the findings are false positives. Step text is each step’s reasoning and tool call; the tool’s output is kept as the step’s observation. 
+
+H.1 Querying the corpus 
+
+Errors are shared, not idiosyncratic. Grouping runs by finding in SQL, 574 findings are judged wrong by all four agents, against about 120 if each agent erred independently at its own rate. 
+
+One repository behind half of the shared errors. A text search over the file paths the agents read places 265 of those 574 findings (46%) in a single PHP repository, which contributes 803 of the 2,737 findings across 42 commits. Its findings are labeled true positive 5% of the time, yet the agents call 58% of them vulnerable, and the code their verdicts cite reads as genuinely exploitable (request parameters concatenated into SQL, class names instantiated from request input). Either labels in that repository deserve another look, or the benchmark labels issues that predate a commit as false positives. Excluding it, errors remain shared: 309 findings wrong for all four agents against about 65 expected (4.8 ×). 
+
+Tool-failure profiles. Pattern matching over observations separates the agents: Claude’s failures are mostly empty searches (51%), the Gemini models mostly hit file-size limits (38–39%) and missing paths (28–35%), and Gemini 3 Pro and DeepSeek R1 produce malformed tool calls (303 and 245 steps). After a failure, Claude and Gemini 2.5 Pro usually adjust the same call (55% and 62%), DeepSeek R1 usually switches tools (60%), and almost none retry the identical call. 
+
+H.2 Vocabulary 
+
+TF-IDF over each agent’s steps, against the other three, gives each agent a recognizable style:          
+
+> Agent Most distinctive vocabulary Claude Sonnet 4.5 the mechanism: loose comparison, prepared statements, template literals, inner-HTML, format strings
+> DeepSeek R1 taint: unsanitized, user-controlled data, flows, should verify, security patterns
+> Gemini 2.5 Pro its own process: first step, final decision, enough information, wants to analyze
+> Gemini 3 Pro navigation: around lines, search usages, suspect
+
+Table 3 Distinctive terms per agent (TF-IDF, each agent’s steps against the other three). 22 RIVAL RESEARCH 
+
+H.3 Two taxonomies, two lenses 
+
+Behavior, from textual regularity. A regex taxonomy built from the regularity of the text splits steps by tool, then by what the agent says it is doing (looking for protections, tracing data flow, reading the flagged code, recovering from an error), what the arguments target (test files, templates, configuration, third-party code; input sources, sinks, definitions), and how the verdict is justified (input not attacker-controlled, framework protects, missing sanitization, and so on): 29 leaves, with no embeddings. 
+
+Subject, from embeddings. A mixed tree keeps the regex roots by tool and puts k-means clusters under each, named by an agent from samples and distinctive terms (36 leaves). Its clusters split by what the code is about (CSRF forms, SQL queries, redirects, container configuration, vendored front-end libraries) rather than by what the agent does: the same steps, a different lens. 
+
+Some subjects fail for every agent. Grouping runs by the subject cluster of their verdict step (Table 4), front-end XSS and integrity findings and network/TLS findings are judged correctly about a quarter of the time by all four agents, while code identified as third-party or non-production is judged correctly almost always. The gap is not a few commits (each subject spans 134–209 commits; dropping its three largest moves accuracy by at most 0.02) and not the base rate (5–18% true positives in every subject). Front-end verdicts say “vulnerable” 88% of the time.                   
+
+> Verdict subject runs accuracy front-end XSS, integrity (SRI) 778 0.24 network, TLS, cookies 743 0.27 PHP web application 834 0.45 container privileges 681 0.45 injection, deserialization 1,221 0.48 ReDoS, path traversal 731 0.61 third-party library 875 0.87 test, example or unused code 1,052 0.88
+
+Table 4 Accuracy by the subject of the verdict step (mixed taxonomy), all agents, excluding the repository of Appendix H.1. 
+
+H.4 State machines 
+
+Discretized runs read as state machines. Figure 9 shows each agent over eight behaviors, with the transitions distinctive to that agent highlighted: Gemini 3 Pro loops between locating code and reading code other than the flagged location; Gemini 2.5 Pro chains error recovery into more error recovery and often concludes right after reading the flagged code; Claude and DeepSeek consult the vulnerability-pattern tool just before concluding, which the Gemini models rarely do. Figures 10–13 show the same at 29 behaviors, with every behavior and transition colored by the accuracy of the runs that pass through it. Drawing only transitions between consecutive behaviors loses little at this granularity: on held-out runs, knowing the current behavior cuts the uncertainty about the next one from about 4.2 to 3.3 bits per step, and knowing the one before adds at most 0.02. 23 RIVAL RESEARCH Claude Sonnet 4.5 
+
+Start 
+
+Read flagged 
+
+> 15% · stays .25
+
+Read other 
+
+> 5%
+
+Protections 
+
+> 33% · stays .55
+
+Locate code 
+
+> 8% · stays .24
+
+Data flow 
+
+> 14% · stays .44
+
+Recover 
+
+> 4%
+
+Patterns 
+
+> 10%
+
+Conclude 
+
+> 10%
+
+Gemini 3 Pro 
+
+Start 
+
+Read flagged 
+
+> 15% · stays .23
+
+Read other 
+
+> 25% · stays .31
+
+Protections 
+
+> 18% · stays .49
+
+Locate code 
+
+> 17% · stays .23
+
+Data flow 
+
+> 11% · stays .34
+
+Recover 
+
+> 3%
+
+Patterns 
+
+> 1%
+
+Conclude 
+
+> 9%
+
+Gemini 2.5 Pro 
+
+Start 
+
+Read flagged 
+
+> 20% · stays .17
+
+Read other 
+
+> 4%
+
+Protections 
+
+> 19% · stays .38
+
+Locate code 
+
+> 9% · stays .16
+
+Data flow 
+
+> 17% · stays .35
+
+Recover 
+
+> 16% · stays .29
+
+Patterns 
+
+> 1%
+
+Conclude 
+
+> 15%
+
+DeepSeek R1 
+
+Start 
+
+Read flagged 
+
+> 13% · stays .23
+
+Read other 
+
+> 3%
+
+Protections 
+
+> 35% · stays .54
+
+Locate code 
+
+> 7% · stays .18
+
+Data flow 
+
+> 10% · stays .35
+
+Recover 
+
+> 9%
+
+Patterns 
+
+> 10%
+
+Conclude 
+
+> 13%
+
+transition, p ≥ 0.15 distinctive for this agent % of steps · stays = probability the next step is the same behavior 
+
+Figure 9 State machines of the four agents over eight behaviors. Each box gives the share of the agent’s steps in that behavior (also its shade) and, where above 0.15, the probability that the next step stays in it. Edges are transitions with probability at least 0.15, width by probability; orange ones are at least 0.12 more likely for that agent than for the other three. 24 RIVAL RESEARCH Claude Sonnet 4.5 accuracy ≤0.2 ≥0.8 
+
+> VERDICT
+
+other 
+
+619 · 0.64 
+
+> VERDICT
+
+test or demo code 
+
+263 · 0.76 
+
+> VERDICT
+
+exploitable 
+
+123 · 0.40 
+
+> VERDICT
+
+framework protects 
+
+216 · 0.50 
+
+> VERDICT
+
+input is sanitized 
+
+262 · 0.34 
+
+> VERDICT
+
+not attacker input 
+
+621 · 0.66 
+
+> VERDICT
+
+insufficient context 
+
+113 · 0.48 
+
+> VERDICT
+
+low impact 
+
+102 · 0.27 
+
+> VERDICT
+
+missing sanitization 
+
+194 · 0.42 
+
+> VERDICT
+
+weak crypto or random 
+
+87 · 0.53 
+
+consult patterns 
+
+2489 · 0.55 
+
+> READ
+
+other 
+
+633 · 0.58 
+
+> READ
+
+look for protections 
+
+1586 · 0.53 
+
+> READ
+
+template or view 
+
+271 · 0.37 
+
+> READ
+
+test file 
+
+133 · 0.59 
+
+> READ
+
+configuration 
+
+266 · 0.52 
+
+> READ
+
+flagged code 
+
+1388 · 0.55 
+
+> READ
+
+third-party code 
+
+423 · 0.81 
+
+> READ
+
+recover from error 
+
+324 · 0.57 
+
+> READ
+
+trace data flow 
+
+819 · 0.57 
+
+> SEARCH
+
+other 
+
+358 · 0.56 
+
+> SEARCH
+
+find a definition 
+
+319 · 0.52 
+
+> SEARCH
+
+find callers or usages 
+
+362 · 0.63 SEARCH 
+
+recover from error 
+
+613 · 0.52 
+
+> SEARCH
+
+dangerous sinks 
+
+549 · 0.59 
+
+> SEARCH
+
+input sources 
+
+908 · 0.57 
+
+> SEARCH
+
+protections 
+
+904 · 0.53 
+
+> SEARCH
+
+routes or config 
+
+216 · 0.55 
+
+start end 
+
+Figure 10 Claude Sonnet 4.5 over 29 behaviors. Each circle holds a behavior (with its tool: read, search or verdict), the runs that pass through it and their accuracy, which also sets its color (red to green). Edges are transitions seen at least 80 times plus each behavior’s strongest way in and out, colored by the accuracy of the runs that make them, width by count. 25 RIVAL RESEARCH Gemini 3 Pro accuracy ≤0.2 ≥0.8 
+
+> VERDICT
+
+other 
+
+928 · 0.39 
+
+> VERDICT
+
+test or demo code 
+
+149 · 0.92 
+
+> VERDICT
+
+exploitable 
+
+172 · 0.26 
+
+> VERDICT
+
+framework protects 
+
+99 · 0.48 
+
+> VERDICT
+
+input is sanitized 
+
+102 · 0.25 
+
+> VERDICT
+
+not attacker input 
+
+323 · 0.63 
+
+> VERDICT
+
+insufficient context 
+
+69 · 0.35 
+
+> VERDICT
+
+low impact 
+
+13 · 0.38 
+
+> VERDICT
+
+missing sanitization 
+
+172 · 0.28 
+
+> VERDICT
+
+weak crypto or random 
+
+105 · 0.35 
+
+consult patterns 
+
+144 · 0.44 
+
+malformed call 
+
+253 · 0.39 
+
+> READ
+
+other 
+
+1494 · 0.45 
+
+> READ
+
+look for protections 
+
+912 · 0.40 
+
+> READ
+
+template or view 
+
+254 · 0.29 
+
+> READ
+
+test file 
+
+100 · 0.77 
+
+> READ
+
+configuration 
+
+331 · 0.49 
+
+> READ
+
+flagged code 
+
+1202 · 0.44 
+
+> READ
+
+third-party code 
+
+411 · 0.60 
+
+> READ
+
+recover from error 
+
+195 · 0.46 
+
+> READ
+
+trace data flow 
+
+672 · 0.44 
+
+> SEARCH
+
+other 
+
+552 · 0.47 
+
+> SEARCH
+
+find a definition 
+
+633 · 0.45 
+
+> SEARCH
+
+find callers or usages 
+
+785 · 0.50 
+
+> SEARCH
+
+recover from error 
+
+330 · 0.50 
+
+> SEARCH
+
+dangerous sinks 
+
+554 · 0.45 
+
+> SEARCH
+
+input sources 
+
+526 · 0.42 
+
+> SEARCH
+
+protections 
+
+486 · 0.40 
+
+> SEARCH
+
+routes or config 
+
+205 · 0.51 
+
+start end 
+
+Figure 11 Gemini 3 Pro over 29 behaviors, as in Figure 10. 26 RIVAL RESEARCH Gemini 2.5 Pro accuracy ≤0.2 ≥0.8 
+
+> VERDICT
+
+other 
+
+884 · 0.56 
+
+> VERDICT
+
+test or demo code 
+
+202 · 0.81 
+
+> VERDICT
+
+exploitable 
+
+299 · 0.35 
+
+> VERDICT
+
+framework protects 
+
+192 · 0.55 
+
+> VERDICT
+
+input is sanitized 
+
+199 · 0.36 
+
+> VERDICT
+
+not attacker input 
+
+548 · 0.70 
+
+> VERDICT
+
+insufficient context 
+
+80 · 0.39 
+
+> VERDICT
+
+low impact 
+
+36 · 0.53 
+
+> VERDICT
+
+missing sanitization 
+
+151 · 0.26 
+
+> VERDICT
+
+weak crypto or random 
+
+95 · 0.61 
+
+consult patterns 
+
+187 · 0.41 
+
+malformed call 
+
+6 · 0.67 
+
+> READ
+
+other 
+
+396 · 0.57 
+
+> READ
+
+look for protections 
+
+1071 · 0.49 
+
+> READ
+
+template or view 
+
+255 · 0.39 
+
+> READ
+
+test file 
+
+73 · 0.68 
+
+> READ
+
+configuration 
+
+237 · 0.52 
+
+> READ
+
+flagged code 
+
+1426 · 0.53 
+
+> READ
+
+third-party code 
+
+361 · 0.74 
+
+> READ
+
+recover from error 
+
+804 · 0.49 
+
+> READ
+
+trace data flow 
+
+946 · 0.51 
+
+> SEARCH
+
+other 
+
+189 · 0.49 
+
+> SEARCH
+
+find a definition 
+
+391 · 0.53 
+
+> SEARCH
+
+find callers or usages 
+
+376 · 0.56 
+
+> SEARCH
+
+recover from error 
+
+862 · 0.50 
+
+> SEARCH
+
+dangerous sinks 
+
+501 · 0.52 
+
+> SEARCH
+
+input sources 
+
+577 · 0.51 
+
+> SEARCH
+
+protections 
+
+458 · 0.50 
+
+> SEARCH
+
+routes or config 
+
+82 · 0.46 
+
+start end 
+
+Figure 12 Gemini 2.5 Pro over 29 behaviors, as in Figure 10. 27 RIVAL RESEARCH DeepSeek R1 accuracy ≤0.2 ≥0.8 
+
+> VERDICT
+
+other 
+
+1118 · 0.62 
+
+> VERDICT
+
+test or demo code 
+
+177 · 0.69 
+
+> VERDICT
+
+exploitable 
+
+47 · 0.23 
+
+> VERDICT
+
+framework protects 
+
+131 · 0.59 
+
+> VERDICT
+
+input is sanitized 
+
+204 · 0.47 
+
+> VERDICT
+
+not attacker input 
+
+329 · 0.55 
+
+> VERDICT
+
+insufficient context 
+
+84 · 0.33 
+
+> VERDICT
+
+low impact 
+
+39 · 0.38 
+
+> VERDICT
+
+missing sanitization 
+
+456 · 0.27 
+
+> VERDICT
+
+weak crypto or random 
+
+107 · 0.64 
+
+consult patterns 
+
+2050 · 0.55 
+
+> READ
+
+other 
+
+317 · 0.52 
+
+> READ
+
+look for protections 
+
+1536 · 0.49 
+
+> READ
+
+template or view 
+
+255 · 0.39 
+
+> READ
+
+test file 
+
+103 · 0.57 
+
+> READ
+
+configuration 
+
+237 · 0.48 
+
+> READ
+
+flagged code 
+
+1042 · 0.53 
+
+> READ
+
+third-party code 
+
+369 · 0.64 
+
+> READ
+
+recover from error 
+
+585 · 0.51 
+
+> READ
+
+trace data flow 
+
+636 · 0.51 
+
+> SEARCH
+
+other 
+
+192 · 0.61 
+
+> SEARCH
+
+find a definition 
+
+335 · 0.55 
+
+> SEARCH
+
+find callers or usages 
+
+381 · 0.61 
+
+> SEARCH
+
+recover from error 
+
+819 · 0.48 
+
+> SEARCH
+
+dangerous sinks 
+
+483 · 0.61 
+
+> SEARCH
+
+input sources 
+
+627 · 0.54 
+
+> SEARCH
+
+protections 
+
+889 · 0.48 
+
+> SEARCH
+
+routes or config 
+
+123 · 0.63 
+
+start end 
+
+Figure 13 DeepSeek R1 over 29 behaviors, as in Figure 10. 28 RIVAL RESEARCH 
+
+H.5 Decision-model questions 
+
+Some questions are semantic and polar, which keyword rules cannot capture: a pattern for “input is sani-tized” also matches “ htmlspecialchars only prevents XSS, not. . . ”. A Jev-style decision model answers them directly. 
+
+Verdicts without an attacker path are half as precise. Asked of 1,546 sampled “vulnerable” verdicts — does the agent show how attacker-controlled input reaches the flagged code, or only that a risky pattern is present? — verdicts that show a path are right 18% of the time (95% interval 15–22%, resampling commits), and those that do not, 9% (7–12%). Claude and Gemini 2.5 Pro show a path in half their “vulnerable” verdicts, DeepSeek R1 and Gemini 3 Pro less often (38% and 43%). Even with a path, “vulnerable” calls are mostly wrong here. 
+
+Most investigations are silent until the verdict. Asked at two points of 1,200 sampled runs (after the first observation, and 60% of the way through) whether the reasoning leans toward a vulnerability, toward a false positive, or neither yet (Table 5): Claude states a position mid-run in half its runs, Gemini 3 Pro in one in six, its “vulnerable” verdicts appearing only at the end. A position, once stated, is the final verdict 90% of the time.                     
+
+> Mid-run stance vulnerable false positive none yet final “vulnerable” Claude Sonnet 4.5 0.22 0.29 0.49 0.45 Gemini 3 Pro 0.09 0.07 0.83 0.63 Gemini 2.5 Pro 0.10 0.18 0.73 0.47 DeepSeek R1 0.17 0.08 0.74 0.50
+
+Table 5 What the agent’s reasoning leans toward 60% of the way through a run (decision model, 300 runs per agent). Both studies together took about 6,300 decision-model calls, a few minutes each at the provider’s rate limit. 
+
+H.6 Beyond the taxonomy 
+
+The task shapes the investigation more than the model. Comparing the behavior profiles of runs (cosine similarity of their behavior histograms), two different models on the same finding are twice as similar (0.58) as one model on two different findings (0.29); unrelated runs score 0.23. 
+
+Models that disagree investigated the same way. Within each finding, pairs of models that reach opposite verdicts are less similar in behavior than pairs that agree by only 0.022 (95% interval 0.009–0.034), a fraction of the gap between task and model. On one container finding, Claude and DeepSeek read the same three compose files in the same order and query the same pattern; from the same evidence one calls an unrestricted database volume a vulnerability, the other a false positive. With errors shared across models (Appendix H.1), disagreement and error live in the judgment, not in the investigation. 
+
+H.7 Anomalies as a spotlight 
+
+Outliers in the discretized runs are not failures in themselves, but they point at subsets worth reading, and some of those are fixable. • Unusual runs go to unusual places. The runs least likely under each agent’s own transition model read test files, templates and configuration; most end in a correct “non-production code” dismissal. 29 RIVAL RESEARCH 
+
+• Failed lookups are evidence, but not for every agent. Rare transitions into a verdict lead to verdicts issued right after a failed read or search (4–14% of verdicts). Claude, DeepSeek and Gemini 2.5 Pro then call “vulnerable” less (38% against 47–50%), and only on false-positive findings (47% to 36%; unchanged on true positives), using the empty result as evidence. Gemini 3 Pro does not adjust, even after its own malformed calls. • Runs that hit the step limit are symbol hunts. They over-represent symbol-definition searches 2.1– 2.9 × and repeat a behavior longer; for Gemini 2.5 Pro a fifth of their steps are error recovery. The fix suggested is in the symbol-lookup tool, not the model. 
+
+H.8 Building a new taxonomy with a decision model 
+
+The construction of Appendix D builds taxonomies Taxi was not given. Here it builds one of the agents’ local mistakes. A decision model scored 11,760 sampled steps for a local mistake, seeing each step with the earlier calls and their outputs, the tool’s output and the agent’s next reasoning (paths, file names and languages masked); construction then built categories over the 594 highest-scoring steps, with guidance never to use the vulnerability class, repository or language. Its 28 categories group into four families (Table 6), for example a failed search followed by “I have completed the analysis and confirmed the vulnerability”, or “no security patterns found” read as “this confirms the absence of integrity verification”. Scoring took 11,760 decision-model calls (under 5 minutes) and construction about 8 minutes.                  
+
+> Per 1,000 steps Claude Gemini 3 Gemini 2.5 DeepSeek Wrong tool arguments (nonexistent path or glob, no line range on a large file, minified files) 8.7 19.3 7.0 12.4 Repeating a call unchanged after it failed or an-swered 2.6 11.0 11.4 10.5 Concluding from a failed or empty lookup 0.0 3.9 3.1 5.6 Inefficient investigation (generic searches, read-ing boilerplate, reading before locating) 16.8 13.6 17.6 27.0
+
+Table 6 Local mistakes per 1,000 steps, from the decision-model-built taxonomy. Lower bounds: only the highest-scoring 5% of steps was categorized. 
+
+## I Related Work 
+
+Agent trajectory clustering and its taxonomization have been studied extensively. For example, [31, 19, 26], and others cluster conversations and create hierarchical taxonomies with natural language descriptions. Their focus was on taxonomizing trajectories as a whole, while our work operates at the granularity of steps, closer to [28], though they worked on a single input prompt at a time. That work belongs to the field of interpretability: it targeted chains-of-thought of simple problem solving tasks in order to understand the various methods a model takes in solving the problem. More broadly, LLMs have been used to induce topics and goal-driven clusters described in natural language [23, 32], to generate and validate taxonomies with humans in the loop [25], and to organize a given set of entities into a taxonomy [34]. A related line of work uses LLMs to describe in natural language how two text corpora differ [35, 37], and to fit statistical models, including clustering, whose parameters are natural-language predicates rather than embedding centroids [36]. 30 RIVAL RESEARCH 
+
+TypeSafe AI introduced Jev as a “System One” model for decisions inside software [1]. Rather than produce free-form text, it accepts application state and typed questions and returns choices, scores, or yes/no proba-bilities. The interface is intended for classification, routing, filtering, and gating at substantially lower cost than generative-model calls. Taxi adopts the interface rather than depending on the original model: through-out this report, Jev-style includes any compatible decision model capable of answering these bounded ques-tions. Over the years, many agent debugging tools have emerged. Laminar [20] and Docent [22] are open source frameworks that use LLMs to identify problems in agentic traces. Recently, LangSmith announced its own LangSmith Engine [27], similarly addressing this problem. All of them now include querying abilities to varying degrees of expressivity. None of them uses clustering as a central step; they use it post hoc, to aggregate results only for better human digestibility. Another related line of work focuses on agent taxonomies [9, 15, 5]. Most of them are constructed manually or at least semi-manually. They are designed to capture behavior on a global level, not tailored to the specific dataset explored. Cemri et al [9] focus on multi-agent failures. Gao et al [15] focus on agent actions in general, closer in spirit to us, rather than just failures. Ashury-Tahan et al [5] focus on failures, and they propose ErrorAtlas, a closed taxonomy, and ErrorMap, a taxonomy construction pipeline based on LLMs. Closer to Taxi in that the taxonomy is tailored to the data, AdaMAST [8] uses LLMs to induce a failure taxonomy from an agent system’s own execution traces, and Gupta et al [16] discover failure taxonomies from robot deployment logs by having a vision-language model explain each failed trajectory and clustering the explanations. Both target failures rather than behavior in general, and both rely on a model reading the trajectories, whereas Taxi’s embedding and regex paths assign steps to clusters without any model call. It will be interesting in the future to absorb such a taxonomy into Taxi, as a set of pre-defined constructs ,that Taxi will then modify or refine for the specific use case. 
+
+## J Advanced: Database Schema 
+
+Every table below lives in the single database described in Section 2.1; pk /fk mark primary/foreign keys, and 
+
+jsonb /vector mark JSON and vector columns respectively. Foreign keys not marked otherwise cascade on delete. 
+
+Corpus (data-source scope). 
+
+data_sources id (uuid, pk), name , source_type , source_spec (jsonb), n_trajectories ,
+
+n_steps , data_version , eval_data_version , embed_model , embed_state (jsonb), created_at ,
+
+updated_at . One row per ingested corpus; data_version /eval_data_version are the watermarks every incremental consumer (embedding, evaluators) reads against. 
+
+trajectories id (text, pk), data_source_id (fk → data_sources ), n_steps , meta (jsonb), 
+
+source_key , created_at . One row per agent run; meta carries source-specific fields (e.g. an ex-ternal run id, the ingest data version it arrived under); source_key is the stable external identifier incremental re-sync deduplicates against. 
+
+steps id (bigint, pk), trajectory_id (fk → trajectories ), step_index , role , action ,
+
+observation , tool_calls (jsonb), system_prompt , message_extras (jsonb), summary_text ,
+
+embedding (vector). One row per message/tool-call/observation within a trajectory; embedding is what embedding-based clustering and semantic search consume. 31 RIVAL RESEARCH 
+
+Taxonomy (project scope). 
+
+projects id (uuid, pk), name , owner , data_source_id (fk → data_sources , restrict), created_at ,
+
+taxonomy_settings (jsonb), pinned_hints (jsonb), filters (jsonb), synced_data_version ,plus a cached-mean-length validity pair. One row per analysis project; filters defines the project’s view-level scope (Section 2.1); synced_data_version is the data version that was last synced to the project. 
+
+project_collaborators project_id (pk, fk → projects ), email (pk), created_at . Per-project ac-cess list. 
+
+taxonomy_versions id (int, pk), project_id (fk → projects ), version , created_at , k,
+
+pipeline_id , settings (jsonb). One immutable row per published taxonomy snapshot. 
+
+clusters id (int, pk), taxonomy_version_id (fk → taxonomy_versions ), cluster_id , label ,
+
+description , kind (regex, embedding, or jev), n_members , mean_chars , centroid (vector), 
+
+pattern (text, nullable regex), parent_cluster_id (fk → clusters , nullable), lft , rgt . One row per cluster in a taxonomy version’s tree; lft /rgt are a nested-set encoding, so “member of cluster 
+
+C” is a single range check rather than a recursive query. 
+
+step_assignments taxonomy_version_id (pk, fk), trajectory_id (pk, fk), step_index (pk), 
+
+cluster_id . Composite-keyed step →cluster mapping for one taxonomy version. 
+
+taxonomy_pipeline_state project_id (fk), pipeline_id , labels (int array), cluster_labels 
+
+(jsonb), silhouette_state (jsonb), centroids (jsonb), step_refs (jsonb), created_at . Tran-sient, resumable staging state for an in-flight construction pipeline – the k-selection search checkpoint and incremental per-cluster labeling progress. 
+
+Chat. 
+
+conversations id (uuid, pk), project_id (fk → projects ), title , created_at , updated_at .
+
+messages id (uuid, pk), conversation_id (fk → conversations ), role , content , created_at ,
+
+metadata (jsonb). Chat history backing the interactive corpus-debugging surfaces. 
+
+Job engine. 
+
+jobs id (uuid, pk), data_source_id (fk, nullable), project_id (fk, nullable), kind , status ,
+
+phase , meta (jsonb), paused , pipeline_id , pipeline_superseded , retry_count , started_at ,
+
+updated_at , finished_at . One row per long-running operation. 
+
+job_events id (bigint, pk), job_id (fk → jobs ), seq , kind , message , payload (jsonb), ts . The append-only, ordered event log per job (phase/progress/thinking/tool/error events) backing streaming progress and after-the-fact inspection. 
+
+Evaluators and insights. 
+
+evaluators id (text, pk), yaml , enabled , created_at , updated_at . One row per published evaluator; 
+
+id is the evaluator name and yaml is the complete definition described in Section 2.5. 
+
+insight_definitions id (text, pk), yaml , enabled , created_at , updated_at . Same shape as 
+
+evaluators , for insight definitions. 32 RIVAL RESEARCH 
+
+insight_reports id (uuid, pk), insight_id (fk → insight_definitions ), data_source_id (fk), 
+
+data_version , trajectory_count , report_markdown , summary_markdown , slack_message_ts ,
+
+slack_thread_posted , created_at .
+
+insight_reports_dry_run a schema-identical shadow of insight_reports that dry-run report gener-ation writes to instead, for tests that don’t touch production reports or their watermark. 
+
+Shared, scoped read views. Rather than querying the tables above directly, every consumer is encouraged to read through four views, re-created at startup and parameterized per request by session-local settings (which project or data source(s) are in scope, the project’s own filters, and, for an insight run, its analysis-window bounds): project_trajectories(id, n_steps, meta, created_at, data_source_id) ,
+
+project_steps(id, trajectory_id, step_index, role, action, observation, tool_calls, system_prompt, summary_text, data_source_id) , project_clusters(cluster_id, label, description, kind, pattern, n_members, mean_chars, lft, rgt, parent_cluster_id) , and 
+
+project_step_assignments(trajectory_id, step_index, cluster_id) . This is an instance of the shared-backbone design in Section 2.1: scoping logic is written once, rather than once per consumer. 33

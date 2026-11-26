@@ -48,7 +48,7 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-25</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-26</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
     <strong class="dpr-home-dashboard-count">共 21 篇</strong>
@@ -58,7 +58,7 @@
     <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>7</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>14</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-25 03:06:55 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-26 02:16:06 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日精读7篇、速览21篇，重点聚焦向量检索架构与自适应复用中的HNSW迁移标准化方法。最值得看的是两篇9分精读：一是嵌入模型更换下的HNSW迁移容错方案，二是TriVS对磁盘驻留向量搜索的重构。普通读者可先读这两篇精读，把握迁移与存储架构的关键结论。</p>
+<p>今日精选21篇AI论文，精读7篇，聚焦Agent真实规模评测与错误恢复基准。最值得关注《Taxi》对Agent真实规模的分析和《SecondChance》对AI Agent可靠错误恢复的基准测试，均为9.0分。普通读者可从这两篇入手，理解Agent在真实场景下的能力边界与容错机制。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -81,9 +81,9 @@
     <strong class="dpr-home-dashboard-count">7 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Standardized Tolerance for Adaptive Reuse and Repair: A Method for HNSW Migration Under Embedding Model Change Scenarios">Standardized Tolerance for Adaptive Reuse and Repair: A Method for HNSW Migration Under Embedding Model Change Scenarios</span></li><li><span class="dpr-home-dashboard-paper-title" title="Look Before You Leap: Re-Architecting Disk-Resident Vector Search with TriVS">Look Before You Leap: Re-Architecting Disk-Resident Vector Search with TriVS</span></li><li><span class="dpr-home-dashboard-paper-title" title="LEDGER: Auditable Agent Memory Under Change">LEDGER: Auditable Agent Memory Under Change</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Taxi: Analyzing Agents at (Real) Scale">Taxi: Analyzing Agents at (Real) Scale</span></li><li><span class="dpr-home-dashboard-paper-title" title="SecondChance: Benchmarking Reliable Error Recovery in AI Agents">SecondChance: Benchmarking Reliable Error Recovery in AI Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="ICLWorld: Benchmarking In-Context Learning of Agents from Digital to Physical Worlds">ICLWorld: Benchmarking In-Context Learning of Agents from Digital to Physical Worlds</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>4</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>1</strong></span><span class="dpr-home-dashboard-tag">ann-graph <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>4</strong></span><span class="dpr-home-dashboard-tag">agent <strong>1</strong></span><span class="dpr-home-dashboard-tag">agent-trace <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -94,9 +94,9 @@
     <strong class="dpr-home-dashboard-count">14 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Lost in the Hallway: Benchmarking Persistent Spatial Memory Across Revisits">Lost in the Hallway: Benchmarking Persistent Spatial Memory Across Revisits</span></li><li><span class="dpr-home-dashboard-paper-title" title="SciResearch-Eval: Evaluating Scientific Judgment in Autonomous Experimental Agents">SciResearch-Eval: Evaluating Scientific Judgment in Autonomous Experimental Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="The abc index: Exact Retrieval for Learned Sparse Representations">The abc index: Exact Retrieval for Learned Sparse Representations</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Structure-Exploiting Hierarchical Retrieval for Long Narrative Documents: A Precision-Oriented Alternative to Learned Abstraction Trees">Structure-Exploiting Hierarchical Retrieval for Long Narrative Documents: A Precision-Oriented Alternative to Learned Abstraction Trees</span></li><li><span class="dpr-home-dashboard-paper-title" title="Same Executions, Different Gaps: Judgment Rules in Web-Agent Evaluation">Same Executions, Different Gaps: Judgment Rules in Web-Agent Evaluation</span></li><li><span class="dpr-home-dashboard-paper-title" title="MMMem: Self-Improving Agents with Task-Aware Multimodal Experience Consolidation">MMMem: Self-Improving Agents with Task-Aware Multimodal Experience Consolidation</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>7</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>4</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>2</strong></span><span class="dpr-home-dashboard-tag">agent-trace <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>7</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>5</strong></span><span class="dpr-home-dashboard-tag">agent-trace <strong>2</strong></span></div>
 </section>
 </div>
 

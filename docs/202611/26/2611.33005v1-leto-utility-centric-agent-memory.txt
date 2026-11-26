@@ -1,0 +1,646 @@
+Title: Leto: Utility-Centric Agent Memory
+
+URL Source: https://arxiv.org/pdf/2611.33005v1
+
+Published Time: Wed, 25 Nov 2026 04:03:00 GMT
+
+Number of Pages: 13
+
+Markdown Content:
+# Leto: Utility-Centric Agent Memory 
+
+Shuguang Chen 
+
+DigitalOcean 
+
+schen@digitalocean.com 
+
+Salman Paracha 
+
+DigitalOcean 
+
+salmanparacha@digitalocean.com 
+
+Abstract 
+
+Large language model (LLM) agents rely on external memory to retain and reuse informa-tion across interactions. Existing memory sys-tems treat memory as a record of the past and evaluate it by fidelity to the conversation. How-ever, the value of memory lies in whether it im-proves the agent’s response. A memory system decides what to memorize and what to serve before that response exists, and fidelity checks neither decision against it. Faithful memory can therefore fail to improve the response. We instead view memory as a prediction problem and present Leto , a memory system for LLM agents that focuses on the utility of memory to the future rather than on its fidelity to the past. Because future requests are unknown, Leto pre-serves access to conversation details through memory indexing, allowing information to re-main available through its sources. When a request arrives, memory replay draws on this index to anticipate and supply the context the agent needs beyond what the request explic-itly states. The utility of the served context remains uncertain until the response is gen-erated, motivating a utility loop that uses re-sponse outcomes to refine future memory se-lection. We evaluate our system against six memory systems on five benchmarks across three scenarios. In personalization, it outper-forms the strongest compared memory system by 16.3 percentage points in accuracy on PrefE-val and by 3.1 points in task completion on PERMA. For long-horizon tasks, it achieves the best overall performance on MemoryArena averaged over five environments with a gain that increases with the chain depth. In long-context understanding, it is on par with retrieval over the raw history while serving fewer con-text tokens. 
+
+1 Introduction 
+
+An LLM agent that serves the same user or works on the same task across sessions requires memory of what earlier sessions established, such as a pref-erence the user expressed weeks ago or the state of an unfinished task. Existing memory systems ex-tract facts or generate summaries from each session, then retrieve the memory most similar to an incom-ing request and insert it into the context (Chhikara et al., 2025; Rasmussen et al., 2025; Latimer et al., 2025). Some systems additionally reflect on the stored memory in the background to form higher-level notes or user profiles (Park et al., 2023; Zhong et al., 2024; Xu et al., 2025). Both the construction and the evaluation of these systems are oriented toward the past. Their evaluation measures fidelity (i.e., how completely the memory covers the con-versation and how often the retrieved memory con-tains the gold evidence) (Maharana et al., 2024; Wu et al., 2025; Liu et al., 2026). However, fidelity to the past does not by itself yield a better response. An agent needs the relevant context in its input to produce a good response. A memory system supplies this context through two decisions: what to memorize when a conversation ends and what to serve when a request arrives. Ex-isting systems assume that fidelity at each stage preserves the context needed for future responses. This assumption leaves two gaps: 1) The mem-orization gap arises because what is memorized determines what can later be served, yet faithful memory does not necessarily preserve what a future request will require. Existing systems keep sum-maries that omit details whose relevance appears later (Wu et al., 2025; Zou et al., 2026), or extract facts judged by coverage of the conversation, not by what a future request requires (Chhikara et al., 2025; Latimer et al., 2025); 2) The serving gap arises because memory is selected by how closely it matches the request, which may not reflect what the response requires. Existing systems rank mem-ory by similarity to the request, yet users rarely re-state standing preferences and memory that would change the response may not rank highly (Salemi 1arXiv:2611.33005v1 [cs.CL] 24 Nov 2026 Hotel Lindenhof                               
+
+> 3min walk 24h desk stairs only
+> Hotel Aurora
+> 6min walk 24h desk accessible UTILITY
+> WORKSHOP LANDS 9PM WHEELCHAIR
+> FIDELITY
+> WORKSHOP LANDS 9PM
+> Flight lands 9pm, Sep 13 Uses awheelchair Vegetarian
+> MEMORY
+> Workshop, Riverside Center, Sep 14–16
+> REQUEST
+> Book me ahotel near the workshop venue.
+
+Figure 1: An example of a request served from the same memory store under different criteria. Selection by fidelity serves the memory that matches the request; selection by utility serves the memory the response needs. Hotel names and details are fictional. 
+
+et al., 2024; Zhao et al., 2025). Fidelity measures neither gap because it assesses how well memory represents the conversation, not whether the served context meets the needs of the response. Both gaps arise because memory decisions must anticipate the context a response will need before their effects can be evaluated. We therefore view memory as a prediction problem. At write time, the system must predict which information will matter for future requests. At serving time, it must predict which memory the response needs. The request provides evidence about these needs but does not fully specify them. The accuracy of these predictions remains unknown until the response is generated. Both should therefore be evaluated against the observed outcome, which can then be used to refine future predictions. The value of mem-ory thus lies in the response it enables, which we call its utility. Figure 1 illustrates the difference between the two criteria on one request served from the same store. Selection by fidelity serves the memory that matches the request and nothing more. The response satisfies the request as stated, yet the user cannot use the hotel it books. Selec-tion by utility also serves the memory that the user uses a wheelchair, which the request does not men-tion. The response then books a hotel the user can use. The two selections differ by a single memory, which decides the outcome. We build on this view and present Leto , a mem-ory system that manages memory by its predicted utility. To address the memorization gap, Leto pre-serves access to conversation details through mem-ory indexing so that information remains available even when its utility is not apparent at write time. To address the serving gap, memory replay draws on this index ahead of the request to anticipate the context the agent needs beyond what the request states. This context is served together with the memory retrieved for the request. The response then provides evidence of the utility of what was served, and a utility loop feeds this evidence back to refine subsequent memory selection. We evaluate Leto against six memory systems on five benchmarks spanning three scenarios: per-sonalization, long-horizon tasks, and long-context understanding. Leto achieves the best overall per-formance among the compared memory systems in all three scenarios. In personalization, it out-performs the strongest compared memory system by 16.3 percentage points in accuracy on PrefEval and by 3.1 points in task completion on PERMA. For long-horizon tasks, it achieves the best over-all performance on MemoryArena averaged over five environments. Its gain over an agent with-out memory increases with the chain depth. For long-context understanding, it is competitive with retrieval over the raw history while serving fewer context tokens. 
+
+2 Related Work 
+
+External memory systems build memory of past interactions and serve parts of it to later ones. They extract facts or write summaries and reconcile them as interactions accumulate (Packer et al., 2023; Chhikara et al., 2025; Zhong et al., 2024). They or-ganize the store as temporal graphs or linked notes or associative indexes (Rasmussen et al., 2025; Xu et al., 2025; Gutiérrez et al., 2024). They add ed-itable memory blocks and reflection over the store 2alongside several retrieval mechanisms (Packer et al., 2023; Park et al., 2023; Latimer et al., 2025). They are also evaluated against the past. The write side is judged by how completely and accurately memory captures the conversation, the read side by how well it ranks memory against the request. The benchmarks measure memory the same way (Wu et al., 2025; Maharana et al., 2024; Liu et al., 2026). Several lines of work move one of the two de-cisions toward the future. On what to memo-rize, some index retained text by decontextualized claims or extracted entities (Choi et al., 2021; Chen et al., 2024; Gutiérrez et al., 2024; Wu et al., 2025). Others keep what a later decision is expected to need (Zou et al., 2026). On what to serve, some place standing memory in the context or revise memory between interactions before any request arrives (Packer et al., 2023; Zhong et al., 2024). Memory-R1 (Yan et al., 2026) learns memory oper-ations from downstream task reward. None carries on the memory itself an estimate of its utility that feedback updates. Leto moves both decisions to-ward the future and maintains such an estimate for every memory. Whether memory helps is a question about outcomes. PrefEval (Zhao et al., 2025) and PERMA measure whether an earlier preference is followed and a personalized task completed. Mem-oryArena (He et al., 2026) measures progress on interdependent tasks. LoCoMo and LongMemEval measure answers to questions over long histories. Each reports a system’s level. The utility of its memory is the level’s difference from the same agent without memory on the same items, which can be negative and which no level shows. 
+
+3 Problem Formulation 
+
+An external memory system supports an agent across timestamped sessions by deciding what to memorize and what to serve. At write time , it de-cides what to memorize when a session ends. At 
+
+serving time , it selects memory M from the store to place in the agent’s context when a request x ar-rives. The fidelity view judges the write decision by how completely and accurately the store represents past sessions, and judges the serving decision by how closely the served memory matches x. Both criteria can be assessed using information available at decision time, but neither establishes whether the context needed for the right response is sup-plied. The memorization gap consists of required information from past sessions that the store no longer holds. The serving gap consists of required information that the store holds but that the served memory omits. We instead define the objective by task outcomes. Let y(x, M ) ∈ { 0, 1} denote the graded task out-come for request x when memory M is supplied to the agent. We define the utility of the served memory as 
+
+U (x, M ) = y(x, M ) − y(x, ∅), (1) where y(x, ∅) is the outcome without memory. This objective captures whether the served memory improves or hurts task performance, or leaves it unchanged. It connects both memory decisions to task performance. The write decision determines what information remains available, and the serv-ing decision determines what reaches the agent. Utility depends on both the request and how the agent uses the served memory. Relevant informa-tion may provide no benefit if it is redundant or unused, and may hurt performance if it misleads the agent. The system must therefore anticipate what the served memory contributes to the response when deciding what to serve. Future requests are unknown at write time, so memory utility must be forecast across them. During subsequent interac-tions, feedback provides proxy signals of memory utility that update the utility index for the serving decisions that follow. 
+
+4 Methodology 
+
+Leto manages memory through three mechanisms, memory indexing and memory replay followed by the utility loop. Figure 2 summarizes this workflow. 
+
+4.1 Memory Indexing 
+
+Because future requests are unknown at write time, a memory system may retain information that is never needed or discard information that is. The costs of these two errors are asymmetric. Unhelpful information costs storage, while a discarded detail degrades the performance on every later request that depends on it. Leto therefore retains every conversation and indexes it to find what a request needs. 
+
+Write time. Indexing the conversation by its raw messages would make retrieval imprecise, because a message can cover several topics and its meaning often depends on its context. Leto therefore indexes the conversation by atomic facts (Choi et al., 2021; 3PREVIOUS SESSIONS MEMORY STORE          
+
+> ABC
+> REQUEST RETRIEVE UPDATE UTILITY INDEX
+> SOURCE EPISODE SUMMARY
+> AFACT UTILITY PROFILE TASK PROFILE TASK
+> ABFACTS
+> UTILITY GATE
+> ?CONSOLIDATE
+> EXTRACT
+> POSITIVE OUTCOME
+> A
+> NEGATIVE OUTCOME
+> BABC
+> τ
+
+Figure 2: Leto workflow. Memory indexing stores atomic facts as keys to their retained source. Memory replay composes the profile and task state that give context across requests. The utility loop gives each new memory a forecast u0(m) and serves retrieved memory whose index satisfies u ≥ τ , then updates the index from feedback. 
+
+Chen et al., 2024). An atomic fact states a single claim in self-contained form. This allows it to be matched to a request precisely and compared with other facts on the same subject. Existing memory systems commonly serve the extracted facts them-selves as the memory. Leto instead uses each fact as a key whose value is its source, the span of adja-cent messages that the fact was extracted from. A source reaches the agent only when a fact match-ing the request points to it, so the context carries less noise than retrieval over raw chunks. Informa-tion omitted from a fact also remains accessible through its source, which preserves the original wording and qualifications. New facts are consoli-dated with the existing ones. A fact that revises an earlier one supersedes it without deleting it. The in-dex can thus distinguish what currently holds from what once held. Each session also receives a short summary. 
+
+Serving time. When a request arrives, Leto re-trieves the relevant facts with their sources. The utility loop (Section 4.3) then decides which are served within a token budget, alongside the stand-ing context from memory replay (Section 4.2). 
+
+4.2 Memory Replay 
+
+Retrieval can miss relevant preferences and con-straints that a request leaves unstated. Leto there-fore replays stored memory between conversations. It re-reads what the store holds and composes the standing context that the next conversation starts with. The standing context consists of a user pro-file and a task state if a task is declared. Both are composed before any request arrives. 
+
+Profile rewrite. Profile rewrite maintains a user profile that carries what holds for the user regard-less of the request, such as standing preferences and constraints or instructions on how to act. After new sessions are indexed, Leto rewrites the pro-file from the current facts about the user and the session summaries. The rewrite keeps the profile concise by merging related facts into one statement and leaving out superseded preferences. 
+
+Task rendering. A later step of a long-horizon task depends on what earlier sessions established, which the request rarely restates. Task rendering supplies it as a task state at the start of every con-versation on the task. The first part of the task state shows where the task stands through its current facts, grouped by entity with each attribute and its current value. The second part shows how the task got there through summaries of its prior sessions in order. 
+
+4.3 Utility Loop 
+
+Whether a memory will improve a response cannot be observed at write time. Leto therefore forecasts a utility index u(m) ∈ [0 , 1] for each memory and revises it with the outcome observed each time the memory is served. This cycle forms the utility loop. 
+
+Utility forecast. Each new memory receives an initial utility forecast u0(m) as its utility index. A low forecast does not delete the memory. The fact and its source remain in the store. Retention and serving are separate decisions, which allows serv-ing priorities to change as feedback accumulates. 
+
+Outcome observations. The forecast is made before a memory is used, and whether the mem-4ory helps becomes evident only after it is served. 
+
+Leto therefore observes the outcome of each served memory to obtain evidence of its utility. We use the interaction signals from Chen et al. (2026) as the observations, which are detected in the conversa-tion by lexical rules. Each signal marks a positive outcome (e.g., a confirmation or a use of the mem-ory) or a negative outcome (e.g., a correction) for a memory, encoded as 1 and 0, respectively. When a graded task outcome is available, it can also be recorded for the memory served during the task. These signals provide evidence of memory utility without directly measuring an individual memory’s contribution to the outcome. 
+
+Utility update. Given observations o1, . . . , o n
+
+and the initial forecast weighted as k observations, the index is 
+
+u(m) = k u 0(m) + Pni=1 oi
+
+k + n . (2) Here, k > 0 controls the weight of the initial fore-cast relative to feedback. The updated index then closes the loop. A retrieved memory passes the util-ity gate only if its index meets a threshold τ . When the retrieved memory exceeds the context budget, memory with a higher utility index is prioritized. The utility index is a heuristic serving priority, not an estimate of Equation 1. It combines observable signals to guide memory selection, while paired evaluation measures whether the system as a whole improves task outcomes. 
+
+5 Experiments 
+
+We evaluate Leto across three scenarios: person-alization, long-horizon tasks, and long-context un-derstanding. These scenarios differ in what infor-mation is needed from earlier interactions and how explicitly the current request identifies it. 
+
+5.1 Experimental Setup Benchmarks. We use five benchmarks grouped into three scenarios: PERMA (Liu et al., 2026) and PrefEval (Zhao et al., 2025) for personalization ;MemoryArena (He et al., 2026) for long-horizon tasks ; and LoCoMo (Maharana et al., 2024) and LongMemEval S (Wu et al., 2025) for long-context understanding . Table 4 in Appendix A summarizes the sample counts and evaluation metrics as well as each memory store’s scope. 
+
+Compared methods. We compare Leto with six memory systems: Mem0 (Chhikara et al., 2025), LangMem 1, Hindsight (Latimer et al., 2025), 
+
+Letta (Packer et al., 2023), Zep (Rasmussen et al., 2025), and Memobase 2. Each system uses the con-figuration provided by the benchmark when avail-able and follows its own documented setup other-wise. We also include a RAG baseline that retains the complete history and retrieves raw conversa-tion chunks by embedding similarity to the current request (Lewis et al., 2020). We establish two further baselines: No Mem-ory supplies no memory from earlier sessions, and 
+
+Standalone is the benchmark’s own agent given the complete history in its context. Appendix B reports the share of units each system improves and degrades against No Memory .
+
+5.2 Scenario 1: Personalization 
+
+Personalization requires an agent to apply informa-tion from earlier interactions even when the cur-rent request leaves it unstated. PrefEval focuses on preference following, while PERMA evaluates personalization across a user’s interaction history. 
+
+5.2.1 PrefEval Main results. PrefEval evaluates whether an agent follows a preference stated earlier in the conversation when it answers the request. Follow-ing the benchmark’s evaluation protocol, we report preference-following accuracy and error categories in Table 1. Leto achieves 60.5% accuracy, exceed-ing the strongest compared system Hindsight by 16.3 percentage points. RAG and Standalone reach 13.1% and 3.3%, respectively. Leto also reduces preference-unaware violations to 19.1%, compared with 33.8% under Hindsight .
+
+Preference availability and use. Accuracy on PrefEval depends on whether the preference reaches the agent’s context and on whether the agent then follows it. Figure 3 separates the two, using lexical detection as a proxy for availability. A preference is detected when at least 40% of its content words occur in the served context. The preference is detected in 84% of Leto ’s contexts, compared with 12%–69% for the other memory systems. The agent follows a detected preference in 64% of cases under Leto , compared with 32%– 56% under the other memory systems. The agent 
+
+> 1https://github.com/langchain-ai/langmem
+> 2https://github.com/memodb-io/memobase
+
+5PrefEval PERMA C-S PERMA C-M System Unaware Halluc. Incons. Unhelp. Acc. MCQ Comp. MS MCQ Comp. MS 
+
+No History 
+
+No Memory 74.00 24.20 0.00 0.40 1.40 53.66 74.23 1.00 56.69 60.51 1.00 
+
+Full History 
+
+Standalone (gpt-4o-mini) 65.40 31.00 0.20 0.10 3.30 78.01 81.56 1.17 71.34 63.69 1.62 RAG 54.20 31.70 1.00 0.00 13.10 70.45 83.69 1.87 68.15 61.78 1.73 
+
+Compared Memory Systems 
+
+Mem0 45.70 18.80 1.80 0.20 33.50 69.98 80.38 1.85 67.52 62.42 1.78 LangMem 32.10 25.40 1.60 0.20 40.70 74.70 81.56 1.80 67.52 62.42 1.84 Hindsight 33.80 19.90 1.90 0.20 44.20 69.03 80.14 2.06 66.24 59.87 1.90 Letta 47.00 34.10 0.10 0.20 18.60 56.50 74.47 2.06 54.78 54.78 2.28 
+
+Zep 68.10 20.90 0.60 1.00 9.40 68.32 78.49 1.57 58.60 63.69 1.46 Memobase 45.80 24.30 1.50 0.20 28.20 73.29 81.80 1.78 67.52 64.97 1.73 
+
+Our System 
+
+Leto 19.10 18.80 1.60 0.00 60.50 79.43 80.38 1.96 71.97 72.61 2.15 
+
+Table 1: Personalization results. PrefEval after ten filler turns (%): four error types and accuracy (Acc.). Unaware: preference-unaware violation; Halluc.: hallucination; Incons.: inconsistency; Unhelp.: unhelpful response. Accu-racy: the share of personalized responses, which satisfy the preference without violating or inventing one. PERMA type-3 (%): C-S / C-M: clean single- / multi-domain; Comp.: completion; MS: memory score (1–4), PERMA’s fidelity measure of the served context against the gold preferences. Bold: best value among the memory systems, the lowest for the four error types. 0 25 50 75 100       
+
+> PREFERENCE DETECTED IN CONTEXT (% OF ITEMS)
+> Leto
+> Mem0 LangMem Memobase Hindsight Letta Zep
+
+PREFERENCE AVAILABILITY         
+
+> 84.2
+> 69.2 67.0 64.1 62.0 41.3 12.4
+> 025 50 75 100
+> RESPONSES FOLLOWING THE PREFERENCE (%)
+> Leto
+> Mem0 LangMem Memobase Hindsight Letta Zep
+
+PREFERENCE USE         
+
+> 39.9 64.4
+> 11.4 43.4 20.3 50.7 14.5 35.9 24.5 56.3 9.5 31.5 3.9 48.4
+> WHEN DETECTED WHEN NOT DETECTED
+
+Figure 3: Preference availability and use on PrefEval. A preference counts as detected when at least 40% of its content words occur in the served context. Blue and gray circles show preference-following rates with and without detection, respectively. 
+
+follows the preference more often when it is de-tected than when it is not, by 21–45 percentage points across the memory systems. Availability therefore matters, but it does not ensure use. Stan-dalone illustrates the difference. The preference is in its context inside the full history in every item, yet the agent follows it in 3.3% of them. Leto 
+
+serves the preference in a short standing user pro-file written without reading the request and placed in every item, so it reaches the agent whether or not the request resembles it. 
+
+5.2.2 PERMA Main results. We follow PERMA’s type-3 evalu-ation, reporting multiple-choice (MCQ) accuracy and interactive task completion under the clean 6Environment Overall System Shopping Travel Search Math Physics PS SR                                                                       
+
+> No History
+> No Memory 44.24 / 0.00 0.00 / 0.00 3.26 / 8.14 24.81 / 15.00 44.75 / 30.00 23.41 10.63
+> Full History
+> Standalone (gpt-5-mini) 53.94 / 0.67 2.30 / 0.00 3.03 / 3.17 31.07 / 20.00 61.39 / 50.00 30.34 14.77 RAG 49.69 / 0.00 1.50 / 0.00 5.85 / 13.57 33.07 / 22.50 57.85 / 45.00 29.59 16.21
+> Compared Memory Systems
+> Mem0 41.56 / 0.00 0.00 / 0.00 4.84 / 11.31 28.97 / 17.50 59.72 / 45.00 27.02 14.76 LangMem 50.56 / 0.67 0.00 / 0.00 5.03 / 13.57 25.51 / 12.50 43.22 / 20.00 24.86 9.35 Hindsight 43.05 / 0.00 0.00 / 0.00 4.19 / 9.95 30.31 / 17.50 54.26 / 30.00 26.36 11.49 Letta 54.78 / 0.67 0.00 / 0.00 5.11 / 16.74 31.71 / 17.50 64.58 / 55.00 31.24 17.98 Zep 46.63 / 0.00 0.00 / 0.00 6.99 / 21.27 27.27 / 12.50 44.47 / 20.00 25.07 10.75 Memobase 48.55 / 0.00 0.00 / 0.00 5.21 / 14.03 23.92 / 0.00 47.18 / 20.00 24.97 6.81
+> Our System
+> Leto 53.22 / 0.00 2.73 / 0.37 7.97 / 21.27 31.77 / 20.00 64.35 / 50.00 32.01 18.33
+
+Table 2: MemoryArena progress score (PS) and success rate (SR) in percent, as PS / SR per environment. Overall columns average the five environments equally. SR measures full-chain completion except in search, where it measures final-question success. Bold: best value among the memory systems. 
+
+single-domain (C-S) and clean multi-domain (C-M) conditions. As shown in Table 1, Leto achieves the highest MCQ accuracy in both conditions. Its clearest advantage is in C-M completion, where it exceeds the strongest compared system Memo-base by 7.64 percentage points. This advantage does not extend to C-S completion, where RAG 
+
+performs best. Leto completes 76.5% of tasks av-eraged over the two conditions, 3.1 points above 
+
+Memobase . Organizing the history matters most when a task draws on preferences from multiple domains: Leto ’s standing user profile gathers the user’s preferences across domains into one block placed for every task, whereas retrieval by the re-quest returns the domain the request names. 
+
+Fidelity and task performance. PERMA’s mem-ory score is a fidelity measure of the served context against the gold preferences and does not consis-tently track task performance. Letta has the highest memory score in the C-M condition but the lowest MCQ accuracy and completion rate. A stronger fi-delity score therefore does not necessarily translate into better personalization. 
+
+5.3 Scenario 2: Long-Horizon Tasks 
+
+Long-horizon tasks require an agent to carry infor-mation from earlier interactions into later decisions. MemoryArena evaluates this ability through inter-dependent subtasks across shopping, travel, search, math, and physics. 
+
+Main results. Table 2 reports progress score (PS) and success rate (SR), averaged equally across the five environments. PS measures progress within a task chain, while SR measures the proportion of completed chains. Leto achieves the highest overall PS (32.01%) and SR (18.33%) among all compared methods. It is also the only memory system whose useful rate exceeds its harmful rate in every environment (Appendix B). 
+
+Effect of chain depth. Figure 4 shows how the gain over the No Memory baseline varies with chain position in shopping and search. Every shopping chain has six purchases, while search chains run longer. Leto ’s gain grows with position in both. In shopping it rises from 1.3 percentage points at the first purchase to 7.3 points at the sixth. In search it rises from zero at the first question to approximately 14 points at the eighth, where every other system is below 10 points and most remain close to zero. A later step depends on what earlier rounds established. Leto serves it as the task state in every later round, so its contribution grows as the chain proceeds. Letta holds the larger gain in shopping, where a later purchase depends on only a few earlier ones. In search Letta reaches 7.2 points at the eighth question, half of Leto ’s gain. 
+
+5.4 Scenario 3: Long-Context Understanding 
+
+Long-context understanding requires an agent to re-cover details and relationships from earlier conver-71 2 3 4 5 6-10 -5 0510 15 20                               
+
+> SHOPPING PURCHASE STEPS
+> Mem0
+> LangMem
+> Hindsight
+> Letta
+> Zep
+> Memobase
+> Leto +7.3
+> +1.3
+> N150 150 150 150 150 150
+> 12345678
+> CHAIN POSITION
+> -10 -5 0510 15 20
+> SEARCH QUESTIONS OF ACHAIN
+> Mem0
+> LangMem
+> Hindsight
+> Letta
+> Zep
+> Memobase
+> Leto +14.4
+> +0.0 +5.4
+> N221 221 221 221 214 184 142 97
+> PASS-RATE  CHANGE  VS.  NO  MEMORY  (PP)
+
+Figure 4: Pass-rate gains over No Memory by chain po-sition in MemoryArena shopping and search. N below the axis counts the chains reaching each position. 
+
+sations. Questions often identify the information sought more explicitly than in the other scenarios. 
+
+Main results. Table 3 reports accuracy on Lo-CoMo and LongMemEval, with the tokens each system retrieves per question and its evidence re-call. Leto achieves the highest accuracy among the memory systems on both benchmarks, 71.82% on LoCoMo and 73.20% on LongMemEval. It is 2.79 percentage points lower than RAG on LoCoMo and 6.80 points higher on LongMemEval. RAG re-trieves about 1.7× and eight times as many tokens. Retrieval over the raw history is already effective because these questions identify the information sought, which suggests that the benefit of memory organization varies with how explicitly the request identifies the relevant history. Results by question category are in Appendix C. 
+
+Evidence coverage. Evidence recall is the frac-tion of an annotated evidence message’s content words that appear in the served context, a lexical proxy for whether the supporting evidence reaches the agent (Appendix C). Leto has the highest re-call on both benchmarks, 86.58% on LoCoMo and 95.38% on LongMemEval. The other memory sys-tems reach at most 56.69% and 79.18%. Serving the source of the retrieved facts therefore keeps most of the evidence in a small context. The re-
+
+LoCoMo LongMemEval System Tokens Recall Acc. Tokens Recall Acc. 
+
+No History 
+
+No Memory – – 4.55 – – 6.40 
+
+Full History 
+
+Standalone 27,834 – 74.42 111,569 – 51.60 RAG 1,999 – 74.61 9,813 – 66.40 
+
+Compared Memory Systems 
+
+Mem0 745 56.69 67.86 1,113 79.18 69.20 LangMem 1,757 43.07 32.08 1,735 67.80 37.60 Hindsight 608 46.51 65.13 701 70.61 70.00 Letta 55 26.24 51.36 86 29.59 36.60 Zep 479 29.79 41.36 2,039 69.36 48.00 Memobase 1,027 24.79 13.18 1,025 34.40 15.00 
+
+Our System 
+
+Leto 1,192 86.58 71.82 1,185 95.38 73.20 
+
+Table 3: Long-context understanding on LoCoMo and LongMemEval S. Tokens: average tokens of retrieved memory per question (the full history for Standalone ,which uses gpt-4o-mini). Recall: evidence recall (%), measured for the memory systems. Acc.: accuracy (%). Bold: best value among the memory systems. 
+
+maining difference from RAG on LoCoMo is con-centrated in single-hop questions. Approximately 40% of those answered correctly by RAG but not by Leto have an evidence message that no extracted fact points to, so access through the fact index still depends on extraction coverage. 
+
+6 Conclusion 
+
+The value of agent memory lies in the responses it enables, and fidelity to past conversations does not ensure that value. We viewed memory as a prediction problem and presented Leto , a memory system that decides what to memorize and what to serve by the utility of memory to future responses. 
+
+Leto leads the compared memory systems in three scenarios that place different demands on memory, which suggests that utility is a general criterion for memory design. We hope this view moves memory systems from how faithfully they record the past toward how much they improve what the agent does next. As future work, we will learn utility forecasts from feedback so that memory systems better anticipate the needs of future interactions. We will also study how to attribute an outcome to an individual memory and how utility transfers across agents. 8Limitations 
+
+Leto trades storage and write-time computation for the ability to recover what extraction did not predict would matter. Keeping every conversation beneath the fact index removes the loss of discarded de-tail, but it does not make every detail reachable: a message that no fact points to is served only when another fact’s source contains it. Extraction cov-erage therefore remains the bound on how far the memorization gap can be closed. Serving standing information before the request bridges the serving gap where a request leaves a standing constraint unstated, at the cost of context that a given request may not need. The profile and task state are gen-erated summaries that can misstate what the con-versations established. The utility index is updated from outcomes, but an outcome is shared by ev-ery memory served for that response. The signal is therefore coarse: an unnecessary memory can be rewarded and a correct one penalized. A mem-ory that is never served never earns an observation. More generally, utility is a property of the memory system together with the agent it serves. The same served memory can help one agent and not another, so what Leto learns about a memory’s utility is spe-cific to the agent and the tasks it was observed on. Finally, the approach addresses what to memorize and what to serve but not how the agent uses what it is served; an agent can still overlook useful served memory (Liu et al., 2024). 
+
+References 
+
+Shuguang Chen, Adil Hafeez, and Salman Paracha. 2026. Signals: Trajectory sampling and triage for agentic interactions. arXiv preprint arXiv:2604.00356 .Tong Chen, Hongwei Wang, Sihao Chen, Wenhao Yu, Kaixin Ma, Xinran Zhao, Hongming Zhang, and Dong Yu. 2024. Dense X retrieval: What retrieval granularity should we use? In Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing , pages 15159–15177, Miami, Florida, USA. Association for Computational Lin-guistics. Prateek Chhikara, Dev Khant, Saket Aryan, Taranjeet Singh, and Deshraj Yadav. 2025. Mem0: Building production-ready AI agents with scalable long-term memory. arXiv preprint arXiv:2504.19413 .Eunsol Choi, Jennimaria Palomaki, Matthew Lamm, Tom Kwiatkowski, Dipanjan Das, and Michael Collins. 2021. Decontextualization: Making sen-tences stand-alone. Transactions of the Association for Computational Linguistics , 9:447–461. Bernal Jiménez Gutiérrez, Yiheng Shu, Yu Gu, Michi-hiro Yasunaga, and Yu Su. 2024. HippoRAG: Neu-robiologically inspired long-term memory for large language models. In Advances in Neural Information Processing Systems , volume 37, pages 59532–59569. Curran Associates, Inc. Zexue He, Yu Wang, Churan Zhi, Yuanzhe Hu, Tzu-Ping Chen, Lang Yin, Ze Chen, Tong Arthur Wu, Siru Ouyang, Zihan Wang, Jiaxin Pei, Julian McAuley, Yejin Choi, and Alex Pentland. 2026. Benchmarking agent memory in interdependent multi-session agen-tic tasks. In Proceedings of the 43rd International Conference on Machine Learning , volume 306 of 
+
+Proceedings of Machine Learning Research , pages 41975–42005. PMLR. Chris Latimer, Nicoló Boschi, Andrew Neeser, Chris Bartholomew, Gaurav Srivastava, Xuan Wang, and Naren Ramakrishnan. 2025. Hindsight is 20/20: Building agent memory that retains, recalls, and re-flects. arXiv preprint arXiv:2512.12818 .Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Hein-rich Küttler, Mike Lewis, Wen-tau Yih, Tim Rock-täschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-augmented generation for knowledge-intensive NLP tasks. In Advances in Neural Infor-mation Processing Systems , volume 33, pages 9459– 9474. Curran Associates, Inc. Nelson F. Liu, Kevin Lin, John Hewitt, Ashwin Paran-jape, Michele Bevilacqua, Fabio Petroni, and Percy Liang. 2024. Lost in the middle: How language mod-els use long contexts. Transactions of the Association for Computational Linguistics , 12:157–173. Shuochen Liu, Junyi Zhu, Long Shu, Junda Lin, Yuhao Chen, Haotian Zhang, Chao Zhang, Derong Xu, Jia Li, Bo Tang, Zhiyu Li, Feiyu Xiong, Enhong Chen, and Tong Xu. 2026. PERMA: Benchmarking per-sonalized memory agents via event-driven prefer-ence and realistic task environments. arXiv preprint arXiv:2603.23231 .Adyasha Maharana, Dong-Ho Lee, Sergey Tulyakov, Mohit Bansal, Francesco Barbieri, and Yuwei Fang. 2024. Evaluating very long-term conversational memory of LLM agents. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) , pages 13851– 13870, Bangkok, Thailand. Association for Compu-tational Linguistics. Charles Packer, Sarah Wooders, Kevin Lin, Vivian Fang, Shishir G. Patil, Ion Stoica, and Joseph E. Gonzalez. 2023. MemGPT: Towards LLMs as operating sys-tems. arXiv preprint arXiv:2310.08560 .Joon Sung Park, Joseph O’Brien, Carrie Jun Cai, Mered-ith Ringel Morris, Percy Liang, and Michael S. Bern-stein. 2023. Generative agents: Interactive simulacra 
+
+9of human behavior. In Proceedings of the 36th An-nual ACM Symposium on User Interface Software and Technology , UIST ’23, pages 1–22. Association for Computing Machinery. Preston Rasmussen, Pavlo Paliychuk, Travis Beauvais, Jack Ryan, and Daniel Chalef. 2025. Zep: A tempo-ral knowledge graph architecture for agent memory. 
+
+arXiv preprint arXiv:2501.13956 .Alireza Salemi, Sheshera Mysore, Michael Bendersky, and Hamed Zamani. 2024. LaMP: When large lan-guage models meet personalization. In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers) ,pages 7370–7392, Bangkok, Thailand. Association for Computational Linguistics. Di Wu, Hongwei Wang, Wenhao Yu, Yuwei Zhang, Kai-Wei Chang, and Dong Yu. 2025. LongMemEval: Benchmarking chat assistants on long-term interac-tive memory. In International Conference on Learn-ing Representations , volume 2025, pages 86809– 86836. Wujiang Xu, Zujie Liang, Kai Mei, Hang Gao, Juntao Tan, and Yongfeng Zhang. 2025. A-Mem: Agentic memory for LLM agents. In Advances in Neural Information Processing Systems , volume 38, Main Conference, pages 17577–17604. Curran Associates, Inc. Sikuan Yan, Xiufeng Yang, Zuchao Huang, Ercong Nie, Zifeng Ding, Zonggen Li, Xiaowen Ma, Jinhe Bi, Kristian Kersting, Jeff Z. Pan, Hinrich Schuetze, Volker Tresp, and Yunpu Ma. 2026. Memory-R1: Enhancing large language model agents to manage and utilize memories via reinforcement learning. In 
+
+Proceedings of the 64th Annual Meeting of the As-sociation for Computational Linguistics (Volume 1: Long Papers) , pages 12805–12825, San Diego, Cali-fornia, United States. Association for Computational Linguistics. Siyan Zhao, Mingyi Hong, Yang Liu, Devamanyu Haz-arika, and Kaixiang Lin. 2025. Do LLMs recog-nize your preferences? Evaluating personalized pref-erence following in LLMs. In International Con-ference on Learning Representations , volume 2025, pages 15888–15931. Wanjun Zhong, Lianghong Guo, Qiqi Gao, He Ye, and Yanlin Wang. 2024. MemoryBank: Enhancing large language models with long-term memory. Proceed-ings of the AAAI Conference on Artificial Intelligence ,38(17):19724–19731. Mingxi Zou, Zhihan Guo, Langzhang Liang, Zhuo Wang, Qifan Wang, Qingsong Wen, Irwin King, Lizhen Qu, and Zenglin Xu. 2026. Remember the decision, not the description: A rate-distortion framework for agent memory. arXiv preprint arXiv:2605.10870 .
+
+A Benchmarks 
+
+Table 4 lists the five benchmarks with their num-ber of graded units and their memory-store scope, along with the metrics reported. 
+
+B Useful and Harmful Rates 
+
+The difference between a system’s level and No Memory ’s on a benchmark is the balance of two outcomes on the same graded units. A unit that passes with memory and fails under No Memory 
+
+has positive utility in Equation 1 and counts as use-ful ; the reverse is harmful ; a unit with the same result in both runs is unchanged. The useful rate minus the harmful rate is the difference in level. Table 5 gives the useful rate and Table 6 the harm-ful rate on every benchmark. These are paired observed outcomes, not attribution to an individual memory. No Memory passes few units on PrefE-val and on LoCoMo and LongMemEval, so every system’s harmful rate there is small and the useful rate alone orders the systems. Leto ’s useful rate ex-ceeds its harmful rate on every evaluated outcome. Among settings with enough No Memory successes to assess degradation, Leto has the lowest harmful rate among the memory systems on PERMA MCQ and C-M completion and on MemoryArena shop-ping and math. On PERMA MCQ, Standalone ’s harmful rate is approximately twice Leto ’s. 
+
+C Long-Context Results by Category 
+
+Tables 7 and 8 give the long-context results by question category. LoCoMo covers single-hop and multi-hop as well as temporal and open-domain questions; its adversarial category of questions with no answer in the conversation is excluded as in 
+
+Mem0 ’s evaluation (Chhikara et al., 2025). The LoCoMo difference from RAG is concentrated in single-hop questions, where RAG reaches 82.05% against Leto ’s 76.69%. The largest LongMemEval advantage over Hindsight is in temporal reasoning, where Leto achieves 73.68% against 62.41%. 
+
+Evidence recall. Evidence recall is the fraction of an evidence message’s content words appearing in the served context, averaged first over evidence messages and then over questions. Content words are lowercased words with at least four letters, ex-cluding stop words. We use annotated evidence for 1,531 LoCoMo questions and the best-matching turn from each annotated answer session for 470 answerable LongMemEval questions. Figure 5 10 Scenario Benchmark # Samples Store Metrics 
+
+Personalization PERMA C-S / C-M 423 / 157 One user MCQ Accuracy, Comp. PrefEval 1,000 One item Accuracy Long-horizon tasks MemoryArena 4,850 a One chain PS, SR Long-context LoCoMo 1,540 One conversation Accuracy LongMemEval S 500 One question Accuracy  
+
+> a
+
+Travel 1,869 traveler-rounds; shopping 900 purchase steps; search 1,641 questions; math 354 and physics 86 subtasks. 
+
+Table 4: Benchmarks and memory-store scope. Samples count graded units. C-S / C-M: PERMA’s clean single- / multi-domain conditions. Metrics: multiple-choice question (MCQ) accuracy; task completion (Comp.); progress score (PS); success rate (SR). 
+
+Full History Compared Memory Systems Our System 
+
+Benchmark Outcome Standalone RAG Mem0 LangMem Hindsight Letta Zep Memobase Leto 
+
+PERMA C-S MCQ 27.66 19.39 19.15 23.17 19.15 13.48 18.68 22.70 27.42 
+
+C-S Comp. 13.95 15.13 12.77 13.00 12.77 10.87 12.29 13.48 12.53 C-M MCQ 21.66 17.83 15.29 16.56 14.65 12.74 9.55 16.56 19.11 
+
+C-M Comp. 14.01 15.29 14.65 12.10 14.01 11.46 14.01 18.47 18.47 
+
+PrefEval Accuracy 2.50 12.50 32.70 39.90 43.00 17.20 8.80 27.20 59.30 
+
+MemoryArena Shopping 17.89 13.33 7.78 15.00 7.33 20.44 12.56 12.89 15.33 Travel 2.30 1.50 0.00 0.00 0.00 0.00 0.00 0.00 2.73 
+
+Search 2.44 4.14 2.80 3.47 2.38 3.47 4.75 3.35 5.91 
+
+Math 10.45 12.15 9.32 3.95 8.19 9.89 7.06 4.80 10.17 
+
+Physics 18.60 15.12 17.44 6.98 12.79 23.26 6.98 10.47 19.77 LoCoMo Accuracy 70.45 70.58 64.09 29.42 61.75 47.53 38.38 10.65 67.86 
+
+LongMemEval Accuracy 47.20 61.20 64.40 32.40 65.40 31.60 43.20 9.20 69.00 
+
+Table 5: Useful rates against No Memory : the share of each benchmark’s graded units that the system passes and No Memory fails (%). Shopping uses step success. Standalone places the full history in the agent’s context (gpt-4o-mini; gpt-5-mini on MemoryArena). C-S / C-M: clean single- / multi-domain; Comp.: completion; Bold: highest value per row among the memory systems. 
+
+groups questions by evidence recall. On LoCoMo, every memory system achieves higher accuracy in the highest recall band than in the lowest. On Long-MemEval, context from the annotated evidence ses-sion reaches the agent for 98% of questions under 
+
+Leto and 99% under RAG . Accuracy among these questions is 75% and 67%, respectively. 11 Full History Compared Memory Systems Our System 
+
+Benchmark Outcome Standalone RAG Mem0 LangMem Hindsight Letta Zep Memobase Leto 
+
+PERMA C-S MCQ 3.31 2.60 2.84 2.13 3.78 10.64 4.02 3.07 1.65 
+
+C-S Comp. 6.62 5.67 6.62 5.67 6.86 10.64 8.04 5.91 6.38 C-M MCQ 7.01 6.37 4.46 5.73 5.10 14.65 7.64 5.73 3.82 
+
+C-M Comp. 10.83 14.01 12.74 10.19 14.65 17.20 10.83 14.01 6.37 
+
+PrefEval Accuracy 0.60 0.80 0.60 0.60 0.20 0.00 0.80 0.40 0.20 MemoryArena Shopping 9.67 9.00 11.56 10.33 9.11 8.78 10.33 9.89 8.00 
+
+Travel 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 0.00 Search 2.38 1.58 1.28 1.58 1.34 1.58 1.16 1.40 1.46 Math 3.39 3.11 4.24 3.67 2.82 2.82 4.52 4.52 2.26 
+
+Physics 3.49 3.49 2.33 9.30 4.65 3.49 5.81 6.98 3.49 LoCoMo Accuracy 0.58 0.52 0.78 1.88 1.17 0.71 1.56 2.01 0.58 
+
+LongMemEval Accuracy 2.00 1.20 1.60 1.20 1.80 1.40 1.60 0.60 2.20 
+
+Table 6: Harmful rates against No Memory : the share of each benchmark’s graded units that No Memory passes and the system fails (%). Shopping uses step success. Standalone places the full history in the agent’s context (gpt-4o-mini; gpt-5-mini on MemoryArena). C-S / C-M: clean single- / multi-domain; Comp.: completion; Bold: lowest value per row among the memory systems. 
+
+Category Overall System Single-hop Multi-hop Temporal Open-domain Tokens Accuracy F1 
+
+No History 
+
+No Memory 5.59 2.48 1.56 11.46 – 4.55 2.99 
+
+Full History 
+
+Standalone (gpt-4o-mini) 86.33 72.70 48.29 62.50 27,834 74.42 46.52 RAG 82.05 62.41 72.27 53.12 1,999 74.61 54.32 
+
+Compared Memory Systems 
+
+Mem0 75.98 58.87 60.44 47.92 745 67.86 49.90 LangMem 39.71 35.46 6.54 40.62 1,757 32.08 22.61 Hindsight 67.66 65.96 62.62 48.96 608 65.13 48.72 Letta 63.85 50.35 24.92 33.33 55 51.36 39.74 Zep 41.74 35.11 45.17 43.75 479 41.36 31.43 Memobase 14.98 8.51 5.61 36.46 1,027 13.18 10.01 
+
+Our System 
+
+Leto 76.69 61.70 72.59 56.25 1,192 71.82 51.86 
+
+Table 7: LoCoMo results (%). Tokens: average tokens of retrieved memory per question (the full history for 
+
+Standalone ). Bold: best value among the memory systems. 
+
+12 Category Overall System SS user SS assistant SS preference Multi-session Knowledge update Temporal reasoning Abstention Tokens Accuracy 
+
+No History 
+
+No Memory 8.57 3.57 0.00 9.02 7.69 4.51 100.00 – 6.40 
+
+Full History 
+
+Standalone (gpt-4o-mini) 65.71 85.71 13.33 38.35 66.67 42.86 66.67 111,569 51.60 RAG 90.00 100.00 20.00 56.39 69.23 58.65 80.00 9,813 66.40 
+
+Compared Memory Systems 
+
+Mem0 94.29 91.07 50.00 59.40 82.05 53.38 73.33 1,113 69.20 LangMem 54.29 30.36 50.00 22.56 60.26 30.83 83.33 1,735 37.60 Hindsight 94.29 64.29 53.33 67.67 75.64 62.41 70.00 701 70.00 Letta 51.43 53.57 33.33 24.81 51.28 25.56 76.67 86 36.60 Zep 67.14 55.36 46.67 36.09 60.26 39.85 73.33 2,039 48.00 Memobase 18.57 7.14 20.00 8.27 34.62 10.53 93.33 1,025 15.00 
+
+Our System 
+
+Leto 90.00 89.29 46.67 61.65 75.64 73.68 63.33 1,185 73.20 
+
+Table 8: LongMemEval S results (%). The 30 abstention questions also count within their question types. SS: single-session. Tokens: average tokens of retrieved memory per question (the full history for Standalone ). Bold: best value among the memory systems. <25 25-50 50-75 >=75      
+
+> EVIDENCE WORDS PRESENT IN CONTEXT (%)
+
+Leto 
+
+Mem0 LangMem Hindsight Letta Zep Memobase 
+
+LoCoMo 1,531 QUESTIONS 
+
+31.8 
+
+> n=22
+
+24.2 
+
+> n=124
+
+48.2 
+
+> n=228
+
+82.2 
+
+> n=1157
+
+27.8 
+
+> n=126
+
+55.5 
+
+> n=425
+
+75.3 
+
+> n=640
+
+84.4 
+
+> n=340
+
+12.2 
+
+> n=197
+
+28.7 
+
+> n=770
+
+40.4 
+
+> n=500
+
+64.1 
+
+> n=64
+
+35.9 
+
+> n=209
+
+64.3 
+
+> n=635
+
+73.9 
+
+> n=566
+
+78.5 
+
+> n=121
+
+35.6 
+
+> n=829
+
+64.8 
+
+> n=505
+
+82.3 
+
+> n=147
+
+88.0 
+
+> n=50
+
+19.5 
+
+> n=732
+
+51.5 
+
+> n=509
+
+74.7 
+
+> n=217
+
+86.3 
+
+> n=73
+
+6.9 
+
+> n=807
+
+14.4 
+
+> n=612
+
+44.6 
+
+> n=101
+
+90.9         
+
+> n=11
+> <25 25-50 50-75 >=75
+> EVIDENCE WORDS PRESENT IN CONTEXT (%)
+
+LongMemEval 470 QUESTIONS 
+
+—
+
+> n=0
+
+—
+
+> n=9
+
+34.6 
+
+> n=26
+
+77.2 
+
+> n=435
+
+—
+
+> n=0
+
+71.4 
+
+> n=21
+
+58.6 
+
+> n=133
+
+73.1 
+
+> n=316
+
+—
+
+> n=6
+
+9.4 
+
+> n=64
+
+33.5 
+
+> n=233
+
+46.7 
+
+> n=167
+
+—
+
+> n=3
+
+73.7 
+
+> n=38
+
+66.1 
+
+> n=227
+
+74.3 
+
+> n=202
+
+23.2 
+
+> n=220
+
+40.3 
+
+> n=191
+
+55.6 
+
+> n=45
+
+50.0 
+
+> n=14
+
+—
+
+> n=6
+
+22.0 
+
+> n=41
+
+45.3 
+
+> n=232
+
+54.5 
+
+> n=191
+
+1.0 
+
+> n=192
+
+5.9 
+
+> n=170
+
+31.8 
+
+> n=88
+
+35.0 
+
+> n=20
+
+Figure 5: Answer accuracy by evidence-recall band. Each cell shows its number of questions; hatched cells contain fewer than ten. 
+
+13
