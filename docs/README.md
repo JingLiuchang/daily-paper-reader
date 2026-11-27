@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-26</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-27</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 21 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 18 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>7</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
     <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>14</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-26 02:16:06 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-27 02:13:16 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日精选21篇AI论文，精读7篇，聚焦Agent真实规模评测与错误恢复基准。最值得关注《Taxi》对Agent真实规模的分析和《SecondChance》对AI Agent可靠错误恢复的基准测试，均为9.0分。普通读者可从这两篇入手，理解Agent在真实场景下的能力边界与容错机制。</p>
+<p>今日筛选18篇AI智能体论文并精读4篇，重点聚焦自进化智能体的长程任务评测。最值得看的是EvoLink-Bench（9.0分），它为“长程、相互依赖”的任务流提供了自进化智能体基准，以及关于工具使用智能体双极性记忆的持续适应研究。普通读者可优先阅读这两篇精读，再按需浏览速读中的CoEvoBench等基准与技能诊断工作。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +78,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">7 篇</strong>
+    <strong class="dpr-home-dashboard-count">4 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Taxi: Analyzing Agents at (Real) Scale">Taxi: Analyzing Agents at (Real) Scale</span></li><li><span class="dpr-home-dashboard-paper-title" title="SecondChance: Benchmarking Reliable Error Recovery in AI Agents">SecondChance: Benchmarking Reliable Error Recovery in AI Agents</span></li><li><span class="dpr-home-dashboard-paper-title" title="ICLWorld: Benchmarking In-Context Learning of Agents from Digital to Physical Worlds">ICLWorld: Benchmarking In-Context Learning of Agents from Digital to Physical Worlds</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="EvoLink-Bench: A Benchmark for Evaluating Self-Evolving Agents in Long-Horizon Interdependent Task Streams">EvoLink-Bench: A Benchmark for Evaluating Self-Evolving Agents in Long-Horizon Interdependent Task Streams</span></li><li><span class="dpr-home-dashboard-paper-title" title="Failure Broadens, Success Sharpens: Continual Adaptation of Tool-Use Agents Across Diverse Tasks with Dual-Polarity Memory">Failure Broadens, Success Sharpens: Continual Adaptation of Tool-Use Agents Across Diverse Tasks with Dual-Polarity Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="MedSkill-E$^{2}$: Evaluating and Evolving Skills for Medical Agents">MedSkill-E$^{2}$: Evaluating and Evolving Skills for Medical Agents</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>4</strong></span><span class="dpr-home-dashboard-tag">agent <strong>1</strong></span><span class="dpr-home-dashboard-tag">agent-trace <strong>1</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -94,9 +94,9 @@
     <strong class="dpr-home-dashboard-count">14 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Structure-Exploiting Hierarchical Retrieval for Long Narrative Documents: A Precision-Oriented Alternative to Learned Abstraction Trees">Structure-Exploiting Hierarchical Retrieval for Long Narrative Documents: A Precision-Oriented Alternative to Learned Abstraction Trees</span></li><li><span class="dpr-home-dashboard-paper-title" title="Same Executions, Different Gaps: Judgment Rules in Web-Agent Evaluation">Same Executions, Different Gaps: Judgment Rules in Web-Agent Evaluation</span></li><li><span class="dpr-home-dashboard-paper-title" title="MMMem: Self-Improving Agents with Task-Aware Multimodal Experience Consolidation">MMMem: Self-Improving Agents with Task-Aware Multimodal Experience Consolidation</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="CoEvoBench: Can LLMs Drive Recursive Co-Evolution of Agentic Systems?">CoEvoBench: Can LLMs Drive Recursive Co-Evolution of Agentic Systems?</span></li><li><span class="dpr-home-dashboard-paper-title" title="SkillLens: An Interactive Human-LLM System for Diagnosing and Refining Agent Skills">SkillLens: An Interactive Human-LLM System for Diagnosing and Refining Agent Skills</span></li><li><span class="dpr-home-dashboard-paper-title" title="BRAG: Bayesian Retrieval Augmented Generation">BRAG: Bayesian Retrieval Augmented Generation</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>7</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>5</strong></span><span class="dpr-home-dashboard-tag">agent-trace <strong>2</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>8</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent-trace <strong>2</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
 </section>
 </div>
 

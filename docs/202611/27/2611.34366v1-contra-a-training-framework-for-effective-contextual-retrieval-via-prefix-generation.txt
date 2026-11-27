@@ -1,0 +1,498 @@
+Title: ConTra: A Training Framework for Effective Contextual Retrieval via Prefix Generation
+
+URL Source: https://arxiv.org/pdf/2611.34366v1
+
+Published Time: Thu, 26 Nov 2026 03:04:57 GMT
+
+Number of Pages: 15
+
+Markdown Content:
+# ConTra: A Training Framework for Effective Contextual Retrieval via Prefix Generation 
+
+# Jiajun Hou 
+
+CUHK-Shenzhen Shenzhen, China jiajunhou@link.cuhk.edu.cn 
+
+# Jingbang Chen ∗
+
+CUHK-Shenzhen & SLAI Shenzhen, China chenjb@cuhk.edu.cn 
+
+## ABSTRACT 
+
+Modern data management systems help organize large text collec-tions for downstream tasks such as finding relevant studies and extracting clauses from contracts. A common way to make long documents searchable at scale is to split them into chunks and index each chunk as a separate record. Chunking can separate text from its identifying details. The indexing challenge is to keep each chunk independently searchable while preserving the context needed to find and rank it. Existing methods either encode that context in chunk vectors or attach it as a text prefix. Context encoded only in vectors is unavailable to text rerankers. Prompted prefixes serve both vector search and reranking, but are costly to generate at index-ing time and can underperform contextual encoders. This motivates us to train lightweight language models to generate more effective prefixes at lower indexing cost. We propose ConTra ( Context That Travels ), a reinforcement learning framework whose reward com-bines feedback from frozen embedding and reranking models with factual verification and length control. ConTra generates one con-cise prefix per chunk during index construction and stores the aug-mented text and its embedding for reuse across queries. To evaluate contextual retrieval across workloads and under interference, we introduce RealContextBench, a benchmark with five application collections and three controlled conditions that isolate the effect of distracting text. On ConTEB and RealContextBench, Con-Tra-2B outperforms the prompted 9B baseline using Anthropic’s method and the PPLX-4B contextual encoder, with a margin of up to 3.15 points over their best overall scores, while indexing short documents 7 .74 × and 2 .15 × as fast as those baselines, respectively. Post-trained only on ConTEB, it still achieves the highest overall reranking score on RealContextBench and is less sensitive to random and topically similar distractors. Code, datasets, and trained models are available at https://github.com/SStan1/ConTra. 
+
+## 1 INTRODUCTION 
+
+Data management systems organize text collections, which can span millions of source documents [20], to support downstream tasks such as finding relevant studies [27], extracting clauses from contracts [35], and generating literature digests [27]. To make long documents searchable at scale, systems often split them into smaller units, called chunks [6, 20], that can be stored as separate records and indexed for retrieval [37, 39]. Retrieval-augmented generation (RAG) systems are commonly used to retrieve chunks from the index [19, 52]. The retrieved chunks can be returned directly as search results or used as evidence to answer questions [44] and check factual claims [27, 28]. For RAG over large collections, the index must retrieve the evidence needed for an accurate answer [44, 
+
+> ∗Corresponding author.
+
+52] while remaining affordable to build and fast to query [20]. In a multi-stage retrieval pipeline, a system first uses a vector index to shortlist chunks by embedding similarity [20, 37]. To improve ranking accuracy, the system often uses a reranker to score each shortlisted chunk’s text for relevance to the query and reorder the candidates by that score [20, 22]. However, conventional chunking methods can separate a passage from the context that identifies it [44]. For example, consider a query for a company’s operating income in a particular fiscal year [13]: the financial table containing the figure may rely on a preceding heading to identify the company and year. If that heading falls in another chunk, vector search may retrieve a similar table for the wrong company or period, and a reranker reading the table alone lacks the evidence to correct the error. To improve retrieval quality at scale, systems must address the fundamental data management challenge of keeping chunks independently searchable while preserving the document context needed to find the right candidates and rank them correctly. Such a challenge of preserving document context has attracted considerable attention from data scientists [7, 12, 44] as well as from AI companies such as Perplexity [10], Voyage AI [41], and Anthropic [2]. Two lines of work address this challenge by encoding document context into chunk vectors or preserving it explicitly in text. Figure 1 illustrates how these approaches differ in the context available to the vector index and the reranker. The first line of work incorporates surrounding document information into chunk vectors via late chunking [12]. Building on this design, InSeNT [7] trains encoders to distinguish chunks from the same document, and PPLX [10] adapts an autoregressive large language model for con-textual encoding. These methods can improve candidate selection by changing only the vector representation of each chunk. How-ever, this line of work faces several limitations. PPLX, for example, requires substantial additional pretraining to enable bidirectional attention, adding to the time and computation required to train the encoder. Furthermore, a reranker that reads the original chunk text cannot use document context encoded only in the chunk vector. The second line of work preserves document context explicitly in text. Anthropic’s method prompts a large language model to read the source document and generate a prefix for each chunk, supplying the augmented text to both retrieval and reranking [1]. The prefixes can be reused across queries, a benefit of enriching the index offline [5]. The upfront cost is the substantial time and computation needed to generate a prefix for every chunk during index construction. Prompted prefixes have also underperformed leading contextual encoders in prior retrieval evaluations [10]. However, those evaluations primarily examined single-stage re-trieval, where chunks are ranked by embedding similarity alone, overlooking multi-stage retrieval. We argue that because an LLM-generated prefix makes context available as readable text beyond 
+
+> 1arXiv:2611.34366v1 [cs.IR] 25 Nov 2026
+
+(a) LLM contextual prefixes Context reaches the reranker     
+
+> 1. Generate prefix 2. Embed 3. Retrieve 4. Rerank 5. Output
+
+(b) Late chunking Context is absent from reranker input     
+
+> 1. Encode document 2. Mean pooling 3. Retrieve 4. Rerank 5. Output
+
+Document Context Target chunk LLM     
+
+> Prefix + chunk
+> Chunk encoder Full-doc encoder
+> Token states By chunk
+> Top-k
+> Search Prefix + chunk
+> Qwen
+> Reranker
+> 123
+> Ranked text
+> Top-k
+> Search Original chunk
+> Qwen
+> Reranker
+> 123
+> Ranked text Context / prefix Chunk text
+
+Figure 1: A textual prefix carries document context through embedding retrieval and reranking. Contextual encoders enrich chunk vectors, while the reranker receives only the original chunk text. 
+
+the chunk vector, it can be reused across retrieval stages and may offer greater benefits than embedding-only evaluations suggest. In Section 3, we use controlled experiments to measure the contribu-tion of prefixes at each stage and demonstrate this potential. To realize this potential at a lower indexing cost, we introduce ConTra ( Context That Travels ), a novel reinforcement learning framework for training lightweight language models to write con-cise, chunk-specific prefixes for both candidate selection and rerank-ing (Section 4). At indexing time, the trained model generates one prefix per chunk. ConTra prepends the prefix to the original text and stores the augmented text and its embedding under the original chunk identifier. At query time, the vector index uses the embedding to select candidates, and the reranker reads the same augmented text to refine their order. During training, frozen embedding and reranking models evaluate each sampled prefix by scoring the aug-mented chunk against the training query. A frozen judge model checks whether the source supports the information added by each prefix, and a length penalty limits prefix length and reduces com-petition among chunks from the same document. Together, these signals let small models generate accurate prefixes that distinguish the target chunk. To accommodate different indexing budgets across deployments, we train ConTra-0.8B, ConTra-2B, and ConTra-4B. Existing benchmarks such as ConTEB [7] emphasize cases where document context is needed to identify relevant chunks. In practice, document collections mix self-contained and context-dependent chunks, and surrounding text can introduce competing entities or topics. Evaluating contextual retrieval therefore requires testing both how it uses helpful context and how it handles distracting text. To this end, we introduce RealContextBench (Section 6), a contextual chunk retrieval benchmark comprising five application collections and three controlled context conditions. The applica-tion collections span web search, technical question answering, story comprehension, meetings, and financial analysis, with human annotations mapped to relevant chunks. In the controlled condi-tions, we hold queries, target chunks, and relevance labels fixed and present each chunk on its own, with randomly sampled text, or with topically similar distractors generated by a large language model. RealContextBench enables systematic comparisons of how retrieval systems represent and use document context, inform-ing the design of document indexes that support reliable search across diverse collections and workloads. Our contributions are summarized as follows: 
+
+• Our controlled experiments reveal the substantial potential of readable prefixes in multi-stage retrieval by showing that their gains in candidate recall and reranking are complementary. Build-ing on this finding, we propose ConTra, a reinforcement learn-ing framework combining online embedding and reranking eval-uation, factual verification, and length control to train prefix generators across multiple model scales. By encouraging informa-tive, source-supported, and concise prefixes, ConTra improves contextual retrieval quality while lowering indexing cost. 
+
+• We introduce RealContextBench, a benchmark for comparing how contextual encoders and prefix-based methods index docu-ment context. It measures end-to-end retrieval quality across five application collections and isolates the effect of random and top-ically similar distractors in three controlled context conditions that vary the surrounding text while holding the search task fixed. Our benchmark enables researchers to evaluate how in-dexing decisions about document context affect search reliability across diverse workloads. 
+
+• Through extensive experiments, we show that ConTra delivers state-of-the-art end-to-end retrieval quality with substantially lower indexing cost and that RealContextBench reveals which methods remain effective across workloads and under interfer-ence. ConTra-2B outperforms the prompted 9B prefix baseline using Anthropic’s method and the PPLX-4B contextual encoder on both datasets, with a margin of up to 3.15 points over their best overall scores. Post-trained only on ConTEB, ConTra-2B still ranks first overall on RealContextBench after reranking. ConTra-2B also indexes short documents 7 .74 × as fast as the 9B pipeline and 2 .15 × as fast as PPLX-4B, while post-training with reinforcement learning reduces total indexing time by up to 52.3% at a fixed 2B model scale. 
+
+## 2 RELATED WORK 
+
+Retrieval Models and Pipelines. Evaluating complex relevance models across an entire large corpus is too costly at query time. 
+
+> 2
+
+Modern retrieval pipelines, as supported by frameworks such as PyTerrier-RAG and RAGPerf [20, 22], therefore combine fast can-didate retrieval with compute-intensive reranking to balance effi-ciency and accuracy [16]. Given a query, a retriever first selects a small candidate set using an embedding model, often paired with lexical matching in multi-way retrieval [11, 45]. While BM25 relies on term overlap and corpus statistics to match exact names and identifiers [33], queries and passages frequently express the same meaning with different words. Embedding models address this lexical gap by mapping queries and passages into a shared continuous vector space to capture se-mantic similarity [14, 15, 24, 45]. Early architectures build upon bidi-rectional BERT encoders [8, 21, 32], whereas recent models such as E5-Mistral and Qwen3-Embedding adapt pretrained LLMs [43, 50]. To combine different retrieval signals within a single backbone, M3-Embedding further unifies dense, sparse, and multi-vector re-trieval [4]. Because these retrievers only narrow the corpus down to a candidate set, a reranker must then judge fine-grained rele-vance by jointly evaluating the query and candidate text [29, 53]. Cross-encoders such as BERT rerankers and Qwen3-Reranker evaluate individual query–passage pairs independently [25, 50], while monoT5 formulates this judgment as relevance-token gen-eration [26]. Rather than judging pairs in isolation, RankGPT compares a group of candidates through listwise ordering [38], whereas RankRAG unifies reranking with answer generation [48]. Ultimately, the retriever determines which candidates reach the reranker, and the text the reranker reads determines what document context it can rely on to judge relevance. 
+
+Contextual Retrieval. Contextual retrieval mitigates the informa-tion loss caused by partitioning documents into isolated chunks. The first paradigm encodes surrounding document context directly into chunk vectors. Late chunking achieves this by encoding an entire source window before pooling token representations within each chunk boundary [12]. Extending this approach, InSeNT trains contextual encoders using in-document negatives, encouraging models to preserve passage-specific details alongside shared docu-ment context [7]. Adapting this paradigm to autoregressive LLMs requires overcoming causal attention, which restricts tokens to preceding context. PPLX adapts an LLM backbone via diffusion pretraining on roughly 250 billion tokens to enable bidirectional attention, followed by contrastive retrieval training [10]. Similarly, Voyage-context-3 and Voyage-context-4 provide document-aware chunk embeddings via proprietary APIs [41, 42]. However, PPLX incurs substantial additional pretraining overhead, and storing con-text implicitly in vectors leaves downstream components reading raw text—such as rerankers—without access to that context. The second paradigm preserves context explicitly as readable text. An-thropic prompts an LLM to generate a concise prefix situating each chunk within its source document, prepending it to the passage for indexing and reranking [2]. Because prefixes are materialized at indexing time, they are reusable for retrieval and reranking across queries while remaining directly legible to rerankers. Neverthe-less, prompting large LLMs incurs high indexing latency and com-putational cost, whereas smaller prompted models often produce verbose or imprecise prefixes that limit retrieval gains. ConTra 
+
+Table 1: Prefix placement analysis on ConTEB using un-trained Qwen3.5-2B with Anthropic’s prompt. The first four rows use Qwen3-Embedding-4B for candidate retrieval, and all rows use Qwen3-Reranker-4B. Emb. and Rer. report nDCG@10; Rec.@15 reports candidate recall. All metrics are macro-averaged across the eight tasks. 
+
+Retrieval view Reranker view Emb. Rec.@15 Rer. Raw Raw .5484 .7691 .6483 Prefix + raw Raw .6547 .8475 .6924 Raw Prefix + raw .5484 .7691 .6940 Prefix + raw Prefix + raw .6547 .8475 .7585 PPLX-4B Raw .8210 .9387 .7310 PPLX-4B Prefix + raw .8210 .9387 .8135 
+
+addresses both bottlenecks by training prefix generators with re-inforcement learning, combining feedback from the embedding model and reranker, factual verification, and length control to pro-duce concise, accurate prefixes that boost retrieval accuracy while reducing indexing time. 
+
+## 3 OBSERVATION: THE ROLE OF PREFIXES IN CONTEXTUAL RETRIEVAL 
+
+We expect retrieval to benefit when several stages can reuse the same readable prefix. Anthropic tried this approach in its contextual retrieval pipeline [2] but did not investigate it in depth. On ConTEB, we vary which stages receive the prefix to measure its contribution at each stage (Table 1). Our analysis shows that a readable prefix can serve multiple retrieval stages, with complementary gains in our experiments. Even with prefixes generated by an untrained 2B model, the resulting pipeline gives better final rankings than retrieving with PPLX-4B and reranking raw chunks. 
+
+Controlled comparison of prefix placement. Using fixed prefixes generated by an untrained Qwen3.5-2B model with An-thropic’s prompt, Qwen3-Embedding-4B retrieves the top 15 candidates from either raw or prefix-augmented chunks. Qwen3-Reranker-4B then scores each candidate set using either raw or prefix-augmented text. We also evaluate both reranker views over fixed top-15 candidates retrieved by PPLX-4B. Reusing the exact same prefix per chunk across all settings isolates the effect of where the prefix is used. 
+
+Prefixes improve embedding retrieval and supply more gold chunks to the reranker. Prepending document context before encoding helps the embedding model distinguish a relevant chunk from similar passages, strengthening initial retrieval ranking. This better ranking brings more gold chunks into the reranker’s candi-date pool, raising Recall@15 from 0.7691 to 0.8475. Even when the reranker reads only raw chunk text, the stronger candidate pool raises final nDCG@10 from 0.6483 to 0.6924. 
+
+Prefixes directly help the reranker judge relevance. Even with-out bringing additional gold chunks into the shortlist, prefixes improve the reranker’s relevance judgments. We rerank the same candidates retrieved from raw chunks twice, changing only whether the reranker sees the prefix. Making the prefix visible raises final nDCG@10 from 0.6483 to 0.6940, showing that the added context 
+
+> 3
+
+helps the reranker recognize and promote relevant chunks already in the shortlist. 
+
+Higher candidate recall alone does not guarantee a better final ranking. PPLX-4B achieves strong initial retrieval at 0.9387 Recall@15 and 0.8210 embedding nDCG@10, bringing more gold chunks into the candidate pool than retrieving with prefixes from an untrained 2B model. Yet when the reranker reads only raw text, the PPLX-4B pipeline yields only 0.7310 final nDCG@10, trailing the 0.7585 achieved when both Qwen3-Embedding-4B and Qwen3-Reranker-4B read those prefixes. PPLX-4B encodes document con-text in the chunk vectors, so the information that helped select a passage is unavailable to a reranker reading the passage in isolation. Attaching the same readable prefixes to the fixed PPLX-4B candi-dates tests this explanation. Without retrieving a single additional candidate, the reranker can then rank the relevant chunks higher, raising final nDCG@10 to 0.8135. 
+
+A readable prefix benefits both embedding and reranking, showing its potential. The prefix helps at either stage, and using it at both stages improves the ranking further. These complemen-tary gains allow even an untrained 2B prefix generator to yield better final rankings than PPLX-4B retrieval with raw-text rerank-ing, illustrating the potential of readable prefixes in multi-stage retrieval. 
+
+## 4 CONTRA: LEARNING TO WRITE CONTEXT PREFIXES 
+
+To realize the potential of LLMs in multi-stage retrieval, we intro-duce ConTra, a framework that trains them to generate more effec-tive context prefixes. For each training instance, the generator reads a source window and target chunk, samples candidate prefixes, and prepends each candidate to the original chunk. Frozen embedding and reranking models then evaluate how well the augmented text matches a training query. A factual judge verifies whether the added information is supported by the source and correctly attributed to the target, while length control discourages superfluous details. We combine these signals into a reward to update the generator. After training, the model generates prefixes during indexing, and the resulting text is reused for embedding retrieval and reranking across queries. 
+
+## 4.1 Prefix Generation, Candidate Retrieval, and Reranking 
+
+Let 𝐷 𝑖 denote a source document and 𝑐 𝑖 denote a target chunk. Our generator 𝜋 𝜃 receives 𝑥 𝑖 = (𝑊 𝑖 , 𝑐 𝑖 ), where 𝑊 𝑖 contains the full document when it fits the source budget, or a window of adjacent complete chunks in source order. The prompt marks the target within this window and also presents it separately, allowing the model to relate the target to a preceding heading or speaker turn. Conditioned on this input, the model generates a prefix 𝑝 𝑖 , which is concatenated with the original chunk: 
+
+𝑝 𝑖 ∼ 𝜋 𝜃 ( · | 𝑥 𝑖 ),
+
+e𝑐 𝑖 = 𝑝 𝑖 ∥ 𝑐 𝑖 . (1) where ∥ denotes concatenation. Because 𝑝 𝑖 depends exclusively on 
+
+(𝑊 𝑖 , 𝑐 𝑖 ) without query conditioning, each stored prefix is reusable across arbitrary incoming queries. The original text preserves ver-batim passage evidence, while the prefix supplies missing identities or relationships. At indexing time, we generate one prefix per chunk and store both the augmented text and its vector e𝑖 = 𝑓 (e𝑐 𝑖 ) under the original chunk identifier, where 𝑓 is an ℓ2-normalized embedding model and 𝑧 is the reranker’s relevance logit. Given a corpus of 𝑁 chunks and an incoming query 𝑞 , the pipeline computes: 
+
+C𝐾 (𝑞 ) = TopK 𝑖 ∈ { 1,...,𝑁 } cos (𝑓 (𝑞 ), e𝑖 ) ,
+
+bC𝐾 (𝑞 ) = argsort ↓   
+
+> 𝑖 ∈ C 𝐾 (𝑞 )
+
+𝑧 (𝑞, e𝑐 𝑖 ). (2) The vector index retrieves 𝐾 identifiers by vector similarity. Each identifier links the retrieved vector to its augmented text, enabling the reranker to read the prefix and original passage jointly before ordering candidates by relevance. 
+
+## 4.2 Training Data 
+
+We construct our training pool from the ConTEB training split [7], where each triple (𝐷 𝑖 , 𝑐 𝑖 , 𝑞 𝑖 ) pairs a source document 𝐷 𝑖 and tar-get chunk 𝑐 𝑖 with a relevant query 𝑞 𝑖 for reward scoring. During training, a generator can easily converge toward broad, generic descriptions: although low-risk and easy to produce, high-level sum-maries offer limited retrieval gains and fail to distinguish closely related chunks. Conversely, specific identifying details—such as exact entities, dates, or cross-chunk relations—naturally situate a passage within its broader context while supplying the discrimi-native cues required for accurate retrieval. To ensure the training data rewards specific details over generic descriptions, we curate query–target pairs via source-based proposals and two screening checks. Starting from 100,000 query–target pairs randomly sampled from the ConTEB training set, GPT-6 Luna reads (𝐷 𝑖 , 𝑐 𝑖 ), proposes a missing entity, date, or relation needed to interpret the target, and locates its supporting source span. For each supported proposal, it writes both a specific prefix 𝑝 spec  
+
+> 𝑖
+
+containing that identifying detail and a generic description 𝑝 gen  
+
+> 𝑖
+
+summarizing the broader topic. We then apply two screening checks to retain instances with clear RL learning signals and a measurable retrieval advantage from specific details. First, inspired by DAPO’s filtering of zero-variance reward groups [47], we verify that the policy can explore meaningful contextual variations: a separate 2B proposal model generates eight candidate prefixes per input. Let V𝑖 contain the indices of valid responses and S𝑖 = (𝑆 (𝑝 𝑖 𝑗 )) 𝑗 ∈ V 𝑖 denote their screening reward sequence. We retain instances satisfying: 
+
+𝑄 0.9 (S 𝑖 ) − 𝑄 0.1 (S 𝑖 ) ≥ 0.05 ,
+
+|V 𝑖 | ≥ 6, |{ 𝑝 𝑖 𝑗 : 𝑗 ∈ V 𝑖 }| ≥ 2. (3) where 𝑄 𝛼 denotes the 𝛼 -quantile. The quantile gap ensures suffi-cient reward variation across usable alternatives without allowing a single outlier to dominate. The screening reward combines retrieval gains, source support, and prefix length, where the factual term compares the verification rewards of the augmented and original target against the same document. Second, we verify that the specific detail measurably improves retrieval over generic context. Let 𝑛 𝑖 (𝑝 ) denote nDCG@10 with the 
+
+> 4
+
+target as the sole relevant chunk for 𝑞 𝑖 . We retrieve and rerank 15 candidates in the training corpus for each text view, changing only the target’s prefix while keeping competing chunks unchanged. We retain instances satisfying: 
+
+𝑛 𝑖 (𝑝 spec  
+
+> 𝑖
+
+) − 𝑛 𝑖 (𝑝 gen  
+
+> 𝑖
+
+) ≥ 0.05 ,𝑛 𝑖 (𝑝 spec  
+
+> 𝑖
+
+) ≥ 𝑛 𝑖 (∅) , (4) where ∅ leaves the target unchanged. The first condition ensures that specific identifying details substantially outperform generic summaries, while the second requires them to match or improve upon the raw chunk. Together, these two screening checks filter the 100,000 randomly sampled candidates down to 5,760 query–target pairs. Each ConTra model is initialized from Qwen3.5 and trained directly via RL for one epoch. 
+
+## 4.3 Reward Design 
+
+Our reward combines embedding feedback, which aligns the target chunk with the query, with reranking feedback, which refines fine-grained relevance distinctions. Because relevance scores alone can favor unsupported associations or verbose, generic summaries, we pair the two relevance signals with factual grounding and length control: 
+
+𝑅 (𝑝 𝑖 ; 𝐷 𝑖 , 𝑐 𝑖 , 𝑞 ) = 𝑅 emb + 𝑅 rank 
+
+| {z }
+
+> retrieval utility
+
++ 𝑅 fact 
+
+|{z} 
+
+> factual grounding
+
++ 𝑅 len 
+
+|{z} 
+
+> length control
+
+. (5) The generator must output a complete plain-text prefix for direct concatenation. Malformed or truncated outputs receive a fixed penalty of −1.5—strictly below the theoretical minimum of −1.475 for valid prefixes—making structural validity a prerequisite for earning retrieval utility. 
+
+4.3.1 Embedding and Reranking Rewards. Both utility branches compare the augmented chunk e𝑐 𝑖 against the raw chunk 𝑐 𝑖 to isolate the marginal contribution of the generated prefix. For the embedding branch, training queries often contain implicit pronouns or references, such as “he” or “the facility,” that rely on document context to resolve. Scoring prefixes solely against the raw query embedding 𝑓 (𝑞 ) can under-reward additions that supply the missing entity identity, whereas relying solely on a context-wrapped query risks shifting the target vector away from the specific question toward general document-opening semantics. We therefore encode the raw query 𝑞 and a context-wrapped query ctx (𝑞, 𝐷 𝑖 ) separately into embeddings of identical dimension and take their normalized weighted sum: 
+
+q∗ = norm  0.75 𝑓 (𝑞 ) + 0.25 𝑓 (ctx (𝑞, 𝐷 𝑖 )) , (6) where ctx (𝑞, 𝐷 𝑖 ) brackets the opening of the document’s first chunk, up to 128 words, with the query on both ends under a fixed dis-ambiguation instruction, and norm (·) applies ℓ2 normalization. Re-taining a 0.75 weight preserves the core question intent, while the 0.25 contextual embedding supplies disambiguating entity cues. Substituting q∗ for 𝑓 (𝑞 ), we compute the embedding reward as: 
+
+𝑅 emb = clip (cos (q∗, 𝑓 (e𝑐 𝑖 )) − cos (q∗, 𝑓 (𝑐 𝑖 )) , −1, 1) . (7) Subtracting raw chunk similarity establishes a per-instance baseline, rewarding prefixes that pull the target closer to the resolved query. Evaluating this change directly on the target chunk keeps online RL training tractable without full-corpus retrieval, which is reserved for the offline check in Equation 4 and final evaluation, whereas query-time inference encodes raw 𝑓 (𝑞 ) as in Equation 2. While embedding similarity captures coarse topical alignment, it can miss fine-grained relational distinctions, such as when two prefixes match the same topic but attribute a statement to different entities. Because the reranker jointly attends to the query and the augmented chunk, we add a reranking utility branch derived from its native relevance logit difference: 
+
+𝑅 rank = 0.025 tanh (𝑧 (𝑞, e𝑐 𝑖 ) − 𝑧 (𝑞, 𝑐 𝑖 )) . (8) Raw reranker logits are unbounded and highly sensitive to minor wording edits; applying tanh preserves the direction of relevance gain while bounding extreme logit spikes within (− 1, 1). Scaling by 0.025 constrains 𝑅 rank within [− 0.025 , 0.025 ], allowing it to act as a fine-grained tie-breaker among topically similar prefixes without overwhelming the smoother embedding signal. 
+
+4.3.2 Factual Grounding. Relevance utility alone cannot distin-guish a truthful prefix from a hallucinated one: inserting fabricated entities, dates, or roles that echo the query often increases both embedding similarity and reranker logits. For instance, if a query asks about a specific executive’s decision, prepending that exec-utive’s name to a chunk describing someone else elevates both cos (q∗, 𝑓 (e𝑐 𝑖 )) and 𝑧 (𝑞, e𝑐 𝑖 ) even though the claim contradicts the source. To prevent such hallucinations, a frozen Qwen3.5-4B judge reads the target chunk 𝑐 𝑖 , generated prefix 𝑝 𝑖 , and up to 8,000 tokens of surrounding source evidence E𝑖 to evaluate contextual faith-fulness [9, 34], verifying both factual support in the source and accurate attribution to 𝑐 𝑖 . Its Yes/No logits define the support confi-dence: 
+
+𝑠 𝑖 = exp (𝑎 Yes )
+
+exp (𝑎 Yes ) + exp (𝑎 No ) = 𝜎 (𝑎 Yes − 𝑎 No ). (9) which we convert into a one-sided penalty: 
+
+𝑅 fact = −0.25 max (0.75 − 𝑠 𝑖 , 0)
+
+0.75 . (10) We design 𝑅 fact to vanish once 𝑠 𝑖 ≥ 0.75: after a prefix achieves sufficient factual support, retrieval utility and length alone decide which identifying detail is most advantageous, whereas rewarding confidence above 0.75 would favor safe, generic truisms that are trivial to verify yet unhelpful for retrieval. Meanwhile, scaling the maximum penalty to −0.25 ensures that factual errors outweigh spurious utility gains; for example, at 𝑠 𝑖 = 0.45, 𝑅 fact equals −0.10, four times the maximum positive reranking reward. 
+
+4.3.3 Length Control. Because utility is scored independently on each query–target pair, a generator can raise local similarity by collecting broad document-level details shared across neighboring chunks. When applied across an entire corpus, however, prepending every chunk with overlapping background context blurs distinc-tions between adjacent passages and causes them to compete for the same queries. Length control discourages this behavior by requiring 
+
+> 5
+
+selectivity: 
+
+𝑅 len = −0.2 min 
+
+ max (ℓ𝑖 − 16 , 0)
+
+96 , 1
+
+
+
+. (11) where ℓ𝑖 denotes the prefix length in generator tokens. Preliminary analysis showed that concise, informative prefixes average roughly 16 tokens, so leaving ℓ𝑖 ≤ 16 unpenalized accommodates essen-tial identifying additions without friction. Beyond 16 tokens, the penalty increases linearly up to a cap of −0.2 at 112 tokens, ensur-ing that additional tokens are retained only when they contribute commensurate retrieval utility rather than generic filler. Keeping prefixes short also reduces autoregressive decoding steps during generation and lowers encoder token overhead at indexing time. 
+
+## 4.4 Policy Optimization 
+
+We optimize ConTra using DAPO [47]. For each training input, the policy samples a group of 𝐺 = 16 candidate prefixes, which are scored by the frozen embedding model, reranker, and factual judge via Equation 5. Each rollout batch comprises 32 inputs, totaling 512 sampled responses, and only the generator parameters are updated. For prefix 𝑗 within sampling group G( 𝑗 ), its advantage is com-puted by centering its reward around the group mean [36]: 
+
+𝐴 𝑗 = 𝑅 𝑗 − 1
+
+𝐺 ∑︁ 𝑘 ∈ G ( 𝑗 )
+
+𝑅 𝑘 . (12) We omit group-wise standard deviation normalization so that the true magnitude of reward differences is preserved across comple-tions. Following DAPO, sampling groups in which all candidates receive identical rewards—yielding zero policy gradient—are dy-namically filtered and replaced during rollout. The policy is updated via a token-averaged clipped surrogate objective that reinforces above-average prefixes while suppressing below-average ones, us-ing importance-sampling ratio clipping bounds of [0.8, 1.28 ] and a dual-clipping threshold of 3 .0 for negative advantages. 
+
+## 5 EXPERIMENTAL EVALUATION 
+
+We evaluate ConTra’s retrieval quality on ConTEB and analyze the effects of reward components, retrieval model size, and candidate pool size. 
+
+## 5.1 Experimental Setup 
+
+Benchmark. We evaluate our method on ConTEB [7] because it is specifically designed to measure whether retrieval systems can leverage document-level context to disambiguate isolated chunks, and it also serves as a principal benchmark for contextual encoders such as PPLX [10]. Across its eight tasks, ConTEB combines broad domain coverage with distinct forms of contextual dependence. Specifically, MLDR and SQuAD cover encyclopedic text [31], Narra-tiveQA spans stories and screenplays [17], COVID-QA tests biomed-ical articles [23], and ESG Reports draws from corporate sustain-ability disclosures, alongside Football, Geography, and Insurance. 
+
+Baselines and retrieval components. To establish retrieval qual-ity without document context, we first include the general-purpose Qwen3-Embedding-4B model [50], which encodes each original chunk independently. We then compare against two categories of contextual retrieval methods: contextual encoders that directly em-bed surrounding document context into chunk representations, and LLM-based methods that generate explicit textual prefixes prior to standard encoding. Within the contextual-encoder category, we evaluate ConTEB’s ModernBERT-Large InSeNT checkpoint trained with in-document negatives using late chunking [7], Perplexity’s web-scale PPLX-context models at 0.6B and 4B scales where the 4B model sets the prior reported ConTEB state of the art [10], and Voyage AI’s API-based Voyage-context-3 together with its flagship successor Voyage-context-4 [41, 42]. In the textual-prefix category, we compare ConTra against prompt-based contextual retrieval following Anthropic’s method [2], instantiated with untrained Qwen3.5-0.8B, 2B, 4B, and 9B genera-tors [30]. Both ConTra and these prompted baselines prepend the generated prefix to the original chunk and encode the combined text using the same Qwen3-Embedding-4B model. To compare all methods with a common reranker, we rerank each method’s top 15 candidates with Qwen3-Reranker-4B, which receives original chunks for the context-free and contextual-encoder baselines and prefix-augmented chunks for ConTra and the prompted prefix baselines. 
+
+## 5.2 Main Results 
+
+ConTra-2B achieves state-of-the-art retrieval quality with smaller model scale. As shown in Table 2, ConTra-2B reaches an overall reranked nDCG@10 of 0.8525, outperforming the reranked results of the flagship contextual encoders PPLX-4B at 0.7310 and Voyage-context-4 at 0.7300 by over 12 points. Among untrained prompt baselines, 9B is the only model with sufficient capacity to exceed PPLX-4B’s strongest result of 0.8210, reaching 0.8279, yet ConTra-2B surpasses this prompted 9B model by 2.46 points, while ConTra-4B outperforms it at 0.8465. These results demonstrate that targeted RL training enables smaller generators to master con-text selection and replace much larger models, improving indexing efficiency and reducing computational overhead. 
+
+ConTra training generalizes across model sizes. With the embedding model and reranker held fixed, Table 2 shows that RL training improves both embedding retrieval and reranking across all three generator sizes. Over same-size Anthropic prompt baselines, ConTra increases final reranked nDCG@10 by 8.15, 9.40, and 3.55 points at 0.8B, 2B, and 4B, respectively. 
+
+Model scale shapes generation behavior and task perfor-mance. Inspecting generated prefixes reveals a clear behavioral divergence between small and large models: smaller generators tend to produce broad, generic topic summaries, whereas larger ones reliably extract specific identifying entities and relations. This con-trast appears most clearly on Insurance, which requires matching similarly formatted tables to country headings located elsewhere in a long document. While the 4B and 9B models already reach 1.000 on Insurance prior to training, the 0.8B model performs poorly both before training at 0.199 and after training at 0.160. Thus, RL post-training cannot bridge this gap at 0.8B, as its small parameter capacity limits its ability to parse long-range document structure. 
+
+ConTra uses pretrained LLM knowledge without extra pre-training. Comparing model families in Table 2 underscores the importance of pretrained LLM knowledge for contextual retrieval: InSeNT, built on an encoder-only ModernBERT-Large backbone, reaches only 0.6381 final nDCG@10 and trails every LLM-based 
+
+> 6
+
+Table 2: ConTEB nDCG@10 for embedding retrieval (Emb.) and reranking (Rer.). Overall reports the macro-average across the eight tasks. Qwen3.5 rows denote untrained models using Anthropic’s prompt. Green bold and underlining indicate the best and second-best scores, respectively. 
+
+Method Ins. COVID Geo. ESG Football SQuAD NQA MLDR Overall 
+
+Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Qwen3-Emb.-4B .145 .166 .546 .692 .719 .853 .397 .483 .317 .465 .726 .798 .777 .846 .760 .883 .5484 .6483 InSeNT .451 .394 .360 .538 .831 .885 .230 .466 .252 .367 .684 .790 .667 .793 .719 .872 .5242 .6381 PPLX-0.6B .997 .333 .561 .700 .898 .880 .461 .541 .714 .650 .789 .838 .842 .861 .867 .885 .7662 .7110 PPLX-4B 1.000 .344 .620 .741 .935 .879 .631 .602 .781 .677 .837 .850 .869 .865 .895 .890 .8210 .7310 Voyage-3 1.000 .348 .547 .695 .928 .880 .574 .571 .796 .728 .826 .850 .818 .861 .896 .900 .7983 .7292 Voyage-4 .994 .344 .554 .689 .938 .884 .579 .581 .802 .727 .830 .853 .816 .862 .873 .901 .7981 .7300 Qwen3.5-0.8B .154 .199 .487 .664 .746 .859 .427 .498 .310 .460 .719 .785 .781 .843 .807 .916 .5538 .6531 Qwen3.5-2B .708 .809 .526 .680 .798 .886 .449 .607 .405 .538 .735 .774 .779 .843 .837 .930 .6547 .7585 Qwen3.5-4B .997 1.000 .523 .680 .925 .928 .543 .664 .601 .742 .669 .719 .764 .834 .797 .921 .7274 .8110 Qwen3.5-9B .994 1.000 .547 .691 .910 .945 .552 .668 .543 .700 .743 .830 .778 .841 .835 .948 .7376 .8279 
+
+ConTra-0.8B .127 .160 .514 .691 .936 .947 .507 .671 .726 .833 .694 .795 .772 .843 .765 .936 .6302 .7346 
+
+ConTra-2B .988 1.000 .518 .694 .922 .942 .515 .730 .649 .825 .766 .841 .785 .851 .832 .937 .7469 .8525 ConTra-4B 1.000 1.000 .527 .688 .938 .952 .523 .692 .719 .840 .705 .821 .754 .842 .792 .938 .7448 .8465 
+
+method. However, unlocking an LLM’s world knowledge and read-ing comprehension for retrieval does not require architectural mod-ification or pretraining. Whereas PPLX relies on costly diffusion pretraining to convert a causal LLM into a bidirectional encoder before retrieval training [10], ConTra preserves the generator’s native autoregressive text interface and requires only a single epoch of RL post-training with frozen retrieval models. 
+
+## 5.3 Reward Ablation 
+
+We remove reranking feedback, factual verification, and length control individually in Table 3, examining how each component shapes generated prefixes and final retrieval accuracy. 
+
+Reranking feedback encourages specific details over generic summaries. Tasks such as Insurance test whether a generator can supply concrete identifying details rather than defaulting to broad topic summaries. Because the reranker jointly evaluates the query and augmented chunk, 𝑅 rank provides the fine-grained preference signal needed to retain exact attributes. Removing 𝑅 rank hits the 2B model hardest, dropping its Insurance nDCG@10 from 1.000 to 0.159, whereas 0.8B and 4B show smaller changes for opposite reasons. The 0.8B model lacks the capacity to parse long-range document structure and stays near 0.16 on Insurance regardless, while the 4B model already extracts country attributes without 
+
+𝑅 rank and maintains 1.000. Sitting between them, the 2B model can locate country headings in the source document, and 𝑅 rank teaches it to keep those identifiers. 
+
+Factual verification ensures prefix reliability for retrieval and downstream use. At 2B, removing 𝑅 fact causes a smaller drop in final retrieval scores than the other ablations, yet it markedly increases factual hallucinations. In a paired manual audit of prefixes for 200 matched target chunks, the factual error rate rises from 4.5% to 16.0% when 𝑅 fact is omitted. Because nDCG@10 scores annotated chunk identifiers rather than prefix text, fabricated prefixes that match query keywords can still rank the target chunk near the top and even inflate embedding retrieval scores at 0.8B and 4B while degrading final reranked nDCG@10. More importantly, in downstream RAG and question-answering pipelines where prefix-augmented chunks serve directly as evidence, unfaithful prefixes corrupt the retrieved context. Adding 𝑅 fact suppresses unsupported claims and keeps prefixes reliable across the pipeline. 
+
+Length control prevents inter-chunk competition and re-duces compute overhead. Based on our observations, concise prefixes of roughly 16 tokens suffice to convey essential identify-ing cues, making lengthy descriptions unnecessary. Removing 𝑅 len 
+
+causes the largest overall retrieval decline at every model size: at 4B, mean prefix length grows from 17.7 to 239.2 tokens while final nDCG@10 falls from 0.8465 to 0.7084. An MLDR document about a Thai wildlife sanctuary illustrates how verbose prefixes induce inter-chunk competition: the full 4B model writes distinct prefixes highlighting each passage’s specific topic, whereas removing length control produces lengthy prefixes that repeat the sanctuary’s shared location and protected status. Prepending identical background to multiple chunks makes neighboring passages overly similar and causes non-target chunks to match the same query terms. Enforc-ing brevity avoids this confusion while reducing autoregressive decoding steps and token overhead during indexing and reranking. 
+
+## 5.4 Ablation of Embedding Model, Reranker, and Candidate Pool Size 
+
+In Table 4, we evaluate the fixed prefix writers on full ConTEB across two Qwen3 retrieval model sizes and three candidate pool sizes. For raw Qwen3 on unprefixed chunks, Anthropic, and Con-Tra, both the embedding model and the reranker change together, whereas InSeNT, PPLX, and Voyage retain their native embeddings for candidate retrieval and vary only the Qwen3 reranker. 
+
+> 7
+
+Table 3: Reward ablation results on ConTEB. Emb. and Rer. report embedding and reranked nDCG@10, respectively. ConTra rows use the full reward objective. Green bold and underlining denote the best and second-best scores within each model scale. 
+
+Method Ins. COVID Geo. ESG Football SQuAD NQA MLDR Overall 
+
+Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. 
+
+ConTra-0.8B .127 .160 .514 .691 .936 .947 .507 .671 .726 .833 .694 .795 .772 .843 .765 .936 .6302 .7346 
+
+0.8B − 𝑅 rank .170 .161 .488 .671 .941 .957 .538 .652 .658 .827 .735 .812 .748 .829 .805 .940 .6353 .7311 0.8B − 𝑅 fact .202 .223 .488 .656 .939 .953 .534 .595 .709 .817 .710 .809 .770 .842 .760 .911 .6388 .7257 0.8B − 𝑅 len .152 .178 .525 .692 .945 .956 .490 .637 .734 .820 .673 .646 .766 .838 .694 .806 .6225 .6966 
+
+ConTra-2B .988 1.000 .518 .694 .922 .942 .515 .730 .649 .825 .766 .841 .785 .851 .832 .937 .7469 .8525 
+
+2B − 𝑅 rank .140 .159 .520 .688 .941 .953 .508 .654 .702 .831 .699 .805 .766 .840 .786 .929 .6326 .7324 2B − 𝑅 fact .985 1.000 .554 .700 .929 .955 .469 .634 .623 .813 .711 .795 .737 .827 .755 .913 .7202 .8297 2B − 𝑅 len .136 .155 .528 .680 .941 .950 .510 .661 .731 .810 .720 .700 .756 .825 .713 .840 .6293 .7027 
+
+ConTra-4B 1.000 1.000 .527 .688 .938 .952 .523 .692 .719 .840 .705 .821 .754 .842 .792 .938 .7448 .8465 
+
+4B − 𝑅 rank .985 1.000 .537 .697 .932 .949 .531 .661 .700 .828 .765 .839 .772 .845 .806 .932 .7535 .8440 4B − 𝑅 fact .997 1.000 .558 .705 .941 .956 .572 .662 .731 .840 .733 .803 .750 .833 .768 .914 .7561 .8391 4B − 𝑅 len .766 .899 .462 .598 .897 .869 .424 .621 .664 .608 .619 .641 .727 .784 .620 .648 .6474 .7084 
+
+Table 4: Eight-task macro final nDCG@10 on full ConTEB across Qwen3 retrieval model sizes and candidate pool sizes without retraining prefix writers. 
+
+Qwen3 0.6B Qwen3 8B Method 𝐾 =10 𝐾 =15 𝐾 =20 𝐾 =10 𝐾 =15 𝐾 =20 Raw Qwen3 .5668 .5792 .5880 .6609 .6735 .6777 InSeNT .5819 .6053 .6065 .6237 .6465 .6526 PPLX-0.6B .6810 .6649 .6477 .7366 .7295 .7204 PPLX-4B .7158 .6862 .6661 .7675 .7454 .7299 Voyage-3 .7118 .6839 .6648 .7635 .7445 .7345 Voyage-4 .7063 .6856 .6653 .7627 .7467 .7315 Anthropic-0.8B .5763 .5905 .5988 .6525 .6663 .6788 ConTra-0.8B .6714 .6841 .6898 .7285 .7447 .7513 Anthropic-2B .6966 .7114 .7189 .7689 .7801 .7856 ConTra-2B .7912 .8045 .8091 .8463 .8558 .8610 
+
+Anthropic-4B .7691 .7820 .7905 .7992 .8129 .8239 ConTra-4B .7808 .7978 .8068 .8397 .8541 .8568 Anthropic-9B .7675 .7794 .7892 .8118 .8219 .8277 
+
+Learned prefixes transfer across retrieval model sizes with-out retraining. Across every retrieval model size in Table 4, all three ConTra writers outperform their same-size Anthropic base-lines, showing that learned prefixes generalize beyond the frozen 4B models used during training. At the default 15 candidates, Con-Tra-2B rises from 0.8045 nDCG@10 with the 0.6B embedding and reranking pair to 0.8525 with the 4B pair in Table 2, whereas scaling further to the 8B pair adds only 0.33 points to reach 0.8558. 
+
+Larger candidate pools improve text-prefix retrieval but de-grade PPLX and Voyage. Expanding the candidate pool consis-tently improves final nDCG@10 for all ConTra variants across both retrieval model sizes in Table 4. Wider pools give the reranker a chance to promote relevant chunks ranked below the initial cutoff, while explicit prefixes supply the identifiers and entity relations needed to recognize them, as shown in Section 3. By contrast, PPLX and Voyage degrade as the candidate pool expands, likely because wider pools introduce additional raw-text distractors that a text reranker struggles to distinguish when document context remains hidden in latent embeddings. Finally, although jointly scaling to the 8B pair and 20 candidates pushes ConTra-2B to a peak nDCG@10 of 0.8610, the modest incremental gains beyond our default 4B pair and 15 candidates incur higher online serving computation, mak-ing the default a practical balance between retrieval quality and overhead. 
+
+## 6 REALCONTEXTBENCH 
+
+While ConTEB specifically targets scenarios where document con-text is essential to disambiguate or answer a query, real-world retrieval corpora present a more complex landscape. First, practical collections naturally mix self-contained passages—which already contain complete answers independently—with context-dependent chunks that rely on surrounding text; indiscriminate contextualiza-tion risks diluting the crisp representation of self-contained chunks. Second, surrounding text is not always helpful: neighboring pas-sages in long documents frequently introduce competing entities, topic shifts, or topically similar distractions that can pull represen-tations away from the target and induce false matches. Existing benchmarks rarely evaluate whether contextual retrieval preserves precision on self-contained passages or resists interference from noisy surroundings. To bridge this gap, we introduce RealContext-Bench, combining five realistic application corpora with controlled distraction conditions on NanoBEIR to assess both practical utility and robustness against contextual interference. 
+
+## 6.1 Dataset Construction 
+
+We cover five application domains: web search, technical question answering, story comprehension, meetings, and financial analy-sis. For each collection, we retain original questions, split docu-ments into non-overlapping chunks at natural boundaries, and map human-annotated answer spans or supporting evidence to gold chunks. This construction naturally yields a mix of self-contained 
+
+> 8
+
+passages and passages requiring surrounding information. Follow-ing ConTEB, we set the chunk size to 1,000 characters, using 2,000 characters for longer Natural Questions pages. Each collection is indexed and searched as a single corpus, with statistics reported in Table 5. 
+
+Table 5: Sizes of the application collections in RealContext-Bench. 
+
+Collection Queries Docs. Chunks NQ 5,499 5,181 99,096 TechQA 149 139 1,036 FairytaleQA 1,007 23 342 QMSum 244 35 2,140 FinanceBench 146 84 45,049 
+
+Natural Questions (NQ). NQ comprises real Google search queries paired with human-annotated answers on Wikipedia pages [18]. We preserve page order and map annotated answer spans to chunks, using short-answer spans to pinpoint evidence whenever a long answer spans multiple chunks. 
+
+TechQA. TechQA features technical support questions from IBM forums grounded in IBM Technotes [3]. Using its answerable de-velopment queries, we split source documents into chunks and designate the chunk with the highest overlap with the annotated answer span as gold. 
+
+FairytaleQA. Although both FairytaleQA [46] and the NarrativeQA task used in ConTEB [17] evaluate narrative comprehension over stories, the two datasets differ inherently in their task design. Nar-rativeQA was intentionally constructed to encourage non-local questions by having annotators write queries from plot summaries without viewing the full text, making the answers less likely to come from a single passage in the full narrative. By contrast, FairytaleQA consists of expert-written questions covering story elements as well as causal and emotional relationships, paired with annotated supporting sections aligned to natural story breaks and spanning both single-section and cross-section queries. Following this origi-nal structure, we preserve narrative order and map FairytaleQA’s expert-annotated supporting sections directly to retrieval chunks, retaining a natural mix of local and multi-section questions that reflects realistic reading comprehension. 
+
+QMSum. QMSum pairs meeting transcripts with human-written queries and annotated supporting utterances for summariza-tion [51]. We use its specific queries as retrieval questions and construct gold chunks from supporting utterances while preserving speaker labels and turn order. 
+
+FinanceBench. FinanceBench contains specialist-curated finan-cial questions, answers, and supporting evidence from corporate filings [13]. We preserve readable table formatting during chunking and select the chunk with the greatest overlap with the annotated evidence as gold, supporting queries over company names, report-ing periods, and numerical figures. 
+
+NanoBEIR context conditions. NanoBEIR is a small-scale bench-mark of 13 BEIR tasks spanning domains such as news, scientific literature, and question answering [40, 49]. Because standard BEIR passages are largely self-contained, NanoBEIR provides an ideal testbed to operationalize the two failure modes motivated above: whether contextualization dilutes self-contained passages or allows noisy neighbors to corrupt target representations. To isolate the effect of surrounding text from corpus differences, we hold queries, target chunks, and gold annotations strictly fixed while varying only surrounding context across three controlled conditions: the original 
+
+condition presents each target chunk alone as a clean baseline; the 
+
+random condition prepends two randomly sampled passages before it and appends two after it; and in the topical condition, GPT-6 Luna generates four independent passages on the target’s narrow topic, each describing an unrelated subject, case, or event. Every contex-tual method receives identical surrounding passages. Specifically, random neighbors simulate abrupt topic shifts—such as unrelated sections or web boilerplate—testing whether a model blindly ab-sorbs off-topic context and shifts the target representation away from its core semantics. 
+
+## 6.2 RealContextBench Results 
+
+We evaluate ConTra on RealContextBench using the embedding model, reranker, and top-15 retrieval pipeline from Section 5.1, reporting nDCG@10 across the five application collections and three NanoBEIR conditions in Table 6. 
+
+ConTra generalizes to new application tasks. Trained solely on ConTEB, ConTra-2B outperforms its same-size untrained base-line across all five application collections and raises overall final nDCG@10 across all eight settings from 0.6456 to 0.6692. Crucially, RealContextBench extends evaluation to application tasks such as multi-speaker meeting queries in QMSum, technical support in TechQA, and financial analysis in FinanceBench. Succeeding across these unfamiliar formats demonstrates that ConTra learns a transferable strategy for selecting and phrasing context rather than overfitting to ConTEB’s task structures. 
+
+Different model sizes offer complementary strengths across tasks. RL training improves performance across most settings at all three scales, with each size excelling on distinct task types. Con-Tra-2B achieves the strongest overall balance and broadest gains across the benchmark. ConTra-4B leads all trained variants on QM-Sum and FairytaleQA, where greater capacity helps track speaker turns in meetings or resolve character aliases across long narratives. Conversely, TechQA exhibits a reversed size ordering within the trained family, where ConTra-0.8B at 0.7713 outperforms Con-Tra-4B at 0.7522. Because technical support passages frequently already contain the target error message or procedure, the smaller model’s broader topical summary establishes relevance without over-narrowing the chunk to a single sub-procedure when a query targets another aspect of the same passage. Together, these results show that each trained model size provides distinct practical utility depending on domain complexity and compute budgets. 
+
+Reranking can change which method performs best. Across almost all application collections, reranking the retrieved chunks substantially improves ranking accuracy over embedding retrieval alone. For search systems that rerank candidates before returning them, the relevant comparison is the order users ultimately see. Text-based prefixes naturally support this workflow by keeping document context legible to the reranker. On FinanceBench, for in-stance, Voyage-context-4 leads ConTra-2B at the embedding stage, 
+
+> 9
+
+Table 6: RealContextBench nDCG@10. FQA and Finance denote FairytaleQA and FinanceBench; Orig., Rand., and Topic. denote original, random, and topical context conditions. Qwen3.5 rows use Anthropic’s prompt. Green bold and underlining mark the best and second-best scores for embedding retrieval and reranking separately. 
+
+Application collections NanoBEIR context Method NQ TechQA FQA QMSum Finance Orig. Rand. Topic. Overall 
+
+Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Emb. Rer. Qwen3-Emb.-4B .651 .710 .722 .742 .628 .787 .314 .357 .292 .339 .689 .721 .689 .721 .689 .721 .5845 .6373 InSeNT .602 .686 .653 .738 .494 .720 .110 .192 .088 .104 .516 .606 .398 .551 .494 .635 .4194 .5291 PPLX-0.6B .598 .685 .728 .758 .674 .798 .263 .301 .247 .288 .597 .685 .582 .668 .596 .683 .5357 .6083 PPLX-4B .679 .717 .759 .770 .722 .812 .412 .405 .418 .445 .629 .705 .590 .678 .633 .703 .6051 .6542 Voyage-3 .691 .735 .820 .779 .657 .777 .377 .410 .522 .479 .651 .710 .652 .713 .642 .706 .6265 .6636 Voyage-4 .719 .741 .827 .779 .651 .772 .379 .402 .524 .469 .677 .716 .623 .698 .652 .709 .6315 .6608 Qwen3.5-0.8B .651 .705 .687 .752 .611 .778 .320 .349 .325 .415 .667 .705 .666 .703 .659 .700 .5733 .6384 Qwen3.5-2B .672 .713 .733 .755 .632 .799 .323 .372 .333 .443 .661 .703 .647 .691 .652 .690 .5816 .6456 Qwen3.5-4B .688 .731 .710 .788 .640 .811 .339 .388 .331 .475 .663 .698 .617 .661 .646 .691 .5793 .6553 Qwen3.5-9B .681 .727 .735 .795 .631 .798 .371 .404 .369 .494 .657 .703 .641 .692 .650 .693 .5918 .6632 
+
+ConTra-0.8B .656 .725 .706 .771 .636 .796 .299 .347 .334 .412 .686 .718 .667 .698 .676 .711 .5825 .6471 
+
+ConTra-2B .683 .749 .692 .765 .661 .809 .338 .381 .402 .525 .679 .709 .678 .710 .673 .706 .6008 .6692 ConTra-4B .672 .727 .711 .752 .643 .812 .358 .411 .391 .491 .680 .719 .669 .707 .671 .715 .5992 .6669 
+
+yet their order reverses after reranking (0.5248 vs. 0.4692): financial tables often list target figures without naming the company, and ConTra supplies the missing company identity in plain text so the reranker can verify the match. 
+
+Training strengthens robustness against distracting context. 
+
+PPLX encodes surrounding passages into the target’s vector, mak-ing retrieval susceptible to distracting neighbors. The prefix-based route instead preserves the original chunk verbatim and adds con-text as a prefix, retaining the target’s own content as a stable anchor. Even before RL, random context reduces reranked nDCG@10 by only 1.19 points for the prompted 2B prefix baseline, compared with 2.66 points for PPLX-4B. Our training further strengthens this robustness. On NanoBEIR, ConTra-4B raises mean reranked nDCG@10 across the three conditions from 0.6831 to 0.7138 af-ter training, with the largest gain under random context, while ConTra-2B also improves under both random and topical interfer-ence. With both the prefix architecture and model size held fixed, these additional gains reflect learned generation behavior. Although training data is filtered for context dependence, some surrounding passages offer little useful information or are difficult to interpret reliably. Relevance rewards and factual verification encourage the generator to distill and reinforce the target’s own content in these cases. This learned selectivity further reduces the influence of ran-dom or topically similar distractors, strengthening the protection provided by preserving the original chunk. 
+
+## 6.3 Combining ConTra Prefixes with PPLX Retrieval 
+
+Although standalone ConTra achieves strong end-to-end retrieval quality, its text-based output interface allows direct pairing with ex-isting contextual encoders. Extending our observation in Section 3 
+
+Table 7: Comparison of candidate retrieval using ConTra ver-sus PPLX-4B, with ConTra prefixes supplied to the reranker in both cases. Reported metrics are reranked nDCG@10. Bold marks the stronger retriever within each generator size. 
+
+2B model 4B model Collection ConTra PPLX ConTra PPLX 
+
+Application collections 
+
+NQ .7486 .7382 .7267 .7161 TechQA .7649 .7797 .7522 .7834 
+
+FairytaleQA .8092 .8194 .8123 .8234 
+
+QMSum .3811 .4140 .4110 .4286 
+
+FinanceBench .5248 .5250 .4913 .5291 
+
+NanoBEIR conditions 
+
+Original .7088 .6993 .7190 .7016 Random .7102 .6729 .7071 .6718 Topical .7057 .6909 .7154 .7030 
+
+Overall .6692 .6675 .6669 .6696 
+
+that reranker-visible prefixes unlock PPLX-4B’s strong candidate recall, we test a hybrid pipeline that uses PPLX-4B to retrieve candi-dates and attaches ConTra prefixes before reranking them, holding the generator and reranker fixed in Table 7. Overall averages are closely matched at both 2B and 4B, yet task-level results show distinct performance patterns across settings. 
+
+ConTra prefixes improve the reranking of candidates from contextual encoders. Because ConTra operates strictly in text space, its generated prefixes can be directly prepended to candidates retrieved by dense contextual encoders without modifying either model. With PPLX-4B candidates held fixed, attaching ConTra-2B 
+
+> 10
+
+prefixes improves reranked nDCG@10 across all five application collections compared with reranking raw chunks—most notably on FinanceBench, where nDCG@10 rises from 0.4446 to 0.5250. PPLX utilizes document-aware embeddings to recall relevant passages, while ConTra externalizes key attributes such as company names and reporting periods into explicit text that the reranker can verify. 
+
+Better candidates from PPLX improve hybrid retrieval. Com-paring individual collections at 2B shows that the hybrid configu-ration outperforms standalone ConTra on QMSum, FairytaleQA, and TechQA, lifting QMSum from 0.3811 to 0.4140. On meeting and story tasks, PPLX’s document-level representations help re-trieve passages whose relevance depends on speaker or narrative relationships, while TechQA gains confirm that a strong candidate retriever complements the same readable prefixes across distinct task needs. Because a reranker can only reorder candidates returned by the retriever, combining PPLX’s broader contextual recall with ConTra’s explicit prefixes improves accuracy on these collections. 
+
+Contextual interference and indexing cost favor standalone ConTra in noisy or resource-constrained settings. Conversely, standalone ConTra outperforms the hybrid pipeline across all three NanoBEIR conditions at both model sizes, reaching 0.7102 compared with 0.6729 for PPLX retrieval under random interference at 2B. Be-cause the prefixes and reranker are identical, this difference reflects the candidate retriever’s sensitivity to noise: dense contextual vec-tors incorporate surrounding distractors and miss target passages, whereas ConTra’s selective prefixes keep chunk embeddings fo-cused on the target. Furthermore, the hybrid retains ConTra prefix generation while replacing the fast Qwen embedding stage with the more expensive PPLX encoder, increasing indexing computation. In practice, the hybrid setup is best suited for clean corpora benefiting from PPLX candidate retrieval where maximizing recall justifies additional indexing cost, while standalone ConTra offers a simpler, lower-overhead, and interference-resistant pipeline for general and noisy retrieval environments. 
+
+## 7 COST AND EFFICIENCY 
+
+Practical deployment of contextual retrieval requires balancing retrieval accuracy against indexing latency and storage overhead. In this section, we evaluate the computational and storage costs of ConTra across model scales and compare them against standard dense retrieval, dedicated contextual encoders, and untrained prefix generators. 
+
+## 7.1 Measurement Protocol 
+
+We benchmark indexing latency on a single NVIDIA H100 80GB GPU across two subsets chosen to represent distinct document length regimes: 51 long Wikipedia articles from Natural Questions comprising 1,027 chunks, and 23 short narratives from FairytaleQA comprising 342 chunks. All methods process identical chunks under the same source-context budget. After warming up each model, we execute three timed runs per configuration and report median end-to-end latency, covering prefix generation where applicable and dense embedding computation while excluding one-time initializa-tion overhead. To ensure a fair comparison across architectures, we evaluate PPLX-4B using its official ONNX-optimized implemen-tation and run all Qwen3.5 generators on vLLM with automatic prefix caching enabled. 
+
+Table 8: Total indexing time in seconds on a single NVIDIA H100 80GB GPU. Paired Qwen3.5–ConTra runs hold all in-ference settings identical within each model size. 
+
+Method Long docs. Short docs. Qwen3-Emb.-4B 7.92 1.01 PPLX-0.6B 29.97 3.51 PPLX-4B 77.97 8.08 Qwen3.5-9B 268.12 29.02 Qwen3.5-0.8B 53.39 6.20 
+
+ConTra-0.8B 38.09 2.70 Qwen3.5-2B 76.58 7.87 
+
+ConTra-2B 55.58 3.75 Qwen3.5-4B 124.30 14.05 
+
+ConTra-4B 114.19 10.11 
+
+## 7.2 Indexing Time 
+
+ConTra-2B substantially reduces indexing latency relative to 9B and PPLX-4B. As reported in Table 8, ConTra-2B indexes the short-document collection 7 .74 × as fast as the prompted 9B pipeline, cutting total latency from 29.02 s to 3.75 s, and 2 .15 × as fast as PPLX-4B at 8.08 s. On the long-document collection, Con-Tra-2B maintains a consistent speed advantage, indexing 4 .82 ×
+
+as fast as prompted 9B and 1 .40 × as fast as PPLX-4B. Within the trained ConTra family, ConTra-0.8B achieves the lowest overall latency across both collections, whereas ConTra-2B combines the strongest retrieval accuracy with substantially lower indexing cost than ConTra-4B. 
+
+Prefix caching yields substantially higher reuse on short documents. Because vLLM hashes and reuses key–value atten-tion states only across requests sharing an identical leading token sequence, cache efficiency depends directly on how source docu-ments are windowed. For short documents, each complete source fits within a single context window, allowing every chunk from the same document to share an identical leading source prompt and reuse precomputed key–value states, yielding an 81.9% cache-hit rate. Conversely, long documents must be partitioned across multiple distinct context windows, shifting leading tokens across windows and reducing the cache-hit rate to 24.9%. This higher pre-fix reuse eliminates most redundant source prefill across chunks and accounts for the larger relative speedup on short documents. 
+
+RL training accelerates inference at fixed model scale. Com-paring paired runs before and after training—with prompts, input budgets, batch sizes, and vLLM settings held identical within each model size—demonstrates that RL post-training consistently lowers indexing latency across all three generator scales. At 2B, short-document indexing time drops from 7.87 s to 3.75 s, driven by a 71.1% reduction in generated output length from 82.4 to 23.8 tokens per chunk, compared with 79.7 tokens for prompted 9B. Generat-ing concise prefixes saves both autoregressive decoding steps and input tokens passed to the downstream embedding model. Because 
+
+> 11
+
+Case 1. Answer information in a non-gold chunk (Natural Questions)     
+
+> Query who wrote the theme song for the winter olympics
+> Chunk ... Arnaud was commissioned by conductor Felix Slatkin to create a piece for his album Charge! in 1958. For this, he wrote “The Charge Suite”, published by Shawnee Press, which included “Bugler's Dream”. ABC began using the composition as the theme to its coverage of the 1964 Winter Olympics in Innsbruck, Austria, and in future Olympics. ...
+> ConTra prefix Leo Arnaud's "Bugler's Dream," its significance, origins, and Olympic uses. Ranking The non-gold chunk with the prefix ranks first.
+
+Case 2. Highlighting self-contained evidence (NanoBEIR / NanoMSMARCO)     
+
+> Query what is rumination syndrome
+> Chunk Rumination Syndrome. Rumination syndrome, also called Merycism, is a type of eating disorder not otherwise specified that causes the regurgitation of food. Even though it is not identified as a specific eating disorder in the DSM-IV, certain parameters have been outlined for diagnosing the disorder.
+> ConTra prefix Rumination syndrome, also known as Merycism, is an eating disorder characterized by food regurgitation, with diagnostic criteria outlined despite its classification. Ranking The gold passage rises from rank 4 to 1 on fixed PPLX candidates.
+
+Figure 2: Case 1: A prefix supplies answer information to a non-gold chunk. Case 2: A prefix highlights relevant information already present in the target chunk. 
+
+high source-cache reuse leaves autoregressive decoding as a larger fraction of total runtime on short documents, output length com-pression translates into pronounced wall-clock savings, aligning indexing efficiency with the inter-chunk distinctiveness observed in Section 5.3. 
+
+## 7.3 Disk Storage 
+
+Retaining generated prefixes adds a lightweight text payload to the index without altering its vector layout. Specifically, each prefix-augmented chunk is encoded into a single 2,560-dimensional 
+
+float32 vector, keeping vector count and dimensionality un-changed. Measuring the UTF-8 size of stored prefixes and sepa-rators relative to raw chunk text plus dense vectors, the median of three saved runs adds 36.1 KB on FairytaleQA and 98.2 KB on Natural Questions. The corresponding original text-and-vector payloads are 3.77 MB and 12.46 MB, so the additions represent only 0.96% and 0.79%, respectively. ConTra thus retains a standard single-vector representation while adding less than 1% in text payload to keep readable context available at retrieval time. 
+
+## 8 CASE STUDIES 
+
+While aggregate ranking metrics quantify overall retrieval accu-racy, inspecting individual predictions reveals how generated pre-fixes reshape retrieved evidence in practice. Figure 2 examines two representative cases from ConTra-2B illustrating complementary behaviors across distinct contextual regimes: recovering missing entity information into an adjacent passage in Natural Questions, and foregrounding existing defining features within an isolated passage in NanoBEIR. 
+
+## 8.1 Answer Information in a Non-Gold Chunk 
+
+The first query asks for the Winter Olympics theme composer, whose annotated answer is Leo Arnaud. ConTra-2B ranks an adja-cent passage first while the annotated gold chunk falls outside the top five, leaving the top-1 passage with no credit under chunk-ID relevance labels. However, because that passage already describes the composition’s Olympic use and sits adjacent to the gold chunk, ConTra’s prefix extracts the composer’s full name from the sur-rounding page and prepends it directly, supplying the complete answer at rank 1. Standard chunk-level evaluation can thus un-derestimate ConTra’s effectiveness, pointing to stronger utility in downstream question answering and RAG pipelines. 
+
+## 8.2 Emphasizing Relevant Information Without Context 
+
+The second case examines an isolated NanoBEIR passage without surrounding context, directly illustrating the self-reinforcing be-havior observed in Section 6.2. The query asks for a definition of rumination syndrome, and the target passage already states the con-dition’s name, alternative term, and primary symptom. As shown in Figure 2, ConTra-2B distills and brings these defining attributes together in the prefix ahead of the original text. With the candidates retrieved by PPLX held fixed, prepending this prefix elevates the gold passage from rank 4 to rank 1. 
+
+> 12
+
+Because our relevance rewards measure ranking gains over the unaugmented target chunk, RL training incentivizes the generator not only to extract external context, but also to foreground the target’s core facts when surrounding text adds little signal. At infer-ence, this learned distillation transfers to self-contained passages, making their defining information more explicit to both encoder and reranker. 
+
+## 9 CONCLUSION 
+
+Our controlled analysis shows that textual prefixes enrich con-textual chunk embeddings, bringing more gold chunks into the candidate pool. With candidates held fixed, the prefix also helps the reranker judge their relevance. Motivated by these comple-mentary gains and the strong potential of learned prefix genera-tion, we introduce ConTra, which optimizes prefix generation via reinforcement learning with embedding and reranking feedback, factual verification, and length control. Across ConTEB and our newly constructed RealContextBench, ConTra preserves source-grounded details and inter-chunk distinctions while resisting con-textual interference—enabling ConTra-2B to match a prompted 9B generator on application collections and surpass it overall at a fraction of the indexing cost. Ultimately, ConTra uses one prefix per chunk throughout the contextual retrieval pipeline, improving retrieval accuracy, robustness, and indexing efficiency. 
+
+## REFERENCES 
+
+[1] Anthropic. 2024. Enhancing RAG with Contextual Retrieval. Claude Cookbook. https://platform.claude.com/cookbook/capabilities-contextual-embeddings-guide Accessed November 24, 2026. [2] Anthropic. 2024. Introducing Contextual Retrieval. https://www.anthropic.co m/research/contextual-retrieval Accessed November 14, 2026. [3] Vittorio Castelli, Rishav Chakravarti, Saswati Dana, Anthony Ferritto, Radu Florian, Martin Franz, Dinesh Garg, Dinesh Khandelwal, J. Scott McCarley, Mike McCawley, Mohamed Nasr, Lin Pan, Cezar Pendus, John F. Pitrelli, Saurabh Pujar, Salim Roukos, Andrzej Sakrajda, Avirup Sil, Rosario Uceda-Sosa, Todd Ward, and Rong Zhang. 2020. The TechQA Dataset. In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics, ACL 2020, Online, July 5-10, 2020 , Dan Jurafsky, Joyce Chai, Natalie Schluter, and Joel R. Tetreault (Eds.). Association for Computational Linguistics, 1269–1278. https://doi.org/10.18653 /V1/2020.ACL-MAIN.117 [4] Jianlyu Chen, Shitao Xiao, Peitian Zhang, Kun Luo, Defu Lian, and Zheng Liu. 2024. M3-Embedding: Multi-Linguality, Multi-Functionality, Multi-Granularity Text Embeddings Through Self-Knowledge Distillation. In Findings of the Asso-ciation for Computational Linguistics, ACL 2024, Bangkok, Thailand and virtual meeting, August 11-16, 2024 (Findings of ACL) , Lun-Wei Ku, Andre Martins, and Vivek Srikumar (Eds.), Vol. ACL 2024. Association for Computational Linguistics, 2318–2335. https://doi.org/10.18653/V1/2024.FINDINGS-ACL.137 [5] Peter Baile Chen, Tomer Wolfson, Michael Cafarella, and Dan Roth. 2025. En-richIndex: Using LLMs to Enrich Retrieval Indices Offline. In Second Conference on Language Modeling . https://openreview.net/forum?id=wyYL5Jov6e [6] Tong Chen, Hongwei Wang, Sihao Chen, Wenhao Yu, Kaixin Ma, Xinran Zhao, Hongming Zhang, and Dong Yu. 2024. Dense X Retrieval: What Re-trieval Granularity Should We Use?. In Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing, EMNLP 2024, Miami, FL, USA, November 12-16, 2024 , Yaser Al-Onaizan, Mohit Bansal, and Yun-Nung Chen (Eds.). Association for Computational Linguistics, 15159–15177. https://doi.org/10.18653/V1/2024.EMNLP-MAIN.845 [7] Max Conti, Manuel Faysse, Gautier Viaud, Antoine Bosselut, Céline Hudelot, and Pierre Colombo. 2025. Context is Gold to find the Gold Passage: Evaluating and Training Contextual Document Embeddings. In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing, EMNLP 2025, Suzhou, China, November 4-9, 2025 , Christos Christodoulopoulos, Tanmoy Chakraborty, Carolyn Rose, and Violet Peng (Eds.). Association for Computational Linguistics, 22594– 22608. https://doi.org/10.18653/V1/2025.EMNLP-MAIN.1150 [8] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2019. BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. In Proceedings of the 2019 Conference of the North American Chapter of the Associ-ation for Computational Linguistics: Human Language Technologies, NAACL-HLT 2019, Minneapolis, MN, USA, June 2-7, 2019, Volume 1 (Long and Short Papers) , Jill Burstein, Christy Doran, and Thamar Solorio (Eds.). Association for Computa-tional Linguistics, 4171–4186. https://doi.org/10.18653/V1/N19-1423 [9] Shahul ES, Jithin James, Luis Espinosa Anke, and Steven Schockaert. 2024. RA-GAs: Automated Evaluation of Retrieval Augmented Generation. In Proceedings of the 18th Conference of the European Chapter of the Association for Computational Linguistics, EACL 2024 - System Demonstrations, St. Julians, Malta, March 17-22, 2024 , Nikolaos Aletras and Orphée De Clercq (Eds.). Association for Computa-tional Linguistics, 150–158. https://doi.org/10.18653/V1/2024.EACL-DEMO.16 [10] Sedigheh Eslami, Maksim Gaiduk, Markus Krimmel, Louis Mark Milliken, Bo Wang, and Denis Bykov. 2026. Diffusion-Pretrained Dense and Contextual Embeddings. In Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (Volume 6: Industry Track), ACL 2026, San Diego, Cali-fornia, USA, July 2-7, 2026 , Yunyao Li, Georg Rehm, and Mei Tu (Eds.). Association for Computational Linguistics, 990–1004. https://doi.org/10.18653/V1/2026.ACL-INDUSTRY.69 [11] Thibault Formal, Benjamin Piwowarski, and Stéphane Clinchant. 2021. SPLADE: Sparse Lexical and Expansion Model for First Stage Ranking. In SIGIR ’21: The 44th International ACM SIGIR Conference on Research and Development in Information Retrieval, Virtual Event, Canada, July 11-15, 2021 , Fernando Diaz, Chirag Shah, Torsten Suel, Pablo Castells, Rosie Jones, and Tetsuya Sakai (Eds.). ACM, 2288– 2292. https://doi.org/10.1145/3404835.3463098 [12] Michael Günther, Isabelle Mohr, Bo Wang, and Han Xiao. 2024. Late Chunk-ing: Contextual Chunk Embeddings Using Long-Context Embedding Models. 
+
+CoRR abs/2409.04701 (2024). https://doi.org/10.48550/ARXIV.2409.04701 arXiv:2409.04701 [13] Pranab Islam, Anand Kannappan, Douwe Kiela, Rebecca Qian, Nino Scherrer, and Bertie Vidgen. 2023. FinanceBench: A New Benchmark for Financial Question Answering. CoRR abs/2311.11944 (2023). https://doi.org/10.48550/ARXIV.2311. 11944 arXiv:2311.11944 [14] Gautier Izacard, Mathilde Caron, Lucas Hosseini, Sebastian Riedel, Piotr Bo-janowski, Armand Joulin, and Edouard Grave. 2022. Unsupervised Dense Infor-mation Retrieval with Contrastive Learning. Trans. Mach. Learn. Res. 2022 (2022). https://openreview.net/forum?id=jKN1pXi7b0 [15] Vladimir Karpukhin, Barlas Oguz, Sewon Min, Patrick Lewis, Ledell Wu, Sergey Edunov, Danqi Chen, and Wen-tau Yih. 2020. Dense Passage Retrieval for Open-Domain Question Answering. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing, EMNLP 2020, Online, November 16-20, 2020 , Bonnie Webber, Trevor Cohn, Yulan He, and Yang Liu (Eds.). Association for Computational Linguistics, 6769–6781. https://doi.org/10.18653/V1/2020.E MNLP-MAIN.550 [16] Omar Khattab and Matei Zaharia. 2020. ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT. In Proceedings of the 43rd International ACM SIGIR conference on research and development in Information Retrieval, SIGIR 2020, Virtual Event, China, July 25-30, 2020 , Jimmy X. Huang, Yi Chang, Xueqi Cheng, Jaap Kamps, Vanessa Murdock, Ji-Rong Wen, and Yiqun Liu (Eds.). ACM, 39–48. https://doi.org/10.1145/3397271.3401075 [17] Tomás Kociský, Jonathan Schwarz, Phil Blunsom, Chris Dyer, Karl Moritz Her-mann, Gábor Melis, and Edward Grefenstette. 2018. The NarrativeQA Reading Comprehension Challenge. Trans. Assoc. Comput. Linguistics 6 (2018), 317–328. https://doi.org/10.1162/TACL_A_00023 [18] Tom Kwiatkowski, Jennimaria Palomaki, Olivia Redfield, Michael Collins, Ankur P. Parikh, Chris Alberti, Danielle Epstein, Illia Polosukhin, Jacob De-vlin, Kenton Lee, Kristina Toutanova, Llion Jones, Matthew Kelcey, Ming-Wei Chang, Andrew M. Dai, Jakob Uszkoreit, Quoc Le, and Slav Petrov. 2019. Natural Questions: a Benchmark for Question Answering Research. Trans. Assoc. Comput. Linguistics 7 (2019), 452–466. https://doi.org/10.1162/TACL_A_00276 [19] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel, Sebastian Riedel, and Douwe Kiela. 2020. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. In Advances in Neural Infor-mation Processing Systems 33: Annual Conference on Neural Information Process-ing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual , Hugo Larochelle, Marc’Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, and Hsuan-Tien Lin (Eds.). https://proceedings.neurips.cc/paper/2020/hash/6b493230205f780e1bc26 945df7481e5-Abstract.html [20] Shaobo Li, Yirui Zhou, Yuan Xu, Kevin Chen, Daniel Waddington, Swaminathan Sundararaman, Hubertus Franke, and Jian Huang. 2026. RAGPerf: An End-to-End Benchmarking Framework for Retrieval-Augmented Generation Systems. Proc. VLDB Endow. 19, 11 (2026), 3689–3703. https://www.vldb.org/pvldb/vol19/p3689-li.pdf [21] Yi Luan, Jacob Eisenstein, Kristina Toutanova, and Michael Collins. 2021. Sparse, Dense, and Attentional Representations for Text Retrieval. Trans. Assoc. Comput. Linguistics 9 (2021), 329–345. https://doi.org/10.1162/TACL_A_00369 [22] Craig Macdonald, Jinyuan Fang, Andrew Parry, and Zaiqiao Meng. 2025. Con-structing and Evaluating Declarative RAG Pipelines in PyTerrier. In Proceedings of the 48th International ACM SIGIR Conference on Research and Development in In-formation Retrieval, SIGIR 2025, Padua, Italy, July 13-18, 2025 , Nicola Ferro, Maria 
+
+> 13
+
+Maistro, Gabriella Pasi, Omar Alonso, Andrew Trotman, and Suzan Verberne (Eds.). ACM, 4035–4040. https://doi.org/10.1145/3726302.3730150 [23] Timo Möller, Anthony Reina, Raghavan Jayakumar, and Malte Pietsch. 2020. COVID-QA: A Question Answering Dataset for COVID-19. In Proceedings of the 1st Workshop on NLP for COVID-19 at ACL 2020 , Karin Verspoor, Kevin Bretonnel Cohen, Mark Dredze, Emilio Ferrara, Jonathan May, Robert Munro, Cecile Paris, and Byron Wallace (Eds.). Association for Computational Linguistics, Online. https://aclanthology.org/2020.nlpcovid19-acl.18/ Dataset and code: https: //github.com/deepset-ai/COVID-QA. Accessed November 14, 2026. [24] Jianmo Ni, Chen Qu, Jing Lu, Zhuyun Dai, Gustavo Hernández Ábrego, Ji Ma, Vincent Y. Zhao, Yi Luan, Keith B. Hall, Ming-Wei Chang, and Yinfei Yang. 2022. Large Dual Encoders Are Generalizable Retrievers. In Proceedings of the 2022 Conference on Empirical Methods in Natural Language Processing, EMNLP 2022, Abu Dhabi, United Arab Emirates, December 7-11, 2022 , Yoav Goldberg, Zornitsa Kozareva, and Yue Zhang (Eds.). Association for Computational Linguistics, 9844–9855. https://doi.org/10.18653/V1/2022.EMNLP-MAIN.669 [25] Rodrigo Nogueira and Kyunghyun Cho. 2019. Passage Re-ranking with BERT. 
+
+CoRR abs/1901.04085 (2019). arXiv:1901.04085 http://arxiv.org/abs/1901.04085 [26] Rodrigo Nogueira, Zhiying Jiang, Ronak Pradeep, and Jimmy Lin. 2020. Docu-ment Ranking with a Pretrained Sequence-to-Sequence Model. In Findings of the Association for Computational Linguistics: EMNLP 2020, Online Event, 16-20 November 2020 (Findings of ACL) , Trevor Cohn, Yulan He, and Yang Liu (Eds.), Vol. EMNLP 2020. Association for Computational Linguistics, 708–718. https://doi.org/10.18653/V1/2020.FINDINGS-EMNLP.63 [27] Liana Patel, Siddharth Jha, Melissa Pan, Harshit Gupta, Parth Asawa, Carlos Guestrin, and Matei Zaharia. 2025. Semantic Operators and Their Optimization: Enabling LLM-Based Data Processing with Accuracy Guarantees in LOTUS. Proc. VLDB Endow. 18, 11 (2025), 4171–4184. https://doi.org/10.14778/3749646.3749685 [28] Fabio Petroni, Aleksandra Piktus, Angela Fan, Patrick Lewis, Majid Yazdani, Nicola De Cao, James Thorne, Yacine Jernite, Vladimir Karpukhin, Jean Mail-lard, Vassilis Plachouras, Tim Rocktäschel, and Sebastian Riedel. 2021. KILT: a Benchmark for Knowledge Intensive Language Tasks. In Proceedings of the 2021 Conference of the North American Chapter of the Association for Computa-tional Linguistics: Human Language Technologies . Association for Computational Linguistics, Online, 2523–2544. https://doi.org/10.18653/v1/2021.naacl-main.200 [29] Ronak Pradeep, Sahel Sharifymoghaddam, and Jimmy Lin. 2023. RankZephyr: Effective and Robust Zero-Shot Listwise Reranking is a Breeze! CoRR 
+
+abs/2312.02724 (2023). https://doi.org/10.48550/ARXI V.2312.02724 arXiv:2312.02724 [30] Qwen Team. 2026. Qwen3.5: Towards Native Multimodal Agents. https: //qwen.ai/blog?id=qwen3.5 Accessed November 14, 2026. [31] Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and Percy Liang. 2016. SQuAD: 100, 000+ Questions for Machine Comprehension of Text. In Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing, EMNLP 2016, Austin, Texas, USA, November 1-4, 2016 , Jian Su, Xavier Carreras, and Kevin Duh (Eds.). The Association for Computational Linguistics, 2383–2392. https://doi.org/10.18653/V1/D16-1264 [32] Nils Reimers and Iryna Gurevych. 2019. Sentence-BERT: Sentence Embed-dings using Siamese BERT-Networks. In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing, EMNLP-IJCNLP 2019, Hong Kong, China, November 3-7, 2019 , Kentaro Inui, Jing Jiang, Vincent Ng, and Xiaojun Wan (Eds.). Association for Computational Linguistics, 3980–3990. https://doi.org/10.18653/V1/D19-1410 [33] Stephen E. Robertson and Hugo Zaragoza. 2009. The Probabilistic Relevance Framework: BM25 and Beyond. Found. Trends Inf. Retr. 3, 4 (2009), 333–389. https://doi.org/10.1561/1500000019 [34] Jon Saad-Falcon, Omar Khattab, Christopher Potts, and Matei Zaharia. 2024. ARES: An Automated Evaluation Framework for Retrieval-Augmented Genera-tion Systems. In Proceedings of the 2024 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies (Volume 1: Long Papers), NAACL 2024, Mexico City, Mexico, June 16-21, 2024 , Kevin Duh, Helena Gómez-Adorno, and Steven Bethard (Eds.). Association for Computa-tional Linguistics, 338–354. https://doi.org/10.18653/V1/2024.NAACL-LONG.20 [35] Shreya Shankar, Tristan Chambers, Tarak Shah, Aditya G. Parameswaran, and Eugene Wu. 2025. DocETL: Agentic Query Rewriting and Evaluation for Complex Document Processing. Proc. VLDB Endow. 18, 9 (2025), 3035–3048. https: //doi.org/10.14778/3746405.3746426 [36] Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Mingchuan Zhang, Y. K. Li, Y. Wu, and Daya Guo. 2024. DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models. CoRR abs/2402.03300 (2024). https://doi.org/10.48550/ARXIV.2402.03300 arXiv:2402.03300 [37] Ji Sun, Guoliang Li, James Pan, Jiang Wang, Yongqing Xie, Ruicheng Liu, and Wen Nie. 2025. GaussDB-Vector: A Large-Scale Persistent Real-Time Vector Database for LLM Applications. Proc. VLDB Endow. 18, 12 (2025), 4951–4963. https://doi.org/10.14778/3750601.3750619 [38] Weiwei Sun, Lingyong Yan, Xinyu Ma, Shuaiqiang Wang, Pengjie Ren, Zhumin Chen, Dawei Yin, and Zhaochun Ren. 2023. Is ChatGPT Good at Search? Investigating Large Language Models as Re-Ranking Agents. In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing, EMNLP 2023, Singapore, December 6-10, 2023 , Houda Bouamor, Juan Pino, and Kalika Bali (Eds.). Association for Computational Linguistics, 14918–14937. https://doi.org/10.18653/V1/2023.EMNLP-MAIN.923 [39] Zhaoze Sun, Chengliang Chai, Qiyan Deng, Kaisen Jin, Xinyu Guo, Han Han, Ye Yuan, Guoren Wang, and Lei Cao. 2025. QUEST: Query Optimization in Unstructured Document Analysis. Proc. VLDB Endow. 18, 11 (2025), 4560–4573. https://doi.org/10.14778/3749646.3749713 [40] Nandan Thakur, Nils Reimers, Andreas Rücklé, Abhishek Srivastava, and Iryna Gurevych. 2021. BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of Information Retrieval Models. In Proceedings of the Neural Information Processing Systems Track on Datasets and Benchmarks 1, NeurIPS Datasets and Benchmarks 2021, December 2021, virtual , Joaquin Vanschoren and Sai-Kit Yeung (Eds.). https: //datasets-benchmarks-proceedings.neurips.cc/paper/2021/hash/65b9eea6e1c c6bb9f0cd2a47751a186f-Abstract-round2.html [41] Voyage AI. 2025. Introducing voyage-context-3: Focused Chunk-Level Details with Global Document Context. https://blog.voyageai.com/2025/07/23/voyage-context-3/ Accessed November 14, 2026. [42] Voyage AI. 2026. voyage-context-4: Stop Worrying about Chunking with Our Best-Performing Model. https://blog.voyageai.com/2026/06/29/voyage-context-4/ Accessed November 14, 2026. [43] Liang Wang, Nan Yang, Xiaolong Huang, Linjun Yang, Rangan Majumder, and Furu Wei. 2024. Improving Text Embeddings with Large Language Models. In 
+
+Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), ACL 2024, Bangkok, Thailand, August 11-16, 2024 , Lun-Wei Ku, Andre Martins, and Vivek Srikumar (Eds.). Association for Computational Linguistics, 11897–11916. https://doi.org/10.18653/V1/2024.ACL-LONG.642 [44] Shu Wang, Yingli Zhou, and Yixiang Fang. 2026. BookRAG: A Hierarchical Structure-Aware Index-Based Approach for Retrieval-Augmented Generation on Complex Documents. Proc. VLDB Endow. 19, 9 (2026), 2358–2371. https: //doi.org/10.14778/3819518.3819556 [45] Lee Xiong, Chenyan Xiong, Ye Li, Kwok-Fung Tang, Jialin Liu, Paul N. Bennett, Junaid Ahmed, and Arnold Overwijk. 2021. Approximate Nearest Neighbor Negative Contrastive Learning for Dense Text Retrieval. In 9th International Conference on Learning Representations, ICLR 2021, Virtual Event, Austria, May 3-7, 2021 . OpenReview.net. https://openreview.net/forum?id=zeFrfgyZln [46] Ying Xu, Dakuo Wang, Mo Yu, Daniel Ritchie, Bingsheng Yao, Tongshuang Wu, Zheng Zhang, Toby Jia-Jun Li, Nora Bradford, Branda Sun, Tran Bao Hoang, Yisi Sang, Yufang Hou, Xiaojuan Ma, Diyi Yang, Nanyun Peng, Zhou Yu, and Mark Warschauer. 2022. Fantastic Questions and Where to Find Them: FairytaleQA -An Authentic Dataset for Narrative Comprehension. In Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), ACL 2022, Dublin, Ireland, May 22-27, 2022 , Smaranda Muresan, Preslav Nakov, and Aline Villavicencio (Eds.). Association for Computational Linguistics, 447–460. https://doi.org/10.18653/V1/2022.ACL-LONG.34 [47] Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu Yue, Weinan Dai, Tiantian Fan, Gaohong Liu, Juncai Liu, Lingjun Liu, Xin Liu, Haibin Lin, Zhiqi Lin, Bole Ma, Guangming Sheng, Yuxuan Tong, Chi Zhang, Mofan Zhang, Ru Zhang, Wang Zhang, Hang Zhu, Jinhua Zhu, Jiaze Chen, Jiangjie Chen, Chengyi Wang, Hongli Yu, Yuxuan Song, Xiangpeng Wei, Hao Zhou, Jingjing Liu, Wei-Ying Ma, Ya-Qin Zhang, Lin Yan, Yonghui Wu, and Mingxuan Wang. 2025. DAPO: An Open-Source LLM Reinforcement Learning System at Scale. In Advances in Neural Information Processing Systems 38: Annual Conference on Neural Information Processing Systems 2025, NeurIPS 2025, San Diego, CA, USA, December 2-7, 2025 / Mexico City, Mexico, November 30 - December 5, 2025 , Danielle Belgrave, Cheng Zhang, Laura N. Montoya, Hsuan-Tien Lin, Razvan Pascanu, Piotr Koniusz, Marzyeh Ghassemi, Nancy Chen, Iván Vladimir Meza Ruíz, and Arturo Loaiza-Bonilla (Eds.). http://papers.nips.cc/paper_files/paper/2025/hash /a4277440d50f1f15d2cb4c14f7e0c0d2-Abstract-Conference.html [48] Yue Yu, Wei Ping, Zihan Liu, Boxin Wang, Jiaxuan You, Chao Zhang, Mohammad Shoeybi, and Bryan Catanzaro. 2024. RankRAG: Unifying Context Ranking with Retrieval-Augmented Generation in LLMs. In Advances in Neural Information Pro-cessing Systems 37: Annual Conference on Neural Information Processing Systems 2024, NeurIPS 2024, Vancouver, BC, Canada, December 10 - 15, 2024 , Amir Glober-sons, Lester Mackey, Danielle Belgrave, Angela Fan, Ulrich Paquet, Jakub M. Tomczak, and Cheng Zhang (Eds.). http://papers.nips.cc/paper_files/paper/202 4/hash/db93ccb6cf392f352570dd5af0a223d3-Abstract-Conference.html [49] Zeta Alpha. [n.d.]. NanoBEIR. https://huggingface.co/collections/zeta-alpha-ai/nanobeir Accessed November 14, 2026. [50] Yanzhao Zhang, Mingxin Li, Dingkun Long, Xin Zhang, Huan Lin, Baosong Yang, Pengjun Xie, An Yang, Dayiheng Liu, Junyang Lin, Fei Huang, and Jingren Zhou. 2025. Qwen3 Embedding: Advancing Text Embedding and Reranking Through Foundation Models. CoRR abs/2506.05176 (2025). https://doi.org/10.48550/ARX IV.2506.05176 arXiv:2506.05176 
+
+> 14
+
+[51] Ming Zhong, Da Yin, Tao Yu, Ahmad Zaidi, Mutethia Mutuma, Rahul Jha, Ahmed Hassan Awadallah, Asli Celikyilmaz, Yang Liu, Xipeng Qiu, and Dragomir R. Radev. 2021. QMSum: A New Benchmark for Query-based Multi-domain Meeting Summarization. In Proceedings of the 2021 Conference of the North American Chapter of the Association for Computational Linguis-tics: Human Language Technologies, NAACL-HLT 2021, Online, June 6-11, 2021 ,Kristina Toutanova, Anna Rumshisky, Luke Zettlemoyer, Dilek Hakkani-Tür, Iz Beltagy, Steven Bethard, Ryan Cotterell, Tanmoy Chakraborty, and Yichao Zhou (Eds.). Association for Computational Linguistics, 5905–5921. https: //doi.org/10.18653/V1/2021.NAACL-MAIN.472 [52] Yingli Zhou, Yaodong Su, Youran Sun, Shu Wang, Taotao Wang, Runyuan He, Yongwei Zhang, Sicong Liang, Xilin Liu, Yuchi Ma, and Yixiang Fang. 2025. In-Depth Analysis of Graph-Based RAG in a Unified Framework. Proc. VLDB Endow. 
+
+18, 13 (2025), 5623–5637. https://doi.org/10.14778/3773731.3773738 [53] Honglei Zhuang, Zhen Qin, Rolf Jagerman, Kai Hui, Ji Ma, Jing Lu, Jianmo Ni, Xuanhui Wang, and Michael Bendersky. 2023. RankT5: Fine-Tuning T5 for Text Ranking with Ranking Losses. In Proceedings of the 46th International ACM SIGIR Conference on Research and Development in Information Retrieval, SIGIR 2023, Taipei, Taiwan, July 23-27, 2023 , Hsin-Hsi Chen, Wei-Jou (Edward) Duh, Hen-Hsen Huang, Makoto P. Kato, Josiane Mothe, and Barbara Poblete (Eds.). ACM, 2308–2313. https://doi.org/10.1145/3539618.3592047
