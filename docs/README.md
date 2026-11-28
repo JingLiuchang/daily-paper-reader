@@ -48,17 +48,17 @@
 <section class="dpr-home-dashboard-card dpr-home-report-card">
   <div class="dpr-home-dashboard-header">
     <div>
-      <span class="dpr-home-dashboard-kicker">2026-11-27</span>
+      <span class="dpr-home-dashboard-kicker">2026-11-28</span>
       <h3 class="dpr-home-dashboard-title">今日汇总</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">共 18 篇</strong>
+    <strong class="dpr-home-dashboard-count">共 7 篇</strong>
   </div>
   <dl class="dpr-home-dashboard-stats">
     <div class="dpr-home-dashboard-stat"><dt>累计更新</dt><dd>1 次</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>4</dd></div>
-    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>14</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>精读</dt><dd>2</dd></div>
+    <div class="dpr-home-dashboard-stat"><dt>速读</dt><dd>5</dd></div>
   </dl>
-  <p class="dpr-home-dashboard-body">最近更新：2026-11-27 02:13:16 UTC<br>状态：成功</p>
+  <p class="dpr-home-dashboard-body">最近更新：2026-11-28 01:53:57 UTC<br>状态：成功</p>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-brief-card">
   <div class="dpr-home-dashboard-header">
@@ -69,7 +69,7 @@
     <strong class="dpr-home-dashboard-count">AI</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<p>今日筛选18篇AI智能体论文并精读4篇，重点聚焦自进化智能体的长程任务评测。最值得看的是EvoLink-Bench（9.0分），它为“长程、相互依赖”的任务流提供了自进化智能体基准，以及关于工具使用智能体双极性记忆的持续适应研究。普通读者可优先阅读这两篇精读，再按需浏览速读中的CoEvoBench等基准与技能诊断工作。</p>
+<p>今日精读2篇、速读5篇，聚焦AI智能体评测与代码编辑行为。最值得看的是FigmaEval如何衡量AI做专业UI设计，以及编码智能体为何会“过度编辑”。普通读者可先读这两篇精读，再按兴趣浏览速读中的评测基准。</p>
   </div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-deep-card">
@@ -78,12 +78,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">精读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">4 篇</strong>
+    <strong class="dpr-home-dashboard-count">2 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="EvoLink-Bench: A Benchmark for Evaluating Self-Evolving Agents in Long-Horizon Interdependent Task Streams">EvoLink-Bench: A Benchmark for Evaluating Self-Evolving Agents in Long-Horizon Interdependent Task Streams</span></li><li><span class="dpr-home-dashboard-paper-title" title="Failure Broadens, Success Sharpens: Continual Adaptation of Tool-Use Agents Across Diverse Tasks with Dual-Polarity Memory">Failure Broadens, Success Sharpens: Continual Adaptation of Tool-Use Agents Across Diverse Tasks with Dual-Polarity Memory</span></li><li><span class="dpr-home-dashboard-paper-title" title="MedSkill-E$^{2}$: Evaluating and Evolving Skills for Medical Agents">MedSkill-E$^{2}$: Evaluating and Evolving Skills for Medical Agents</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="FigmaEval: A Benchmark for Evaluating AI Agents in Professional UI Design">FigmaEval: A Benchmark for Evaluating AI Agents in Professional UI Design</span></li><li><span class="dpr-home-dashboard-paper-title" title="How Much Do Coding Agents Over-Edit, and Why? An Empirical Study of Unneeded Edits in Repository-Level Agent Patches">How Much Do Coding Agents Over-Edit, and Why? An Empirical Study of Unneeded Edits in Repository-Level Agent Patches</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>1</strong></span><span class="dpr-home-dashboard-tag">agent-trace <strong>1</strong></span></div>
 </section>
 <section class="dpr-home-dashboard-card dpr-home-skim-card">
   <div class="dpr-home-dashboard-header">
@@ -91,12 +91,12 @@
       <span class="dpr-home-dashboard-kicker">今日累计</span>
       <h3 class="dpr-home-dashboard-title">速读推荐</h3>
     </div>
-    <strong class="dpr-home-dashboard-count">14 篇</strong>
+    <strong class="dpr-home-dashboard-count">5 篇</strong>
   </div>
   <div class="dpr-home-dashboard-body">
-<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="CoEvoBench: Can LLMs Drive Recursive Co-Evolution of Agentic Systems?">CoEvoBench: Can LLMs Drive Recursive Co-Evolution of Agentic Systems?</span></li><li><span class="dpr-home-dashboard-paper-title" title="SkillLens: An Interactive Human-LLM System for Diagnosing and Refining Agent Skills">SkillLens: An Interactive Human-LLM System for Diagnosing and Refining Agent Skills</span></li><li><span class="dpr-home-dashboard-paper-title" title="BRAG: Bayesian Retrieval Augmented Generation">BRAG: Bayesian Retrieval Augmented Generation</span></li></ul>
+<ul class="dpr-home-dashboard-paper-list"><li><span class="dpr-home-dashboard-paper-title" title="Automatic Occupational Coding through Retrieval-Augmented Generation">Automatic Occupational Coding through Retrieval-Augmented Generation</span></li><li><span class="dpr-home-dashboard-paper-title" title="mini-psych-agent: Evaluating Human-Like Behavior in LLM Agents through Interactive Psychological Environments">mini-psych-agent: Evaluating Human-Like Behavior in LLM Agents through Interactive Psychological Environments</span></li><li><span class="dpr-home-dashboard-paper-title" title="TACT-Bench: Testing Adaptive Conversational Threats against Tool-Use Agents">TACT-Bench: Testing Adaptive Conversational Threats against Tool-Use Agents</span></li></ul>
   </div>
-  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent <strong>8</strong></span><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent-trace <strong>2</strong></span><span class="dpr-home-dashboard-tag">vector-ann <strong>1</strong></span></div>
+  <div class="dpr-home-dashboard-tags"><span class="dpr-home-dashboard-tag">agent-bench <strong>3</strong></span><span class="dpr-home-dashboard-tag">agent <strong>2</strong></span></div>
 </section>
 </div>
 

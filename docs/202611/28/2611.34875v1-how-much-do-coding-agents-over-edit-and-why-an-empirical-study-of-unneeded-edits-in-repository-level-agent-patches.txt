@@ -1,0 +1,2618 @@
+Microsoft
+November 26, 2026
+How Much Do Coding Agents Over-Edit, and Why? An
+Empirical Study of Unneeded Edits in Repository-Level
+Agent Patches
+Aakash Goel*, Benjamin Steenhoek*, Yu Hu
+Microsoft
+{aakashgoel, bensteenhoek, yuhu}@microsoft.com
+Agent patches are larger than developers’, which is widely read as over-editing. But patch size does
+not say whether the extra edits are needed, what they are, or where they come from. We introduce
+Delta Residue Attribution (DRA), which replays agent trajectories, traces every block (unit) of the final
+patch to the step that wrote it, reverts each unit, and reruns the task tests to decide whether the unit is
+needed. We apply DRA to 7,660 resolved GitHub Copilot CLI trajectories from 18 frontier models on
+SWE-bench Verified (6,728) and DeepSWE (932), and grade developer patches using the same method.
+Agent patches do change more lines than developers’; on SWE-bench Verified the majority of extra edits
+add tests (61%) and documentation (13%) while on DeepSWE, most extra edits are code (58%). On both
+benchmarks, agents’ code is on average at least as necessary as developers’ (mean NPcode 0.887 vs. 0.864
+on SWE-bench Verified, where 11 of 18 models leave less unneeded code than developers, and 0.797
+vs. 0.785 on DeepSWE). On average, 11% of an agent patch’s code units on SWE-bench Verified are
+still unneeded, and 89% of those change behavior. Tests the agent adds detect most injected bugs (68%,
+against 77% for the task tests); 5% of all injected bugs are caught by the agent’s new or strengthened
+tests but missed by the task tests. Debug steps write almost none of the unneeded code. Code necessity
+differs substantially by model; it is unrelated to resolve rate on SWE-bench Verified and negatively
+correlated with it on DeepSWE (Spearman −0.59, p = 0.01). On SWE-bench Verified, pruning with
+DRA using only the tests the agent can see (its own tests and the repository’s) removes the majority
+of unneeded code but also some needed code (67% recall, 46% precision), and 89% of pruned patches
+still resolve the task; asking the agent to audit its own diff is more precise but less effective (36% recall,
+66% precision). We recommend that benchmarks report code necessity next to resolve rate and that
+over-editing be addressed through model training and harness-level pruning.
+1
+Introduction
+Language models are now routinely asked to edit existing code rather than write it from scratch. Passing tests
+is necessary but not sufficient: a patch that fixes a three-line bug by rewriting fifty lines is harder to review
+and more likely to carry unintended changes. In a maintainer study, roughly half of the SWE-bench-passing
+patches would not have been merged (Whitfill et al., 2026), and many plausible patches behave differently
+from the developer fix on inputs the tests do not cover (Wang et al., 2026). We call the tendency to change
+more than necessary over-editing. On minimal function-level edits, models change far more than the task
+requires (Zhu et al., 2026). At the repository level, successful agent patches contain about twice as many
+changes as developers’ patches, and minimality prompts barely help (Luo et al., 2026). Larger agent patches
+are therefore widely read as over-editing.
+Preservation prompts (Zhu et al., 2026; Chai et al., 2026) and edit-aware training (Zhu et al., 2026; Yang
+et al., 2026; Ke et al., 2026) reduce function-level over-editing. Patch size does not tell whether the extra edits
+are needed, what kind of edits they are, or when in the trajectory they were written; the answers to these
+*Equal contribution.
+arXiv:2611.34875v1  [cs.SE]  25 Nov 2026
+
+
+Unneeded Edits in Coding-Agent Patches
+2
+questions determine what a fix should look like. If the extra edits are debugging leftovers, a harness can clean
+them up. If they are tests, they may be welcome. If they are written into the fix, the model has to change.
+We study over-editing in repository-level patches at the level of individual blocks and the trajectory steps that
+wrote them. Our research questions are: RQ1: How much do agents over-edit compared with developers?
+RQ2: What are the unneeded edits? RQ3: Where in the trajectory do they come from? RQ4: Which
+models over-edit more, and does over-editing track resolve rate? RQ5: Can unneeded code be removed
+automatically?
+To answer these questions, we build DRA. DRA replays a resolved trajectory, splits the final patch into units
+(contiguous blocks of changed lines that can be reverted on their own), and traces each unit to the step that
+wrote it. It decides whether a unit is needed by reverting it and rerunning the task tests, in the tradition of
+delta debugging (Zeller and Hildebrandt, 2002). The share of needed units is the necessity precision NP, and
+NPcode is that share over code units. Because benchmark tests miss some needed behavior (Wang et al., 2026),
+we also check unneeded code with behavioral probes (Section 3.4) and grade developer patches the same
+way. We apply DRA to 7,660 resolved coding-agent trajectories of 18 models on SWE-bench Verified and
+DeepSWE.
+Findings.
+Agent patches do change more lines than developers’, but on SWE-bench Verified the extra lines
+are mostly tests (61%) and documentation (13%), while on DeepSWE most extra edits are code (58%; RQ2).
+On code, on SWE-bench Verified 11 of 18 models leave less unneeded code than developers (mean NPcode
+0.887 vs. 0.864), for four no significant difference is detected (which does not establish equivalence), and three
+models leave more (RQ1, Section 5.1). On DeepSWE, agents are on par with developers (0.797 vs. 0.785), but
+no model is significantly above the developer baseline. On average, 11% of an agent patch’s code units are still
+unneeded, and 89% of those change behavior (RQ2). Debug steps (exploring, reproducing, or probing) write
+almost none of the code residue (154 of 3,987 units); fix steps write 83% of it (RQ3). Code necessity differs by
+model and does not correlate with resolve rate on SWE-bench Verified (Spearman −0.10), but on DeepSWE
+it is anti-correlated (−0.59, p = 0.01; RQ4). On SWE-bench Verified, after generation, self-audit is precise
+(65.7%) but finds only 35.5% of unneeded code, pruning with the agent’s own tests and the repository’s
+regression tests finds 67.3% at lower precision (46.3%) on the 2,495 eligible patches, and stopping early barely
+changes NPcode (0.700 to 0.710; RQ5). Our contributions are a block-level empirical study of over-editing
+with developer patches graded the same way, the DRA method (Section 3), and implications for evaluation
+and harness design (Section 6). Appendix A.1 lists our pre-registered hypotheses and our deviations from
+them.
+2
+Related Work
+Measuring over-editing.
+Zhu et al. (2026) and PDB (Chai et al., 2026) measure unneeded edits against a
+known minimal fix, mostly on single functions, CanItEdit (Cassano et al., 2024) measures how much of a
+function edit the tests cover, and edit-aware training reduces it (Yang et al., 2026; Ke et al., 2026). At the
+repository level, RECAP (Luo et al., 2026) compares patch sizes. Coverage metrics conflate “executed by
+tests” with “required by the task”. DRA measures necessity by counterfactual removal and needs no unique
+reference patch.
+Why unneeded changes are costly.
+Change size predicts defects (Nagappan and Ball, 2005; Kamei et al.,
+2013), and tangled changes distort defect data (Herzig and Zeller, 2013). Reviewers favor small, focused
+changes (Rigby and Bird, 2013; Bacchelli and Bird, 2013), and larger changes take longer to review (Sadowski
+et al., 2018). Agent pull requests often need reviewer involvement or later rework (Peralta et al., 2026; Pham
+and Ghaleb, 2026). Plausible patches often differ from the developer fix on untested inputs (Wang et al., 2026).
+LLM refactorings that pass existing tests can still change behavior (Dristi and Dwyer, 2026). Both findings
+motivate our behavioral checks.
+Agent harnesses, trajectories, and delta debugging.
+Work on agent harnesses and trajectories (Yang et al.,
+2024; Wang et al., 2025; SWE-agent Team, 2025; Shu et al., 2026; Ceka et al., 2026) does not attribute individual
+
+
+Unneeded Edits in Coding-Agent Patches
+3
+1
+Replay + role labels
+snapshot Dt after every step
+2
+Units of final patch Δ
+provenance t*(u)
+3
+Necessity
+revert u; tests + probes
+4
+Decomposition
+excess split by step role
+t1 Explore: grep parse_date
+t2 Reproduce: run repro.py
+t3 Probe: add type guard
+t4 Probe: add debug log()
+t5 Fix: return None on ""
+t6 Refine: rename d→dt
+t7 Cleanup: delete repro.py
+ reverted before submission: leaves no unit in Δ
+u1  isinstance guard
+u4  debug log() line
+u2  empty-string check
+u3  variable rename
+Unneeded
+Unneeded
+Needed
+Unneeded
+Debug-step excess Edbg = {u1, u4}
+introduced at Probe steps t3, t4
+Necessary N = {u2}
+In-fix excess Efix = {u3}
+introduced at Refine step t6
+NP = |N| / |Δ|     ρ = |Edbg| / |Edbg ∪ Efix|
+Figure 1: Overview of DRA. A resolved trajectory is replayed, each unit of the final patch is traced to the step that wrote
+it, the step is labeled with a role, and each unit is reverted to test whether it is needed. Unneeded units are attributed to
+the role of the step that wrote them. The example is the parse_date() fix of Appendix B.1.
+Algorithm 1 Delta Residue Attribution (DRA)
+Require: base files S0, resolved trajectory τ = ((at, ot))T
+t=1, submitted patch ∆, oracle O
+1: replay the edit and create calls of τ on S0, recording line-level blame after every step
+2: assert the replayed final state equals ∆
+3: for each unit u ∈U(∆) do
+4:
+t⋆(u) ←latest step that wrote or deleted a line of u
+5:
+r(t⋆(u)) ←RULES(at⋆) or JUDGE(at⋆, ot⋆, context)
+6:
+class(u) ∈{code, test, docs, nonsemantic, config}
+7:
+n(u) ←1 −O(ST ⊖u)
+8: end for
+9: return NPtest(∆), NPcode(∆), ρ, and the per-unit table
+patch blocks to the steps that wrote them. DRA builds on delta debugging (Zeller and Hildebrandt, 2002)
+and inherits the overfitting caveat of test-based repair (Smith et al., 2015), so we calibrate against developer
+patches. Appendix I gives the extended discussion.
+3
+Tracing Edits to Trajectory Steps: DRA
+DRA has four steps: replay, unit provenance, step-role labeling, and necessity grading. Figure 1 shows the
+pipeline on a small example (Appendix B.1), and Algorithm 1 gives pseudocode.
+3.1
+Definitions
+An agent produces a trajectory of actions and observations; executing the first t actions of a task yields the
+working-tree state St, and the submitted patch is ∆= diff(S0, ST). We decompose ∆into units U(∆) =
+{u1, . . . , un} that can each be reverted on their own, and write ST ⊖u for the state with unit u reverted. An
+oracle O accepts a state (O(S) = 1) if it passes some check. The task-test oracle Otest runs the SWE-bench
+FAIL_TO_PASS and PASS_TO_PASS tests (Jimenez et al., 2024) (on DeepSWE, the task’s own tests). We
+analyze only resolved patches, so O(ST) = 1. A unit is needed for O if reverting it causes rejection (nO(u) = 1,
+written NEEDED), and unneeded otherwise (nO(u) = 0, written UNNEEDED). The necessity precision NPO of a
+patch is its needed units divided by all its units:
+nO(u) = 1 −O(ST ⊖u),
+(1)
+NPO(∆) =
+1
+|U(∆)| ∑
+u
+nO(u).
+(2)
+NP = 1 exactly when ∆is 1-minimal (Zeller and Hildebrandt, 2002), meaning no single unit can be removed
+without the oracle rejecting the patch; larger groups of units may still be removable together. A unit is
+
+
+Unneeded Edits in Coding-Agent Patches
+4
+an atomic piece of an edit. Unneeded code is an unneeded unit in a code file; units in test files are graded
+separately (Section 3.2). NP inherits the oracle’s blind spots: a unit that the tests do not need may still serve
+the developer’s intent (Smith et al., 2015). We therefore treat the share of unneeded units as an upper bound
+on true excess, and we compare agents with developer patches graded the same way (Appendix B.2 separates
+three notions of minimality).
+3.2
+Replay, Units, and Provenance
+Agent trajectories record every tool call but not intermediate repository states. We replay the structured file-
+editing calls on the task’s base files with line-level blame after each step, and we exclude trajectories whose
+replayed final state does not match the submitted patch exactly (96.7% of SWE-bench Verified trajectories
+replay). A unit is a contiguous block of changed lines in one file (blocks separated by at most one unchanged
+line are merged), and a new or deleted file is one unit. Each unit is a code unit or a non-code unit (test,
+documentation, configuration, or comment and formatting edits). SWE-bench grading resets test files, so test
+changes don’t change the oracle’s result. We therefore report test edits separately from code as ungraded, and
+call ungraded test edits and unneeded units together the patch’s extra edits. We use NPcode as the primary
+measure (Appendix B.3 gives the rules). The introduction step t⋆(u) of a unit is the latest step that wrote or
+deleted any of its lines, so a unit first written at a debug step and later revised at a fix step is attributed to the
+fix.
+3.3
+Step-Role Labeling
+Each step that introduces a unit gets a role. We group roles into three: DEBUG (explore, reproduce, and probe
+steps), FIX (fix and refine steps), and CLEANUP (steps that revert earlier changes). Two deterministic rules run
+first, and an LLM judge (GPT-6.1 Sol) labels the rest based on the issue, the condensed history, the action, and
+the agent’s narration (Appendix B.4 gives the six fine-grained roles and the rubric).
+3.4
+Oracle: Grading Necessity
+For each unit we revert its lines in the task container and rerun the task tests. We count reversions that cannot
+be applied (they leave the base state or do not parse) as needed. Task tests do not exercise every input path,
+so we also check unneeded code units with behavioral probes modeled on PatchDiff (Wang et al., 2026). We
+report necessity under Otest and use the probes to validate its unneeded verdicts; the strengthened oracle
+O+, which also rescues units whose reversion matches the developer patch, uses the same probe labels. For
+each code unit that Otest marks unneeded, an LLM (GPT-6.1 Sol) sees the issue and the diff of the reversion,
+without the task tests or the developer patch, and writes several differential calls: probe-script inputs that
+call the changed code and print labeled outputs. We run them under the agent patch, the reverted state,
+and the developer patch. A unit is needed under O+ if its reversion fails the task tests or makes the same
+behavioral change as the developer patch. Appendix C.1 reports the breakdown. Units are reverted one at a
+time (Section 6).
+3.5
+Step Attribution and Developer Calibration
+The unneeded units form the residue Edbg ∪Efix: Edbg holds the units whose introducing step is a debug step,
+and Efix holds the rest. The debug share is
+ρ = |Edbg| / |Edbg ∪Efix|,
+(3)
+and ρcode restricts it to code residue. A debug-step edit that is needed is not residue, because the experiment
+became the fix.
+Developer patches also contain code the tests do not need, so we grade SWE-bench Verified developer
+patches (code files only) the same way and report, for each model, the gap between the means
+∆dev = NPcode(agent) −NPcode(developer)
+(4)
+
+
+Unneeded Edits in Coding-Agent Patches
+5
+over instances where both have code units, with a 95% instance-bootstrap CI (B = 2000; all CIs in this paper
+are 95% bootstrap intervals over instances unless noted). If ∆dev < 0, the agent leaves more unneeded code
+than the developer.
+4
+Study Setup
+4.1
+Data
+We evaluate 18 models from four providers on SWE-bench Verified (Jimenez et al., 2024; Chowdhury et al.,
+2024) (500 Python coding tasks) and DeepSWE (Huang et al., 2026) (113 long-horizon coding tasks in Go,
+TypeScript, Python, Rust, and JavaScript), using the GitHub Copilot CLI (GitHub, 2026) coding agent.
+SWE-bench Verified resolve rates range from 64.0% to 89.4%. The resolve rate of a model is the share of its
+attempted tasks whose final patch passes the task tests. For each model we use all of its resolved SWE-bench
+Verified instances whose trajectory replays exactly, and all of its resolved DeepSWE tasks. Model-level
+DeepSWE statistics use the 17 models with at least 10 graded tasks. The study covers 6,728 SWE-bench
+Verified patches (30,265 units; 482 distinct instances, 114 shared by all 18 models) and 932 DeepSWE patches
+(26,209 units). We ran developer baselines on SWE-bench Verified (470 analyzed instances, 1,317 code units)
+and on DeepSWE (103 graded tasks; four developer patches fail the task tests and are dropped). Other
+harnesses and SWE-bench Pro are reported in Appendix D. All units are graded in the official evaluation
+images under Otest; behavioral probes validate the unneeded verdicts (Section 3.4). Role and probe judges
+are GPT-6.1 Sol. A second judge (Claude Opus 5.5) relabeled 10,000 randomly sampled steps and agreed
+with the primary judge on 84.4% of role labels (κ = 0.69) and 89.1% of debug vs. non-debug labels (κ = 0.55;
+Appendix B.4).
+4.2
+Research Questions and Analyses
+For each research question, we pre-registered the outcome we expected (Appendix A.1), with thresholds
+and deviations from the original experiment plan. A two-model pilot showed that most extra edits are test
+edits, so we implemented separate analyses for code and tests, made code units the primary population, and
+added the developer calibration.
+5
+Results
+Appendix E.6 lists per-model results and Appendix D holds the secondary analyses referenced below.
+5.1
+RQ1: How Much Do Agents Over-Edit?
+By size, agent patches look bloated. On SWE-bench Verified the median model changes 2.33 times as many
+lines as the developer patch, in line with Luo et al. (2026). On code units alone the ratio is 0.86, and the
+per-task median is 1.00. Outside test files, agents still change more lines than developers (median ratio 1.09).
+By necessity, agents’ mean NPcode is 0.887, against 0.864 for developer patches on the same instances. So
+agents produce more non-test changes, but most of the code they write is needed. Developer patches serve
+as a baseline for the oracle: Otest alone calls 33% of developer code units unneeded, and the strengthened
+oracle O+ calls 3% unneeded (Appendix C.1).
+Figure 2 shows the gap ∆dev on both benchmarks. On SWE-bench Verified (Figure 2a), eleven models leave
+significantly less unneeded code than developers (GPT-6 Astra only marginally, with a CI lower bound of
+0.002), four show no significant difference (Kimi K3, Claude Haiku 4.5, GPT-6 Sol, GPT-6.1 Sol), and three
+leave significantly more: Gemini 3.8, 3.7, and 3.6 Flash. On DeepSWE (Figure 2b), mean NPcode is 0.797,
+against 0.785 for the 103 developer patches; only two models are significantly below the developer baseline
+and none significantly above (mean gap −0.005). The sign of the SWE-bench Verified gap depends on the
+oracle: under O+ it flips from +2.3 to −4.5 percentage points (Appendix C.1).
+
+
+Unneeded Edits in Coding-Agent Patches
+6
+−0.1
+0
+0.1
+Gemini 3.8 Flash
+Gemini 3.6 Flash
+Gemini 3.7 Flash
+Claude Haiku 4.5
+GPT-6 Sol
+Kimi K3
+GPT-6.1 Sol
+GPT-6 Astra
+Claude Opus 5
+Claude Opus 5.5
+GPT-5.6 Sol
+Claude Haiku 5.5
+Claude Opus 4.8
+GPT-6 Luna
+Claude Sonnet 5
+Claude Sonnet 5.5
+GPT-5.6 Terra
+GPT-5.6 Luna
+(a) SWE-bench Verified
+−0.1
+0
+0.1
+Gemini 3.8 Flash
+Gemini 3.7 Flash
+GPT-6 Astra
+GPT-6.1 Sol
+GPT-6 Sol
+Claude Opus 5.5
+GPT-5.6 Sol
+Gemini 3.6 Flash
+GPT-6 Luna
+GPT-5.6 Luna
+Claude Sonnet 5.5
+Claude Opus 5
+Kimi K3
+Claude Sonnet 5
+GPT-5.6 Terra
+Claude Haiku 5.5
+Claude Opus 4.8
+(b) DeepSWE
+Code necessity: agent − developer (95% CI)
+Figure 2: Agent minus developer NPcode (∆dev) per model under Otest, with 95% bootstrap CIs. (a) SWE-bench Verified
+instances with developer patches (6,728 agent patches, 470 developer patches). (b) DeepSWE tasks with developer
+patches (914 agent patches from 17 models, 103 developer patches). Each panel is sorted by ∆dev. Red: the CI excludes 0
+below; blue: above.
+Finding 1. Agent patches are larger than developers’ (2.33 times the lines). Outside tests, agents change 1.09 times
+the lines, yet most of their code is needed. On SWE-bench Verified, 11 of 18 models leave less unneeded code than
+developers (mean NPcode 0.887 vs. 0.864), four show no significant difference, and the three Gemini Flash models leave
+significantly more. On DeepSWE, agents are on par with developers (0.797 vs. 0.785), but no model is significantly
+above the developer baseline. On average, 11% of an agent patch’s code units are unneeded.
+5.2
+RQ2: What Are the Unneeded Edits?
+Figure 3 shows the classes of extra edits. On SWE-bench Verified, 61% are test-file edits, 21% are code, 13%
+are documentation, and 5% are comment or formatting edits. Test edits are pervasive (81.5% of agent patches
+edit a test file) and ungraded, and a reviewer may welcome many of them. Counting them as unneeded
+would dominate the all-unit NP, which then mostly tracks how many tests a model writes. On DeepSWE the
+composition flips: tasks are feature implementations with about six times more units per patch. Code is 58%
+of extra edits, and tests are 26% (Appendix D).
+On SWE-bench Verified, among the 3,987 unneeded code units, the behavioral probes (run on 3,559 unneeded
+agent units) show that 89% change behavior, for example by raising or swallowing an exception on nearby
+inputs. The other 11% are inert guards or duplicate checks (Appendix C.1).
+We use mutation testing (Jia and Harman, 2011; Just et al., 2014) to ask whether the tests agents add are
+useful. Over the 271 SWE-bench Verified instances that pass our validity checks, we inject 1,962 mutants
+(small artificial bugs) into the patched code with mutmut (Hovmöller, 2026). The agent’s added tests catch
+68.1% of them: more than the existing regression tests in the same files (45.6%), but fewer than the task tests
+(77.1%). They catch 73.2% of mutants in needed code and 31.2% in unneeded code. The agent’s tests also
+catch bugs the task tests miss. Of the mutants that slip past the task tests, 22.7% (102) are caught by tests the
+agent added or strengthened; this is 5.2% of all mutants (Appendix F.1). Most agent tests are written after the
+fix, and few show a failing-then-passing run (Appendix D).
+
+
+Unneeded Edits in Coding-Agent Patches
+7
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Share of unneeded blocks
+SWE-V
+DeepSWE
+21%
+61%
+13%
+58%
+26%
+12%
+code
+test
+docs
+nonsemantic
+config
+Figure 3: Composition of extra edits: ungraded test edits and unneeded units (18 models; 6,728 SWE-bench Verified and
+932 DeepSWE patches, all under Otest). On DeepSWE, code is 58% of extra edits.
+Finding 2. On SWE-bench Verified, beyond the code, patches mostly add tests (61%) and documentation (13%); on
+DeepSWE, most extra edits are code (58%). The added tests catch more injected bugs than the regression tests (68.1% vs.
+45.6%), though fewer than the task tests (77.1%), and they catch 22.7% of the bugs the task tests miss, so agent-written
+tests can help strengthen benchmark test suites. Finally, 89% of unneeded code units change behavior.
+5.3
+RQ3: Where Do Unneeded Edits Come From?
+If residue came mostly from debugging, it would enter the patch at debug steps and never be reverted. The
+pooled debug share over all residue is ρ = 0.257, but 4,676 of the 4,898 debug-step residue units are test-file
+hunks that the agent wrote before the fix as regression tests. On code, only 154 of the 3,987 code-residue
+units (in 55 patches) come from debug steps, so ρcode = 0.039. Scratch scripts and debug prints almost never
+survive into resolved patches.
+Fix steps write 83% of unneeded code, and revision steps write 11%. Code written while revising a fix
+is unneeded only slightly more often than code from the first fix (0.29 vs. 0.25), and revisions are rare
+(Appendix D). On DeepSWE, over units with exact provenance, ρcode is 0.037.
+Finding 3. Debug steps write almost none of the unneeded code (154 of 3,987 units, ρcode = 0.039); fix steps write 83%
+of it, and code from revisions is unneeded only slightly more often than first-fix code (0.29 vs. 0.25).
+5.4
+RQ4: Which Models Over-Edit More?
+Across the 18 models on SWE-bench Verified, the Spearman correlation between resolve rate and NPcode
+is −0.10 (raw p = 0.69; 95% CI [−0.28, +0.05], bootstrap over each model’s instances). At nearly the same
+resolve rate, Sonnet 5 (80.6%) has NPcode = 0.922 and Gemini 3.7 Flash (81.4%) has 0.789, so Gemini 3.7 Flash
+leaves about 3.6 times as many unneeded code units per task (1.23 vs. 0.34).
+The model effect survives controls for unit granularity and task selection (Appendix D.4). Multi-unit and
+line-weighted variants keep the ranking, and task fixed effects leave the same three Gemini Flash models
+below developers.
+On DeepSWE the relation reverses: NPcode is negatively correlated with resolve rate (Spearman −0.59,
+p = 0.01; −0.52, p = 0.03, task-adjusted), so models that solve more tasks leave more unneeded code. The
+model ranking agrees moderately between benchmarks (+0.59), and Gemini 3.7 and 3.8 Flash are low on
+both (Table 9).
+Finding 4. The amount of unneeded code differs by model. It does not track resolve rate on SWE-bench Verified
+(Spearman −0.10), even after controlling for unit granularity and task selection, but on DeepSWE models with higher
+resolve rates leave more unneeded code (−0.59).
+5.5
+RQ5: Can Unneeded Code Be Removed Automatically?
+Task tests are unavailable at deployment, so we test three strategies that do not need them (Table 1). All RQ5
+experiments use SWE-bench Verified.
+
+
+Unneeded Edits in Coding-Agent Patches
+8
+First green
+Self-audit
+DRA + Oagent
+DRA + Oagent+P2P
+Patches / units graded
+3,031 / 7,419
+6,345 / 13,729
+2,495 / 5,060
+2,495 / 5,060
+Dropped units
+150 (2.0%, net)
+1,238 (9.0%)
+997 (19.7%)
+863 (17.1%)
+Precision
+–
+65.7%
+39.6%
+46.3%
+Recall
+–
+35.5%
+66.5%
+67.3%
+NPcode before →after
+0.700 →0.710 (3%)
+0.924 →0.944 (26%)
+0.936 →0.974 (59%)
+0.936 →0.975 (61%)
+Patches still resolving
+97.3%
+98.2%
+86.6%
+89.1%
+Table 1: Post-generation cleanup on SWE-bench Verified under O+. Units are code units; dropped-unit percentages
+are of units graded, and NPcode is shown before and after reduction on each column’s patches, with the share of the
+unneeded-code gap (1 −NPcode) closed in parentheses. Oagent is the agent’s own test command; Oagent+P2P also requires
+the existing PASS_TO_PASS regression tests. The DRA columns cover the 2,495 eligible patches where Oagent(ST) = 1.
+First green covers the patches edited after it; its pass rate uses the task tests, and its units are the net change in code units.
+The self-audit covers 17 models; 1,540 patches had at least one drop, and the passing rate is on the regraded patches
+(none ungraded).
+Stopping at the first green run.
+The numbers below cover all resolved SWE-bench Verified patches. For
+each trajectory we find the agent’s first all-green run of its own tests, replay to that step, and grade the patch.
+The early patch still passes the task tests in 2,948 of 3,031 graded cases (97.3%), but code units barely change
+(7,419 to 7,269) and NPcode on those patches moves only from 0.700 to 0.710.
+Self-audit.
+We ask each model to justify every hunk of its final diff and drop the ones it cannot. Across all
+resolved SWE-bench Verified patches (17 of 18 models; Appendix D.5), dropped code hunks match a unit
+that O+ calls unneeded 65.7% of the time, but the audit finds only 35.5% of all such units (κ = 0.39); the
+drops break 1.8% of resolved patches. Models are selective: they drop 40.5% of unneeded units that behave
+like the patch without them, against 14.7% of those that behave like the full patch. Applying the drops raises
+NPcode from 0.924 to 0.944.
+Pruning with DRA.
+Most agents run their own tests, and 4,860 of 6,728 trajectories reach a green run.
+We run a simplified cumulative DRA that reverts a unit whenever the agent’s test command Oagent still
+passes, and we also require the existing PASS_TO_PASS tests (Oagent+P2P). This applies to 2,495 of the 6,724
+patches, because the others have no standalone test command or fail the baseline check (Appendix G.1). With
+Oagent+P2P, pruning removes 67.3% of the unneeded code units, nearly twice the self-audit’s recall, but at
+46.3% precision against the self-audit’s 65.7%. It raises NPcode from 0.936 to 0.975, and 89.1% of patches still
+pass the task tests. With Oagent alone, pruning reaches 39.6% precision and 66.5% recall, and 86.6% of its
+patches still pass the task tests. Most false drops are code units that implement behavior that neither the
+existing tests nor the agent’s tests exercise.
+Finding 5. On SWE-bench Verified, self-audit and test-based pruning trade precision for recall. Self-audits are precise
+(65.7%) but find only about a third of unneeded code (35.5%), and their drops break 1.8% of resolved patches. Pruning
+with the agent’s own tests and the repository’s regression tests finds about two thirds (67.3%) at lower precision (46.3%)
+on the 2,495 eligible patches, and 89.1% of them still resolve. Early stopping barely changes the patch (NPcode 0.700 to
+0.710), because most unneeded code is already in the patch when the agent’s tests first pass.
+6
+Discussion and Limitations
+Does the metric measure what we claim?
+We check the metric against the developer patch. A code unit is
+outside-patch if it lies outside every function the developer patch touched. Of 14,591 agent code units on 6,596
+instances, 2,607 are outside-patch. The DRA unneeded flag predicts outside-patch units with an AUROC of
+0.718, against 0.478 for unit size (difference +0.24, 95% CI [0.21, 0.27]); it flags 3,753 units at precision 0.43
+and recall 0.62. At the instance level, the unneeded-line fraction correlates with the outside-patch fraction at
+Spearman 0.40, against 0.21 for edit distance and 0.25 for lines relative to the developer patch. The metric
+flags code a developer would likely not have written better than patch size does, though fewer than half of
+
+
+Unneeded Edits in Coding-Agent Patches
+9
+flagged units are outside-patch. Whether a reviewer would remove the flagged units needs human labels
+(Appendix D).
+Implications.
+The amount of unneeded code a model writes does not track its resolve rate on SWE-bench
+Verified and is anti-correlated with it on DeepSWE, and most unneeded code changes behavior, so reviewers
+cannot skip it (Section 5.2, Section 5.4). Because code necessity differs by model, coding benchmarks should
+report NPcode with a developer-patch baseline alongside resolve rate. Size comparisons with developer
+patches should separate test and code edits. Debug steps write little code residue, so in-loop cleanup
+would have little to remove, although we did not test it, and post-generation cleanup is the more promising
+target. Its two forms trade off: self-audit rarely drops needed code but misses most unneeded code, while
+pruning with the agent’s and the repository’s regression tests finds most of it at the cost of more false drops
+(Section 5.5). Because the unneeded code is written while constructing and revising the fix, we recommend
+debloating training trajectories: drop units that the tests do not need before supervised fine-tuning, in line
+with edit-aware training (Yang et al., 2026; Ke et al., 2026) and as PDB proposes (Chai et al., 2026).
+Limitations.
+Necessity depends on the oracle, and on DeepSWE and SWE-bench Pro it is an upper bound
+on unneeded code (on DeepSWE the developer baseline is 0.785). Behavioral checks are LLM-written, and
+oracle-unneeded code can still be wanted. Units are reverted one at a time, so jointly needed pairs and
+mixed blocks can mislead. We study over-editing in successful trajectories, i.e., resolved patches, and leave
+over-editing in unsuccessful trajectories to future work. Role labels were validated against a second LLM
+judge only, with no human audit (Appendix B.4). The debug-share result rests on 154 of 3,987 code-residue
+units, and the mutation results cover 271 instances (1,962 mutants). Provenance needs replayable trajectories:
+3.3% of SWE-bench Verified replays are not exact (228 replay mismatches, 6 self-check failures, 5 binary
+patches), and 33.4% of DeepSWE patches (311 of 932) contain at least one unit without provenance (14.9%
+of units, 12.7% of code units). The main results use one harness, Copilot CLI (Appendix D covers others).
+SWE-bench Verified is Python-only and may be contaminated.
+Future work.
+Human labels (Appendix B.5) would test whether reviewers agree with the oracle. Property-
+based testing (MacIver et al., 2019) and LLM-generated differential tests (Hu et al., 2026) could extend
+probe-based grading to benchmarks without developer patches. Repeating the experiment on open-source
+harnesses such as OpenHands (Wang et al., 2025) and mini-SWE-agent (SWE-agent Team, 2025), using public
+trajectories (SWE-bench Team, 2026), would show how harness design affects over-editing.
+7
+Conclusion
+We took 7,660 resolved coding-agent trajectories and traced each block of the final patch to the step that
+wrote it, then graded necessity with the task tests and validated unneeded code with behavioral probes.
+Agent patches are larger than developers’, but on SWE-bench Verified the extra lines are mostly tests and
+documentation. On code, on average about 11% of an agent patch’s code units are unneeded; on SWE-bench
+Verified, 11 of 18 models leave less unneeded code than developers and the three Gemini Flash models leave
+more, while on DeepSWE agents are on par with developers. The unneeded code that remains is written
+while building and revising the fix, usually changes behavior, and differs by model, with no relation to resolve
+rate on SWE-bench Verified and a negative one on DeepSWE. After generation, self-audit removes it precisely
+but finds only about a third, while pruning with the agent’s own tests and the repository’s regression tests
+finds about two thirds at lower precision on the patches where it applies. We recommend reporting code
+necessity next to resolve rate and addressing over-editing through model training and harness-level pruning.
+
+
+Unneeded Edits in Coding-Agent Patches
+10
+References
+Alberto Bacchelli and Christian Bird. Expectations, outcomes, and challenges of modern code review. In
+Proceedings of the 35th International Conference on Software Engineering (ICSE), pages 712–721, 2013. doi:
+10.1109/ICSE.2013.6606617.
+Federico Cassano, Luisa Li, Akul Sethi, Noah Shinn, Abby Brennan-Jones, Jacob Ginesin, Edward Berman,
+George Chakhnashvili, Anton Lozhkov, Carolyn Jane Anderson, and Arjun Guha. Can it edit? evaluating
+the ability of large language models to follow code editing instructions. In Conference on Language Modeling
+(COLM), 2024. arXiv:2312.12450.
+Ira Ceka, Hailie Mitchell, Saurabh Pujar, Luca Buratti, Shyam Ramji, Junfeng Yang, Gail Kaiser, and Baishakhi
+Ray. Understanding automated program repair agents through the lens of traceability: An empirical study.
+Proceedings of the ACM on Software Engineering, 3(ISSTA):4450–4473, 2026. doi: 10.1145/3832285. ISSTA
+2026; arXiv:2506.08311.
+Miaosen Chai, Wang Bill Zhu, Shangshang Wang, Yejia Liu, Song Bian, Honghua Dong, Willie Neiswanger,
+and Robin Jia. Precise debugging benchmark: Is your model debugging or regenerating? In Advances in
+Neural Information Processing Systems, Evaluations and Datasets Track, 2026. arXiv:2604.17338.
+Neil Chowdhury, James Aung, Chan Jun Shern, Oliver Jaffe, Dane Sherburn, Giulio Starace, Evan Mays,
+Rachel Dias, Marwan Aljubeh, Mia Glaese, Carlos E. Jimenez, John Yang, Leyton Ho, Tejal Patward-
+han, Kevin Liu, and Aleksander Madry. Introducing SWE-bench verified. https://openai.com/index/
+introducing-swe-bench-verified/, 2024. OpenAI blog post, August 13, 2024.
+Xiang Deng, Jeff Da, Edwin Pan, Yannis Yiming He, Charles Ide, Kanak Garg, Niklas Lauffer, Andrew Park,
+Nitin Pasari, Chetan Rane, Karmini Sampath, Maya Krishnan, Srivatsa Kundurthy, Sean Hendryx, Zifan
+Wang, Vijay Bharadwaj, Jeff Holm, Raja Aluri, Chen Bo Calvin Zhang, Noah Jacobson, Bing Liu, and Brad
+Kenstler. SWE-Bench Pro: Can AI agents solve long-horizon software engineering tasks?, 2025. URL
+https://arxiv.org/abs/2509.16941.
+Simantika Bhattacharjee Dristi and Matthew B. Dwyer. A differential fuzzing-based evaluation of functional
+equivalence in LLM-generated code refactorings, 2026. URL https://arxiv.org/abs/2602.15761.
+GitHub. GitHub Copilot CLI. https://github.com/github/copilot-cli, 2026. Accessed 2026-10-10.
+Kim Herzig and Andreas Zeller. The impact of tangled code changes. In Proceedings of the 10th Working
+Conference on Mining Software Repositories (MSR), pages 121–130, 2013. doi: 10.1109/MSR.2013.6624018.
+Anders Hovmöller. mutmut: Mutation testing for Python 3. https://github.com/boxed/mutmut, 2026.
+Version 3.8.1.
+Huimin Hu, Cristian Cadar, and Michael Pradel. DiffTestGen: Change-directed LLM-based testing for
+exposing behavioral differences, 2026. URL https://arxiv.org/abs/2607.16024.
+Wenqi Huang, Charley Lee, Leonard Tng, and Serena Ge. DeepSWE: Measuring frontier coding agents on
+original, long-horizon engineering tasks, 2026. URL https://arxiv.org/abs/2607.07946.
+Yue Jia and Mark Harman. An analysis and survey of the development of mutation testing. IEEE Transactions
+on Software Engineering, 37(5):649–678, 2011. doi: 10.1109/TSE.2010.62.
+Carlos E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir Press, and Karthik Narasimhan.
+SWE-bench: Can language models resolve real-world GitHub issues?
+In Proceedings of the 12th Inter-
+national Conference on Learning Representations (ICLR), 2024. URL https://openreview.net/forum?id=
+VTF8yNQM66. arXiv:2310.06770.
+René Just, Darioush Jalali, Laura Inozemtseva, Michael D. Ernst, Reid Holmes, and Gordon Fraser. Are
+mutants a valid substitute for real faults in software testing? In Proceedings of the 22nd ACM SIGSOFT
+International Symposium on Foundations of Software Engineering (FSE), pages 654–665, 2014. doi: 10.1145/
+2635868.2635929.
+
+
+Unneeded Edits in Coding-Agent Patches
+11
+Yasutaka Kamei, Emad Shihab, Bram Adams, Ahmed E. Hassan, Audris Mockus, Anand Sinha, and Naoyasu
+Ubayashi. A large-scale empirical study of just-in-time quality assurance. IEEE Transactions on Software
+Engineering, 39(6):757–773, 2013. doi: 10.1109/TSE.2012.70.
+Changxin Ke, Rui Zhang, Jiaming Guo, Yuanbo Wen, Li Ding, Shuo Wang, Xuyuan Zhu, Xiong Peng,
+Di Huang, Zidong Du, Xing Hu, Qi Guo, and Yunji Chen. QiMeng-PRepair: Precise code repair via
+edit-aware reward optimization. In Proceedings of the 64th Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pages 29114–29129. Association for Computational Linguistics, 2026.
+URL https://aclanthology.org/2026.acl-long.1343/. arXiv:2604.05963.
+Wenqiang Luo, Jacky Keung, Xiaoyu Shi, Yicheng Sun, Boyang Yang, Zhou Yang, and Haoye Tian. Refine
+after generation: Toward correct and concise patches in LLM-based program repair, 2026. URL https:
+//arxiv.org/abs/2608.13292.
+David R. MacIver, Zac Hatfield-Dodds, and Many Other Contributors. Hypothesis: A new approach to
+property-based testing. Journal of Open Source Software, 4(43):1891, 2019. doi: 10.21105/joss.01891.
+Sergey Mechtaev, Jooyong Yi, and Abhik Roychoudhury. DirectFix: Looking for simple program repairs. In
+Proceedings of the 37th IEEE/ACM International Conference on Software Engineering (ICSE), pages 448–458,
+2015. doi: 10.1109/ICSE.2015.63.
+Ghassan Misherghi and Zhendong Su. HDD: Hierarchical delta debugging. In Proceedings of the 28th
+International Conference on Software Engineering (ICSE), pages 142–151, 2006. doi: 10.1145/1134285.1134307.
+Nachiappan Nagappan and Thomas Ball. Use of relative code churn measures to predict system defect
+density. In Proceedings of the 27th International Conference on Software Engineering (ICSE), pages 284–292,
+2005. doi: 10.1145/1062455.1062514.
+Sien Reeve O. Peralta, Fumika Hoshi, Hironori Washizaki, Naoyasu Ubayashi, Inase Kondo, Yoshiki Higo,
+Hiroki Mukai, Norihiro Yoshida, Kazuki Kusama, Hidetake Tanaka, and Youmei Fan. Why are agentic
+pull requests merged or rejected? an empirical study. In Proceedings of the 23rd International Conference on
+Mining Software Repositories (MSR), pages 787–791, 2026. doi: 10.1145/3793302.3793575. arXiv:2605.22534.
+Dung Pham and Taher A. Ghaleb. Code change characteristics and description alignment: A comparative
+study of agentic versus human pull requests. In Proceedings of the 23rd International Conference on Mining
+Software Repositories (MSR), pages 737–741, 2026. doi: 10.1145/3793302.3793565. arXiv:2601.17627.
+Peter C. Rigby and Christian Bird. Convergent contemporary software peer review practices. In Proceedings
+of the 9th Joint Meeting on Foundations of Software Engineering (ESEC/FSE), pages 202–212, 2013.
+doi:
+10.1145/2491411.2491444.
+Caitlin Sadowski, Emma Söderberg, Luke Church, Michal Sipko, and Alberto Bacchelli. Modern code review:
+A case study at Google. In Proceedings of the 40th International Conference on Software Engineering: Software
+Engineering in Practice (ICSE-SEIP), pages 181–190, 2018. doi: 10.1145/3183519.3183525.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang,
+Y. K. Li, Y. Wu, and Daya Guo. DeepSeekMath: Pushing the limits of mathematical reasoning in open
+language models, 2024. URL https://arxiv.org/abs/2402.03300.
+Rui Shu, Chun Yong Chong, Xin Zhou, Yun Peng, Zihan Wu, Xu Han, Zeyang Zhuang, Guowen Yuan,
+and Yuan Wang. What resolve rate hides: Trajectory structure diagnostics for coding agents, 2026. URL
+https://arxiv.org/abs/2607.06184.
+Edward K. Smith, Earl T. Barr, Claire Le Goues, and Yuriy Brun. Is the cure worse than the disease? overfitting
+in automated program repair. In Proceedings of the 10th Joint Meeting on Foundations of Software Engineering
+(ESEC/FSE), pages 532–543, 2015. doi: 10.1145/2786805.2786825.
+Chengnian Sun, Yuanbo Li, Qirun Zhang, Tianxiao Gu, and Zhendong Su. Perses: Syntax-guided program
+reduction. In Proceedings of the 40th International Conference on Software Engineering (ICSE), pages 361–371,
+2018. doi: 10.1145/3180155.3180236.
+
+
+Unneeded Edits in Coding-Agent Patches
+12
+SWE-agent Team. mini-SWE-agent. https://github.com/SWE-agent/mini-swe-agent, 2025.
+SWE-bench Team. SWE-bench experiments. https://github.com/SWE-bench/experiments, 2026.
+Xingyao Wang, Boxuan Li, Yufan Song, Frank F. Xu, Xiangru Tang, Mingchen Zhuge, Jiayi Pan, Yueqi Song,
+Bowen Li, Jaskirat Singh, Hoang H. Tran, Fuqiang Li, Ren Ma, Mingzhang Zheng, Bill Qian, Yanjun Shao,
+Niklas Muennighoff, Yizhe Zhang, Binyuan Hui, Junyang Lin, Robert Brennan, Hao Peng, Heng Ji, and
+Graham Neubig. OpenHands: An open platform for AI software developers as generalist agents. In
+Proceedings of the 13th International Conference on Learning Representations (ICLR), 2025. arXiv:2407.16741.
+You Wang, Michael Pradel, and Zhongxin Liu. Are “solved issues” in SWE-bench really solved correctly? an
+empirical study. In Proceedings of the 48th IEEE/ACM International Conference on Software Engineering (ICSE),
+pages 169–181, 2026. doi: 10.1145/3744916.3764576. arXiv:2503.15223.
+Parker Whitfill, Cheryl Wu, Joel Becker, and Nate Rush. Many SWE-bench-passing PRs would not be
+merged into main. https://metr.org/notes/2026-03-10-many-swe-bench-passing-prs-would-not-
+be-merged-into-main/, 2026. METR research note, March 10, 2026.
+Boyang Yang, Zijian Cai, Shunfu Jin, and Haoye Tian. PAFT: Preservation aware fine-tuning for minimal-edit
+program repair, 2026. URL https://arxiv.org/abs/2604.03113.
+John Yang, Carlos E. Jimenez, Alexander Wettig, Kilian Lieret, Shunyu Yao, Karthik Narasimhan, and Ofir
+Press. SWE-agent: Agent-computer interfaces enable automated software engineering. In Advances in
+Neural Information Processing Systems, volume 37, pages 50528–50652, 2024. doi: 10.52202/079017-1601.
+arXiv:2405.15793.
+John Yang, Kilian Lieret, Carlos E. Jimenez, Alexander Wettig, Kabir Khandpur, Yanzhe Zhang, Binyuan Hui,
+Ofir Press, Ludwig Schmidt, and Diyi Yang. SWE-smith: Scaling data for software engineering agents.
+In Advances in Neural Information Processing Systems, Datasets and Benchmarks Track, volume 38, 2025. doi:
+10.52202/085713-3239. arXiv:2504.21798.
+Andreas Zeller and Ralf Hildebrandt. Simplifying and isolating failure-inducing input. IEEE Transactions on
+Software Engineering, 28(2):183–200, 2002. doi: 10.1109/32.988498.
+Tongyao Zhu, Wei Hern Lim, and Min-Yen Kan. When models edit too much: On the fidelity of minimal code
+edits. In Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing (EMNLP),
+pages 47646–47667. Association for Computational Linguistics, 2026. URL https://aclanthology.org/
+2026.emnlp-main.2092/. arXiv:2609.04061.
+
+
+Unneeded Edits in Coding-Agent Patches
+13
+Appendix
+Table of Contents
+A
+Pre-Registered Hypotheses and Deviations . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+14
+A.1
+Pre-Registered Hypotheses . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+14
+A.2
+Deviations from the Registered Plan . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+14
+B
+Method Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+15
+B.1
+Running Example . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+15
+B.2
+Three Notions of Minimality . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+16
+B.3
+Replay, Units, and Grading Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+16
+B.4
+Step-Role Rules and Judge Prompt . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+17
+B.5
+Human Validation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+17
+C
+Oracles
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+18
+C.1
+Strengthened Test Oracle and Behavioral Probes . . . . . . . . . . . . . . . . . . . . . . . . . . .
+18
+D
+Extended Analyses . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+19
+D.1
+RQ1 Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+19
+D.2
+RQ2 Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+20
+D.3
+RQ3 Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+20
+D.4
+RQ4 Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+20
+D.5
+RQ5 Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+21
+D.6
+Validity Check Against Developer Patches
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+22
+E
+Per-Model and Per-Benchmark Results
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+22
+E.1
+Cohort Funnel . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+22
+E.2
+Per-Model Results . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+22
+E.3
+Introducing Role of Unneeded Code
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+23
+E.4
+DeepSWE Per-Model Results . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+23
+E.5
+SWE-bench Pro (Supplementary) . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+25
+E.6
+Model Pool . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+25
+F
+Test Edits and Mutation Testing
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+26
+F.1
+Test-Edit Utility and Mutation Testing Details . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+26
+G
+Agent-Test Oracle and Removal Bounds . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+28
+G.1
+Repeatably Passing Agent-Test Oracle (Oagent) and Non-Passing Cases . . . . . . . . . . .
+28
+H
+Prompts and Protocols . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+29
+H.1
+Intervention Prompts (Not Run) . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+29
+I
+Extended Related Work . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+30
+
+
+Unneeded Edits in Coding-Agent Patches
+14
+A
+Pre-Registered Hypotheses and Deviations
+A.1
+Pre-Registered Hypotheses
+Before the main experiments we registered five hypotheses with support and kill criteria. A two-model pilot
+(Opus 5 and Haiku 4.5, 50 instances each) met the registered bar for continuing (pooled ρ ≥0.15). Table 2
+lists the hypotheses and Table 3 summarizes what each study found. The main text reports the studies as
+research questions. The hypotheses keep their registered wording, in which residue meant unneeded units
+written at debug steps; the main text calls all unneeded units residue and reports the debug share ρ.
+H
+RQ
+Hypothesis
+Support if
+Kill or redirect if
+H1 RQ3
+Residue dominance: much
+of the unneeded code in
+resolved patches is debug
+residue.
+Pooled ρ ≥0.40.
+ρ < 0.15: unneeded
+code is in the fix;
+redirect to
+training-time causes.
+H2 RQ4
+Second axis: NP separates
+models that resolve rate
+does not.
+Spearman(resolve,
+NP) < 0.5 and at
+least one pair within
+3 pp with
+non-overlapping CIs.
+Spearman ≥0.8.
+H3 Validity Metric validity: NP tracks
+human “should remove”
+labels better than
+edit-distance.
+AUROC gain ≥0.1.
+No advantage.
+H4 RQ5
+Harness fix:
+revert-on-reject plus a diff
+audit cut |E| by ≥20%.
+Resolve rate within
+1 pp.
+Resolve loss > 1 pp.
+H5 RQ3
+Preservation prompts act
+on Efix, not Edbg.
+|Efix| drops ≥20%
+but |Edbg| drops
+< 10%.
+Both drop alike.
+Table 2: Pre-registered hypotheses.
+H
+Status
+What the data show
+H1 Depends on
+statistic
+Pooled ρ = 0.257 over all units falls between the kill (0.15) and
+support (0.40) thresholds. Almost all of it is regression-test hunks;
+over code units ρcode = 0.039, below the kill threshold. The
+conclusion therefore rests on switching to ρcode.
+H2 Met, with a
+changed statistic
+The registered criteria used the all-unit NP (Spearman +0.069); the
+main text uses NPcode (−0.10, 19 separated pairs). Both pass.
+H3 Stage 1 only
+Only the developer-patch proxy (stage 1) was run: AUROC gain
++0.24 (0.718 vs. 0.478), above the 0.1 bar on the proxy. The human
+stage has LLM pre-labels (κ = 0.63) and no human labels, so H3 is
+not confirmed.
+H4 Deferred
+Not run; it targets debug-step edits, which leave little code residue.
+RQ5 tests offline proxies.
+H5 Deferred
+Not run, for the same reason.
+Table 3: Outcome of each pre-registered hypothesis.
+A.2
+Deviations from the Registered Plan
+Table 4 lists where the study departs from the registered plan and why.
+
+
+Unneeded Edits in Coding-Agent Patches
+15
+Registered
+Done
+Reason and effect
+Statement-level AST units
+with dependency closure
+(GumTree).
+Contiguous line blocks; new file =
+one unit.
+Language-independent and exactly
+revertible. Coarser units make
+single-unit patches more common; the
+multi-unit and line-weighted checks
+address this (Section 5.4).
+Strengthened oracle with
+property-based differential
+testing (LIVE/INERT).
+Strengthened oracle O+ combining
+Otest with 8 LLM-written
+differential behavioral probes per
+test-unneeded code unit
+(Section 3.4; Appendix C.1).
+Property-based testing is future work
+(Section 6). O+ counts
+developer-equivalent untested code as
+needed and splits remaining
+unneeded units into live vs. inert.
+Debug share ρ over all units
+as the H1 statistic.
+Reported, plus ρcode over code
+units.
+The pilot showed most extra edits are
+test-file edits, which the test oracle
+cannot grade.
+Agent NP compared with
+the developer baseline.
+Matched ∆dev on NPcode as the
+main comparison.
+Developer patches have no test-file
+units in the oracle’s sense; comparing
+code with code is like for like.
+All resolved SWE-bench
+Verified instances per
+model.
+All resolved instances for
+RQ1–RQ5, the cleanup analyses,
+the strengthened oracle, and the
+mutation analysis (eligible frame).
+Grading cost for the probe-based
+analyses; task fixed effects and the
+99-task paired comparison control for
+task mix.
+Single role/probe judge.
+Role and probe judges are GPT-6.1
+Sol.
+Roles were validated against a second
+judge (Appendix B.4).
+Role judge on every step;
+hand audit of 150 steps.
+Rules plus judge on
+unit-introducing steps;
+second-judge check on 10,000
+sampled steps.
+Only introducing steps enter ρ. No
+hand audit was done.
+Generalization on
+mini-SWE-agent and
+OpenHands trajectories.
+Final-patch NP under four other
+harnesses; no public trajectories.
+Run access; roles are not generalized
+beyond Copilot CLI.
+Exploratory E1 (debug
+share vs. trajectory length)
+and E2 (review-aware
+routing).
+Not run.
+Debug steps write too little code
+residue for E1 to be informative; E2 is
+left to follow-up work.
+H4 and H5 intervention
+runs.
+Deferred; offline self-audit as a
+proxy for the diff-audit
+intervention.
+They target debug-step edits, which
+H1 shows leave little code residue.
+Table 4: Deviations from the registered plan.
+B
+Method Details
+B.1
+Running Example
+Consider an issue reporting that parse_date("") raises ValueError instead of returning None; the task’s test
+asserts parse_date("") is None. The developer fix adds two lines. Suppose an agent submits the following
+patch, whose four units entered at different steps:
+def parse_date(s):
++
+if not isinstance(s, str):
+# u1
+t3 Probe
++
+return None
++
+log.debug("parse_date(%r)", s)
+# u4
+t4 Probe
++
+if s == "":
+# u2
+t5 Fix
++
+return None
+-
+d = datetime.strptime(s, FMT)
+-
+return d.date()
++
+dt = datetime.strptime(s, FMT)
+# u3
+t6 Refine
++
+return dt.date()
+
+
+Unneeded Edits in Coding-Agent Patches
+16
+After exploring (t1) and reproducing the error (t2), the agent adds a type guard u1 (t3, PROBE) and a debug
+log u4 (t4, PROBE). The fix u2 follows (t5, FIX), and a final pass renames a local variable (u3, t6, REFINE). The
+reproduction script is deleted at t7 and leaves nothing in ∆. Reverting u2 fails the task’s test, so u2 is needed.
+Reverting u1, u3, or u4 keeps the tests passing, so NP = 1/4 and the unneeded units are {u1, u3, u4}. These
+three are the patch’s residue; two were introduced at PROBE steps, so DRA attributes them to debugging.
+RQ3 shows this pattern is rare: in resolved patches, unneeded code looks like u3, not like u1 or u4.
+B.2
+Three Notions of Minimality
+Table 5 contrasts the minimality notions discussed in Section 3.1.
+Notion
+Definition
+Cost to establish
+Main weakness
+Global minimum
+Fewest units among all patches
+accepted by O.
+Search over subsets of
+candidate edits; exponential
+in general (Zeller and
+Hildebrandt, 2002).
+Infeasible at repository
+scale; still oracle-relative.
+1-minimal
+Removing any single unit makes
+O reject.
+Verification: |U(∆)| oracle
+calls; reduction via delta
+debugging (ddmin) and
+related reducers (Zeller and
+Hildebrandt, 2002;
+Misherghi and Su, 2006;
+Sun et al., 2018).
+Inherits oracle
+incompleteness; sensitive to
+unit granularity and
+interactions.
+Semantic minimum
+Smallest semantic change
+satisfying a specification, e.g., via
+MaxSMT (Mechtaev et al., 2015).
+Requires a specification
+(often tests) and constraint
+solving.
+Specifications are rarely
+available; tests used as
+specifications overfit (Smith
+et al., 2015).
+Table 5: Notions of patch minimality. DRA uses 1-minimality with respect to the task tests as a tractable, explicitly
+oracle-relative measure.
+NP establishes that each unit is required by a stated oracle, so reporting the oracle, and a developer baseline
+graded by the same oracle, alongside NP is part of the metric.
+B.3
+Replay, Units, and Grading Details
+Replay.
+For each instance we fetch the base version of every file the final patch touches and apply the
+trajectory’s file-editing tool calls (edit string replacements, create, and patch-application calls) in order,
+keeping for each line of each file the step that last wrote it and, for each deleted base line, the step that deleted
+it. When a file was written by a shell command (for example sed or a heredoc), we attribute it to the last shell
+command that writes and names that file and reconstruct the file state after it by undoing the later structured
+edits; if that is not possible, the file’s units keep their necessity grade but have no provenance. A trajectory is
+kept only if the replayed final contents equal the submitted patch for every file.
+Units.
+For each file we diff base and final contents with Python’s difflib (no autojunk) and merge
+change blocks separated by at most one unchanged line. A created or deleted file is one unit. Units
+are classified by path and content, in this order. Test: the file is in the official test patch, or its path is
+in a test/tests/testing/__tests__/testdata/e2e directory or matches a test-file pattern (test_*.py,
+*_test(s).py, conftest.py, *_test.go, *.test/spec.[jt]s(x), snapshots, tests.rs). Docs: the path is
+under doc/docs, ends in .rst, .txt, or .md, or is a changelog, authors, or news file. Config: JSON, YAML,
+TOML, lock, module, and similar files. Nonsemantic: a Python file whose AST, with docstrings removed, is
+unchanged by the unit, or a C-like source file whose token sequence without comments and whitespace is
+unchanged. Code: everything else. Developer patches, SWE-bench Pro patches, and other-harness patches
+are unitized the same way, without replay.
+
+
+Unneeded Edits in Coding-Agent Patches
+17
+Grading.
+For unit k, the variant patch is the final patch with unit k restored to its base lines (or the file
+removed or restored). Each variant is graded with the task’s FAIL_TO_PASS and PASS_TO_PASS tests in the
+official evaluation image, together with a control run of the full patch; instances whose control run fails are
+excluded. Units whose reversion would leave the base state are recorded as necessary without a run (742
+units on SWE-bench Verified); reversions that do not parse are counted as necessary (39 units); and variants
+whose test run hung repeatedly are recorded as failures, i.e., necessary (22 units). An evaluation status of
+error counts as unresolved.
+B.4
+Step-Role Rules and Judge Prompt
+Table 6 defines the step roles.
+Role
+Description
+EXPLORE
+Reads, searches, or lists code without modifying tracked files.
+REPRODUCE
+Creates or edits a script or test whose purpose is to reproduce or check the issue.
+Rule: a newly created file that is executed (python, pytest, node, bash) within the
+next three steps.
+PROBE
+Inserts instrumentation or tries a change to test a hypothesis. Rule: an edit whose
+added lines are all print, logging, pdb/breakpoint, or console.log statements.
+FIX
+Applies the change the agent presents as its solution.
+REFINE
+Modifies an existing fix after test or self-review feedback.
+CLEANUP
+Reverts or deletes earlier changes.
+Table 6: Step roles. Only unit-introducing steps are labeled. The two rules run first; the judge labels the remaining steps.
+The judge (GPT-6.1 Sol, no tools) receives the following prompt; debug roles are EXPLORE, REPRODUCE, and
+PROBE.
+You are labeling one step of a software-engineering agent trajectory.
+Issue summary: {issue}
+Previous steps (condensed): {history}
+Current action: {action}
+Observation (truncated): {observation}
+Working-tree change caused by this step: {diff_delta}
+Agent narration in the following steps: {after}
+Agent’s final message describing its solution: {final}
+Choose exactly one role from:
+EXPLORE, REPRODUCE, PROBE, FIX, REFINE, CLEANUP.
+Use FIX only if the agent treats this change as part of its intended solution.
+Use PROBE if the change is made to test a hypothesis or gather information.
+Use REFINE if the step modifies an existing fix after test or self-review feedback.
+Use REPRODUCE if the step creates or edits a script/test whose purpose is to
+reproduce or check the issue.
+Answer with the role and one sentence of justification, formatted as:
+ROLE: <role>
+WHY: <sentence>
+Judge agreement.
+Role labels were validated against a second LLM judge (Claude Opus 5.5) only; no
+human audit exists. On a uniform random sample of 10,000 judge-labeled steps, the second judge agrees with
+the primary on 84.4% of role labels (κ = 0.69; per-model κ 0.59–0.86) and on 89.1% of debug vs. non-debug
+role labels (κ = 0.55). Agreement is 82.1% (κ = 0.65; debug 87.0%, κ = 0.56) on SWE-bench Verified and 88.4%
+(κ = 0.76; debug 93.1%, κ = 0.50) on DeepSWE. The most common disagreement is REPRODUCE labeled FIX
+by the second judge (786 steps), a direction that would shrink ρ, so the primary labels are conservative for
+the debug-share finding.
+B.5
+Human Validation
+This appendix gives the protocol for the human labeling stage of the metric-validity check, which we leave to
+future work; the packet and the LLM pre-labels are prepared. The packet has 80 code units: 20 from developer
+
+
+Unneeded Edits in Coding-Agent Patches
+18
+patches, 30 from the two lowest-NPcode models, and 30 from high-NPcode models, each half DRA-needed
+and half unneeded; untested single-unit patches are excluded. Annotators see the issue text and the full
+patch with the target unit highlighted, but not DRA’s label, the step role, or the model identity. They label
+each unit required, over-editing, or unsure, with a one-sentence reason. Labeling is LLM-assisted: two LLM
+judges (Claude Opus 5.5 and GPT-6 Astra) first label each unit from the same information, and each author
+approves or overrides their label, or labels directly where the judges disagree, recording a reason for every
+override. The two judges agree on 72 of 80 units (κ = 0.63). Both judge models are in the evaluated pool,
+and annotators may anchor on the suggested label, so raw judge labels, human-final labels, and the override
+rate are to be reported separately. If agreement between authors is below κ = 0.6, or the CI of the AUROC
+difference straddles 0.1, the sample is expanded to 200 units with a third adjudicating annotator.
+C
+Oracles
+C.1
+Strengthened Test Oracle and Behavioral Probes
+Benchmark test suites do not exercise every path a developer fix touches (Wang et al., 2026). The primary
+measure is NP under Otest (developer baseline NPcode = 0.864 over 1,317 code units), and behavioral probes
+validate the unneeded verdicts. The strengthened oracle O+ uses the GPT-6.1 Sol probe judge. We probed
+3,559 Otest-unneeded agent code units and 432 of the 434 Otest-unneeded developer code units (26 agent units
+on 9 patches lie on tasks without a developer source patch and are unprobed). The pooled NP comparisons
+under O+ below use the probe cohort of 18 models, 6,728 patches and 482 unique tasks (469 with developer
+source patches), where Otest gives an agent mean NPcode = 0.887 against a developer baseline of 0.864
+(∆dev = +0.023, p = 0.016). To separate untested but developer-equivalent fixes from truly unneeded code,
+we use differential behavioral probes inspired by PatchDiff (Wang et al., 2026).
+Probe results (GPT-6.1 Sol).
+GPT-6.1 Sol wrote the probes. Of 3,559 probed unneeded agent code units,
+3,151 (89%, 95% CI [87, 90]) change behavior when reverted, against 363 of 432 (84% [80, 87]) for developer
+code units. On 388 units judged by both, Opus 5.5 finds 81% changing behavior and GPT-6.1 Sol 89%
+(κ = 0.53; for developer units 70% vs. 80%, κ = 0.64), so the judge change makes the probe stricter about
+inertness. Class agreement between judges is 93% (287 of 308).
+Probe protocol and breakdown.
+For each Otest-unneeded unit u of a final patch ST, the probe judge reads
+the issue and the diff between ST and ST ⊖u (without seeing the hidden tests or the developer patch) and
+writes a probe script that calls the changed code and prints labeled outputs. Each probe runs on ST, ST ⊖u,
+and the developer-patched repository Sdev. On the 112 Otest-needed agent code units used as a positive
+control, the probes detect a behavioral change on all 112 (100%; 119 of 119 with developer units, Table 7).
+Among the 3,559 Otest-unneeded agent units, 3,151 (88.5%) change behavior when reverted: on 1,263 (35.5%),
+Sdev matches ST rather than ST ⊖u (untested developer-aligned fix, needed under O+); on 1,586 (44.6%),
+Sdev matches ST ⊖u (unrequested behavioral change); on 133 (3.7%) the evidence is mixed and on 169
+(4.7%) Sdev matches neither version. The remaining 408 (11.5%) are inert on all probes. Under O+, the 2,296
+remaining unneeded agent code units therefore split into 1,888 live divergences (82%) and 408 inert edits
+(18%). Replacing Otest with O+ raises developer NPcode from 0.864 to 0.970 and mean agent NPcode from 0.887
+to 0.925, so the developer-baseline gap flips from +2.3 to −4.5 percentage points (p = 9.6 × 10−5; −4.8 ± 0.7
+with task fixed effects, p = 4 × 10−11; −11.0 on patches with at least two code units, p = 1.1 × 10−9).
+Under the live-behavior oracle Olive (any behavior change counts as needed) agents are +0.8 points above
+developers (0.978 vs. 0.970, p = 2.4 × 10−4). Per model, Olive puts 14 of 18 models above developers and one
+below, while O+ puts 12 models below developers and none above. The 428 unneeded agent units that could
+not be probed (234 have no developer code, 194 timed out) do not change the sign: restricted to patches with
+all units probed, the Olive and O+ gaps are +1.5 and −3.8 points. Table 8 reports the per-model results with
+95% bootstrap confidence intervals under the benchmark task tests (Otest) alone.
+
+
+Unneeded Edits in Coding-Agent Patches
+19
+Units (Otest pre-filter)
+Checked
+Changes behavior
+Needed agent units (positive control)
+112
+112 (100%)
+Test-unneeded agent units
+3,559
+3,151 (88.5%) [87, 90]
+Test-unneeded developer units
+432
+363 (84.0%) [80, 87]
+Test-unneeded agent units, by how the developer patch behaves on the differing probes
+Like the full agent patch (needed under O+)
+3,559
+1,263 (35.5%) [34, 37]
+Like the patch without the unit (unrequested change; unneeded under O+)
+3,559
+1,586 (44.6%) [43, 46]
+Mixed (unneeded under O+)
+3,559
+133 (3.7%)
+Neither (divergent change; unneeded under O+)
+3,559
+169 (4.7%)
+No probe difference (inert; unneeded under O+)
+3,559
+408 (11.5%)
+Table 7: Differential behavior probes on Otest-unneeded code units (SWE-bench Verified, GPT-6.1 Sol probe judge).
+Brackets are 95% Wilson intervals.
+Model
+Tasks
+NPtest
+NPcode [95% CI]
+∆dev vs. developer [95% CI]
+ρ
+Developer patch
+470
+0.864∗
+0.864
+–
+n/a
+Claude Opus 5.5
+424
+0.451
+0.900 [0.879, 0.919]
++0.042 [+0.018, +0.065]
+0.39
+Kimi K3
+410
+0.479
+0.897 [0.876, 0.917]
++0.024 [+0.000, +0.047]
+0.36
+Claude Opus 5
+420
+0.657
+0.898 [0.877, 0.919]
++0.031 [+0.009, +0.055]
+0.25
+Claude Opus 4.8
+404
+0.657
+0.912 [0.892, 0.930]
++0.045 [+0.022, +0.069]
+0.34
+GPT-6 Astra
+400
+0.279
+0.889 [0.867, 0.910]
++0.025 [+0.002, +0.047]
+0.24
+GPT-5.6 Sol
+388
+0.422
+0.924 [0.904, 0.942]
++0.042 [+0.021, +0.063]
+0.02
+Gemini 3.8 Flash
+392
+0.339
+0.765 [0.735, 0.793]
+−0.095 [−0.129, −0.064]
+0.37
+Gemini 3.7 Flash
+392
+0.348
+0.789 [0.759, 0.820]
+−0.074 [−0.107, −0.042]
+0.39
+Claude Sonnet 5
+382
+0.634
+0.922 [0.903, 0.942]
++0.052 [+0.028, +0.077]
+0.34
+Claude Haiku 5.5
+351
+0.552
+0.913 [0.891, 0.933]
++0.044 [+0.016, +0.071]
+0.42
+GPT-6.1 Sol
+377
+0.273
+0.887 [0.865, 0.908]
++0.024 [−0.003, +0.048]
+0.18
+GPT-6 Sol
+363
+0.333
+0.886 [0.862, 0.908]
++0.011 [−0.016, +0.038]
+0.12
+GPT-5.6 Terra
+360
+0.433
+0.928 [0.910, 0.946]
++0.058 [+0.035, +0.083]
+0.04
+Claude Sonnet 5.5
+367
+0.848
+0.929 [0.911, 0.947]
++0.055 [+0.033, +0.078]
+0.07
+GPT-5.6 Luna
+330
+0.463
+0.946 [0.928, 0.962]
++0.059 [+0.035, +0.084]
+0.05
+Gemini 3.6 Flash
+349
+0.374
+0.791 [0.760, 0.820]
+−0.076 [−0.111, −0.041]
+0.38
+GPT-6 Luna
+312
+0.431
+0.921 [0.900, 0.941]
++0.048 [+0.022, +0.072]
+0.08
+Claude Haiku 4.5
+307
+0.522
+0.873 [0.847, 0.899]
+−0.003 [−0.035, +0.030]
+0.38
+All models
+6,728 patches
+0.472
+0.887
+–
+0.257
+Table 8: Per-model necessity on SWE-bench Verified (all resolved instances) under the benchmark task tests (Otest), the
+primary oracle. ∗Developer NPtest over all units is not reported separately; the developer value shown is NPcode. Tasks is
+the number of tasks analyzed per model. Bold ∆dev indicates a 95% instance-bootstrap CI excluding 0. NPtest CIs are not
+reported.
+D
+Extended Analyses
+D.1
+RQ1 Details
+The median model changes 2.33 times as many lines as the developer’s source patch (range 0.94–5.10 across
+models). Counting only non-test files, the median ratio is 1.09 (0.79–2.03). Counting only code units, it is 0.86
+(0.72 for Sonnet 5.5 to 1.36 for Gemini 3.7 Flash), and the per-task median ratio is 1.00. The mean all-unit NP
+under Otest is 0.472. Under Otest, 33% of developer code units (434 of 1,317) are unneeded; strengthening
+with behavioral checks reclassified 84% of test-unneeded developer code units (363 of 432 probed) and 35%
+of test-unneeded agent code units (1,263 of 3,559) as needed, leaving 3% of developer code units unneeded
+
+
+Unneeded Edits in Coding-Agent Patches
+20
+(Appendix C.1). The three models significantly below developers have ∆dev of −0.095 (Gemini 3.8 Flash),
+−0.074 (Gemini 3.7 Flash), and −0.076 (Gemini 3.6 Flash).
+D.2
+RQ2 Details
+Besides tests (61%), code (21%), and documentation (13%), 5% of extra edits are nonsemantic edits (comments,
+docstrings, formatting). Per-model all-unit NP, which counts test edits as unneeded, ranges from 0.273
+(GPT-6.1 Sol) to 0.848 (Sonnet 5.5), largely tracking how many tests a model writes; 60% of all agent-changed
+lines are in test files. On DeepSWE, tasks are feature implementations with about six times more units per
+patch; code is 58% of extra edits, tests 26%, and documentation 12%.
+Added tests.
+Among the 5,439 SWE-bench Verified patches that edit tests and have step provenance (11,526
+test units; 5,482 patches and 11,640 units overall), 67.2% of test units reference symbols from needed code
+units, 52.0% of these patches write all surviving tests after the last needed code edit, and 8.7% see a test fail
+before the fix and pass after (Appendix F.1).
+Mutation testing.
+We evaluated 1,962 mutants in 271 instances (387 instances are eligible and 271 yielded
+valid mutants) with mutmut (v3.8.1) (Hovmöller, 2026) under four suites: the existing regression tests in the
+touched test files, the agent’s added tests, the task tests Otest, and O+. The agent’s added tests detect 68.1% of
+mutants, the regression tests 45.6%, and Otest 77.1%. They detect 73.2% of mutants in needed code and 31.2%
+in unneeded code (Otest: 83.4% and 31.2%). Of the mutants Otest misses, 22.7% (102, or 5.2% of all mutants)
+are caught by tests the agent added or strengthened. O+ detects 84.7% (79.4% under the strict variant), and
+the agent’s added or strengthened tests catch a further 4.1% of all mutants (81) that O+ misses. Appendix F.1
+gives details.
+D.3
+RQ3 Details
+Per-model ρ ranges from 0.018 (GPT-5.6 Sol) to 0.422 (Haiku 5.5), mostly reflecting whether a model writes
+tests first. Counting REFINE as a debug role raises ρcode to 0.148. The 154 residue code units written at debug
+steps come from 55 patches. Code introduced while revising a fix is unneeded only slightly more often than
+code from the first fix, within model families: 0.26 vs. 0.19 for Claude, 0.24 vs. 0.21 for GPT, 0.50 vs. 0.41 for
+Gemini Flash, and 0.25 vs. 0.20 for all models except Gemini Flash. Revision steps are 1,512 of 15,190 labeled
+code units. On DeepSWE, FIX steps contribute 72% of unneeded code and REFINE steps 22%, with unneeded
+rates of 0.24 and 0.27. The full role table is in Appendix E.3.
+D.4
+RQ4 Details
+Of the 39 model pairs within 3 pp resolve rate, 19 have non-overlapping 95% CIs on NPcode, with gaps up to
+0.158. Sonnet 5 has NPcode = 0.922 [0.903, 0.942] and Gemini 3.7 Flash 0.789 [0.759, 0.820], which is 0.34 vs.
+1.23 unneeded code units per task. For the all-unit NP, the Spearman correlation with resolve rate is +0.07
+(p = 0.79).
+Unit granularity.
+A patch with a single code unit has NPcode = 1 by definition, and such patches are
+common (62% of Sonnet 5’s, 39% of Gemini 3.8 Flash’s, 50% of developer patches). On multi-unit patches
+only, or with units weighted by changed lines, the model ranking is unchanged (Spearman +0.97 and +0.99)
+and resolve rate stays uncorrelated (−0.01 and −0.07). The three Gemini Flash models stay significantly
+below developers when line-weighted. On multi-unit patches, developers average 0.729 (237 patches) and
+agents about 0.75 (∆dev ≈+0.02); the Gemini Flash models stay significantly below (−0.064, −0.047, −0.059).
+Task selection.
+Each model was analyzed on its own resolved tasks (482 distinct tasks; 114 shared by all
+18 models). With task fixed effects and task-clustered standard errors, the three Gemini Flash models stay
+significantly below developers and ten models are significantly above. The fixed-effect ranking matches the
+raw one (Spearman +0.99) and is unrelated to resolve rate (−0.10, p = 0.70). Task difficulty has no significant
+effect (−0.008, p = 0.83), and log developer code units has a negative one (−0.133, p < 0.001). On the 99
+
+
+Unneeded Edits in Coding-Agent Patches
+21
+tasks that all models resolve and that have complete grading, the Gemini Flash models are again significantly
+below developers.
+Other harnesses.
+We pair each model’s Copilot CLI patches with its final patches from other agents on
+tasks both resolved (Table 9). For Opus 5 on SWE-bench Verified, NPcode is 0.903 under the Copilot coding
+agent, 0.911 under VS Code agent mode, against 0.910 and 0.909 for Copilot CLI on the same tasks. Over
+three models in Claude Code (426 pairs), the changes are +0.004 (Opus 5), +0.016 (GPT-6 Astra), and −0.010
+(GPT-5.6 Luna). On DeepSWE, Codex CLI over six GPT models (179 pairs) gives +0.006 [−0.01, +0.03], and
+Claude Code over three Claude models (105 pairs) gives −0.007 [−0.03, +0.01].
+Benchmark
+Harness
+Models
+Resolve (%)
+NPcode
+rs
+SWE-bench Verified
+Copilot CLI
+18
+64.0–89.4
+0.887
+−0.10
+DeepSWE
+Copilot CLI
+17
+21.2–68.1
+0.797
+−0.59
+SWE-bench Verified
+Claude Code
+3
+–
+0.926 (CLI 0.923)
+–
+SWE-bench Verified
+Copilot coding agent
+1
+–
+0.903 (CLI 0.910)
+–
+SWE-bench Verified
+VS Code agent mode
+1
+–
+0.911 (CLI 0.909)
+–
+DeepSWE
+Claude Code
+3
+–
+0.828 (CLI 0.835)
+–
+DeepSWE
+Codex CLI
+6
+–
+0.787 (CLI 0.794)
+–
+Table 9: Necessity across benchmarks and harnesses. Resolve is the range across models, and rs is the Spearman
+correlation between resolve rate and NPcode across models. The first two rows give the pooled mean over patches (6,728
+and 932). The other rows use final patches only on tasks resolved under both harnesses, with the paired Copilot CLI
+(CLI) value in parentheses.
+Across benchmarks.
+On DeepSWE the Spearman correlation between resolve rate and NPcode is −0.59
+(p = 0.01), and −0.52 (p = 0.03) for the task-adjusted measure (each model’s necessity minus the mean of all
+models on the same task, over the 92 tasks solved by at least three models). The raw model ranking agrees
+moderately with SWE-bench Verified (+0.59, p = 0.01), and the task-adjusted ranking slightly more (+0.63,
+p = 0.007). Gemini 3.7 and 3.8 Flash and GPT-6 Astra are significantly below the task mean, and Sonnet 5.5,
+Opus 4.8, Haiku 5.5, Kimi K3, and Opus 5 are above it (Appendix E.4). On SWE-bench Pro, two models
+show no sign of over-editing relative to developers, but the Pro developer patches are far from test-minimal
+(Appendix E.5).
+D.5
+RQ5 Details
+First green run.
+Of 6,728 trajectories, 4,860 reach a first all-green run of the agent’s own tests after its first
+source edit, and in 3,035 of them (62%) the agent keeps editing. On the 3,031 graded patches, code units go
+from 7,419 to 7,269, and 2,948 (97.3%) still pass the task tests. Of the 2,939 changed patches that still resolve,
+the post-green edits change source-code units in 208, touch only tests, documentation, or configuration in
+1,472, and cancel out in 1,259.
+Self-audit.
+We showed each resolved SWE-bench Verified patch, with the issue, to the same model (or the
+closest sibling) and asked it to justify every hunk and drop the rest. The audit covers 17 of 18 models (no
+Copilot-CLI auditor exists for Kimi K3); where the original auditor model was unavailable a sibling model
+audited (Opus 5 by Claude Opus 5.5, Opus 4.8 by Claude Opus 4.6, GPT-5.6 Terra by GPT-6.1 Terra), and 4
+over-length patches were skipped. The audit covers 6,345 patches and 13,729 code units; 1,540 patches had at
+least one drop. Against O+, 813 of the 1,238 dropped code hunks are unneeded (precision 0.657, recall 0.355,
+κ = 0.389; TP/FP/FN/TN = 813/425/1,478/11,013). Under Otest precision is 0.785 (recall 0.288, κ = 0.333;
+972/266/2,403/10,088), under O+
+any 0.631 (recall 0.360; 781/457/1,391/11,100), and under Olive 0.164 (recall
+0.287; 203/1,035/504/11,987). Among Otest-unneeded units, models drop 40.5% of those that behave like
+the patch without them (unrequested changes), against 14.7% of those that behave like the full patch (Fisher
+p = 8 × 10−46) and 2.6% of needed units. Pooled against the original DRA grading (Otest), 79% of dropped
+code hunks are unneeded and the audit finds 29% of the 3,407 unneeded code hunks (κ = 0.33). Applying
+
+
+Unneeded Edits in Coding-Agent Patches
+22
+the drops lifts NPcode from 0.924 to 0.944 under O+, and 98.2% of the regraded patches still pass O+ (the
+drops break 1.8%; none were ungraded).
+Pruning with DRA.
+Of the 6,724 patches, 3,777 have no standalone test selector in the trajectory and 450
+fail the baseline repeatability check (Appendix G.1). On the remaining 2,495, the cumulative leave-one-out
+update is S ←S ⊖u whenever Oagent(S ⊖u) = 1, without emptying all code units. With Oagent, NPcode rises
+from 0.936 to 0.974, and 86.6% of patches still pass the task tests (84.3% without the empty-patch guard, at
+37.3% precision and 68.2% recall). With Oagent+P2P, NPcode rises to 0.975, and 89.1% still pass the task tests.
+The false drops are code units that implement behavior that neither the existing tests nor the agent’s tests
+exercise.
+D.6
+Validity Check Against Developer Patches
+The outside-patch check uses 14,591 agent code units on 6,596 matched instances, of which 2,607 are outside-
+patch. Of the 3,753 units the metric flags, 43% are outside-patch, and the rest touch developer-modified
+functions but add unrequested behavior or dead guards. Patch size cannot separate Sonnet 5 (0.86 lines per
+developer line, NPcode = 0.922) from GPT-6.1 Sol (0.84, 0.887).
+E
+Per-Model and Per-Benchmark Results
+E.1
+Cohort Funnel
+Table 10 lists the nested denominators used in the paper, from the instances sampled to the cohorts behind
+each analysis.
+Count
+Cohort
+Used for
+6,728
+Resolved SWE-bench Verified patches analyzed (18 models)
+Main results
+6,345
+Resolved SWE-bench Verified patches in the self-audit (17 models; 13,729 code units)
+RQ5 self-audit
+5,482
+Patches that edit tests
+RQ2 test analyses
+2,945
+Patches with a standalone test selector, run in containers
+Oagent
+2,495
+Repeatably passing Oagent
+Oagent cleanup
+3,035
+Patches that keep editing after first green (of 4,860 that reach it)
+Post-green analysis
+3,031
+Of these, graded
+Post-green analysis
+2,948
+Of these, pass the grader
+Post-green analysis
+Table 10: Nested cohorts. The main results analyze all 6,728 resolved patches; the cleanup experiments use the 6,724
+resolved patches of 18 models, and the container cohorts (2,945, 2,495) are subsets of them.
+E.2
+Per-Model Results
+Table 11 collects the per-model results on both benchmarks; Table 8 gives the confidence intervals.
+
+
+Unneeded Edits in Coding-Agent Patches
+23
+Model
+Resolve
+Tasks
+NPtest
+NPcode
+∆dev vs. dev.
+ρ
+DeepSWE NPcode
+Lines/dev.
+Developer patch
+n/a
+470
+0.864
+0.864
+–
+n/a
+0.785
+1.00
+Claude Opus 5.5
+89.4
+424
+0.451
+0.900
++.042
+0.39
+0.790
+0.82
+Kimi K3
+88.4
+410
+0.479
+0.897
++.024
+0.36
+0.822
+0.86
+Claude Opus 5
+87.2
+420
+0.657
+0.898
++.031
+0.25
+0.808
+0.94
+Claude Opus 4.8
+85.0
+404
+0.657
+0.912
++.045
+0.34
+0.866
+0.91
+GPT-6 Astra
+84.4
+400
+0.279
+0.889
++.025
+0.24
+0.749
+0.85
+GPT-5.6 Sol
+83.6
+388
+0.422
+0.924
++.042
+0.02
+0.787
+0.84
+Gemini 3.8 Flash
+82.4
+392
+0.339
+0.765
+−.095
+0.37
+0.748
+1.32
+Gemini 3.7 Flash
+81.4
+392
+0.348
+0.789
+−.074
+0.39
+0.730
+1.36
+Claude Sonnet 5
+80.6
+382
+0.634
+0.922
++.052
+0.34
+0.814
+0.86
+Claude Haiku 5.5
+79.8
+351
+0.552
+0.913
++.044
+0.42
+0.834
+0.81
+GPT-6.1 Sol
+79.4
+377
+0.273
+0.887
++.024
+0.18
+0.767
+0.84
+GPT-6 Sol
+78.6
+363
+0.333
+0.886
++.011
+0.12
+0.770
+0.89
+GPT-5.6 Terra
+77.4
+360
+0.433
+0.928
++.058
+0.04
+0.840
+0.77
+Claude Sonnet 5.5
+76.4
+367
+0.848
+0.929
++.055
+0.07
+0.821
+0.72
+GPT-5.6 Luna
+76.0
+330
+0.463
+0.946
++.059
+0.05
+0.798
+0.74
+Gemini 3.6 Flash
+73.2
+349
+0.374
+0.791
+−.076
+0.38
+0.801
+1.36
+GPT-6 Luna
+71.6
+312
+0.431
+0.921
++.048
+0.08
+0.805
+0.79
+Claude Haiku 4.5
+64.0
+307
+0.522
+0.873
+−.003
+0.38
+n/a
+1.15
+All models
+–
+6,728 patches
+0.472
+0.887
+–
+0.257
+0.797
+0.86
+Table 11: Per-model results on GitHub Copilot CLI trajectories, SWE-bench Verified (all resolved instances; Otest). NPtest
+is over all units; NPcode is over code units on each model’s own instances. Tasks is the number of tasks analyzed per
+model. ∆dev is agent minus developer NPcode on matched instances; bold means the 95% bootstrap CI excludes 0. ρ is
+the debug share of all residue. The DeepSWE developer baseline is 0.785 over 103 graded reference solutions; Haiku 4.5
+solved one DeepSWE task. Lines/dev. is code lines changed by the agent divided by those changed by the developer on
+matched instances (ratio of sums; bottom row: median across models). Bottom-row NP values are means over patches.
+E.3
+Introducing Role of Unneeded Code
+Table 12 splits code units by the role of the step that introduced them.
+SWE-bench Verified
+DeepSWE
+Introducing role
+Needed
+Unneeded
+Rate
+Needed
+Unneeded
+Rate
+Fix
+9,799
+3,315 (83%)
+0.25
+7,869
+2,547 (72%)
+0.24
+Refine
+1,074
+438 (11%)
+0.29
+2,146
+796 (22%)
+0.27
+Probe
+182
+120 (3%)
+0.40
+494
+78 (2%)
+0.14
+Reproduce
+76
+33 (1%)
+0.30
+122
+52 (1%)
+0.30
+Cleanup
+71
+79 (2%)
+0.53
+477
+81 (2%)
+0.15
+Table 12: Code units by the role of their introducing step (labeled units only). Percentages are shares of unneeded code
+units; rate is unneeded divided by all units with that role.
+E.4
+DeepSWE Per-Model Results
+Figure 4 compares per-model NPcode across the two benchmarks, and Table 13 lists the DeepSWE values.
+
+
+Unneeded Edits in Coding-Agent Patches
+24
+0.75
+0.80
+0.85
+0.90
+0.95
+Code necessity, SWE-bench Verified
+0.72
+0.74
+0.76
+0.78
+0.80
+0.82
+0.84
+0.86
+0.88
+Code necessity, DeepSWE
+Opus 4.8
+GPT-5.6 Terra
+Sonnet 5.5
+Haiku 5.5
+Kimi K3
+Sonnet 5
+Opus 5
+GPT-6 Luna
+GPT-5.6 Sol
+Gemini 3.6 Flash
+GPT-5.6 Luna
+Opus 5.5
+GPT-6.1 Sol
+GPT-6 Sol
+Gemini 3.8 Flash
+Gemini 3.7 Flash
+GPT-6 Astra
+y = x
+Figure 4: Raw NPcode per model on SWE-bench Verified and DeepSWE (17 models with at least 10 graded DeepSWE
+tasks; red: Gemini Flash). Rank correlation is +0.59 raw and +0.63 after adjusting DeepSWE for task mix.
+Model
+DeepSWE resolve
+Tasks
+Raw NPcode
+Task-adjusted [95% CI]
+Claude Opus 4.8
+49.6
+47
+0.866
++0.045 [+0.024, +0.067]
+Claude Sonnet 5.5
+56.6
+55
+0.821
++0.042 [+0.018, +0.066]
+Claude Haiku 5.5
+48.7
+47
+0.834
++0.037 [+0.006, +0.067]
+Kimi K3
+66.4
+64
+0.822
++0.032 [+0.016, +0.047]
+Claude Opus 5
+64.6
+65
+0.808
++0.027 [+0.013, +0.042]
+GPT-5.6 Luna
+21.2
+23
+0.798
++0.023 [−0.020, +0.066]
+GPT-5.6 Terra
+37.2
+36
+0.840
++0.021 [−0.007, +0.046]
+Claude Sonnet 5
+41.6
+43
+0.814
++0.017 [−0.013, +0.049]
+GPT-6 Luna
+46.9
+49
+0.805
++0.011 [−0.017, +0.037]
+Gemini 3.6 Flash
+41.6
+42
+0.801
++0.001 [−0.030, +0.034]
+Claude Opus 5.5
+67.3
+68
+0.790
+−0.011 [−0.037, +0.013]
+GPT-5.6 Sol
+58.4
+57
+0.787
+−0.018 [−0.044, +0.007]
+GPT-6 Sol
+60.2
+58
+0.770
+−0.020 [−0.049, +0.005]
+GPT-6.1 Sol
+68.1
+67
+0.767
+−0.021 [−0.047, +0.005]
+GPT-6 Astra
+67.3
+63
+0.749
+−0.033 [−0.062, −0.006]
+Gemini 3.7 Flash
+68.1
+63
+0.730
+−0.047 [−0.071, −0.022]
+Gemini 3.8 Flash
+65.5
+64
+0.748
+−0.049 [−0.075, −0.023]
+Table 13: DeepSWE, Copilot CLI, sorted by task-adjusted NPcode (model necessity minus the mean of all models on the
+same task, over the 92 tasks solved by ≥3 models). Raw and adjusted values correlate at Spearman +0.92. The developer
+baseline is 0.785 [0.749, 0.820] over 103 tasks. Claude Haiku 4.5 solved one task and is omitted.
+
+
+Unneeded Edits in Coding-Agent Patches
+25
+E.5
+SWE-bench Pro (Supplementary)
+We use complete Copilot CLI runs of two models on the SWE-bench Pro public set (Deng et al., 2025): GPT-5.6
+Luna (399 of 731 tasks resolved) and GPT-5.3 Codex (316 of 731); later Pro runs failed at agent setup. We
+graded all resolved public-split tasks (398 Luna, 315 Codex), unitizing the final patches without replay
+(git-submodule pointer changes dropped); deltas use the 345/272 tasks where both the model and developer
+patches re-resolve under DRA and grading completed (Table 14).
+Model
+Tasks Model Developer
+∆dev [95% CI]
+∆dev, line-weighted
+Units/task
+GPT-5.6 Luna
+345
+0.609
+0.499
++0.111 [+0.08, +0.14] +0.098 [+0.07, +0.12] 9.0 vs. 12.4
+GPT-5.3 Codex
+272
+0.597
+0.481
++0.116 [+0.09, +0.15] +0.114 [+0.08, +0.15] 9.0 vs. 12.5
+Table 14: SWE-bench Pro, Copilot CLI final patches vs. developer patches on the same tasks. Model and Developer
+columns give NPcode; ∆dev is model minus developer (paired task bootstrap); units/task counts code units, model vs.
+developer.
+Both models have higher NPcode than the developer, also on multi-unit patches (+0.069 and +0.079). Pro
+developer patches are large, and the hidden tests need less than half of their code (NPcode 0.48–0.50, against
+0.86 on SWE-bench Verified), so the developer patch is a weak reference for minimality on Pro. The check
+shows only that these two models do not over-edit relative to developers on Pro; two models are too few to
+test the ranking question.
+E.6
+Model Pool
+Table 15 lists every model in the GitHub Copilot CLI evaluation pool with the number of resolved instances
+analyzed and the replay success rate.
+Model
+Resolve
+Resolved tasks analyzed
+Replay success
+Claude Opus 5.5
+89.4
+424
+99% (443/447)
+Kimi K3
+88.4
+410
+95% (422/442)
+Claude Opus 5
+87.2
+420
+99% (432/436)
+Claude Opus 4.8
+85.0
+404
+97% (413/425)
+GPT-6 Astra
+84.4
+400
+98% (412/422)
+GPT-5.6 Sol
+83.6
+388
+95% (398/418)
+Gemini 3.8 Flash
+82.4
+392
+99% (406/412)
+Gemini 3.7 Flash
+81.4
+392
+99% (402/407)
+Claude Sonnet 5
+80.6
+382
+98% (394/403)
+Claude Haiku 5.5
+79.8
+351
+99% (367/369)
+GPT-6.1 Sol
+79.4
+377
+98% (389/397)
+GPT-6 Sol
+78.6
+363
+95% (375/393)
+GPT-5.6 Terra
+77.4
+360
+95% (366/387)
+Claude Sonnet 5.5
+76.4
+367
+99% (378/382)
+GPT-5.6 Luna
+76.0
+330
+89% (338/380)
+Gemini 3.6 Flash
+73.2
+349
+98% (358/366)
+GPT-6 Luna
+71.6
+312
+89% (320/358)
+Claude Haiku 4.5
+64.0
+307
+98% (312/320)
+Table 15: Full Copilot CLI model pool on SWE-bench Verified. Replay success is the share of resolved instances whose
+trajectory replays exactly (6,925 of 7,164, 96.7%); 197 control failures then leave 6,728 analyzed.
+
+
+Unneeded Edits in Coding-Agent Patches
+26
+F
+Test Edits and Mutation Testing
+F.1
+Test-Edit Utility and Mutation Testing Details
+Table 16 gives the full mutation results over the 271 valid instances (1,962 evaluated mutants).
+Metric
+Needed (n = 1) Unneeded (n = 0) Full frame (271)
+Evaluated code mutants
+1,725
+237
+1,962
+Killed by baseline tests in touched files (S0)
+–
+–
+45.6%
+Killed by agent test units
+73.2%
+31.2%
+68.1%
+Killed by held-out task tests (Otest)
+83.4%
+31.2%
+77.1%
+Killed by strengthened oracle (O+)
+–
+–
+84.7%
+Net gain of agent tests over baseline file tests
+–
+–
+58.8%
+Marginal kills of agent tests beyond Otest and S0
+4.6%
+9.3%
+5.2%
+Marginal kills of agent tests beyond O+ and S0
+–
+–
+4.1%
+Table 16: Mutation testing of agent-patched code units on SWE-bench Verified over the 271 valid instances of the
+387-instance eligible frame. The needed and unneeded columns are Otest-needed and unneeded code units. Marginal
+kills are mutants killed by agent tests but by none of the listed suites, as a share of all evaluated mutants in the column
+(not of the mutants those suites miss). – marks values not reported by the full-frame run.
+Among the 1,341 test-editing patches with unneeded source code, 37.8% of test units reference symbols
+unique to the unneeded code.
+Four-arm mutmut protocol and mutant catalog.
+To evaluate the fault-detection value of agent-edited test
+units (Section 5.2), we used mutmut (v3.8.1, built on libcst v1.9.0) (Hovmöller, 2026; Jia and Harman, 2011;
+Just et al., 2014) to enumerate syntactic mutants restricted to the line ranges of agent-modified Python code
+units across all 6,728 resolved SWE-bench Verified patches (4,461 unique patched files; 198 files fail to parse).
+Because mutmut 3.8.1 skips most decorated functions by default, we subclassed MutationVisitor to strip
+node.decorators only while walking the function body, preserving mutations inside decorated methods
+without mutating decorator arguments. Across all patches, mutmut produces 96,790 mutants: 77,549 in
+Otest-needed code units and 19,241 in Otest-unneeded code units (Table 17).
+For dynamic execution, we scaled to the 387-instance eligible frame of single-patch runs that edit both
+Python source and test files (3,525 patches, 11 repositories). Of these, 271 instances pass the validity gates
+G1–G4 (115 fail the G1 base guard, mostly environment differences in astropy, django and sphinx, and 1 fails
+G4): worktree tree-hash parity with ST, zero-mutation control pass on T, ≥1 collected test in Ascope, and
+≥1 evaluated non-stillborn mutant. Of 2,937 planned mutants, 1,962 were evaluated and non-stillborn (56
+stillborn, 3 timeouts, 5 unresolved, 21 skipped by the run budget). Each mutant was tested under up to four
+arms:
+1. Held-out task tests (T, Otest): the benchmark’s FAIL_TO_PASS and PASS_TO_PASS tests run after resetting
+test files and applying the developer test_patch.
+2. Strengthened oracle (O+ = T ∪P): Otest combined with differential behavioral probes P (Section 5.2),
+where P kills a mutant if the mutant alters any probe’s return value or exception outcome relative to the
+unmutated patch ST. The probes are the GPT-6.1 Sol-judged PatchDiff probe scripts, executed in the task
+container on every mutant; 98 instances (485 of the 2,937 planned mutants) are probe-eligible.
+3. Baseline tests in agent-touched files (B): the unedited S0 versions of the test files modified by the agent.
+4. Agent test files (A) and exact agent test units (Ascope): the agent-modified test files in ST, scoped to the
+specific test functions or classes added or edited by the agent’s test units.
+Before running mutants on an instance, a zero-mutation control run recorded baseline passing and failing test
+IDs for each arm; a mutant is killed by an arm only if it causes a test that passed on the unmutated control to
+fail or error, and mutants that fail collection or time out at import are excluded as stillborn.
+
+
+Unneeded Edits in Coding-Agent Patches
+27
+mutmut operator class
+6,728 catalog Share
+Call argument (CALL)
+41,890 43.3%
+String constant (STR)
+19,231 19.9%
+Operator swap (OPR / comp.)
+12,836 13.3%
+Assignment / null (ASN)
+10,321 10.7%
+Number constant (NUM)
+6,280
+6.5%
+Unary / keyword / other
+6,232
+6.4%
+All mutants
+96,790
+100%
+Table 17: mutmut 3.8.1 operator distribution across all 6,728 resolved SWE-bench Verified patches. Unary / keyword /
+other combines unary negation (2,572), name/keyword swap (1,983), ternary swap (1,336), control-flow jump (257) and
+lambda body (84). Per-operator kill rates of the executed mutants, which use a different operator set, are in Table 18.
+Full-frame results.
+Across the 271 valid instances (1,962 evaluated mutants), B kills 45.6% (95% instance-
+cluster bootstrap CI [41.1%, 50.1%]), Ascope kills 68.1% ([63.7%, 72.5%]; 79.7% at whole-file level A,
+[76.2%, 83.1%]), and T kills 77.1% ([73.6%, 80.5%]). The net gain of Ascope over B is 58.8% (1,153/1,962,
+[54.2%, 63.3%]). A marginal kill is a mutant that the reference suite misses and that at least one Ascope test
+kills, excluding tests whose unedited version in B also kills it; because the exclusion is per test, a mutant can
+count even when a different baseline test also kills it. Marginal kills beyond T and B are 5.2% (102/1,962,
+[3.7%, 6.9%]), which is 22.7% of the mutants T misses and occurs in 46 of 271 instances. Needed code is
+killed far more often than unneeded code under both Ascope (73.2% vs. 31.2%) and T (83.4% vs. 31.2%);
+marginal kills beyond T are 4.6% (80) on needed and 9.3% (22) on unneeded code. The probes alone kill
+12.2% (239/1,962), so O+ kills 84.7% (1,661/1,962, [82.0%, 87.2%]); the stricter O+
+strict, which uses only probes
+from fully live units, kills 79.4% ([75.9%, 82.6%]). With the same exclusion of B, agent tests still add kills
+beyond O+: 4.1% (81/1,962, [2.8%, 5.6%]; 38 of 271 instances) and 4.6% beyond O+
+strict (91/1,962, [3.2%, 6.2%];
+43 instances). Table 18 gives per-operator kill rates.
+Operator
+Mutants T kill O+ kill
+Constant (CON)
+569 66.3%
+77.2%
+Statement deletion (SDL)
+507 78.9%
+86.4%
+Relational operator (ROR)
+195 81.5%
+89.7%
+Condition (COND)
+244 88.5%
+92.6%
+Arithmetic operator (AOR)
+111 83.8%
+90.1%
+Return value (RET)
+143 78.3%
+84.6%
+Logical connector (LCR)
+110 80.9%
+85.5%
+Negation (NEG)
+83 80.7%
+81.9%
+All evaluated mutants
+1,962 77.1%
+84.7%
+Table 18: Per-operator kill rates of the held-out task tests (T) and the strengthened oracle (O+) over the 1,962 evaluated
+mutants. These operator classes are those of the executed mutants and differ from the static mutmut catalog classes in
+Table 17.
+Static anatomy, timing, and per-model breakdown.
+Across all 6,728 SWE-bench Verified patches, 11,614 of
+11,640 test units (99.8%) have n(u) = 0 (9,617 in test files reset by eval.sh and 2,023 in other test files). On
+DeepSWE, which does not reset test files, 2,440 of 2,889 test units (84.5%) still have n(u) = 0. Structurally,
+8,702 of the 11,640 test units (74.8%) define or modify a test function (detected by a function named test_*),
+1,179 (10.1%) are import-only hunks, and 1,759 (15.1%) edit helpers or fixtures; 72.0% reside in or add an
+assertion-bearing test. Relative to the final needed code edit t⋆
+code across the 5,439 test-editing patches with
+step provenance, 2,827 (52.0%) write all surviving test units strictly after t⋆
+code, 1,704 (31.3%) write them in
+the same step with none before, and 908 (16.7%) write at least one before t⋆
+code. Only 471 patches (8.7%;
+610 = 11.2% raw) record a pre-fix red-to-green transition in bash. Table 19 gives the per-model breakdown:
+across the 18 models, writing tests before the fix correlates strongly with witnessing a red-to-green transition
+
+
+Unneeded Edits in Coding-Agent Patches
+28
+(Spearman rs = 0.83, p < 10−4 raw; rs = 0.80, p < 10−3 strict pre-fix).
+Model
+Patches Units test_* Assert Needed
+Dev Before Fix % Post-fix R→G (Pre/Raw)
+Sites (N/U)
+Claude Opus 5.5
+396
+661
+76.1% 71.4%
+70.3% 61.4%
+7.9%
+68.3%
+0.5% / 1.8%
+2,277 / 440
+Kimi K3
+322
+711
+73.7% 70.7%
+63.7% 58.9%
+3.8%
+96.2%
+2.2% / 4.1%
+2,420 / 566
+Claude Opus 5
+181
+386
+74.6% 73.6%
+68.1% 59.6%
+11.1%
+81.1%
+1.1% / 2.8%
+2,629 / 772
+Claude Opus 4.8
+203
+387
+76.5% 74.4%
+70.5% 64.9%
+6.9%
+92.1%
+2.5% / 4.4%
+2,610 / 619
+GPT-6 Astra
+400
+995
+73.3% 71.1%
+65.8% 59.3%
+62.6%
+19.6%
+38.2% / 44.7%
+1,765 / 542
+GPT-5.6 Sol
+387
+770
+72.5% 69.9%
+66.9% 58.7%
+7.5%
+19.7%
+3.6% / 5.2%
+1,790 / 300
+Gemini 3.8 Flash
+391
+1050
+75.1% 72.5%
+65.7% 60.1%
+11.5%
+92.4%
+5.5% / 8.7%
+2,665 / 1,609
+Gemini 3.7 Flash
+391
+1056
+76.1% 75.5%
+66.7% 59.0%
+6.2%
+95.6%
+2.3% / 4.4%
+2,628 / 1,640
+Claude Sonnet 5
+195
+389
+76.3% 73.8%
+71.2% 65.6%
+6.2%
+93.8%
+2.1% / 3.6%
+1,803 / 422
+Claude Haiku 5.5
+270
+463
+78.6% 73.9%
+70.0% 60.0%
+10.9%
+61.8%
+1.9% / 4.9%
+2,311 / 373
+GPT-6.1 Sol
+377
+956
+70.5% 68.0%
+66.9% 59.5%
+48.7%
+29.4%
+29.1% / 33.4%
+1,731 / 457
+GPT-6 Sol
+363
+805
+73.8% 70.7%
+64.8% 56.4%
+20.7%
+46.0%
+11.8% / 16.5%
+1,877 / 511
+GPT-5.6 Terra
+358
+711
+70.3% 68.5%
+66.4% 61.0%
+10.9%
+24.1%
+6.2% / 7.0%
+2,262 / 262
+Claude Sonnet 5.5
+45
+101
+87.1% 88.1%
+69.3% 54.5%
+2.3%
+65.1%
+0.0% / 2.3%
+2,074 / 460
+GPT-5.6 Luna
+319
+549
+76.0% 71.2%
+68.5% 57.2%
+11.6%
+26.1%
+6.6% / 7.5%
+1,420 / 225
+Gemini 3.6 Flash
+348
+674
+79.7% 75.1%
+66.2% 58.5%
+6.7%
+94.2%
+3.2% / 3.8%
+2,507 / 1,463
+GPT-6 Luna
+310
+552
+76.3% 72.5%
+65.9% 57.8%
+15.8%
+31.3%
+7.4% / 9.0%
+1,425 / 224
+Claude Haiku 4.5
+226
+424
+75.2% 72.6%
+73.3% 66.3%
+16.8%
+88.9%
+9.3% / 14.2%
+1,671 / 458
+All models
+5,482 11,640
+74.8% 72.0%
+67.2% 59.8%
+16.7%
+59.3%
+8.7% / 11.2% 37,865 / 11,343
+Table 19: Per-model test-edit anatomy, AST symbol coupling, trajectory timing, and first-order syntactic AST mutation
+sites on SWE-bench Verified. Columns 4–7 are percentages of test units defining/modifying test functions (detected
+by a function named test_*), containing assertions, referencing needed source symbols, and referencing developer-
+patch symbols; Columns 8–10 are percentages of labeled test-editing patches with any test unit written before the fix
+(t⋆
+test < t⋆
+code), with any test unit written post-fix (t⋆
+test > t⋆
+code), and witnessing a bash red-to-green transition (strict pre-fix
+/ raw trajectory); Column 11 lists first-order syntactic AST mutation sites in needed (N) and unneeded (U) code units
+across all code units of each model.
+G
+Agent-Test Oracle and Removal Bounds
+G.1
+Repeatably Passing Agent-Test Oracle (Oagent) and Non-Passing Cases
+Definition of repeatably passing (Oagent(ST) = 1).
+A resolved patch ST has a repeatably passing agent-test
+oracle (Oagent(ST) = 1) if the standalone test command extracted from the agent’s trajectory still exists in ST
+and passes twice consecutively with a non-zero, identical passing test count when re-executed against the
+unpruned final patch ST before reverting any units. Because post-generation cleanup tests each candidate
+revert by checking whether Oagent(S ⊖u) = 1 (requiring the passing test count to match baseline), verifying
+Oagent(ST) = 1 on the unpruned patch is a prerequisite: if Oagent(ST) = 0, every candidate revert would fail
+the oracle check and no unit could be pruned.
+Label-free eligibility funnel across the 6,724 resolved patches.
+Because the cleanup procedure never
+reverts the last remaining code unit (|S ∩Ucode| ≥1), all 3,781 single-code-unit patches (|ST ∩Ucode| = 1) are
+deterministic no-ops from patch structure alone, without consulting O+ or Otest. Table 20 breaks down all
+6,724 resolved patches (3,781 single-code-unit and 2,943 multi-code-unit) through trajectory test extraction
+and in-container baseline repeatability testing (executing C/Cython extension repositories directly in the
+pre-built /testbed environment so zero tasks fail environment imports):
+1. No standalone extracted test selector (3,777 of 6,724 patches). The trajectory parser extracts new stan-
+dalone test selectors without reading O+ or Otest; these patches either submit no test-file edits in ST (for
+example, the agent ran a temporary reproduction script or an inline python -c command and deleted it)
+or modify existing test files without a standalone pytest or runtests.py node selector after the final edit.
+
+
+Unneeded Edits in Coding-Agent Patches
+29
+2. In-container baseline check fails, Oagent(ST) = 0 (450 patches). Of the 2,945 container-tested patches
+where Oagent(ST) is executed, 2,495 pass repeatably (Oagent(ST) = 1: 1,468 single-code-unit no-ops and
+1,027 multi-code-unit patches) and 450 fail and are left untouched. The most common causes are runner
+mismatches in standalone replay (for example SymPy patches whose probe invokes python -m pytest
+where the agent ran bin/test), abstract mixin test classes in Django, strict pytest mark collection errors
+in Astropy, and extracted commands that relied on uncommitted scratch settings.
+Stage / Outcome
+All patches
+|Ucode| = 1 (no-op)
+|Ucode| ≥2
+All resolved patches analyzed
+6,724
+3,781
+2,943
+No standalone extracted test selector in trajectory
+3,777
+–
+–
+Container-verified patches tested with Oagent(ST)
+2,945
+–
+–
+Baseline fails (Oagent(ST) = 0; left untouched)
+450
+–
+–
+Repeatably passing (Oagent(ST) = 1; evaluated)
+2,495
+1,468
+1,027
+Table 20: Label-free eligibility breakdown from all 6,724 resolved SWE-bench Verified patches to the 2,495 container-
+evaluated patches with Oagent(ST) = 1. The single- and multi-code-unit split (|Ucode| = 1 vs. |Ucode| ≥2) is shown
+where available, and is computed without consulting O+ or Otest.
+Pre-existing tests alone and full-suite reference bounds under O+.
+Because pre-existing regression tests
+(OP2P, the PASS_TO_PASS suite) do not check the new issue fix or untested developer-aligned behavior,
+OP2P alone drops 2,540 O+-needed units across all 6,724 patches (and 951 across the 2,495 container cohort;
+Table 21). Guarded Oagent in an oracle-guided simulation across all 6,724 patches reaches 57.5% precision
+and 69.9% recall, with 87.4% of patches still passing O+, compared with 51.5% precision and 85.4% retention
+for the patch’s own tests alone; of the 2,717 unneeded units, 1,899 (69.9%) are pruned, 617 (22.7%) are locked
+in by agent tests, and 201 (7.4%) are kept by the empty-patch guard. Intersecting the in-container Oagent+P2P
+drops with the self-audit on the 2,344 patches where both exist raises precision to 67.7% at 98.3% retention.
+Pruning with the strengthened oracle O+ keeps 99.8% of patches passing (6,710 of 6,724) when all 2,717
+unneeded units are removed simultaneously, and 100% (99.5% recall, 2,703 of 2,717 units) under guarded
+cumulative leave-one-out removal.
+Method
+Patches Dropped
+TP / FP
+Prec.
+Recall Post NPcode Passes O+
+DRA + OP2P (all)
+6,724
+4,047
+1,507 / 2,540
+37.2%
+55.5%
+0.953
+80.7%
+DRA + OP2P (2,495 cohort)
+2,495
+1,220
+269 / 951
+22.0%
+45.3%
+0.960
+80.0%
+DRA + Opatch-test (sim.)
+6,724
+3,449
+1,775 / 1,674
+51.5%
+65.3%
+0.962
+85.4%
+DRA + Oagent (sim.)
+6,724
+3,305
+1,899 / 1,406
+57.5%
+69.9%
+0.969
+87.4%
+DRA + Oagent+P2P ∩audit
+2,344
+229
+155 / 74
+67.7%
+27.1%
+–
+98.3%
+DRA + O+ (cumulative)
+6,724
+2,703
+2,703 / 0
+100.0% 99.5%
+0.998
+100.0%
+Table 21: Reference bounds for post-generation removal on SWE-bench Verified evaluated under O+ using pre-existing
+regression tests alone (OP2P), oracle-guided simulations over all 6,724 resolved patches (15,191 code units, 2,717 un-
+needed), and the full strengthened oracle (O+). Post-reduction NPcode is the task mean. The ∩audit row is on the 2,344
+patches that have both an in-container run and a self-audit.
+H
+Prompts and Protocols
+H.1
+Intervention Prompts (Not Run)
+These prompts were written for the intervention study that we did not run. The offline self-audit of Section 5.5
+adapts I2 to final patches, without tools.
+
+
+Unneeded Edits in Coding-Agent Patches
+30
+I1: Revert-on-reject.
+Appended to the system prompt:
+When you edit code to test a hypothesis and the hypothesis turns out
+to be wrong, revert that edit before trying the next idea. Use
+‘checkpoint save <name>‘ before exploratory edits and
+‘checkpoint restore <name>‘ to undo them. Reproduction scripts and
+debugging prints must not remain in the final working tree.
+I2: Pre-submit diff audit.
+Sent before submission:
+Before submitting, here is your complete diff against the original
+repository:
+{full_diff}
+For each hunk, state in one line why it is required to resolve the
+issue. Remove every hunk you cannot justify, then submit.
+I
+Extended Related Work
+Measuring over-editing.
+Recent work measures how much of an agent’s patch is unneeded by comparing
+it with a reference patch, using edit distance or patch-level diffs (Zhu et al., 2026; Luo et al., 2026). These
+measures treat every difference from the reference as unneeded. Our measure grades each unit with an
+oracle, so a different but valid edit is not counted against the agent.
+Training for minimal edits.
+Synthetic task generation (Yang et al., 2025) and reinforcement learning with
+verifiable rewards (Shao et al., 2024) could be shaped to reward smaller patches. Our results suggest what to
+target: unneeded code is mostly part of the fix, not debugging scaffolding.
+Agent harnesses and trajectories.
+Open harnesses and their published trajectories (SWE-agent Team, 2025;
+Wang et al., 2025; SWE-bench Team, 2026) let us compare patches across agents. We replay trajectories to
+attribute each line to the step that wrote it, which final-patch comparisons cannot do.
+Delta debugging and repair minimality.
+Delta debugging reduces a failing input to a minimal one (Zeller
+and Hildebrandt, 2002), and repair work favors small changes that keep the program correct (Mechtaev et al.,
+2015), though test-passing repairs can still overfit (Smith et al., 2015). Our oracle-guided unit removal follows
+the same idea for agent patches.
+Tests and mutation testing.
+Property-based testing (MacIver et al., 2019), LLM-written differential tests (Hu
+et al., 2026), and mutation testing (Jia and Harman, 2011; Just et al., 2014; Hovmöller, 2026) measure whether
+tests detect changes in behavior. We use them to strengthen the oracle and to ask whether the agent’s own
+tests guard its code.
